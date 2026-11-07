@@ -70,6 +70,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: wallpaperlive-windows-x64
@@ -84,21 +87,31 @@ jobs:
           $hash = (Get-FileHash -LiteralPath .\dist\wallpaperlivesetup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           $expected = "$hash  wallpaperlivesetup.exe"
           if ((Get-Content -LiteralPath .\dist\SHA256SUMS.txt -Raw).Trim() -ne $expected) { throw 'Installer checksum mismatch.' }
+          $changelog = Get-Content -LiteralPath .\CHANGELOG.md -Raw
+          $pattern = '(?ms)^## ' + [regex]::Escape($env:RELEASE_TAG) + '\r?$\s*(.*?)(?=^---\s*$|^## |\z)'
+          $entry = [regex]::Match($changelog, $pattern)
+          if (-not $entry.Success) { throw "Missing changelog for $env:RELEASE_TAG" }
+          $changes = $entry.Groups[1].Value.Trim()
           $notes = @"
-          Windows x64 installer built by GitHub Actions after formatting, lint, tests and release compilation passed.
+          ## WallpaperLive $env:RELEASE_TAG
 
-          Features: automatic display-sized SDR video cache without changing originals; manual 24/30/45/60 FPS cap; detected dedicated GPU preference; folder/subfolder import and folder filter; Select all plus confirmed mass library removal.
-          FPS changes now update a native filter on the running player without reload or re-encoding. Original media starts immediately while a fixed source-rate display cache is prepared in the background; uncached 4K can temporarily use more RAM. The same renderer is reused on switches.
-          Pause keeps the last frame and decoder visible, stops animation/audio, drops thumbnails and requests a one-shot resident RAM trim. Resume does not re-prepare or reload the active file. Fullscreen and maximized foreground apps on the wallpaper display trigger automatic pause, and cache conversion is cancelled/deferred while paused.
-          Tray context menus follow the Windows system dark/light theme without restart; high-contrast mode retains native system rendering.
-          The app checks GitHub once in the background per process for a newer stable release. A tray balloon and Pembaruan tersedia (vX.Y.Z) menu entry open the validated repository release page; no automatic download or installation.
-          RAM is not globally capped. UI/tray/resume detection still use resources; cache conversion is CPU/disk work performed once per profile. HDR and animated images retain their original media in this version.
+          $changes
 
-          Unsigned build. Setup reuses a matching installed decoder or a checksum-verified mpv-dev.7z beside the installer without Internet access. Otherwise it asks for a one-time decoder download. No wallpaper or startup setting is applied by Setup.
-          Installation, desktop playback and resource use still require manual testing. Use trusted local media; do not disable security protections or run as administrator to bypass warnings.
+          ---
 
-          SHA256: $hash
-          Build: https://github.com/$env:GH_REPO/actions/runs/$env:GITHUB_RUN_ID
+          ### Download and verification
+
+          - [Windows x64 installer](https://github.com/$env:GH_REPO/releases/download/$env:RELEASE_TAG/wallpaperlivesetup.exe)
+          - [SHA256SUMS.txt](https://github.com/$env:GH_REPO/releases/download/$env:RELEASE_TAG/SHA256SUMS.txt)
+          - [GitHub Actions build](https://github.com/$env:GH_REPO/actions/runs/$env:GITHUB_RUN_ID): formatting, Clippy, source tests, release compilation and installer build passed.
+
+          **Installer SHA256:** ``$hash``
+
+          ### Installation notes
+
+          - Unsigned build. Keep Windows security protections enabled and use trusted local media.
+          - Setup reuses a verified decoder or local archive; otherwise it asks before a one-time decoder download. No wallpapers or decoder binaries are bundled.
+          - Setup does not launch the app, apply a wallpaper or enable startup. Installation and live desktop testing remain manual.
           "@
           $notes | Set-Content -LiteralPath .\dist\release-notes.md -Encoding utf8
           $arguments = @('release', 'create', $env:RELEASE_TAG, '.\dist\wallpaperlivesetup.exe', '.\dist\SHA256SUMS.txt', '--verify-tag', '--draft', '--title', "WallpaperLive $env:RELEASE_TAG", '--notes-file', '.\dist\release-notes.md')

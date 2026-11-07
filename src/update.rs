@@ -127,7 +127,7 @@ fn parse_release(text: &str) -> Result<Option<String>, String> {
     Ok((remote > local).then(|| format!("v{}.{}.{}", remote.0, remote.1, remote.2)))
 }
 
-fn fetch(cancelled: &AtomicBool, deadline: Instant) -> Result<Option<Vec<u8>>, String> {
+fn fetch(cancelled: &AtomicBool, deadline: Instant) -> Result<Vec<u8>, String> {
     checkpoint(cancelled, deadline)?;
     let agent: Vec<u16> = format!("WallpaperLive/{}", env!("CARGO_PKG_VERSION"))
         .encode_utf16()
@@ -193,7 +193,7 @@ fn fetch(cancelled: &AtomicBool, deadline: Instant) -> Result<Option<Vec<u8>>, S
     }
     .map_err(|e| e.to_string())?;
     if status == 404 {
-        return Ok(None);
+        return Err("No published stable release was found on GitHub".into());
     }
     if status != 200 {
         return Err(format!("GitHub update check returned HTTP {status}"));
@@ -222,7 +222,20 @@ fn fetch(cancelled: &AtomicBool, deadline: Instant) -> Result<Option<Vec<u8>>, S
         }
         body.extend_from_slice(&chunk[..read as usize]);
     }
-    Ok(Some(body))
+    Ok(body)
+}
+
+pub fn message(result: &Result<Option<String>, String>) -> String {
+    let current = env!("CARGO_PKG_VERSION");
+    match result {
+        Ok(Some(tag)) => format!(
+            "A new version of WallpaperLive is available ({tag}).\n\nYou are using v{current}. Open the GitHub release page?\n\nNo automatic download or installation."
+        ),
+        Ok(None) => format!("You are using the latest version of WallpaperLive (v{current})."),
+        Err(error) => format!(
+            "Could not check for updates.\n\n{error}\n\nCheck your Internet connection and try again."
+        ),
+    }
 }
 
 pub fn check(cancelled: &AtomicBool) -> Result<Option<String>, String> {
@@ -230,12 +243,8 @@ pub fn check(cancelled: &AtomicBool) -> Result<Option<String>, String> {
     // ponytail: native synchronous calls have 3s phase limits; cancellation waits for the current call.
     let body = fetch(cancelled, deadline)?;
     checkpoint(cancelled, deadline)?;
-    let result = match body {
-        Some(body) => {
-            parse_release(std::str::from_utf8(&body).map_err(|_| "Release JSON is not UTF-8")?)
-        }
-        None => Ok(None),
-    };
+    let result =
+        parse_release(std::str::from_utf8(&body).map_err(|_| "Release JSON is not UTF-8")?);
     checkpoint(cancelled, deadline)?;
     result
 }
@@ -243,6 +252,20 @@ pub fn check(cancelled: &AtomicBool) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_update_messages_are_english_and_versioned() {
+        assert_eq!(
+            message(&Ok(None)),
+            format!(
+                "You are using the latest version of WallpaperLive (v{}).",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        let newer = message(&Ok(Some("v9.0.0".into())));
+        assert!(newer.contains("v9.0.0") && newer.contains("Open the GitHub release page?"));
+        let failed = message(&Err("GitHub update check returned HTTP 403".into()));
+        assert!(failed.contains("HTTP 403") && !failed.contains("latest version"));
+    }
     #[test]
     fn versions_are_strict_numeric_triples() {
         assert_eq!(version("0.1.1"), Some((0, 1, 1)));

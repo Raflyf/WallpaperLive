@@ -44,7 +44,6 @@ pub struct Layout {
     pub preview_title: Rect,
     pub display_label: Rect,
     pub fit_label: Rect,
-    pub settings_title: Rect,
     pub settings_note: Rect,
     pub tile_rects: [Rect; 4],
     controls: [(usize, Rect); 23],
@@ -73,7 +72,7 @@ impl Layout {
         });
         let side_x = split + 24;
         let side_width = 296;
-        let preview_height = (height - 528).clamp(1, side_width * 9 / 16);
+        let preview_height = (height - 572).clamp(1, side_width * 9 / 16);
         let preview_width = preview_height * 16 / 9;
         let preview = r(
             side_x + (side_width - preview_width) / 2,
@@ -102,14 +101,13 @@ impl Layout {
             preview_title: r(side_x, 88, side_width, 24),
             display_label,
             fit_label,
-            settings_title: r(24, 184, split - 48, 32),
-            settings_note: r(24, 230, split - 48, 64),
+            settings_note: r(24, 176, (split - 48).min(480), 36),
             tile_rects,
             controls: [
                 (101, r(width - 464, 18, 160, 36)),
                 (ADD_FOLDER, r(width - 292, 18, 148, 36)),
                 (114, r(width - 132, 18, 108, 36)),
-                (FOLDER_FILTER, r(24, 164, split - 48, 34)),
+                (FOLDER_FILTER, r(24, 164, split - 164, 34)),
                 (PREVIEW, preview),
                 (112, file),
                 (105, display),
@@ -119,19 +117,19 @@ impl Layout {
                 (102, r(side_x, apply_y, side_width, 38)),
                 (103, r(side_x, pause_y, 142, 34)),
                 (104, r(side_x + 154, pause_y, 142, 34)),
-                (107, r(24, 316, split - 48, 32)),
-                (108, r(24, 366, split - 48, 32)),
-                (121, r(24, 416, split - 48, 32)),
-                (FPS, r(24, 458, 240, 34)),
-                (SELECT_ALL, r(pager.left, pager.top, 104, 36)),
-                (PREVIOUS, r(pager.left + 116, pager.top, 84, 36)),
-                (NEXT, r(pager.left + 212, pager.top, 84, 36)),
+                (107, r(24, 224, (split - 48).min(400), 32)),
+                (108, r(24, 304, (split - 48).min(400), 32)),
+                (121, r(24, 264, (split - 48).min(400), 32)),
+                (FPS, r(side_x, fit.bottom + 12, side_width, 34)),
+                (SELECT_ALL, r(split - 128, 164, 104, 34)),
+                (PREVIOUS, r(pager.left, pager.top, 104, 36)),
+                (NEXT, r(pager.left + 116, pager.top, 104, 36)),
                 (
                     PAGE,
                     r(
-                        pager.left + 308,
+                        pager.left + 232,
                         pager.top,
-                        pager.right - pager.left - 308,
+                        pager.right - pager.left - 232,
                         36,
                     ),
                 ),
@@ -644,7 +642,7 @@ pub unsafe fn paint(window: HWND) {
         label(
             dc,
             if show_settings {
-                "Playback preferences"
+                "Pause and startup preferences"
             } else {
                 "Preview a thumbnail. Ctrl-click marks files for removal."
             },
@@ -725,18 +723,9 @@ pub unsafe fn paint(window: HWND) {
         if show_settings {
             label(
                 dc,
-                "Playback",
-                pixels(layout.settings_title),
-                scale(21),
-                true,
-                TEXT,
-                DT_SINGLELINE,
-            );
-            label(
-                dc,
-                "Pause preferences apply to the active wallpaper. Locking the session or turning off the display pauses playback.",
+                "Session lock and display sleep always pause playback.",
                 pixels(layout.settings_note),
-                scale(15),
+                scale(13),
                 false,
                 MUTED,
                 DT_WORDBREAK,
@@ -760,6 +749,8 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
         SetTextColor(dc, rgb(if id == 113 { MUTED } else { TEXT }));
         let color = if id == 113 {
             0x20252c
+        } else if matches!(id, 107 | 108 | 121) {
+            CANVAS
         } else if matches!(id, 105 | 106) {
             0x303943
         } else {
@@ -815,12 +806,17 @@ mod tests {
                         assert!(!overlap(scale(*tile), scale(*other)));
                     }
                 }
-                for id in [PREVIEW, 112, 105, 106, AUDIO, REMOVE, 102, 103, 104] {
+                for id in [PREVIEW, 112, 105, 106, FPS, AUDIO, REMOVE, 102, 103, 104] {
                     assert!(scale(layout.sidebar).covers(scale(layout.control(id).unwrap())));
                 }
-                for id in [SELECT_ALL, PREVIOUS, NEXT, PAGE] {
+                for id in [PREVIOUS, NEXT, PAGE] {
                     assert!(scale(layout.pager).covers(scale(layout.control(id).unwrap())));
                 }
+                let selection = layout.control(SELECT_ALL).unwrap();
+                assert_eq!(selection.top, layout.control(FOLDER_FILTER).unwrap().top);
+                assert!(selection.bottom < layout.library.top);
+                assert!(!overlap(scale(selection), scale(layout.pager)));
+                assert_eq!(layout.control(PREVIOUS).unwrap().left, layout.pager.left);
             }
             for (i, (id, area)) in layout.controls.iter().enumerate() {
                 for (_, other) in &layout.controls[i + 1..] {
@@ -830,7 +826,16 @@ mod tests {
                     );
                 }
             }
-            assert!(layout.control(106).unwrap().bottom <= layout.control(AUDIO).unwrap().top);
+            assert!(layout.control(106).unwrap().bottom < layout.control(FPS).unwrap().top);
+            assert!(layout.control(FPS).unwrap().bottom < layout.control(AUDIO).unwrap().top);
+            assert_eq!(
+                layout.control(107).unwrap().left,
+                layout.control(121).unwrap().left
+            );
+            assert_eq!(
+                layout.control(121).unwrap().left,
+                layout.control(108).unwrap().left
+            );
             assert_eq!(
                 layout.control(105).unwrap().bottom - layout.control(105).unwrap().top,
                 34

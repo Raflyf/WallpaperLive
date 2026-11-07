@@ -348,7 +348,7 @@ mod tests {
             (103, "Pause"),
             (120, "Turn sound on"),
             (104, "Stop wallpaper"),
-            (126, "Pembaruan tersedia (v0.1.2)"),
+            (126, "Check for updates"),
             (110, "Exit"),
         ];
         for dpi in [96, 192] {

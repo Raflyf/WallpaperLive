@@ -120,6 +120,18 @@ impl Event {
     }
 }
 
+fn fps_filter(fps: u32, source_fps: f64) -> Result<String, String> {
+    if !crate::core::FPS_OPTIONS.contains(&fps) || !source_fps.is_finite() || source_fps < 0.0 {
+        return Err("Invalid playback frame-rate limit or source rate".into());
+    }
+    // Zero means unknown; it must not silently disable the requested cap.
+    Ok(if source_fps > 0.0 && source_fps <= f64::from(fps) + 0.05 {
+        String::new()
+    } else {
+        format!("lavfi=[fps=fps={fps}:round=near]")
+    })
+}
+
 struct Library(HMODULE);
 impl Drop for Library {
     fn drop(&mut self) {
@@ -744,16 +756,8 @@ impl Mpv {
         Ok(request)
     }
     pub fn set_fps(&self, fps: u32, source_fps: f64) -> Result<(), String> {
-        if !crate::core::FPS_OPTIONS.contains(&fps) || !source_fps.is_finite() || source_fps <= 0.0
-        {
-            return Err("Invalid playback frame-rate limit or source rate".into());
-        }
-        let filter = if source_fps <= f64::from(fps) + 0.05 {
-            CString::new("").map_err(|_| "Invalid frame-rate filter")?
-        } else {
-            CString::new(format!("lavfi=[fps=fps={fps}:round=near]"))
-                .map_err(|_| "Invalid frame-rate filter")?
-        };
+        let filter =
+            CString::new(fps_filter(fps, source_fps)?).map_err(|_| "Invalid frame-rate filter")?;
         let args = [
             c"vf".as_ptr(),
             c"set".as_ptr(),
@@ -956,6 +960,20 @@ unsafe extern "C" fn wakeup(data: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fps_cap_handles_unknown_and_known_source_rates() {
+        let capped = "lavfi=[fps=fps=24:round=near]";
+        assert_eq!(fps_filter(24, 0.0).unwrap(), capped);
+        assert_eq!(fps_filter(24, 60.0).unwrap(), capped);
+        assert_eq!(fps_filter(24, 10.0).unwrap(), "");
+        assert_eq!(fps_filter(60, 60.0).unwrap(), "");
+        for fps in [0, 25, 120] {
+            assert!(fps_filter(fps, 60.0).is_err());
+        }
+        for source_fps in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(fps_filter(24, source_fps).is_err());
+        }
+    }
     #[test]
     fn native_load_result_identity_is_typed_and_bounded() {
         let parse = |integer, format| {

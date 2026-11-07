@@ -157,7 +157,8 @@ struct App {
     power: Vec<HPOWERNOTIFY>,
     tray_present: bool,
     update_tag: Option<String>,
-    update_label: String,
+    update_manual: bool,
+    update_tx: std::sync::mpsc::Sender<Result<Option<String>, String>>,
     update_rx: std::sync::mpsc::Receiver<Result<Option<String>, String>>,
     update_thread: Option<(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -571,7 +572,7 @@ impl App {
                     if visible { SW_SHOWNA } else { SW_HIDE },
                 );
             }
-            for id in [BATTERY, STARTUP, 121, visuals::FPS] {
+            for id in [BATTERY, STARTUP, 121] {
                 let _ = ShowWindow(
                     self.control(id),
                     if self.settings_open { SW_SHOW } else { SW_HIDE },
@@ -914,21 +915,86 @@ impl App {
         }
         Ok(())
     }
+    fn check_updates(&mut self, manual: bool) -> Result<(), String> {
+        self.update_manual |= manual;
+        if self.update_thread.is_some() {
+            return Ok(());
+        }
+        if unsafe { SetTimer(self.hwnd, 2, 100, None) } == 0 {
+            return Err("Could not start the update check".into());
+        }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let tx = self.update_tx.clone();
+        let hwnd = self.hwnd.0 as usize;
+        self.update_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                let result = crate::update::check(&flag);
+                if !flag.load(std::sync::atomic::Ordering::Relaxed) && tx.send(result).is_ok() {
+                    // SAFETY: completion targets only the owned panel, retained until the worker is joined.
+                    unsafe {
+                        let _ =
+                            PostMessageW(HWND(hwnd as *mut _), UPDATE_READY, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }),
+        ));
+        Ok(())
+    }
     fn update_ready(&mut self) -> Result<(), String> {
-        let Ok(result) = self.update_rx.try_recv() else {
+        if self
+            .update_thread
+            .as_ref()
+            .is_some_and(|(_, worker)| !worker.is_finished())
+        {
+            return Ok(());
+        }
+        let finished = self
+            .update_thread
+            .take()
+            .map(|(_, worker)| worker.join().is_err());
+        let result = if finished == Some(true) {
+            Err("Update checker stopped unexpectedly".into())
+        } else if let Ok(result) = self.update_rx.try_recv() {
+            result
+        } else if finished.is_some() {
+            Err("Update checker returned no result".into())
+        } else {
             return Ok(());
         };
-        if let Some((_, worker)) = self.update_thread.take() {
-            let _ = worker.join();
+        unsafe {
+            let _ = KillTimer(self.hwnd, 2);
         }
-        match result {
-            Ok(Some(tag)) => {
-                self.update_label = format!("Pembaruan tersedia ({tag})");
-                self.update_tag = Some(tag);
-                self.notify_update()?;
+        if let Ok(tag) = &result {
+            self.update_tag = tag.clone();
+        }
+        if std::mem::take(&mut self.update_manual) {
+            let newer = matches!(result, Ok(Some(_)));
+            let text = wide(&crate::update::message(&result));
+            let flags = if newer {
+                MB_YESNO | MB_ICONINFORMATION
+            } else if result.is_err() {
+                MB_OK | MB_ICONWARNING
+            } else {
+                MB_OK | MB_ICONINFORMATION
+            };
+            let choice = unsafe {
+                MessageBoxW(
+                    self.hwnd,
+                    PCWSTR(text.as_ptr()),
+                    w!("WallpaperLive"),
+                    flags | MB_SETFOREGROUND,
+                )
+            };
+            if choice.0 == 0 {
+                return Err("Windows could not show the update result".into());
             }
-            Ok(None) => self.update_label = "Tidak ada pembaruan".into(),
-            Err(_) => self.update_label = "Pemeriksaan pembaruan gagal (lihat rilis)".into(),
+            if newer && choice == IDYES {
+                self.open_release()?;
+            }
+        } else if matches!(result, Ok(Some(_))) {
+            self.notify_update()?;
         }
         Ok(())
     }
@@ -944,9 +1010,11 @@ impl App {
             dwInfoFlags: NIIF_INFO,
             ..Default::default()
         };
-        let title = wide(&self.update_label);
-        let info =
-            wide("Klik untuk membuka halaman rilis GitHub. Tidak ada unduh atau instal otomatis.");
+        let title = wide("WallpaperLive update available");
+        let info = wide(&format!(
+            "A newer version is available ({}). Click to open its GitHub release page. No automatic download or installation.",
+            self.update_tag.as_deref().unwrap_or_default()
+        ));
         let title_len = title.len().min(data.szInfoTitle.len() - 1);
         data.szInfoTitle[..title_len].copy_from_slice(&title[..title_len]);
         let info_len = info.len().min(data.szInfo.len() - 1);
@@ -1022,7 +1090,7 @@ impl App {
                     },
                 ),
                 (STOP, "Stop wallpaper"),
-                (UPDATE_RELEASE, self.update_label.as_str()),
+                (UPDATE_RELEASE, "Check for updates"),
                 (EXIT, "Exit"),
             ],
         )?;
@@ -1184,7 +1252,6 @@ impl App {
             playback.surface.place(rect)?;
             playback.player.pause(true)?;
             let _ = playback.player.poll();
-            playback.player.set_fps(self.settings.fps, 1.0)?;
             playback.player.set_audio(self.settings.audio_enabled)?;
             request = playback.player.load(&prepared.path)?;
             playback.path = path;
@@ -1517,8 +1584,8 @@ impl App {
         let source_fps = self
             .playback_info
             .as_ref()
-            .filter(|p| p.fps > 0.0)
             .map(|p| p.fps)
+            .filter(|f| f.is_finite() && *f > 0.0)
             .or_else(|| {
                 playback
                     .player
@@ -1526,7 +1593,7 @@ impl App {
                     .and_then(|s| s.parse::<f64>().ok())
             })
             .filter(|f| f.is_finite() && *f > 0.0)
-            .unwrap_or(1.0);
+            .unwrap_or(0.0);
         playback.player.set_fps(self.settings.fps, source_fps)?;
         if let Some(info) = &mut self.playback_info {
             info.fps = source_fps;
@@ -1599,7 +1666,11 @@ impl App {
                         p.note,
                         p.width,
                         p.height,
-                        p.fps.min(f64::from(self.settings.fps))
+                        if p.fps > 0.0 {
+                            p.fps.min(f64::from(self.settings.fps))
+                        } else {
+                            f64::from(self.settings.fps)
+                        }
                     )
                 })
                 .unwrap_or_default();
@@ -1809,7 +1880,14 @@ impl App {
                 .as_ref()
                 .map(|p| p.fps)
                 .filter(|f| f.is_finite() && *f > 0.0)
-                .unwrap_or(1.0);
+                .or_else(|| {
+                    playback
+                        .player
+                        .property(c"container-fps")
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .filter(|f| f.is_finite() && *f > 0.0)
+                })
+                .unwrap_or(0.0);
             playback.player.set_fps(fps, source_fps)?;
         }
         self.update_status();
@@ -1820,7 +1898,7 @@ impl App {
             return Ok(false);
         }
         match id {
-            UPDATE_RELEASE => self.open_release()?,
+            UPDATE_RELEASE => self.check_updates(true)?,
             SETTINGS => {
                 self.settings_open = !self.settings_open;
                 visuals::settings(self.settings_open);
@@ -2076,6 +2154,7 @@ impl Drop for App {
         // SAFETY: unregister only notifications/timer/tray and HWND owned by this App.
         unsafe {
             let _ = KillTimer(self.hwnd, 1);
+            let _ = KillTimer(self.hwnd, 2);
             let _ = WTSUnRegisterSessionNotification(self.hwnd);
             for notification in self.power.drain(..) {
                 let _ = UnregisterPowerSettingNotification(notification);
@@ -2338,7 +2417,8 @@ pub fn run() -> Result<(), String> {
             power: vec![],
             tray_present: false,
             update_tag: None,
-            update_label: "Memeriksa pembaruan...".into(),
+            update_manual: false,
+            update_tx: update_tx.clone(),
             update_rx,
             update_thread: None,
             error,
@@ -2413,26 +2493,9 @@ pub fn run() -> Result<(), String> {
             app.show();
         }
         app.update_status();
-        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = cancelled.clone();
-        let notification_hwnd = hwnd.0 as usize;
-        app.update_thread = Some((
-            cancelled,
-            std::thread::spawn(move || {
-                let result = crate::update::check(&flag);
-                if !flag.load(std::sync::atomic::Ordering::Relaxed)
-                    && update_tx.send(result).is_ok()
-                {
-                    // SAFETY: background worker only posts to the owned panel, destroyed after joining this worker.
-                    let _ = PostMessageW(
-                        HWND(notification_hwnd as *mut _),
-                        UPDATE_READY,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
-                }
-            }),
-        ));
+        if let Err(error) = app.check_updates(false) {
+            app.set_error(error);
+        }
         let mut message = MSG::default();
         loop {
             let result = GetMessageW(&mut message, None, 0, 0).0;
@@ -2466,6 +2529,7 @@ pub fn run() -> Result<(), String> {
                         app.layout().map(|_| false)
                     }
                     mpv::WM_MPV => app.tick().map(|_| false),
+                    WM_TIMER if message.wParam.0 == 2 => app.update_ready().map(|_| false),
                     WM_TIMER => app.tick().map(|_| false),
                     POWER => {
                         match message.wParam.0 {
@@ -2511,7 +2575,7 @@ pub fn run() -> Result<(), String> {
                         Ok(false)
                     })(),
                     TRAY => match tray_event(message.lParam.0 as u32) {
-                        Some(TrayEvent::Update) => app.action(UPDATE_RELEASE, BN_CLICKED),
+                        Some(TrayEvent::Update) => app.open_release().map(|_| false),
                         Some(TrayEvent::Menu) => app.tray_menu(message.wParam),
                         Some(TrayEvent::Open) => {
                             app.show();
@@ -2737,7 +2801,7 @@ mod tests {
     fn fixture() -> App {
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
-        let (_, update_rx) = std::sync::mpsc::channel();
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
         App {
             hwnd: HWND::default(),
             controls: vec![],
@@ -2763,7 +2827,8 @@ mod tests {
             power: vec![],
             tray_present: false,
             update_tag: None,
-            update_label: String::new(),
+            update_manual: false,
+            update_tx,
             update_rx,
             update_thread: None,
             error: None,
@@ -2788,6 +2853,31 @@ mod tests {
             thumbnail_rx,
             thumbnail_tx,
         }
+    }
+    #[test]
+    fn manual_update_clicks_share_one_running_check() {
+        let mut app = fixture();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        app.update_thread = Some((
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::thread::spawn(move || {
+                let _ = done_rx.recv();
+            }),
+        ));
+        let id = app.update_thread.as_ref().unwrap().1.thread().id();
+        app.check_updates(true).unwrap();
+        app.check_updates(true).unwrap();
+        assert!(app.update_manual);
+        assert_eq!(app.update_thread.as_ref().unwrap().1.thread().id(), id);
+        app.update_ready().unwrap();
+        assert!(app.update_thread.is_some());
+        app.update_manual = false;
+        app.update_tx.send(Ok(None)).unwrap();
+        done_tx.send(()).unwrap();
+        let (_, worker) = app.update_thread.take().unwrap();
+        worker.join().unwrap();
+        app.update_ready().unwrap();
+        assert!(app.update_tag.is_none());
     }
     #[test]
     fn obsolete_decoder_entries_cannot_fail_a_new_load() {
@@ -3201,7 +3291,8 @@ mod tests {
             power: vec![],
             tray_present: false,
             update_tag: None,
-            update_label: "Memeriksa pembaruan...".into(),
+            update_manual: false,
+            update_tx: update_tx.clone(),
             update_rx,
             update_thread: None,
             error: None,
@@ -3228,7 +3319,7 @@ mod tests {
         };
         update_tx.send(Ok(Some("v0.1.2".into()))).unwrap();
         app.update_ready().unwrap();
-        assert_eq!(app.update_label, "Pembaruan tersedia (v0.1.2)");
+        assert!(!app.update_manual);
         assert_eq!(app.update_tag.as_deref(), Some("v0.1.2"));
         assert!(app.update_thread.is_none());
         assert!(
