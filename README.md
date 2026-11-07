@@ -8,12 +8,12 @@
 
 <p align="center">
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows checks"></a>
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.0-alpha.1"><img src="https://img.shields.io/badge/release-v0.1.0--alpha.1-586575" alt="Release v0.1.0-alpha.1"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.0-alpha.2"><img src="https://img.shields.io/badge/release-v0.1.0--alpha.1-586575" alt="Release v0.1.0-alpha.2"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later license"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.0-alpha.1/wallpaperlivesetup.exe">Download Windows installer</a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.0-alpha.2/wallpaperlivesetup.exe">Download Windows installer</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/Raflyf/WallpaperLive/releases">All releases</a>
   &nbsp;·&nbsp;
@@ -22,7 +22,7 @@
 
 WallpaperLive uses Rust and Win32 for its English interface, desktop integration and tray controls. The thumbnail library lets you preview a file before applying it. libmpv handles media decoding; the app does not require a browser engine or an account.
 
-> **Testing prerelease:** v0.1.0-alpha.1 is unsigned. Manual installation and desktop playback testing are still outstanding. Build checks do not establish compatibility with your Windows build, GPU or media. This release makes no measured CPU or RAM claims.
+> **Testing prerelease:** v0.1.0-alpha.2 is unsigned. Manual installation and desktop playback testing are still outstanding. Build checks do not establish compatibility with your Windows build, GPU or media. This release makes no measured CPU or RAM claims.
 
 ## Features
 
@@ -43,7 +43,7 @@ Native media parsers run with your user privileges. WallpaperLive is not a sandb
 
 ## Install
 
-1. [Download the installer](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.0-alpha.1/wallpaperlivesetup.exe) and run it as your normal Windows user.
+1. [Download the installer](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.0-alpha.2/wallpaperlivesetup.exe) and run it as your normal Windows user.
 2. Review the decoder download prompt and grant consent if you want to proceed. Cancel setup if you do not want the download.
 3. Open WallpaperLive from the Start menu after installation.
 
