@@ -98,7 +98,9 @@ To create the installer, run [Installer.ps1](scripts/Installer.ps1) after the re
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 ```
 
-The script downloads and verifies a portable Inno Setup compiler when needed. It does not install tools globally. Windows CI checks source, tests and the release build; it does not run desktop playback tests.
+The script downloads and verifies a portable Inno Setup compiler when needed. It does not install tools globally.
+
+[Windows checks](.github/workflows/ci.yml) builds the application and `wallpaperlivesetup.exe` on every push, pull request and manual run. Download the installer and its SHA256 manifest from the run's **wallpaperlive-windows-x64** artifact. A pushed version tag beginning with `v` publishes those same verified files to GitHub Releases after all checks pass; tags containing `-` are prereleases. Builds remain unsigned. CI does not install the app or run desktop playback tests.
 
 ## License
 
