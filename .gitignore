@@ -1,0 +1,38 @@
+/target/
+/scratch/
+/runtime/
+/dist/
+
+# Local planning, research, and agent tooling
+/PRODUCT.md
+/DESIGN.md
+/docs/plans/
+/docs/native-panel.md
+/.impeccable/
+/.taste-skill/
+/.agents/
+/.claude/
+/.dsh/
+/task_plan.md
+/findings.md
+/progress.md
+
+# Local settings, logs, and credentials
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+*.pfx
+*.p12
+*.key
+/settings.ini
+/recent.txt
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,49 @@
+name: Windows checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { throw "rustup failed: $LASTEXITCODE" }
+      - name: Format
+        run: |
+          cargo +stable fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw "fmt failed: $LASTEXITCODE" }
+      - name: Clippy
+        run: |
+          cargo +stable clippy --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "clippy failed: $LASTEXITCODE" }
+      - name: Tests
+        run: |
+          cargo +stable test --locked
+          if ($LASTEXITCODE -ne 0) { throw "tests failed: $LASTEXITCODE" }
+      - name: Release application
+        run: |
+          cargo +stable build --locked --release --bin wallpaperlive
+          if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
+      - name: Delivery script syntax
+        run: |
+          foreach ($path in Get-ChildItem scripts/*.ps1) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($path.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }

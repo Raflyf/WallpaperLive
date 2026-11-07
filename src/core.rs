@@ -1,0 +1,353 @@
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Fit {
+    #[default]
+    Fill,
+    Contain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    pub path: Option<PathBuf>,
+    pub monitor: String,
+    pub fit: Fit,
+    pub pause_battery: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            path: None,
+            monitor: String::new(),
+            fit: Fit::Fill,
+            pause_battery: true,
+        }
+    }
+}
+
+impl Settings {
+    pub fn encode(&self) -> Result<String, String> {
+        let path = self
+            .path
+            .as_ref()
+            .map(|p| p.to_str().ok_or("File name is not valid Unicode"))
+            .transpose()?
+            .unwrap_or("");
+        if [path, &self.monitor]
+            .iter()
+            .any(|s| s.chars().any(char::is_control))
+        {
+            return Err("Configuration contains control characters".into());
+        }
+        Ok(format!(
+            "version=1\nfit={}\nbattery={}\nmonitor={}\npath={}\n",
+            if self.fit == Fit::Fill {
+                "fill"
+            } else {
+                "contain"
+            },
+            self.pause_battery,
+            self.monitor,
+            path
+        ))
+    }
+    pub fn decode(text: &str) -> Result<Self, String> {
+        let lines: Vec<_> = text.lines().collect();
+        if lines.len() != 5 || lines[0] != "version=1" {
+            return Err("Invalid configuration version or contents".into());
+        }
+        let fit = match lines[1] {
+            "fit=fill" => Fit::Fill,
+            "fit=contain" => Fit::Contain,
+            _ => return Err("Invalid display fit mode".into()),
+        };
+        let pause_battery = match lines[2] {
+            "battery=true" => true,
+            "battery=false" => false,
+            _ => return Err("Invalid battery pause setting".into()),
+        };
+        let monitor = lines[3]
+            .strip_prefix("monitor=")
+            .ok_or("Invalid monitor setting")?
+            .to_owned();
+        let path = lines[4].strip_prefix("path=").ok_or("Invalid file path")?;
+        if monitor.chars().any(char::is_control) {
+            return Err("Invalid monitor setting".into());
+        }
+        if !path.is_empty() {
+            validate_path_syntax(Path::new(path))?;
+        }
+        Ok(Self {
+            path: if path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(path))
+            },
+            monitor,
+            fit,
+            pause_battery,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PauseReasons {
+    pub manual: bool,
+    pub locked: bool,
+    pub remote: bool,
+    pub disconnected: bool,
+    pub display_off: bool,
+    pub suspended: bool,
+    pub battery: bool,
+    pub fullscreen: bool,
+}
+impl PauseReasons {
+    pub fn session_event(&mut self, event: u32) {
+        match event {
+            1 => {
+                self.disconnected = false;
+                self.remote = false;
+            }
+            2 => self.disconnected = true,
+            3 => {
+                self.remote = true;
+                self.disconnected = false;
+            }
+            4 => self.disconnected = true,
+            6 => self.disconnected = true,
+            7 => self.locked = true,
+            8 => self.locked = false,
+            _ => {}
+        }
+    }
+    pub fn reason(&self) -> Option<&'static str> {
+        if self.locked {
+            Some("Paused: session inactive")
+        } else if self.remote || self.disconnected {
+            Some("Paused: remote or disconnected session")
+        } else if self.suspended {
+            Some("Paused: system suspended")
+        } else if self.display_off {
+            Some("Paused: display off")
+        } else if self.manual {
+            Some("Paused manually")
+        } else if self.battery {
+            Some("Paused: on battery")
+        } else if self.fullscreen {
+            Some("Paused: fullscreen application")
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+impl Rect {
+    pub fn covers(self, other: Self) -> bool {
+        self.right > self.left
+            && self.bottom > self.top
+            && other.right > other.left
+            && other.bottom > other.top
+            && self.left <= other.left
+            && self.top <= other.top
+            && self.right >= other.right
+            && self.bottom >= other.bottom
+    }
+}
+
+pub fn validate_path_syntax(path: &Path) -> Result<(), String> {
+    let s = path.to_str().ok_or("File name is not valid Unicode")?;
+    let b = s.as_bytes();
+    if b.len() < 3
+        || !b[0].is_ascii_alphabetic()
+        || b[1] != b':'
+        || !matches!(b[2], b'\\' | b'/')
+        || s[2..].contains(':')
+        || s.chars().any(char::is_control)
+    {
+        return Err(
+            "Choose a file on a local drive, not a URL, network share, or device path".into(),
+        );
+    }
+    Ok(())
+}
+pub fn supported_extension(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some(
+            "mp4"
+                | "gif"
+                | "mkv"
+                | "webm"
+                | "mov"
+                | "avi"
+                | "mpg"
+                | "mpeg"
+                | "m4v"
+                | "apng"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "bmp"
+                | "webp"
+        )
+    )
+}
+pub fn validate_media(path: &Path) -> Result<PathBuf, String> {
+    validate_path_syntax(path)?;
+    if !supported_extension(path) {
+        return Err("Unsupported file format".into());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Could not read the file: {e}"))?;
+    let s = canonical.to_str().ok_or("File name is not valid Unicode")?;
+    let clean = PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(s));
+    validate_path_syntax(&clean)?;
+    if !clean.is_file() {
+        return Err("Choose a media file, not a folder".into());
+    }
+    Ok(clean)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conservative_defaults() {
+        let s = Settings::default();
+        assert!(s.path.is_none());
+        assert!(s.pause_battery);
+        assert_eq!(s.fit, Fit::Fill);
+    }
+
+    #[test]
+    fn settings_roundtrip_unicode() {
+        let s = Settings {
+            path: Some(PathBuf::from(r"C:\media\pemandangan senja é.mp4")),
+            monitor: r"\\.\DISPLAY1".into(),
+            fit: Fit::Contain,
+            pause_battery: false,
+        };
+        assert_eq!(Settings::decode(&s.encode().unwrap()).unwrap(), s);
+        let empty = Settings::default();
+        assert_eq!(Settings::decode(&empty.encode().unwrap()).unwrap(), empty);
+    }
+
+    #[test]
+    fn invalid_settings_are_rejected() {
+        for text in [
+            "",
+            "version=2\n",
+            "version=1\nfit=fill\nbattery=true\nmonitor=\npath=\nfit=fill\n",
+            "version=1\nfit=bad\nbattery=true\nmonitor=\npath=\n",
+            "version=1\nfit=fill\nbattery=maybe\nmonitor=\npath=\n",
+        ] {
+            assert!(Settings::decode(text).is_err(), "accepted {text:?}");
+        }
+    }
+
+    #[test]
+    fn local_paths_only() {
+        for p in [
+            "https://example.org/a.mp4",
+            r"\\server\share\a.mp4",
+            r"\\?\C:\a.mp4",
+            r"\\.\pipe\a.mp4",
+            r"C:\media\a.mp4:evil",
+            "C:\\a.mp4\n",
+        ] {
+            assert!(validate_path_syntax(Path::new(p)).is_err(), "accepted {p}");
+        }
+        assert!(validate_path_syntax(Path::new(r"C:\media\file with spaces.mp4")).is_ok());
+    }
+
+    #[test]
+    fn finite_extensions() {
+        for extension in [
+            "mp4", "GIF", "mkv", "webm", "mov", "avi", "mpg", "mpeg", "m4v", "apng", "png", "jpg",
+            "jpeg", "bmp", "webp",
+        ] {
+            assert!(
+                supported_extension(Path::new(&format!("wallpaper.{extension}"))),
+                "{extension}"
+            );
+        }
+        for extension in ["exe", "html", "m3u", "m3u8", "mp3", "bat", "lnk"] {
+            assert!(!supported_extension(Path::new(&format!(
+                "wallpaper.{extension}"
+            ))));
+        }
+    }
+
+    #[test]
+    fn fullscreen_negative_monitor_origin() {
+        let monitor = Rect {
+            left: -1920,
+            top: -200,
+            right: 0,
+            bottom: 880,
+        };
+        assert!(monitor.covers(monitor));
+        assert!(
+            !Rect {
+                right: -1,
+                ..monitor
+            }
+            .covers(monitor)
+        );
+        assert!(!Rect::default().covers(monitor));
+        assert!(!monitor.covers(Rect::default()));
+    }
+
+    #[test]
+    fn manual_pause_survives_automatic_resume() {
+        let mut p = PauseReasons {
+            manual: true,
+            fullscreen: true,
+            ..Default::default()
+        };
+        assert!(p.reason().is_some());
+        p.fullscreen = false;
+        assert_eq!(p.reason(), Some("Paused manually"));
+        p.manual = false;
+        assert!(p.reason().is_none());
+        p.battery = true;
+        assert_eq!(p.reason(), Some("Paused: on battery"));
+        p.locked = true;
+        assert_eq!(p.reason(), Some("Paused: session inactive"));
+    }
+
+    #[test]
+    fn session_unlock_does_not_clear_remote_pause() {
+        let mut reasons = PauseReasons::default();
+        reasons.session_event(3);
+        reasons.session_event(8);
+        assert!(reasons.reason().is_some());
+        reasons.session_event(1);
+        assert!(reasons.reason().is_none());
+        reasons.session_event(7);
+        reasons.session_event(10);
+        assert!(reasons.reason().is_some());
+        reasons.session_event(8);
+        assert!(reasons.reason().is_none());
+    }
+
+    #[test]
+    fn absent_media_rejected() {
+        assert!(
+            validate_media(Path::new(r"C:\definitely-missing-wallpaper-3f491927.mp4")).is_err()
+        );
+    }
+}

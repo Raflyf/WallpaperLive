@@ -1,0 +1,24 @@
+[package]
+name = "wallpaperlive"
+version = "0.1.0"
+edition = "2024"
+autoexamples = false
+license = "GPL-3.0-or-later"
+description = "Native Windows live wallpaper with essential controls"
+
+[[bin]]
+name = "native-smoke"
+path = "examples/smoke.rs"
+
+[dependencies]
+windows = { version = "0.58.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Power", "Win32_System_RemoteDesktop", "Win32_System_Registry", "Win32_System_SystemServices", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_Accessibility", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Com", "Win32_Graphics_Dwm"] }
+
+[build-dependencies]
+embed-manifest = "1.5.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "s"
