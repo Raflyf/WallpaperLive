@@ -16,13 +16,13 @@ use windows::{
         Graphics::Gdi::*,
         Storage::FileSystem::*,
         System::{
-            Com::*, LibraryLoader::GetModuleHandleW, Power::*, Registry::*, RemoteDesktop::*,
+            LibraryLoader::GetModuleHandleW, Power::*, Registry::*, RemoteDesktop::*,
             SystemServices::*, Threading::*,
         },
         UI::{
             Controls::{
                 BST_CHECKED, DRAWITEMSTRUCT, Dialogs::*, ICC_STANDARD_CLASSES,
-                INITCOMMONCONTROLSEX, InitCommonControlsEx, SetWindowTheme,
+                INITCOMMONCONTROLSEX, InitCommonControlsEx,
             },
             HiDpi::*,
             Input::KeyboardAndMouse::{EnableWindow, SetFocus},
@@ -64,6 +64,22 @@ fn wide(text: &str) -> Vec<u16> {
 }
 fn native_error(error: windows::core::Error) -> String {
     error.to_string()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TrayEvent {
+    Open,
+    Menu,
+}
+fn tray_event(payload: u32) -> Option<TrayEvent> {
+    if payload >> 16 != 1 {
+        return None;
+    }
+    match payload & 0xffff {
+        NIN_SELECT | 1025 => Some(TrayEvent::Open),
+        WM_CONTEXTMENU => Some(TrayEvent::Menu),
+        _ => None,
+    }
 }
 
 struct Icon(HICON);
@@ -131,8 +147,14 @@ struct App {
     library: Vec<PathBuf>,
     page: usize,
     settings_open: bool,
-    thumbnail_rx: std::sync::mpsc::Receiver<(PathBuf, isize)>,
-    thumbnail_tx: std::sync::mpsc::Sender<(PathBuf, isize)>,
+    thumbnail_pending: Option<PathBuf>,
+    thumbnail_thread: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    thumbnail_failed: std::collections::HashSet<PathBuf>,
+    thumbnail_rx: std::sync::mpsc::Receiver<(PathBuf, Result<Vec<u8>, String>)>,
+    thumbnail_tx: std::sync::mpsc::Sender<(PathBuf, Result<Vec<u8>, String>)>,
 }
 impl App {
     fn control(&self, id: usize) -> HWND {
@@ -215,15 +237,15 @@ impl App {
                 ),
                 (
                     SCREEN,
-                    w!("COMBOBOX"),
-                    "",
-                    CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0 | WS_TABSTOP.0,
+                    w!("BUTTON"),
+                    "Select display",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
                     FIT,
-                    w!("COMBOBOX"),
-                    "",
-                    CBS_DROPDOWNLIST as u32 | WS_TABSTOP.0,
+                    w!("BUTTON"),
+                    "Fill (crop to screen)",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
                     PAUSE,
@@ -280,6 +302,25 @@ impl App {
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::AUDIO,
+                    w!("BUTTON"),
+                    "Sound: Off",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::REMOVE,
+                    w!("BUTTON"),
+                    "Remove",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (visuals::PAGE, w!("STATIC"), "", 13),
+                (
+                    121,
+                    w!("BUTTON"),
+                    "Pause for fullscreen apps",
+                    BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+                ),
+                (
                     EXIT,
                     w!("BUTTON"),
                     "Exit",
@@ -302,12 +343,12 @@ impl App {
                     None,
                 )
                 .map_err(native_error)?;
-                if matches!(id, SCREEN | FIT) {
-                    let _ = SetWindowTheme(child, w!("DarkMode_Explorer"), None);
-                }
                 self.controls.push((id, child));
+                if matches!(id, BATTERY | STARTUP | 121) {
+                    let _ = windows::Win32::UI::Controls::SetWindowTheme(child, w!(""), w!(""));
+                }
             }
-            for i in 0..6 {
+            for i in 0..4 {
                 let child = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
                     w!("BUTTON"),
@@ -325,19 +366,18 @@ impl App {
                 .map_err(native_error)?;
                 self.controls.push((visuals::TILE_BASE + i, child));
             }
-            for label in ["Fill (crop to screen)", "Fit (show full frame)"] {
-                let label = wide(label);
-                SendMessageW(
-                    self.control(FIT),
-                    CB_ADDSTRING,
-                    WPARAM(0),
-                    LPARAM(label.as_ptr() as isize),
-                );
-            }
+            self.text(
+                FIT,
+                if self.settings.fit == Fit::Contain {
+                    "Fit (show full frame)"
+                } else {
+                    "Fill (crop to screen)"
+                },
+            );
             SendMessageW(
-                self.control(FIT),
-                CB_SETCURSEL,
-                WPARAM(usize::from(self.settings.fit == Fit::Contain)),
+                self.control(121),
+                BM_SETCHECK,
+                WPARAM(self.settings.pause_fullscreen as usize),
                 LPARAM(0),
             );
             SendMessageW(
@@ -367,28 +407,24 @@ impl App {
             self.settings.monitor = monitors[0].name.clone();
         }
         self.monitors = monitors;
-        // SAFETY: native combo owns copies of strings and uses stable indexes in current monitor list.
-        unsafe {
-            SendMessageW(self.control(SCREEN), CB_RESETCONTENT, WPARAM(0), LPARAM(0));
-            for (i, monitor) in self.monitors.iter().enumerate() {
-                let label = wide(&format!(
-                    "{}  {}x{}{}",
-                    monitor.name,
-                    monitor.rect.right - monitor.rect.left,
-                    monitor.rect.bottom - monitor.rect.top,
-                    if monitor.primary { " (primary)" } else { "" }
-                ));
-                SendMessageW(
-                    self.control(SCREEN),
-                    CB_ADDSTRING,
-                    WPARAM(0),
-                    LPARAM(label.as_ptr() as isize),
-                );
-                if monitor.name == self.settings.monitor {
-                    SendMessageW(self.control(SCREEN), CB_SETCURSEL, WPARAM(i), LPARAM(0));
+        self.text(
+            SCREEN,
+            &format!(
+                "Display {}  {} x {}{}",
+                self.monitors
+                    .iter()
+                    .position(|m| m.name == self.settings.monitor)
+                    .unwrap_or(0)
+                    + 1,
+                self.screen().rect.right - self.screen().rect.left,
+                self.screen().rect.bottom - self.screen().rect.top,
+                if self.screen().primary {
+                    " (primary)"
+                } else {
+                    ""
                 }
-            }
-        }
+            ),
+        );
         Ok(())
     }
     fn layout(&mut self) -> Result<(), String> {
@@ -426,63 +462,35 @@ impl App {
             GetClientRect(self.hwnd, &mut r).map_err(native_error)?;
             let width = r.right * 96 / dpi;
             let height = r.bottom * 96 / dpi;
-            let split = width - 344;
-            let tile_width = (split - 72) / 2;
-            let tile_height = ((height - 326) / 2).clamp(170, 210);
-            let layout = [
-                (PICK, width - 330, 20, 188, 36),
-                (SETTINGS, width - 128, 20, 100, 36),
-                (visuals::PREVIEW, split + 24, 143, 296, 177),
-                (FILE, split + 24, 334, 296, 24),
-                (SCREEN, split + 24, 403, 296, 220),
-                (FIT, split + 24, 481, 296, 180),
-                (APPLY, split + 24, 538, 296, 42),
-                (PAUSE, split + 24, 594, 142, 36),
-                (STOP, split + 178, 594, 142, 36),
-                (BATTERY, 28, 316, split - 56, 36),
-                (STARTUP, 28, 366, split - 56, 36),
-                (visuals::PREVIOUS, 28, height - 136, 112, 34),
-                (visuals::NEXT, 152, height - 136, 112, 34),
-                (EXIT, width - 108, height - 60, 80, 36),
-                (STATUS, 28, height - 68, width - 164, 56),
-            ];
-            for (id, x, y, w, h) in layout {
-                SetWindowPos(
-                    self.control(id),
-                    None,
-                    scale(x),
-                    scale(y),
-                    scale(w),
-                    scale(h),
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-                .map_err(native_error)?;
+            let layout = visuals::Layout::new(width, height);
+            for (id, control) in &self.controls {
+                if let Some(area) = layout.control(*id) {
+                    SetWindowPos(
+                        *control,
+                        None,
+                        scale(area.left),
+                        scale(area.top),
+                        scale(area.right - area.left),
+                        scale(area.bottom - area.top),
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                    .map_err(native_error)?;
+                }
             }
-            for i in 0..6 {
-                let control = self.control(visuals::TILE_BASE + i);
-                let x = 28 + (i % 2) as i32 * (tile_width + 16);
-                let y = 183 + (i / 2) as i32 * (tile_height + 18);
-                SetWindowPos(
-                    control,
-                    None,
-                    scale(x),
-                    scale(y),
-                    scale(tile_width),
-                    scale(tile_height),
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-                .map_err(native_error)?;
-                let visible =
-                    !self.settings_open && i < 4 && self.library.get(self.page * 4 + i).is_some();
-                let _ = ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
+            for i in 0..4 {
+                let visible = !self.settings_open && self.library.get(self.page * 4 + i).is_some();
+                let _ = ShowWindow(
+                    self.control(visuals::TILE_BASE + i),
+                    if visible { SW_SHOWNA } else { SW_HIDE },
+                );
             }
-            for id in [BATTERY, STARTUP] {
+            for id in [BATTERY, STARTUP, 121] {
                 let _ = ShowWindow(
                     self.control(id),
                     if self.settings_open { SW_SHOW } else { SW_HIDE },
                 );
             }
-            for id in [visuals::PREVIOUS, visuals::NEXT] {
+            for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
                 let _ = ShowWindow(
                     self.control(id),
                     if !self.settings_open && self.library.len() > 4 {
@@ -497,15 +505,22 @@ impl App {
                 self.control(visuals::NEXT),
                 (self.page + 1) * 4 < self.library.len(),
             );
+            for (_, control) in &self.controls {
+                let _ = InvalidateRect(*control, None, true);
+            }
             let _ = InvalidateRect(self.hwnd, None, false);
         }
         Ok(())
     }
     fn refresh_library(&mut self) -> Result<(), String> {
+        let pages = self.library.len().div_ceil(4).max(1);
+        self.page = self.page.min(pages - 1);
         let start = self.page * 4;
         let paths: Vec<_> = self.library.iter().skip(start).take(4).cloned().collect();
         visuals::tiles(&paths);
         visuals::selected(self.selected.clone());
+        visuals::playing(self.playback.as_ref().map(|p| p.path.clone()));
+        self.text(visuals::PAGE, &format!("Page {} of {pages}", self.page + 1));
         for (i, path) in paths.iter().enumerate() {
             self.text(
                 visuals::TILE_BASE + i,
@@ -526,69 +541,156 @@ impl App {
         );
         unsafe {
             let _ = EnableWindow(self.control(APPLY), self.selected.is_some());
+            let _ = EnableWindow(
+                self.control(visuals::REMOVE),
+                self.selected
+                    .as_ref()
+                    .is_some_and(|path| self.library.contains(path)),
+            );
             let _ = InvalidateRect(self.hwnd, None, false);
             for (_, h) in &self.controls {
                 let _ = InvalidateRect(*h, None, false);
             }
         }
+        self.request_thumbnails();
         self.layout()
     }
     fn add_media(&mut self, path: PathBuf) -> Result<(), String> {
         let path = validate_media(&path)?;
-        self.library.retain(|p| p != &path);
-        self.library.insert(0, path.clone());
-        self.library.truncate(12);
+        let mut library = self.library.clone();
+        library.retain(|p| p != &path);
+        library.insert(0, path.clone());
+        library.truncate(12);
+        self.save_library(&library)?;
+        self.library = library;
         self.page = 0;
         self.selected = Some(path.clone());
         self.error = None;
         self.refresh_library()?;
-        let mut recent = String::from("version=1\n");
-        for item in &self.library {
-            recent.push_str(item.to_str().ok_or("File name is not valid Unicode")?);
-            recent.push('\n');
-        }
-        if let Some(parent) = self.config.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            fs::write(parent.join("recent.txt"), recent)
-                .map_err(|e| format!("Could not save the library: {e}"))?;
-        }
-        self.request_thumbnail(path);
+        self.thumbnail_failed.remove(&path);
+        self.request_thumbnails();
         self.update_status();
         Ok(())
     }
-    fn request_thumbnail(&self, path: PathBuf) {
+    fn save_library(&self, paths: &[PathBuf]) -> Result<(), String> {
+        if !self.config_valid {
+            return Err(
+                "Existing preferences could not be read; library was not overwritten.".into(),
+            );
+        }
+        let parent = self.config.parent().ok_or("Invalid library directory")?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let mut recent = String::from("version=1\n");
+        for path in paths {
+            let text = path.to_str().ok_or("File name is not valid Unicode")?;
+            crate::core::validate_path_syntax(path)?;
+            recent.push_str(text);
+            recent.push('\n');
+        }
+        let temporary = parent.join("recent.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)
+            .map_err(|e| e.to_string())?;
+        file.write_all(recent.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("Could not save library: {e}"))?;
+        drop(file);
+        let from = wide(temporary.to_str().ok_or("Invalid library path")?);
+        let to = wide(
+            parent
+                .join("recent.txt")
+                .to_str()
+                .ok_or("Invalid library path")?,
+        );
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from.as_ptr()),
+                PCWSTR(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|e| format!("Previous library was kept: {e}"))
+    }
+    fn remove_selected(&mut self) -> Result<(), String> {
+        let path = self
+            .selected
+            .clone()
+            .ok_or("Select a wallpaper to remove")?;
+        let paths: Vec<_> = self
+            .library
+            .iter()
+            .filter(|p| *p != &path)
+            .cloned()
+            .collect();
+        if paths.len() == self.library.len() {
+            return Ok(());
+        }
+        self.save_library(&paths)?;
+        if self.settings.path.as_ref() == Some(&path)
+            || self.playback.as_ref().is_some_and(|p| p.path == path)
+            || self.recovery.as_ref().is_some_and(|(_, _, p)| p == &path)
+        {
+            self.stop()?;
+        }
+        self.library = paths;
+        self.page = self.page.min(self.library.len().div_ceil(4).max(1) - 1);
+        self.selected = self.library.first().cloned();
+        self.thumbnail_failed.remove(&path);
+        visuals::remove_thumbnail(&path);
+        Ok(())
+    }
+    fn thumbnail_paths(&self) -> Vec<PathBuf> {
+        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+            return Vec::new();
+        }
+        let mut paths: Vec<_> = if self.settings_open {
+            Vec::new()
+        } else {
+            self.library
+                .iter()
+                .skip(self.page * 4)
+                .take(4)
+                .cloned()
+                .collect()
+        };
+        if let Some(path) = &self.selected
+            && !paths.contains(path)
+        {
+            paths.push(path.clone());
+        }
+        paths
+    }
+    fn request_thumbnails(&mut self) {
+        let paths = self.thumbnail_paths();
+        visuals::retain_thumbnails(&paths);
+        if self.thumbnail_pending.is_some() {
+            return;
+        }
+        let Some(path) = paths
+            .into_iter()
+            .find(|path| !visuals::has_thumbnail(path) && !self.thumbnail_failed.contains(path))
+        else {
+            return;
+        };
+        self.thumbnail_pending = Some(path.clone());
         let tx = self.thumbnail_tx.clone();
         let hwnd = self.hwnd.0 as usize;
-        // Worker performs optional shell thumbnail work; it never receives a Rust GUI reference.
-        std::thread::spawn(move || {
-            let result = unsafe {
-                if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
-                    return;
-                }
-                let name = wide(path.to_str().unwrap_or(""));
-                let image = (|| {
-                    let item: IShellItemImageFactory =
-                        SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None)?;
-                    item.GetImage(
-                        SIZE { cx: 640, cy: 360 },
-                        SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK,
-                    )
-                })();
-                CoUninitialize();
-                image
-            };
-            if let Ok(image) = result {
-                if tx.send((path, image.0 as isize)).is_err() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        self.thumbnail_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                let result = crate::thumbnail::capture(&path, &worker_cancelled);
+                if tx.send((path, result)).is_ok() {
                     unsafe {
-                        let _ = DeleteObject(image);
+                        let _ = PostMessageW(HWND(hwnd as *mut _), THUMBNAIL, WPARAM(0), LPARAM(0));
                     }
-                    return;
                 }
-                unsafe {
-                    let _ = PostMessageW(HWND(hwnd as *mut _), THUMBNAIL, WPARAM(0), LPARAM(0));
-                }
-            }
-        });
+            }),
+        ));
     }
     fn tray(&mut self, add: bool) -> Result<(), String> {
         let mut data = NOTIFYICONDATAW {
@@ -608,15 +710,33 @@ impl App {
             );
         }
         self.tray_present = add;
+        if add {
+            data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) }.as_bool() {
+                let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+                self.tray_present = false;
+                return Err(
+                    "Windows could not enable tray controls. Keep this window open.".into(),
+                );
+            }
+        }
         Ok(())
     }
-    fn show(&self) {
-        // SAFETY: own top-level panel only; focus request may be refused by Windows normally.
+    fn show(&mut self) {
+        // SAFETY: own panel only; showing a hidden maximized window preserves its state.
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            let _ = ShowWindow(
+                self.hwnd,
+                if IsIconic(self.hwnd).as_bool() {
+                    SW_RESTORE
+                } else {
+                    SW_SHOW
+                },
+            );
             let _ = SetForegroundWindow(self.hwnd);
             let _ = SetFocus(self.control(PICK));
         }
+        self.request_thumbnails();
     }
     fn tray_menu(&mut self) -> Result<bool, String> {
         // SAFETY: native menu is synchronously tracked and destroyed before returning.
@@ -633,6 +753,14 @@ impl App {
                             "Pause"
                         },
                     ),
+                    (
+                        visuals::AUDIO,
+                        if self.settings.audio_enabled {
+                            "Turn sound off"
+                        } else {
+                            "Turn sound on"
+                        },
+                    ),
                     (STOP, "Stop wallpaper"),
                     (EXIT, "Exit"),
                 ] {
@@ -645,7 +773,7 @@ impl App {
                 let _ = SetForegroundWindow(self.hwnd);
                 let id = TrackPopupMenu(
                     menu,
-                    TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                    TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                     point.x,
                     point.y,
                     0,
@@ -653,6 +781,7 @@ impl App {
                     None,
                 )
                 .0 as usize;
+                let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
                 self.action(id, 0)
             })();
             let _ = DestroyMenu(menu);
@@ -661,6 +790,7 @@ impl App {
     }
     fn release_playback(&mut self) {
         self.playback = None;
+        visuals::playing(None);
         self.loaded = false;
         self.loading_since = None;
         self.requested_pause = false;
@@ -693,6 +823,7 @@ impl App {
         self.update_reasons();
         let pause = self.reasons.reason().is_some();
         player.pause(pause)?;
+        player.set_audio(self.settings.audio_enabled)?;
         player.load(&path)?;
         self.playback = Some(Playback {
             player,
@@ -771,7 +902,8 @@ impl App {
             let mut class = [0u16; 64];
             let n = GetClassNameW(foreground, &mut class).max(0) as usize;
             let class = String::from_utf16_lossy(&class[..n]);
-            self.reasons.fullscreen = pid != std::process::id()
+            self.reasons.fullscreen = self.settings.pause_fullscreen
+                && pid != std::process::id()
                 && !foreground.0.is_null()
                 && !IsIconic(foreground).as_bool()
                 && !matches!(
@@ -878,6 +1010,13 @@ impl App {
                     playback.surface.show();
                     self.settings.path = Some(playback.path.clone());
                     self.loaded = true;
+                    visuals::playing(Some(playback.path.clone()));
+                    for i in 0..4 {
+                        unsafe {
+                            let _ =
+                                InvalidateRect(self.control(visuals::TILE_BASE + i), None, false);
+                        }
+                    }
                     self.loading_since = None;
                     if let Err(error) = self.save() {
                         self.error = Some(format!("Playing, but settings were not saved: {error}"));
@@ -910,7 +1049,19 @@ impl App {
         } else if self.actual_pause {
             "Resuming playback...".into()
         } else {
-            "Playing muted. Auto-pause is enabled for fullscreen apps.".into()
+            format!(
+                "Playing. Sound: {}. Fullscreen pause: {}.",
+                if self.settings.audio_enabled {
+                    "On"
+                } else {
+                    "Off"
+                },
+                if self.settings.pause_fullscreen {
+                    "On"
+                } else {
+                    "Off"
+                }
+            )
         };
         if window_text(self.control(STATUS)) != status {
             self.text(STATUS, &status);
@@ -922,6 +1073,14 @@ impl App {
         };
         if window_text(self.control(PAUSE)) != label {
             self.text(PAUSE, label);
+        }
+        let sound = if self.settings.audio_enabled {
+            "Sound: On"
+        } else {
+            "Sound: Off"
+        };
+        if window_text(self.control(visuals::AUDIO)) != sound {
+            self.text(visuals::AUDIO, sound);
         }
         unsafe {
             let _ = EnableWindow(self.control(PAUSE), self.playback.is_some());
@@ -957,11 +1116,65 @@ impl App {
         }
         Ok(())
     }
+    fn selector(
+        &self,
+        id: usize,
+        labels: &[String],
+        selected: usize,
+    ) -> Result<Option<usize>, String> {
+        unsafe {
+            let menu = CreatePopupMenu().map_err(native_error)?;
+            let result = (|| {
+                for (index, label) in labels.iter().enumerate() {
+                    let text = wide(label);
+                    AppendMenuW(
+                        menu,
+                        if index == selected {
+                            MF_STRING | MF_CHECKED
+                        } else {
+                            MF_STRING
+                        },
+                        index + 1,
+                        PCWSTR(text.as_ptr()),
+                    )
+                    .map_err(native_error)?;
+                }
+                let mut rect = RECT::default();
+                GetWindowRect(self.control(id), &mut rect).map_err(native_error)?;
+                let choice = TrackPopupMenu(
+                    menu,
+                    TPM_RETURNCMD | TPM_NONOTIFY,
+                    rect.left,
+                    rect.bottom,
+                    0,
+                    self.hwnd,
+                    None,
+                )
+                .0 as usize;
+                let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+                Ok(choice.checked_sub(1))
+            })();
+            let _ = DestroyMenu(menu);
+            result
+        }
+    }
     fn action(&mut self, id: usize, notification: u32) -> Result<bool, String> {
+        if notification != BN_CLICKED {
+            return Ok(false);
+        }
         match id {
             SETTINGS => {
                 self.settings_open = !self.settings_open;
                 visuals::settings(self.settings_open);
+                self.text(
+                    SETTINGS,
+                    if self.settings_open {
+                        "Library"
+                    } else {
+                        "Settings"
+                    },
+                );
+                self.request_thumbnails();
                 self.layout()?;
             }
             visuals::PREVIOUS => {
@@ -983,7 +1196,6 @@ impl App {
                     self.selected = Some(path.clone());
                     self.error = None;
                     self.refresh_library()?;
-                    self.request_thumbnail(path);
                 }
             }
             PICK => self.pick()?,
@@ -995,6 +1207,40 @@ impl App {
                 self.reasons.manual = !self.reasons.manual;
                 self.tick()?;
             }
+            visuals::AUDIO => {
+                let enabled = !self.settings.audio_enabled;
+                if let Some(playback) = &self.playback {
+                    playback.player.set_audio(enabled)?;
+                }
+                self.settings.audio_enabled = enabled;
+                self.save()?;
+                self.update_status();
+            }
+            visuals::REMOVE => {
+                let prompt = wide(
+                    "Remove this wallpaper from the library?\n\nThe original media file will not be deleted. An active wallpaper will be stopped.",
+                );
+                if unsafe {
+                    MessageBoxW(
+                        self.hwnd,
+                        PCWSTR(prompt.as_ptr()),
+                        w!("Remove wallpaper"),
+                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                    )
+                } == IDYES
+                {
+                    self.remove_selected()?;
+                    self.refresh_library()?;
+                    self.update_status();
+                }
+            }
+            121 => {
+                self.settings.pause_fullscreen =
+                    unsafe { SendMessageW(self.control(121), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 }
+                        == BST_CHECKED.0 as isize;
+                self.save()?;
+                self.tick()?;
+            }
             STOP => self.stop()?,
             OPEN => self.show(),
             EXIT => return Ok(true),
@@ -1003,36 +1249,59 @@ impl App {
                     unsafe {
                         let _ = ShowWindow(self.hwnd, SW_HIDE);
                     }
+                    self.request_thumbnails();
                 } else {
                     return Ok(true);
                 }
             }
-            SCREEN if notification == CBN_SELCHANGE => {
-                let selected = unsafe {
-                    SendMessageW(self.control(SCREEN), CB_GETCURSEL, WPARAM(0), LPARAM(0)).0
-                };
-                if let Some(monitor) = self.monitors.get(selected as usize) {
-                    self.settings.monitor = monitor.name.clone();
-                }
-                if let Some(playback) = &self.playback {
-                    playback.surface.place(self.screen().rect)?;
-                }
-                self.save()?;
-                self.tick()?;
-            }
-            FIT if notification == CBN_SELCHANGE => {
-                self.settings.fit = if unsafe {
-                    SendMessageW(self.control(FIT), CB_GETCURSEL, WPARAM(0), LPARAM(0)).0
-                } == 0
+            SCREEN => {
+                let labels: Vec<_> = self
+                    .monitors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        format!(
+                            "Display {}  {} x {}{}",
+                            i + 1,
+                            m.rect.right - m.rect.left,
+                            m.rect.bottom - m.rect.top,
+                            if m.primary { " (primary)" } else { "" }
+                        )
+                    })
+                    .collect();
+                let selected = self
+                    .monitors
+                    .iter()
+                    .position(|m| m.name == self.settings.monitor)
+                    .unwrap_or(0);
+                if let Some(index) = self.selector(SCREEN, &labels, selected)?
+                    && let Some(monitor) = self.monitors.get(index)
                 {
-                    Fit::Fill
-                } else {
-                    Fit::Contain
-                };
-                if let Some(playback) = &self.playback {
-                    playback.player.set_fit(self.settings.fit)?;
+                    if let Some(playback) = &self.playback {
+                        playback.surface.place(monitor.rect)?;
+                    }
+                    self.settings.monitor = monitor.name.clone();
+                    self.text(SCREEN, &labels[index]);
+                    self.save()?;
+                    self.tick()?;
                 }
-                self.save()?;
+            }
+            FIT => {
+                let labels = [
+                    "Fill (crop to screen)".to_owned(),
+                    "Fit (show full frame)".to_owned(),
+                ];
+                if let Some(index) =
+                    self.selector(FIT, &labels, usize::from(self.settings.fit == Fit::Contain))?
+                {
+                    let fit = if index == 0 { Fit::Fill } else { Fit::Contain };
+                    if let Some(playback) = &self.playback {
+                        playback.player.set_fit(fit)?;
+                    }
+                    self.settings.fit = fit;
+                    self.text(FIT, &labels[index]);
+                    self.save()?;
+                }
             }
             BATTERY => {
                 self.settings.pause_battery = unsafe {
@@ -1064,6 +1333,10 @@ impl App {
 }
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = worker.join();
+        }
         self.release_playback();
         // SAFETY: unregister only notifications/timer/tray and HWND owned by this App.
         unsafe {
@@ -1082,9 +1355,6 @@ impl Drop for App {
                 let _ = DeleteObject(self.font);
             }
             visuals::clear();
-            for (_, bitmap) in self.thumbnail_rx.try_iter() {
-                let _ = DeleteObject(HBITMAP(bitmap as *mut _));
-            }
         }
     }
 }
@@ -1251,11 +1521,11 @@ pub fn run() -> Result<(), String> {
             WS_EX_CONTROLPARENT,
             CLASS,
             w!("WallpaperLive"),
-            (WS_OVERLAPPEDWINDOW & !WS_MAXIMIZEBOX) | WS_CLIPCHILDREN,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1100 * dpi / 96,
-            780 * dpi / 96,
+            1040 * dpi / 96,
+            720 * dpi / 96,
             None,
             None,
             instance,
@@ -1282,16 +1552,33 @@ pub fn run() -> Result<(), String> {
             ),
         };
         let selected = settings.path.clone();
-        let library = fs::read_to_string(config.with_file_name("recent.txt"))
-            .ok()
-            .map(|t| {
-                t.lines()
+        let (library, library_error) = match fs::read_to_string(config.with_file_name("recent.txt"))
+        {
+            Ok(text) if text.lines().next() == Some("version=1") => (
+                text.lines()
                     .skip(1)
                     .filter_map(|p| validate_media(Path::new(p)).ok())
                     .take(12)
-                    .collect()
-            })
-            .unwrap_or_else(Vec::new);
+                    .collect(),
+                None,
+            ),
+            Ok(_) => (
+                Vec::new(),
+                Some(
+                    "Existing library has an invalid format and will not be overwritten."
+                        .to_owned(),
+                ),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+            Err(e) => (
+                Vec::new(),
+                Some(format!(
+                    "Could not read library; existing data was kept: {e}"
+                )),
+            ),
+        };
+        let config_valid = config_valid && library_error.is_none();
+        let error = error.or(library_error);
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd,
@@ -1317,6 +1604,9 @@ pub fn run() -> Result<(), String> {
             library,
             page: 0,
             settings_open: false,
+            thumbnail_pending: None,
+            thumbnail_thread: None,
+            thumbnail_failed: std::collections::HashSet::new(),
             thumbnail_tx,
             thumbnail_rx,
         };
@@ -1340,9 +1630,6 @@ pub fn run() -> Result<(), String> {
             4,
         );
         app.create_controls()?;
-        for path in app.library.clone() {
-            app.request_thumbnail(path);
-        }
         if let Err(e) = app.tray(true) {
             app.set_error(e);
         }
@@ -1396,10 +1683,26 @@ pub fn run() -> Result<(), String> {
                         ((message.wParam.0 >> 16) & 0xffff) as u32,
                     ),
                     THUMBNAIL => {
-                        for (path, bitmap) in app.thumbnail_rx.try_iter() {
-                            visuals::thumbnail(path, HBITMAP(bitmap as *mut _));
+                        let needed = app.thumbnail_paths();
+                        for (path, result) in app.thumbnail_rx.try_iter() {
+                            if let Some((_, worker)) = app.thumbnail_thread.take() {
+                                let _ = worker.join();
+                            }
+                            app.thumbnail_pending = None;
+                            if needed.contains(&path) {
+                                match result.and_then(|bytes| crate::thumbnail::bitmap(&bytes)) {
+                                    Ok(bitmap) => visuals::thumbnail(path, bitmap),
+                                    Err(_) => {
+                                        app.thumbnail_failed.insert(path);
+                                    }
+                                }
+                            }
                         }
-                        app.refresh_library().map(|_| false)
+                        app.request_thumbnails();
+                        for (_, control) in &app.controls {
+                            let _ = InvalidateRect(*control, None, false);
+                        }
+                        Ok(false)
                     }
                     LAYOUT => app.layout().map(|_| false),
                     mpv::WM_MPV => app.events().map(|_| false),
@@ -1438,14 +1741,14 @@ pub fn run() -> Result<(), String> {
                         }
                         Ok(false)
                     }
-                    TRAY => {
-                        if message.lParam.0 as u32 == WM_RBUTTONUP {
-                            app.tray_menu()
-                        } else {
+                    TRAY => match tray_event(message.lParam.0 as u32) {
+                        Some(TrayEvent::Menu) => app.tray_menu(),
+                        Some(TrayEvent::Open) => {
                             app.show();
                             Ok(false)
                         }
-                    }
+                        None => Ok(false),
+                    },
                     DROP => {
                         let drop = HDROP(message.wParam.0 as *mut _);
                         let mut name = vec![0u16; 32768];
@@ -1542,9 +1845,22 @@ unsafe extern "system" fn window_proc(
                 if lparam.0 != 0 {
                     let info = &mut *(lparam.0 as *mut MINMAXINFO);
                     let dpi = GetDpiForWindow(window).max(96) as i32;
+                    let mut rect = RECT {
+                        left: 0,
+                        top: 0,
+                        right: visuals::MIN_CLIENT_WIDTH * dpi / 96,
+                        bottom: visuals::MIN_CLIENT_HEIGHT * dpi / 96,
+                    };
+                    let _ = AdjustWindowRectExForDpi(
+                        &mut rect,
+                        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                        false,
+                        WS_EX_CONTROLPARENT,
+                        dpi as u32,
+                    );
                     info.ptMinTrackSize = POINT {
-                        x: 930 * dpi / 96,
-                        y: 750 * dpi / 96,
+                        x: rect.right - rect.left,
+                        y: rect.bottom - rect.top,
                     };
                 }
                 LRESULT(0)
@@ -1558,7 +1874,9 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             TRAY_EVENT => {
-                post(TRAY, wparam, lparam);
+                if tray_event(lparam.0 as u32).is_some() {
+                    post(TRAY, wparam, lparam);
+                }
                 LRESULT(0)
             }
             WM_WTSSESSION_CHANGE => {
@@ -1602,6 +1920,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tray_hover_and_popup_notifications_do_not_open_controls() {
+        let event = |message| (1 << 16) | message;
+        for message in [
+            WM_MOUSEMOVE,
+            WM_LBUTTONDOWN,
+            WM_RBUTTONDOWN,
+            NIN_POPUPOPEN,
+            NIN_POPUPCLOSE,
+        ] {
+            assert_eq!(tray_event(event(message)), None);
+        }
+        assert_eq!(tray_event(event(NIN_SELECT)), Some(TrayEvent::Open));
+        assert_eq!(
+            tray_event(event(NIN_SELECT | NINF_KEY)),
+            Some(TrayEvent::Open)
+        );
+        assert_eq!(tray_event(event(WM_CONTEXTMENU)), Some(TrayEvent::Menu));
+        assert_eq!(tray_event((2 << 16) | NIN_SELECT), None);
+    }
+
+    #[test]
     fn embedded_brand_icon_decodes_at_windows_sizes() {
         for size in [16, 20, 24, 32, 48, 64, 256] {
             let icon = Icon::load(size).expect("bundled logo must decode as a Windows icon");
@@ -1643,6 +1982,9 @@ mod tests {
             library: vec![],
             page: 0,
             settings_open: false,
+            thumbnail_pending: None,
+            thumbnail_thread: None,
+            thumbnail_failed: std::collections::HashSet::new(),
             thumbnail_rx,
             thumbnail_tx,
         };
@@ -1660,5 +2002,56 @@ mod tests {
         assert!(app.recovery.is_none());
         assert_eq!(app.selected.as_ref(), Some(&preview));
         assert_eq!(app.settings, settings);
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!(
+                "library-regression-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&directory).unwrap();
+        let original = directory.join("original.mp4");
+        fs::write(&original, b"owned regression fixture, not decoder media").unwrap();
+        app.config = directory.join("settings.ini");
+        app.library = vec![original.clone(), preview.clone()];
+        app.selected = Some(original.clone());
+        app.page = 2;
+        app.settings.path = None;
+        app.save_library(&app.library).unwrap();
+        app.remove_selected().unwrap();
+        assert_eq!(
+            fs::read(&original).unwrap(),
+            b"owned regression fixture, not decoder media"
+        );
+        assert_eq!(app.library.as_slice(), std::slice::from_ref(&preview));
+        assert_eq!(app.selected.as_ref(), Some(&preview));
+        assert_eq!(app.page, 0);
+        let saved = fs::read(directory.join("recent.txt")).unwrap();
+        assert!(!String::from_utf8_lossy(&saved).contains("original.mp4"));
+        app.config_valid = false;
+        app.selected = Some(preview.clone());
+        assert!(app.remove_selected().is_err());
+        assert_eq!(fs::read(directory.join("recent.txt")).unwrap(), saved);
+        assert_eq!(app.library, [preview]);
+        assert!(!app.settings.audio_enabled);
+        assert!(!app.action(visuals::AUDIO, BN_SETFOCUS).unwrap());
+        assert!(!app.settings.audio_enabled);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        app.thumbnail_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                while !worker_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+                finished_tx.send(()).unwrap();
+            }),
+        ));
+        drop(app);
+        assert_eq!(finished_rx.try_recv(), Ok(()));
     }
 }

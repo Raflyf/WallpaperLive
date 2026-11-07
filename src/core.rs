@@ -13,6 +13,8 @@ pub struct Settings {
     pub monitor: String,
     pub fit: Fit,
     pub pause_battery: bool,
+    pub audio_enabled: bool,
+    pub pause_fullscreen: bool,
 }
 
 impl Default for Settings {
@@ -22,6 +24,8 @@ impl Default for Settings {
             monitor: String::new(),
             fit: Fit::Fill,
             pause_battery: true,
+            audio_enabled: false,
+            pause_fullscreen: true,
         }
     }
 }
@@ -41,7 +45,7 @@ impl Settings {
             return Err("Configuration contains control characters".into());
         }
         Ok(format!(
-            "version=1\nfit={}\nbattery={}\nmonitor={}\npath={}\n",
+            "version=2\nfit={}\nbattery={}\nmonitor={}\npath={}\naudio={}\nfullscreen={}\n",
             if self.fit == Fit::Fill {
                 "fill"
             } else {
@@ -49,14 +53,35 @@ impl Settings {
             },
             self.pause_battery,
             self.monitor,
-            path
+            path,
+            self.audio_enabled,
+            self.pause_fullscreen
         ))
     }
     pub fn decode(text: &str) -> Result<Self, String> {
         let lines: Vec<_> = text.lines().collect();
-        if lines.len() != 5 || lines[0] != "version=1" {
+        let legacy = lines.len() == 5 && lines[0] == "version=1";
+        if !legacy && !(lines.len() == 7 && lines[0] == "version=2") {
             return Err("Invalid configuration version or contents".into());
         }
+        let audio_enabled = if legacy {
+            false
+        } else {
+            match lines[5] {
+                "audio=true" => true,
+                "audio=false" => false,
+                _ => return Err("Invalid audio setting".into()),
+            }
+        };
+        let pause_fullscreen = if legacy {
+            true
+        } else {
+            match lines[6] {
+                "fullscreen=true" => true,
+                "fullscreen=false" => false,
+                _ => return Err("Invalid fullscreen pause setting".into()),
+            }
+        };
         let fit = match lines[1] {
             "fit=fill" => Fit::Fill,
             "fit=contain" => Fit::Contain,
@@ -87,6 +112,8 @@ impl Settings {
             monitor,
             fit,
             pause_battery,
+            audio_enabled,
+            pause_fullscreen,
         })
     }
 }
@@ -239,6 +266,8 @@ mod tests {
             monitor: r"\\.\DISPLAY1".into(),
             fit: Fit::Contain,
             pause_battery: false,
+            audio_enabled: true,
+            pause_fullscreen: false,
         };
         assert_eq!(Settings::decode(&s.encode().unwrap()).unwrap(), s);
         let empty = Settings::default();
@@ -256,6 +285,31 @@ mod tests {
         ] {
             assert!(Settings::decode(text).is_err(), "accepted {text:?}");
         }
+    }
+
+    #[test]
+    fn legacy_settings_keep_audio_disabled_and_fullscreen_pause_enabled() {
+        let text = "version=1\nfit=contain\nbattery=false\nmonitor=\\\\.\\DISPLAY1\npath=C:\\media\\wallpaper.mp4\n";
+        let settings = Settings::decode(text).unwrap();
+        assert!(!settings.audio_enabled);
+        assert!(settings.pause_fullscreen);
+        assert_eq!(settings.fit, Fit::Contain);
+        let mut changed = settings;
+        changed.audio_enabled = true;
+        changed.pause_fullscreen = false;
+        assert_eq!(
+            Settings::decode(&changed.encode().unwrap()).unwrap(),
+            changed
+        );
+        assert!(
+            Settings::decode(
+                &changed
+                    .encode()
+                    .unwrap()
+                    .replace("audio=true", "audio=maybe")
+            )
+            .is_err()
+        );
     }
 
     #[test]

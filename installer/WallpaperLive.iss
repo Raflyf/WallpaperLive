@@ -77,10 +77,21 @@ begin
   DownloadPage.ShowBaseNameInsteadOfUrl := True;
 end;
 
+function LocalDecoderAvailable: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\runtime\libmpv-2.dll')) or
+    FileExists(ExpandConstant('{src}\mpv-dev.7z'));
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = ConsentPage.ID) and LocalDecoderAvailable;
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if CurPageID = ConsentPage.ID then
+  if (CurPageID = ConsentPage.ID) and not LocalDecoderAvailable then
     if not ConsentPage.Values[0] then begin
       SuppressibleMsgBox('Decoder consent is required. Cancel Setup if you do not want this download.', mbInformation, MB_OK, IDOK);
       Result := False;
@@ -91,10 +102,11 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ExistingDecoder: String;
   DecoderDir: String;
+  DecoderArchive: String;
 begin
   Result := '';
   NeedsRestart := False;
-  if not ConsentPage.Values[0] then begin
+  if not LocalDecoderAvailable and not ConsentPage.Values[0] then begin
     Result := 'Decoder download consent was not granted. Nothing installed.';
     Exit;
   end;
@@ -108,17 +120,26 @@ begin
     end;
     DownloadDecoder := True;
     if DecoderPrepared then Exit;
-    DownloadPage.Clear;
-    DownloadPage.Add('{#DecoderURL}', 'mpv-dev.7z', '{#ArchiveSHA256}');
-    DownloadPage.Show;
-    try
-      DownloadPage.Download;
-    finally
-      DownloadPage.Hide;
+    DecoderArchive := ExpandConstant('{src}\mpv-dev.7z');
+    if FileExists(DecoderArchive) then begin
+      if CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0 then
+        RaiseException('Local mpv-dev.7z checksum differs from the pinned decoder. Nothing installed; move that file aside or supply the correct upstream archive.');
+    end else begin
+      if not ConsentPage.Values[0] then
+        RaiseException('Decoder is not available locally and download consent was not granted.');
+      DownloadPage.Clear;
+      DownloadPage.Add('{#DecoderURL}', 'mpv-dev.7z', '{#ArchiveSHA256}');
+      DownloadPage.Show;
+      try
+        DownloadPage.Download;
+      finally
+        DownloadPage.Hide;
+      end;
+      DecoderArchive := ExpandConstant('{tmp}\mpv-dev.7z');
     end;
     DecoderDir := ExpandConstant('{tmp}\decoder');
     if not ForceDirectories(DecoderDir) then RaiseException('Could not create temporary decoder directory.');
-    ExtractArchive(ExpandConstant('{tmp}\mpv-dev.7z'), DecoderDir, '', True, nil);
+    ExtractArchive(DecoderArchive, DecoderDir, '', True, nil);
     if not FileExists(DecoderDir + '\libmpv-2.dll') then RaiseException('Decoder DLL is missing from the verified archive.');
     if CompareText(GetSHA256OfFile(DecoderDir + '\libmpv-2.dll'), '{#DecoderSHA256}') <> 0 then
       RaiseException('Extracted decoder SHA256 mismatch. Nothing installed.');

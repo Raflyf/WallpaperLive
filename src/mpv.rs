@@ -195,15 +195,19 @@ impl Mpv {
             ("terminal", "no"),
             ("media-controls", "no"),
             ("stop-screensaver", "no"),
-            ("audio", "no"),
+            ("aid", "no"),
+            ("mute", "yes"),
             ("sid", "no"),
             ("autoload-files", "no"),
             ("access-references", "no"),
             ("load-unsafe-playlists", "no"),
             ("demuxer-lavf-o", "protocol_whitelist=[file]"),
             ("cache", "no"),
-            ("demuxer-max-bytes", "16MiB"),
+            ("demuxer-max-bytes", "8MiB"),
             ("demuxer-max-back-bytes", "0"),
+            ("demuxer-readahead-secs", "0.5"),
+            // ponytail: four software decode threads bound frame pools; revisit for measured high-resolution drops.
+            ("vd-lavc-threads", "4"),
             ("loop-file", "inf"),
             ("image-display-duration", "inf"),
             ("keep-open", "yes"),
@@ -261,6 +265,33 @@ impl Mpv {
                 c"pause".as_ptr(),
                 3,
                 (&mut flag as *mut c_int).cast(),
+            )
+        })
+    }
+    pub fn set_audio(&self, enabled: bool) -> Result<(), String> {
+        let mut track = if enabled {
+            c"auto".as_ptr()
+        } else {
+            c"no".as_ptr()
+        };
+        let mut muted: c_int = (!enabled).into();
+        // SAFETY: STRING=1 expects char**, FLAG=3 expects int*; async API copies both values.
+        self.api.check(unsafe {
+            (self.api.set)(
+                self.handle,
+                4,
+                c"aid".as_ptr(),
+                1,
+                (&mut track as *mut *const c_char).cast(),
+            )
+        })?;
+        self.api.check(unsafe {
+            (self.api.set)(
+                self.handle,
+                5,
+                c"mute".as_ptr(),
+                3,
+                (&mut muted as *mut c_int).cast(),
             )
         })
     }
@@ -418,6 +449,190 @@ mod tests {
                 expected
             );
         }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "Requires pinned runtime DLL; headless, no media or audio output is opened"]
+    fn native_audio_and_memory_contract() -> Result<(), String> {
+        let api = Api::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/libmpv-2.dll"))?;
+        // SAFETY: test owns its handle and uses null audio/video outputs, never a desktop window.
+        let handle = unsafe { (api.create)() };
+        if handle.is_null() {
+            return Err("Could not create decoder".into());
+        }
+        let player = Mpv { handle, api };
+        for (name, value) in [
+            ("config", "no"),
+            ("load-scripts", "no"),
+            ("osc", "no"),
+            ("ytdl", "no"),
+            ("terminal", "no"),
+            ("aid", "no"),
+            ("mute", "yes"),
+            ("vo", "null"),
+            ("ao", "null"),
+            ("cache", "no"),
+            ("demuxer-max-bytes", "8MiB"),
+            ("demuxer-max-back-bytes", "0"),
+            ("demuxer-readahead-secs", "0.5"),
+            ("vd-lavc-threads", "4"),
+        ] {
+            player.option(name, value)?;
+        }
+        player
+            .api
+            .check(unsafe { (player.api.initialize)(handle) })?;
+        assert_eq!(player.property(c"aid").as_deref(), Some("no"));
+        assert_eq!(player.property(c"mute").as_deref(), Some("yes"));
+        for enabled in [true, false, true, false] {
+            player.set_audio(enabled)?;
+            let mut replies = 0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while replies < 2 {
+                let event = unsafe { &*(player.api.wait)(handle, 0.1) };
+                if event.id == 4 && matches!(event.request, 4 | 5) {
+                    player.api.check(event.error)?;
+                    replies += 1;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Missing audio property reply"
+                );
+            }
+            assert_eq!(
+                player.property(c"aid").as_deref(),
+                Some(if enabled { "auto" } else { "no" })
+            );
+            assert_eq!(
+                player.property(c"mute").as_deref(),
+                Some(if enabled { "no" } else { "yes" })
+            );
+        }
+        for (name, expected) in [
+            (c"options/vd-lavc-threads", "4"),
+            (c"options/demuxer-max-bytes", "8388608"),
+            (c"options/demuxer-max-back-bytes", "0"),
+        ] {
+            assert_eq!(player.property(name).as_deref(), Some(expected));
+        }
+        assert_eq!(
+            player
+                .property(c"options/demuxer-readahead-secs")
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            0.5
+        );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "Requires pinned runtime DLL; synthesized PCM uses null audio/video outputs"]
+    fn native_audio_toggle_keeps_loaded_media() -> Result<(), String> {
+        use std::{
+            fs,
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        };
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "scratch/native-audio-{}-{stamp}.wav",
+            std::process::id()
+        ));
+        let data_bytes = 8000u32 * 2 * 5;
+        let mut wave = Vec::with_capacity(44 + data_bytes as usize);
+        wave.extend_from_slice(b"RIFF");
+        wave.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wave.extend_from_slice(b"WAVEfmt ");
+        wave.extend_from_slice(&16u32.to_le_bytes());
+        wave.extend_from_slice(&1u16.to_le_bytes());
+        wave.extend_from_slice(&1u16.to_le_bytes());
+        wave.extend_from_slice(&8000u32.to_le_bytes());
+        wave.extend_from_slice(&16000u32.to_le_bytes());
+        wave.extend_from_slice(&2u16.to_le_bytes());
+        wave.extend_from_slice(&16u16.to_le_bytes());
+        wave.extend_from_slice(b"data");
+        wave.extend_from_slice(&data_bytes.to_le_bytes());
+        wave.resize(44 + data_bytes as usize, 0);
+        // ponytail: keep unique test media in ignored scratch; no automatic user-data deletion.
+        fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        fs::write(&path, wave).map_err(|e| e.to_string())?;
+        let api = Api::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/libmpv-2.dll"))?;
+        // SAFETY: owned native context, no window and null audio output; no user process touched.
+        let handle = unsafe { (api.create)() };
+        if handle.is_null() {
+            return Err("Could not create decoder".into());
+        }
+        let player = Mpv { handle, api };
+        for (name, value) in [
+            ("config", "no"),
+            ("load-scripts", "no"),
+            ("osc", "no"),
+            ("ytdl", "no"),
+            ("terminal", "no"),
+            ("vo", "null"),
+            ("ao", "null"),
+            ("aid", "auto"),
+            ("mute", "yes"),
+            ("pause", "yes"),
+            ("keep-open", "always"),
+            ("cache", "no"),
+            ("access-references", "no"),
+            ("autoload-files", "no"),
+        ] {
+            player.option(name, value)?;
+        }
+        player
+            .api
+            .check(unsafe { (player.api.initialize)(handle) })?;
+        player.load(&path)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let event = unsafe { &*(player.api.wait)(handle, 0.1) };
+            if event.id == 8 {
+                break;
+            }
+            if event.id == 5 && event.request == 1 {
+                player.api.check(event.error)?;
+            }
+            assert!(Instant::now() < deadline, "Native PCM did not load");
+        }
+        let loaded_path = player.property(c"path");
+        assert!(loaded_path.is_some());
+        for enabled in [true, false, true, false] {
+            player.set_audio(enabled)?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut replies = 0;
+            while replies < 2 {
+                let event = unsafe { &*(player.api.wait)(handle, 0.1) };
+                assert_ne!(event.id, 6, "Audio toggle restarted media loading");
+                if event.id == 4 && matches!(event.request, 4 | 5) {
+                    player.api.check(event.error)?;
+                    replies += 1;
+                }
+                assert!(Instant::now() < deadline, "Missing audio toggle reply");
+            }
+            let track = player.property(c"aid").unwrap();
+            if enabled {
+                assert!(
+                    track.parse::<u64>().is_ok(),
+                    "Audio track not selected: {track}"
+                );
+            } else {
+                assert_eq!(track, "no");
+            }
+            assert_eq!(
+                player.property(c"mute").as_deref(),
+                Some(if enabled { "no" } else { "yes" })
+            );
+            assert_eq!(player.property(c"path"), loaded_path);
+            assert_eq!(player.property(c"pause").as_deref(), Some("yes"));
+        }
+        println!(
+            "Native PCM audio toggle passed without reload; fixture={}",
+            path.display()
+        );
         Ok(())
     }
     #[test]

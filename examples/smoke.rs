@@ -109,6 +109,23 @@ fn main() -> Result<(), String> {
                             player.property(c"aid"),
                             format
                         );
+                        for name in [
+                            c"video-params/w",
+                            c"video-params/h",
+                            c"video-params/pixelformat",
+                            c"video-dec-params/pixelformat",
+                            c"decoder-frame-drop-count",
+                            c"options/vd-lavc-threads",
+                            c"options/hwdec-extra-frames",
+                            c"options/swapchain-depth",
+                            c"options/demuxer-max-bytes",
+                            c"options/demuxer-max-back-bytes",
+                            c"options/demuxer-readahead-secs",
+                            c"demuxer-cache-state/fw-bytes",
+                            c"mute",
+                        ] {
+                            println!("{}={:?}", name.to_string_lossy(), player.property(name));
+                        }
                     }
                     mpv::Event::Failed(e) => failure = Some(e),
                     mpv::Event::Pause(value) => println!("pause={value}"),

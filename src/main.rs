@@ -3,8 +3,24 @@ mod app;
 mod core;
 mod desktop;
 mod mpv;
+mod thumbnail;
 mod visuals;
 fn main() {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--thumbnail") {
+        use std::io::Write;
+        let result = args
+            .get(1)
+            .ok_or_else(|| "Thumbnail media is missing".to_string())
+            .and_then(|path| thumbnail::extract(std::path::Path::new(path)))
+            .and_then(|bytes| {
+                std::io::stdout()
+                    .lock()
+                    .write_all(&bytes)
+                    .map_err(|e| e.to_string())
+            });
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     if let Err(error) = app::run() {
         let message: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();
         // SAFETY: NUL-terminated temporary string lives until native message box returns.
