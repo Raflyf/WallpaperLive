@@ -88,7 +88,8 @@ jobs:
           Windows x64 installer built by GitHub Actions after formatting, lint, tests and release compilation passed.
 
           Features: automatic display-sized SDR video cache without changing originals; manual 24/30/45/60 FPS cap; detected dedicated GPU preference; folder/subfolder import and folder filter; Select all plus confirmed mass library removal.
-          Pause now releases decoder, video surface and thumbnail buffers, then reloads near the previous position on resume. Fullscreen and maximized foreground apps on the wallpaper display trigger automatic pause, and video conversion is cancelled/deferred while paused.
+          FPS changes now update a native filter on the running player without reload or re-encoding. Original media starts immediately while a fixed source-rate display cache is prepared in the background; uncached 4K can temporarily use more RAM. The same renderer is reused on switches.
+          Pause keeps the last frame and decoder visible, stops animation/audio, drops thumbnails and requests a one-shot resident RAM trim. Resume does not re-prepare or reload the active file. Fullscreen and maximized foreground apps on the wallpaper display trigger automatic pause, and cache conversion is cancelled/deferred while paused.
           Tray context menus follow the Windows system dark/light theme without restart; high-contrast mode retains native system rendering.
           The app checks GitHub once in the background per process for a newer stable release. A tray balloon and Pembaruan tersedia (vX.Y.Z) menu entry open the validated repository release page; no automatic download or installation.
           RAM is not globally capped. UI/tray/resume detection still use resources; cache conversion is CPU/disk work performed once per profile. HDR and animated images retain their original media in this version.

@@ -146,7 +146,12 @@ struct App {
     playback: Option<Playback>,
     reasons: PauseReasons,
     actual_pause: bool,
+    requested_pause: bool,
     loaded: bool,
+    load_request: u64,
+    load_entry: Option<i64>,
+    file_loaded: Option<i64>,
+    video_ready: Option<i64>,
     loading_since: Option<Instant>,
     recovery: Option<(Instant, u8, PathBuf)>,
     power: Vec<HPOWERNOTIFY>,
@@ -168,8 +173,10 @@ struct App {
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::thread::JoinHandle<()>,
     )>,
-    preparation_rx: std::sync::mpsc::Receiver<Result<crate::cache::Prepared, String>>,
-    preparation_tx: std::sync::mpsc::Sender<Result<crate::cache::Prepared, String>>,
+    preparation_id: u64,
+    preparation_rx: std::sync::mpsc::Receiver<(u64, Result<crate::cache::Prepared, String>)>,
+    preparation_tx: std::sync::mpsc::Sender<(u64, Result<crate::cache::Prepared, String>)>,
+    prepared_waiting: Option<(Instant, PathBuf, crate::cache::Prepared)>,
     playback_info: Option<crate::cache::Prepared>,
     dormant: Option<Dormant>,
     resume_position: f64,
@@ -205,8 +212,11 @@ impl App {
             && self.preparation.is_none()
             && self.dormant.is_none()
             && self.recovery.is_none()
+            && self.preparation_thread.is_none()
+            && self.prepared_waiting.is_none()
+            && self.thumbnail_thread.is_none()
         {
-            // No wallpaper remains to resume after a failed preparation.
+            // No wallpaper or worker remains to monitor after a failed preparation.
             unsafe {
                 let _ = KillTimer(self.hwnd, 1);
             }
@@ -807,10 +817,45 @@ impl App {
         }
         paths
     }
+    fn cancel_thumbnails(&mut self) {
+        if let Some((cancelled, _)) = &self.thumbnail_thread {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        visuals::retain_thumbnails(&[]);
+    }
     fn request_thumbnails(&mut self) {
         let paths = self.thumbnail_paths();
         visuals::retain_thumbnails(&paths);
-        if self.thumbnail_pending.is_some() {
+        if self
+            .thumbnail_thread
+            .as_ref()
+            .is_some_and(|(_, worker)| worker.is_finished())
+        {
+            let Some((cancelled, worker)) = self.thumbnail_thread.take() else {
+                return;
+            };
+            let _ = worker.join();
+            self.thumbnail_pending = None;
+            for (path, result) in self.thumbnail_rx.try_iter() {
+                if !cancelled.load(std::sync::atomic::Ordering::Relaxed) && paths.contains(&path) {
+                    match result.and_then(|bytes| crate::thumbnail::bitmap(&bytes)) {
+                        Ok(bitmap) => visuals::thumbnail(path, bitmap),
+                        Err(_) => {
+                            self.thumbnail_failed.insert(path);
+                        }
+                    }
+                }
+            }
+            for (_, control) in &self.controls {
+                unsafe {
+                    let _ = InvalidateRect(*control, None, false);
+                }
+            }
+        }
+        if self.thumbnail_thread.is_some() {
+            if paths.is_empty() {
+                self.cancel_thumbnails();
+            }
             return;
         }
         let Some(path) = paths
@@ -835,6 +880,9 @@ impl App {
                 }
             }),
         ));
+        if let Err(error) = self.arm_monitor() {
+            self.set_error(error);
+        }
     }
     fn tray(&mut self, add: bool) -> Result<(), String> {
         let mut data = NOTIFYICONDATAW {
@@ -985,8 +1033,13 @@ impl App {
         self.playback_info = None;
         visuals::playing(None);
         self.loaded = false;
+        self.load_request = 0;
+        self.load_entry = None;
+        self.file_loaded = None;
+        self.video_ready = None;
         self.loading_since = None;
         self.actual_pause = false;
+        self.requested_pause = false;
         // SAFETY: teardown cancels only the timer owned by this controller.
         unsafe {
             let _ = KillTimer(self.hwnd, 1);
@@ -1006,100 +1059,118 @@ impl App {
             "{}\\",
             &path.to_str().ok_or("Invalid file name")?[..2]
         ));
-        // SAFETY: canonical local drive root queried without changing filesystem.
+        // SAFETY: read-only local drive check; no remote media or command execution.
         if !matches!(unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) }, 2 | 3 | 5) {
             return Err("Media must be on a local drive, not a network drive".into());
         }
-        let dll = decoder_path()?;
         let rect = self.screen().rect;
         let display = (
             (rect.right - rect.left) as u32,
             (rect.bottom - rect.top) as u32,
         );
-        let fps = self.settings.fps;
+        self.cancel_preparation();
+        self.cancel_thumbnails();
+        self.dormant = None;
+        self.update_reasons();
+        let prepared = crate::cache::Prepared {
+            path: path.clone(),
+            width: 0,
+            height: 0,
+            fps: 0.0,
+            cached: false,
+            note: "Original media".into(),
+        };
+        self.load_prepared(path.clone(), prepared, self.resume_position)?;
+        self.preparation = Some((path, display, crate::cache::CACHE_FPS));
+        self.launch_preparation()?;
+        self.update_status();
+        Ok(())
+    }
+    fn cancel_preparation(&mut self) {
+        if let Some((cancelled, _)) = &self.preparation_thread {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.preparation_id = self.preparation_id.wrapping_add(1);
+        self.preparation = None;
+        self.prepared_waiting = None;
+        while self.preparation_rx.try_recv().is_ok() {}
+    }
+    fn launch_preparation(&mut self) -> Result<(), String> {
+        if self
+            .preparation_thread
+            .as_ref()
+            .is_some_and(|(_, worker)| worker.is_finished())
+        {
+            if let Some((_, worker)) = self.preparation_thread.take() {
+                let _ = worker.join();
+            }
+            self.prepared()?;
+        }
+        if self.preparation_thread.is_some() || self.reasons.reason().is_some() {
+            return Ok(());
+        }
+        let Some((path, display, fps)) = self.preparation.clone() else {
+            return Ok(());
+        };
+        let dll = decoder_path()?;
         let directory = self
             .config
             .parent()
             .ok_or("Invalid cache directory")?
             .join("video-cache");
-        self.cancel_preparation();
-        self.release_playback();
-        self.dormant = None;
-        self.update_reasons();
-        if self.reasons.reason().is_some() {
-            self.dormant = Some(Dormant {
-                path,
-                position: self.resume_position,
-            });
-            self.arm_monitor()?;
-            self.update_status();
-            return Ok(());
-        }
-        if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
-            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = worker.join();
-            self.thumbnail_pending = None;
-            while self.thumbnail_rx.try_recv().is_ok() {}
-        }
-        self.preparation = Some((path.clone(), display, fps));
-        self.error = None;
-        visuals::retain_thumbnails(&[]);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cancelled.clone();
         let tx = self.preparation_tx.clone();
+        let id = self.preparation_id;
         let hwnd = self.hwnd.0 as usize;
         let worker = std::thread::spawn(move || {
             let result = crate::cache::prepare(&dll, &path, &directory, display, fps, &flag);
-            let _ = tx.send(result);
-            unsafe {
-                let _ = PostMessageW(HWND(hwnd as *mut _), PREPARED, WPARAM(0), LPARAM(0));
+            if tx.send((id, result)).is_ok() {
+                // SAFETY: worker only posts completion; App owns and joins its lifetime on exit.
+                unsafe {
+                    let _ = PostMessageW(HWND(hwnd as *mut _), PREPARED, WPARAM(0), LPARAM(0));
+                }
             }
         });
         self.preparation_thread = Some((cancelled, worker));
-        self.arm_monitor()?;
-        self.update_status();
         Ok(())
     }
-    fn cancel_preparation(&mut self) {
-        if let Some((cancelled, worker)) = self.preparation_thread.take() {
-            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = worker.join();
-        }
-        self.preparation = None;
-        while self.preparation_rx.try_recv().is_ok() {}
-    }
     fn prepared(&mut self) -> Result<(), String> {
-        let Ok(result) = self.preparation_rx.try_recv() else {
-            return Ok(());
-        };
-        if let Some((_, worker)) = self.preparation_thread.take() {
-            let _ = worker.join();
+        while let Ok((id, result)) = self.preparation_rx.try_recv() {
+            if id != self.preparation_id {
+                continue;
+            }
+            let Some((path, display, _)) = self.preparation.take() else {
+                continue;
+            };
+            let prepared = match result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.error = Some(format!(
+                        "Original playback kept; display cache unavailable: {error}"
+                    ));
+                    continue;
+                }
+            };
+            let rect = self.screen().rect;
+            if display
+                != (
+                    (rect.right - rect.left) as u32,
+                    (rect.bottom - rect.top) as u32,
+                )
+            {
+                return self.start_path(&path);
+            }
+            if !prepared.cached {
+                if self.playback.as_ref().is_some_and(|p| p.path == path) {
+                    self.playback_info = Some(prepared);
+                }
+                continue;
+            }
+            self.prepared_waiting = Some((Instant::now(), path, prepared));
         }
-        let Some((path, display, fps)) = self.preparation.take() else {
-            return Ok(());
-        };
-        let prepared = result?;
-        let rect = self.screen().rect;
-        if display
-            != (
-                (rect.right - rect.left) as u32,
-                (rect.bottom - rect.top) as u32,
-            )
-            || fps != self.settings.fps
-        {
-            return self.start_path(&path);
-        }
-        self.update_reasons();
-        if self.reasons.reason().is_some() {
-            self.dormant = Some(Dormant {
-                path,
-                position: self.resume_position,
-            });
-            self.arm_monitor()?;
-            self.update_status();
-            return Ok(());
-        }
-        self.load_prepared(path, prepared, self.resume_position)
+        self.update_status();
+        Ok(())
     }
     fn load_prepared(
         &mut self,
@@ -1108,18 +1179,39 @@ impl App {
         position: f64,
     ) -> Result<(), String> {
         let rect = self.screen().rect;
-        let surface = Surface::create(rect)?;
-        let player = Mpv::open_at(&decoder_path()?, surface.hwnd, self.hwnd, self.settings.fit)?;
-        player.pause(true)?;
-        player.set_audio(self.settings.audio_enabled)?;
-        player.load(&prepared.path)?;
-        self.playback = Some(Playback {
-            player,
-            surface,
-            path,
-        });
+        let request;
+        if let Some(playback) = &mut self.playback {
+            playback.surface.place(rect)?;
+            playback.player.pause(true)?;
+            let _ = playback.player.poll();
+            playback.player.set_fps(self.settings.fps, 1.0)?;
+            playback.player.set_audio(self.settings.audio_enabled)?;
+            request = playback.player.load(&prepared.path)?;
+            playback.path = path;
+        } else {
+            #[cfg(not(test))]
+            let surface = Surface::create(rect)?;
+            #[cfg(test)]
+            let surface = Surface::isolated(self.hwnd, rect)?;
+            let player =
+                Mpv::open_at(&decoder_path()?, surface.hwnd, self.hwnd, self.settings.fit)?;
+            player.pause(true)?;
+            player.set_audio(self.settings.audio_enabled)?;
+            request = player.load(&prepared.path)?;
+            self.playback = Some(Playback {
+                player,
+                surface,
+                path,
+            });
+        }
         self.playback_info = Some(prepared);
         self.resume_position = position;
+        self.requested_pause = true;
+        self.loaded = false;
+        self.load_request = request;
+        self.load_entry = None;
+        self.file_loaded = None;
+        self.video_ready = None;
         self.loading_since = Some(Instant::now());
         self.error = None;
         self.arm_monitor()?;
@@ -1136,6 +1228,9 @@ impl App {
         self.settings.path = None;
         unsafe {
             let _ = KillTimer(self.hwnd, 1);
+        }
+        if self.preparation_thread.is_some() || self.thumbnail_thread.is_some() {
+            self.arm_monitor()?;
         }
         self.save()?;
         self.error = None;
@@ -1223,37 +1318,55 @@ impl App {
     }
     fn tick(&mut self) -> Result<(), String> {
         self.update_reasons();
-        if self.reasons.reason().is_some() {
+        self.prepared()?;
+        self.events()?;
+        let paused = self.reasons.reason().is_some();
+        if self.loaded && self.requested_pause != paused {
+            if !paused && let Some((due, _, _)) = &mut self.prepared_waiting {
+                *due = Instant::now() + Duration::from_secs(2);
+            }
             if let Some(playback) = &self.playback {
-                let path = playback.path.clone();
-                let position = playback
-                    .player
-                    .property(c"time-pos")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|p| p.is_finite() && *p >= 0.0)
-                    .unwrap_or(self.resume_position);
-                self.release_playback();
-                self.dormant = Some(Dormant { path, position });
-                self.arm_monitor()?;
+                playback.player.pause(paused)?;
             }
-            if let Some((path, _, _)) = self.preparation.take() {
+            self.requested_pause = paused;
+        }
+        if paused {
+            if self.preparation.is_some()
+                && self
+                    .preparation_thread
+                    .as_ref()
+                    .is_some_and(|(cancelled, _)| {
+                        !cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    })
+            {
+                let preparation = self.preparation.take();
                 self.cancel_preparation();
-                self.dormant = Some(Dormant {
-                    path,
-                    position: self.resume_position,
-                });
-                self.arm_monitor()?;
+                self.preparation = preparation;
             }
-            if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
-                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = worker.join();
-                self.thumbnail_pending = None;
-                while self.thumbnail_rx.try_recv().is_ok() {}
-            }
-            visuals::retain_thumbnails(&[]);
+            self.cancel_thumbnails();
+            self.launch_preparation()?;
+            self.request_thumbnails();
             self.update_status();
             return Ok(());
         }
+        if (self.playback.is_none() || self.loaded)
+            && !self.requested_pause
+            && self
+                .prepared_waiting
+                .as_ref()
+                .is_some_and(|(due, _, _)| Instant::now() >= *due)
+            && let Some((_, path, prepared)) = self.prepared_waiting.take()
+        {
+            let position = self
+                .playback
+                .as_ref()
+                .and_then(|p| p.player.property(c"time-pos"))
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|p| p.is_finite() && *p >= 0.0)
+                .unwrap_or(0.0);
+            self.load_prepared(path, prepared, position)?;
+        }
+        self.launch_preparation()?;
         if let Some(dormant) = self.dormant.take() {
             self.resume_position = dormant.position;
             self.start_path(&dormant.path)?;
@@ -1300,10 +1413,22 @@ impl App {
             .is_some_and(|s| s.elapsed() > Duration::from_secs(15))
         {
             self.release_playback();
+            self.arm_monitor()?;
             return Err("Media did not finish loading. Try another file or decoder.".into());
         }
-        self.events()?;
+        self.request_thumbnails();
         self.update_status();
+        if self.playback.is_none()
+            && self.preparation.is_none()
+            && self.recovery.is_none()
+            && self.preparation_thread.is_none()
+            && self.prepared_waiting.is_none()
+            && self.thumbnail_thread.is_none()
+        {
+            unsafe {
+                let _ = KillTimer(self.hwnd, 1);
+            }
+        }
         Ok(())
     }
     fn events(&mut self) -> Result<(), String> {
@@ -1313,53 +1438,129 @@ impl App {
             .map(|p| p.player.poll())
             .unwrap_or_default();
         for event in events {
-            match event {
-                Event::Loaded => {}
-                Event::Ready => {
-                    if self.loaded {
-                        continue;
-                    }
-                    let Some(playback) = self.playback.as_ref() else {
-                        continue;
-                    };
-                    if playback.player.property(c"video-format").is_none() {
-                        continue;
-                    }
-                    if let Err(error) = playback.surface.prepare_renderer() {
-                        self.release_playback();
-                        return Err(error);
-                    }
-                    if self.resume_position > 0.0 {
-                        playback.player.seek(self.resume_position)?;
-                        self.resume_position = 0.0;
-                    }
-                    playback.player.pause(false)?;
-                    playback.surface.show();
-                    self.settings.path = Some(playback.path.clone());
-                    self.loaded = true;
-                    visuals::playing(Some(playback.path.clone()));
-                    for i in 0..4 {
-                        unsafe {
-                            let _ =
-                                InvalidateRect(self.control(visuals::TILE_BASE + i), None, false);
-                        }
-                    }
-                    self.loading_since = None;
-                    if let Err(error) = self.save() {
-                        self.error = Some(format!("Playing, but settings were not saved: {error}"));
-                    }
+            self.event(event)?;
+        }
+        self.finish_load()?;
+        self.update_status();
+        Ok(())
+    }
+    fn event(&mut self, event: Event) -> Result<(), String> {
+        match event {
+            Event::LoadAccepted { request, entry } if request == self.load_request => {
+                self.load_entry = Some(entry)
+            }
+            Event::LoadAccepted { .. } => {}
+            Event::Started(entry) => {
+                if self.load_entry == Some(entry) || self.load_entry.is_none() {
+                    self.file_loaded = None;
+                    self.video_ready = None;
                 }
-                Event::Failed(error) => {
-                    self.release_playback();
+            }
+            Event::Loaded(entry) => self.file_loaded = entry,
+            Event::Ready(entry) => self.video_ready = entry,
+            Event::FileFailed { entry, error } if self.load_entry == Some(entry) => {
+                self.release_playback();
+                self.arm_monitor()?;
+                return Err(error);
+            }
+            Event::FileFailed { .. } => {}
+            Event::Failed(error) => {
+                self.release_playback();
+                self.arm_monitor()?;
+                return Err(error);
+            }
+            Event::FrameRateFailed(error) => {
+                self.error = Some(format!("Frame-rate change failed; wallpaper kept: {error}"))
+            }
+            Event::Pause(paused) => {
+                if paused && !self.actual_pause && self.loaded && self.reasons.reason().is_some() {
+                    // ponytail: trims resident pages, not decoder allocations; retain frame for fast resume.
                     unsafe {
-                        let _ = KillTimer(self.hwnd, 1);
+                        let _ =
+                            SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
                     }
-                    return Err(error);
                 }
-                Event::Pause(paused) => self.actual_pause = paused,
+                self.actual_pause = paused;
             }
         }
-        self.update_status();
+        Ok(())
+    }
+    fn finish_load(&mut self) -> Result<(), String> {
+        if self.loaded
+            || self.load_entry.is_none()
+            || self.file_loaded != self.load_entry
+            || self.video_ready != self.load_entry
+        {
+            return Ok(());
+        }
+        let Some(playback) = self.playback.as_ref() else {
+            return Ok(());
+        };
+        if playback.player.property(c"video-format").is_none()
+            || self.playback_info.as_ref().is_none_or(|info| {
+                playback
+                    .player
+                    .property(c"path")
+                    .is_none_or(|path| Path::new(&path) != info.path)
+            })
+        {
+            return Ok(());
+        }
+        if let Err(error) = playback.surface.prepare_renderer() {
+            self.release_playback();
+            return Err(error);
+        }
+        if self.resume_position > 0.0 {
+            playback.player.seek(self.resume_position)?;
+            self.resume_position = 0.0;
+        }
+        let source_fps = self
+            .playback_info
+            .as_ref()
+            .filter(|p| p.fps > 0.0)
+            .map(|p| p.fps)
+            .or_else(|| {
+                playback
+                    .player
+                    .property(c"container-fps")
+                    .and_then(|s| s.parse::<f64>().ok())
+            })
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or(1.0);
+        playback.player.set_fps(self.settings.fps, source_fps)?;
+        if let Some(info) = &mut self.playback_info {
+            info.fps = source_fps;
+            if let Some(width) = playback
+                .player
+                .property(c"video-params/w")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                info.width = width;
+            }
+            if let Some(height) = playback
+                .player
+                .property(c"video-params/h")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                info.height = height;
+            }
+        }
+        let paused = self.reasons.reason().is_some();
+        playback.player.pause(paused)?;
+        self.requested_pause = paused;
+        playback.surface.show();
+        self.settings.path = Some(playback.path.clone());
+        self.loaded = true;
+        visuals::playing(Some(playback.path.clone()));
+        for i in 0..4 {
+            unsafe {
+                let _ = InvalidateRect(self.control(visuals::TILE_BASE + i), None, false);
+            }
+        }
+        self.loading_since = None;
+        if let Err(error) = self.save() {
+            self.error = Some(format!("Playing, but settings were not saved: {error}"));
+        }
         Ok(())
     }
     fn update_status(&self) {
@@ -1367,8 +1568,13 @@ impl App {
             format!("Error: {error}")
         } else if self.recovery.is_some() {
             "Desktop changed. Restoring wallpaper...".into()
+        } else if self.reasons.reason().is_some() && self.playback.is_some() {
+            format!(
+                "{}. Last frame kept; resume does not reload.",
+                self.reasons.reason().unwrap_or("Paused")
+            )
         } else if self.preparation.is_some() {
-            "Preparing screen-sized video cache. Stop to cancel; original media stays unchanged."
+            "Playing original; preparing display cache in background. Temporary RAM may be higher."
                 .into()
         } else if self.dormant.is_some() {
             format!(
@@ -1387,7 +1593,15 @@ impl App {
             let detail = self
                 .playback_info
                 .as_ref()
-                .map(|p| format!("{}: {} x {}, {:.1} FPS. ", p.note, p.width, p.height, p.fps))
+                .map(|p| {
+                    format!(
+                        "{}: {} x {}, cap {:.1} FPS. ",
+                        p.note,
+                        p.width,
+                        p.height,
+                        p.fps.min(f64::from(self.settings.fps))
+                    )
+                })
                 .unwrap_or_default();
             format!(
                 "{detail}Sound: {}. Auto-pause: {}.",
@@ -1573,6 +1787,34 @@ impl App {
             result
         }
     }
+    fn change_fps(&mut self, fps: u32) -> Result<(), String> {
+        if !crate::core::FPS_OPTIONS.contains(&fps) {
+            return Err("Invalid frame-rate limit".into());
+        }
+        if self.settings.fps == fps {
+            return Ok(());
+        }
+        let old = self.settings.fps;
+        self.settings.fps = fps;
+        if let Err(error) = self.save() {
+            self.settings.fps = old;
+            return Err(error);
+        }
+        self.text(visuals::FPS, &format!("Frame rate: {fps} FPS"));
+        if self.loaded
+            && let Some(playback) = &self.playback
+        {
+            let source_fps = self
+                .playback_info
+                .as_ref()
+                .map(|p| p.fps)
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .unwrap_or(1.0);
+            playback.player.set_fps(fps, source_fps)?;
+        }
+        self.update_status();
+        Ok(())
+    }
     fn action(&mut self, id: usize, notification: u32) -> Result<bool, String> {
         if notification != BN_CLICKED {
             return Ok(false);
@@ -1634,25 +1876,7 @@ impl App {
                 if let Some(index) = self.selector(visuals::FPS, &labels, selected)?
                     && let Some(fps) = crate::core::FPS_OPTIONS.get(index)
                 {
-                    let old = self.settings.fps;
-                    self.settings.fps = *fps;
-                    if let Err(error) = self.save() {
-                        self.settings.fps = old;
-                        return Err(error);
-                    }
-                    self.text(
-                        visuals::FPS,
-                        &format!("Frame rate: {} FPS", self.settings.fps),
-                    );
-                    let active = self
-                        .playback
-                        .as_ref()
-                        .map(|p| p.path.clone())
-                        .or_else(|| self.preparation.as_ref().map(|(p, _, _)| p.clone()))
-                        .or_else(|| self.dormant.as_ref().map(|p| p.path.clone()));
-                    if let Some(path) = active {
-                        self.start_path(&path)?;
-                    }
+                    self.change_fps(*fps)?;
                 }
             }
             visuals::PREVIOUS => {
@@ -1838,6 +2062,9 @@ impl Drop for App {
             cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.cancel_preparation();
+        if let Some((_, worker)) = self.preparation_thread.take() {
+            let _ = worker.join();
+        }
         if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
             cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = worker.join();
@@ -2100,7 +2327,12 @@ pub fn run() -> Result<(), String> {
             playback: None,
             reasons: PauseReasons::default(),
             actual_pause: false,
+            requested_pause: false,
             loaded: false,
+            load_request: 0,
+            load_entry: None,
+            file_loaded: None,
+            video_ready: None,
             loading_since: None,
             recovery: None,
             power: vec![],
@@ -2116,8 +2348,10 @@ pub fn run() -> Result<(), String> {
             marked: vec![],
             preparation: None,
             preparation_thread: None,
+            preparation_id: 0,
             preparation_rx,
             preparation_tx,
+            prepared_waiting: None,
             playback_info: None,
             dormant: None,
             resume_position: 0.0,
@@ -2222,28 +2456,10 @@ pub fn run() -> Result<(), String> {
                         ((message.wParam.0 >> 16) & 0xffff) as u32,
                     ),
                     THUMBNAIL => {
-                        let needed = app.thumbnail_paths();
-                        for (path, result) in app.thumbnail_rx.try_iter() {
-                            if let Some((_, worker)) = app.thumbnail_thread.take() {
-                                let _ = worker.join();
-                            }
-                            app.thumbnail_pending = None;
-                            if needed.contains(&path) {
-                                match result.and_then(|bytes| crate::thumbnail::bitmap(&bytes)) {
-                                    Ok(bitmap) => visuals::thumbnail(path, bitmap),
-                                    Err(_) => {
-                                        app.thumbnail_failed.insert(path);
-                                    }
-                                }
-                            }
-                        }
                         app.request_thumbnails();
-                        for (_, control) in &app.controls {
-                            let _ = InvalidateRect(*control, None, false);
-                        }
                         Ok(false)
                     }
-                    PREPARED => app.prepared().map(|_| false),
+                    PREPARED => app.tick().map(|_| false),
                     UPDATE_READY => app.update_ready().map(|_| false),
                     LAYOUT => {
                         app.request_thumbnails();
@@ -2518,6 +2734,436 @@ mod tests {
         }
     }
 
+    fn fixture() -> App {
+        let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
+        let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
+        let (_, update_rx) = std::sync::mpsc::channel();
+        App {
+            hwnd: HWND::default(),
+            controls: vec![],
+            font: HFONT::default(),
+            icon: Icon(HICON::default()),
+            small_icon: Icon(HICON::default()),
+            monitors: vec![],
+            settings: Settings::default(),
+            selected: None,
+            config: PathBuf::new(),
+            config_valid: true,
+            playback: None,
+            reasons: PauseReasons::default(),
+            actual_pause: false,
+            requested_pause: false,
+            loaded: false,
+            load_request: 0,
+            load_entry: None,
+            file_loaded: None,
+            video_ready: None,
+            loading_since: None,
+            recovery: None,
+            power: vec![],
+            tray_present: false,
+            update_tag: None,
+            update_label: String::new(),
+            update_rx,
+            update_thread: None,
+            error: None,
+            library: vec![],
+            folder_filter: None,
+            folder_roots: vec![],
+            marked: vec![],
+            preparation: None,
+            preparation_thread: None,
+            preparation_id: 0,
+            preparation_rx,
+            preparation_tx,
+            prepared_waiting: None,
+            playback_info: None,
+            dormant: None,
+            resume_position: 0.0,
+            page: 0,
+            settings_open: false,
+            thumbnail_pending: None,
+            thumbnail_thread: None,
+            thumbnail_failed: std::collections::HashSet::new(),
+            thumbnail_rx,
+            thumbnail_tx,
+        }
+    }
+    #[test]
+    fn obsolete_decoder_entries_cannot_fail_a_new_load() {
+        let mut app = fixture();
+        app.load_request = 18;
+        app.event(Event::LoadAccepted {
+            request: 17,
+            entry: 2,
+        })
+        .unwrap();
+        app.event(Event::Started(2)).unwrap();
+        app.event(Event::Loaded(Some(2))).unwrap();
+        app.event(Event::Ready(Some(2))).unwrap();
+        app.event(Event::FileFailed {
+            entry: 2,
+            error: "obsolete source".into(),
+        })
+        .unwrap();
+        assert!(app.load_entry.is_none() && app.error.is_none());
+        app.event(Event::LoadAccepted {
+            request: 18,
+            entry: 3,
+        })
+        .unwrap();
+        app.event(Event::Started(3)).unwrap();
+        app.event(Event::Loaded(Some(3))).unwrap();
+        app.event(Event::Ready(Some(3))).unwrap();
+        app.event(Event::FileFailed {
+            entry: 2,
+            error: "late old error".into(),
+        })
+        .unwrap();
+        assert_eq!(app.load_entry, Some(3));
+        assert_eq!(app.file_loaded, Some(3));
+        assert_eq!(app.video_ready, Some(3));
+        assert_eq!(app.load_request, 18);
+    }
+    #[test]
+    fn cancellation_is_nonblocking_and_stale_cache_is_ignored() {
+        let mut app = fixture();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        app.preparation_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                let _ = release_rx.recv();
+                assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+            }),
+        ));
+        app.preparation = Some((
+            PathBuf::from(r"C:\test\original.mp4"),
+            (1920, 1080),
+            crate::cache::CACHE_FPS,
+        ));
+        let stale = app.preparation_id;
+        let started = Instant::now();
+        app.cancel_preparation();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(app.preparation_thread.is_some());
+        app.preparation_tx
+            .send((stale, Err("obsolete worker".into())))
+            .unwrap();
+        app.prepared().unwrap();
+        assert!(app.error.is_none() && app.preparation.is_none());
+        release_tx.send(()).unwrap();
+        if let Some((_, worker)) = app.preparation_thread.take() {
+            worker.join().unwrap();
+        }
+        app.monitors.push(Monitor {
+            name: "owned-test".into(),
+            rect: Rect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            primary: true,
+        });
+        app.reasons.manual = true;
+        let original = PathBuf::from(r"C:\test\original.mp4");
+        app.preparation = Some((original.clone(), (1920, 1080), crate::cache::CACHE_FPS));
+        app.preparation_tx
+            .send((
+                app.preparation_id,
+                Ok(crate::cache::Prepared {
+                    path: PathBuf::from(r"C:\test\cache.mp4"),
+                    width: 1920,
+                    height: 1080,
+                    fps: 60.0,
+                    cached: true,
+                    note: "Screen-sized cache".into(),
+                }),
+            ))
+            .unwrap();
+        app.prepared().unwrap();
+        assert!(app.preparation.is_none());
+        assert_eq!(app.prepared_waiting.as_ref().unwrap().1, original);
+        app.tick().unwrap();
+        assert!(app.prepared_waiting.is_some() && app.preparation_thread.is_none());
+        drop(app);
+    }
+    #[test]
+    #[ignore = "Requires pinned decoder and owned fixtures; isolated HWND only, no app/tray/desktop interaction"]
+    fn native_switch_fps_and_retained_pause() -> Result<(), String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = root.join("scratch/media/sample.mp4");
+        let source_bytes = fs::read(&source).map_err(|e| e.to_string())?;
+        let directory = root.join(format!(
+            "scratch/switch-proof-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let mut app = fixture();
+        app.config = directory.join("settings.ini");
+        app.settings.pause_battery = false;
+        app.settings.pause_fullscreen = false;
+        app.monitors.push(Monitor {
+            name: "owned-test".into(),
+            rect: Rect {
+                left: 0,
+                top: 0,
+                right: 640,
+                bottom: 360,
+            },
+            primary: true,
+        });
+        // SAFETY: owned test HWND; never enters run(), mutex, startup, tray or Explorer discovery.
+        app.hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("WallpaperLive isolated switch proof"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                680,
+                420,
+                None,
+                None,
+                GetModuleHandleW(None).map_err(|e| e.to_string())?,
+                None,
+            )
+        }
+        .map_err(|e| e.to_string())?;
+        let surface = Surface::isolated(app.hwnd, app.screen().rect)?;
+        let surface_hwnd = surface.hwnd;
+        let player = Mpv::open_at(
+            &root.join("runtime/libmpv-2.dll"),
+            surface_hwnd,
+            app.hwnd,
+            Fit::Fill,
+        )?;
+        app.playback = Some(Playback {
+            player,
+            surface,
+            path: source.clone(),
+        });
+        let original = || crate::cache::Prepared {
+            path: source.clone(),
+            width: 640,
+            height: 360,
+            fps: 30.0,
+            cached: false,
+            note: "Original media".into(),
+        };
+        app.load_prepared(source.clone(), original(), 0.0)?;
+        let pump = |app: &mut App, duration: Duration| -> Result<(), String> {
+            let end = Instant::now() + duration;
+            while Instant::now() < end {
+                let mut msg = MSG::default();
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                app.events()?;
+                std::thread::park_timeout(Duration::from_millis(5));
+            }
+            Ok(())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.loaded {
+            pump(&mut app, Duration::from_millis(20))?;
+            assert!(Instant::now() < deadline, "First owned video did not load");
+        }
+        let position = |app: &App| {
+            app.playback
+                .as_ref()
+                .unwrap()
+                .player
+                .property(c"time-pos")
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+        };
+        for fps in crate::core::FPS_OPTIONS {
+            let started = Instant::now();
+            app.change_fps(fps)?;
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(app.preparation.is_none() && app.preparation_thread.is_none());
+            assert_eq!(app.playback.as_ref().unwrap().surface.hwnd, surface_hwnd);
+            pump(&mut app, Duration::from_millis(50))?;
+            assert!(app.error.is_none(), "{:?}", app.error);
+        }
+        app.reasons.manual = true;
+        app.tick()?;
+        pump(&mut app, Duration::from_millis(150))?;
+        let paused_position = position(&app);
+        pump(&mut app, Duration::from_millis(300))?;
+        assert!((position(&app) - paused_position).abs() < 0.01);
+        assert!(app.actual_pause && app.playback.is_some());
+        assert!(unsafe { IsWindow(surface_hwnd) }.as_bool());
+        app.reasons.manual = false;
+        let resumed = Instant::now();
+        app.tick()?;
+        pump(&mut app, Duration::from_millis(180))?;
+        assert!(!app.actual_pause && position(&app) > paused_position);
+        assert!(resumed.elapsed() < Duration::from_millis(500));
+        assert!(app.preparation.is_none());
+        app.reasons.manual = true;
+        app.tick()?;
+        pump(&mut app, Duration::from_millis(100))?;
+        let old_request = app.load_request;
+        app.prepared_waiting = Some((Instant::now(), source.clone(), original()));
+        app.reasons.manual = false;
+        app.tick()?;
+        assert_eq!(app.load_request, old_request);
+        assert!(app.prepared_waiting.as_ref().unwrap().0 > Instant::now());
+        pump(&mut app, Duration::from_millis(150))?;
+        assert!(!app.actual_pause);
+        app.prepared_waiting = None;
+        app.load_prepared(source.clone(), original(), 0.0)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.loaded {
+            pump(&mut app, Duration::from_millis(20))?;
+            assert!(Instant::now() < deadline);
+        }
+        assert_eq!(app.playback.as_ref().unwrap().surface.hwnd, surface_hwnd);
+        let bad = directory.join("bad.mp4");
+        fs::write(&bad, b"owned malformed media fixture").map_err(|e| e.to_string())?;
+        for _ in 0..3 {
+            let mut broken = original();
+            broken.path = bad.clone();
+            app.load_prepared(bad.clone(), broken, 0.0)?;
+            app.load_prepared(source.clone(), original(), 0.0)?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.loaded {
+                pump(&mut app, Duration::from_millis(20))?;
+                assert!(Instant::now() < deadline, "Rapid bad A/good B did not load");
+            }
+            assert!(app.error.is_none(), "{:?}", app.error);
+        }
+        let gif = root.join("scratch/media/sample.gif");
+        let video_4k = root.join("scratch/media/cache-proof-4k60.mp4");
+        let gif_bytes = fs::read(&gif).map_err(|e| e.to_string())?;
+        let video_4k_bytes = fs::read(&video_4k).map_err(|e| e.to_string())?;
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        app.preparation_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                let _ = finish_rx.recv();
+                assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+            }),
+        ));
+        app.preparation = Some((source.clone(), (640, 360), crate::cache::CACHE_FPS));
+        let request_id = app.preparation_id;
+        let started = Instant::now();
+        app.change_fps(24)?;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(app.preparation_id, request_id);
+        app.reasons.manual = true;
+        let started = Instant::now();
+        app.tick()?;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(app.playback.is_some() && app.preparation_thread.is_some());
+        app.cancel_preparation();
+        finish_tx.send(()).unwrap();
+        if let Some((_, worker)) = app.preparation_thread.take() {
+            worker.join().unwrap();
+        }
+        app.reasons.manual = false;
+        for (media, width, height, fps) in [
+            (&gif, 320, 180, 10.0),
+            (&video_4k, 3840, 2160, 60.0),
+            (&source, 640, 360, 30.0),
+        ] {
+            let started = Instant::now();
+            app.load_prepared(
+                media.clone(),
+                crate::cache::Prepared {
+                    path: media.clone(),
+                    width,
+                    height,
+                    fps,
+                    cached: false,
+                    note: "Owned original".into(),
+                },
+                0.0,
+            )?;
+            assert!(started.elapsed() < Duration::from_millis(500));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.loaded {
+                pump(&mut app, Duration::from_millis(20))?;
+                assert!(Instant::now() < deadline, "{:?}", media);
+            }
+            assert_eq!(app.playback.as_ref().unwrap().surface.hwnd, surface_hwnd);
+            assert!(app.error.is_none(), "{:?}", app.error);
+        }
+        let bad_bytes = fs::read(&bad).map_err(|e| e.to_string())?;
+        let final_cache = directory.join("finalized-cache.mp4");
+        fs::write(&final_cache, &source_bytes).map_err(|e| e.to_string())?;
+        let mut broken = original();
+        broken.path = bad.clone();
+        app.load_prepared(bad.clone(), broken, 0.0)?;
+        app.preparation = Some((bad.clone(), (640, 360), crate::cache::CACHE_FPS));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            match pump(&mut app, Duration::from_millis(20)) {
+                Ok(()) => assert!(
+                    Instant::now() < deadline,
+                    "Malformed original was not rejected"
+                ),
+                Err(error) => break error,
+            }
+        };
+        app.set_error(error);
+        assert!(app.playback.is_none());
+        app.reasons.manual = true;
+        let mut cached = original();
+        cached.path = final_cache.clone();
+        cached.cached = true;
+        app.preparation_tx
+            .send((app.preparation_id, Ok(cached)))
+            .unwrap();
+        app.tick()?;
+        assert!(app.playback.is_none() && app.prepared_waiting.is_some());
+        app.reasons.manual = false;
+        app.tick()?;
+        assert!(app.playback.is_some() && app.prepared_waiting.is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.loaded {
+            pump(&mut app, Duration::from_millis(20))?;
+            assert!(
+                Instant::now() < deadline,
+                "Finalized cache was stranded after original failure"
+            );
+        }
+        assert_eq!(
+            app.playback
+                .as_ref()
+                .unwrap()
+                .player
+                .property(c"path")
+                .map(PathBuf::from),
+            Some(final_cache.clone())
+        );
+        assert_eq!(fs::read(&bad).map_err(|e| e.to_string())?, bad_bytes);
+        assert_eq!(fs::read(&gif).map_err(|e| e.to_string())?, gif_bytes);
+        assert_eq!(
+            fs::read(&video_4k).map_err(|e| e.to_string())?,
+            video_4k_bytes
+        );
+        assert_eq!(fs::read(&source).map_err(|e| e.to_string())?, source_bytes);
+        println!(
+            "Owned renderer reused across GIF/4K/video; FPS, pause/cancel and resume below500ms without blocking worker; original files unchanged"
+        );
+        Ok(())
+    }
     #[test]
     fn invalid_media_preserves_preview_and_last_good_recovery() {
         let active = PathBuf::from(r"C:\wallpaperlive-missing-regression-87b81342\active.mp4");
@@ -2544,7 +3190,12 @@ mod tests {
             playback: None,
             reasons: PauseReasons::default(),
             actual_pause: false,
+            requested_pause: false,
             loaded: false,
+            load_request: 0,
+            load_entry: None,
+            file_loaded: None,
+            video_ready: None,
             loading_since: None,
             recovery: None,
             power: vec![],
@@ -2560,8 +3211,10 @@ mod tests {
             marked: vec![],
             preparation: None,
             preparation_thread: None,
+            preparation_id: 0,
             preparation_rx,
             preparation_tx,
+            prepared_waiting: None,
             playback_info: None,
             dormant: None,
             resume_position: 0.0,
@@ -2650,9 +3303,15 @@ mod tests {
         app.preparation = Some((preview.clone(), (1920, 1080), 30));
         app.resume_position = 1.25;
         app.tick().unwrap();
-        assert!(app.preparation.is_none() && app.playback.is_none() && app.playback_info.is_none());
-        assert_eq!(app.dormant.as_ref().unwrap().path, preview);
-        assert_eq!(app.dormant.as_ref().unwrap().position, 1.25);
+        assert!(app.preparation.is_some() && app.playback.is_none() && app.playback_info.is_none());
+        assert!(app.dormant.is_none());
+        assert_eq!(app.resume_position, 1.25);
+        let preparation_id = app.preparation_id;
+        app.change_fps(45).unwrap();
+        assert_eq!(app.settings.fps, 45);
+        assert_eq!(app.preparation_id, preparation_id);
+        assert_eq!(app.preparation.as_ref().unwrap().0, preview);
+        assert_eq!(app.resume_position, 1.25);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();

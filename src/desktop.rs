@@ -1,7 +1,9 @@
 use crate::core::Rect;
+#[cfg(not(test))]
+use windows::Win32::Foundation::{LRESULT, WPARAM};
 use windows::{
     Win32::{
-        Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{BOOL, COLORREF, HWND, LPARAM, POINT, RECT},
         Graphics::Gdi::{
             EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
             MapWindowPoints,
@@ -83,10 +85,12 @@ pub struct Surface {
     icons: HWND,
     raised: bool,
 }
+#[cfg(not(test))]
 struct Search {
     worker: HWND,
     icons: HWND,
 }
+#[cfg(not(test))]
 unsafe extern "system" fn search_callback(window: HWND, data: LPARAM) -> BOOL {
     // SAFETY: enumeration synchronous; Search lives for whole callback sequence.
     unsafe {
@@ -102,6 +106,34 @@ unsafe extern "system" fn search_callback(window: HWND, data: LPARAM) -> BOOL {
 }
 
 impl Surface {
+    #[cfg(test)]
+    pub fn isolated(parent: HWND, rect: Rect) -> Result<Self, String> {
+        // SAFETY: caller owns parent; this test-only path never discovers or changes Explorer.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("WallpaperLive isolated surface"),
+                WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                0,
+                0,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                parent,
+                None,
+                GetModuleHandleW(None).map_err(|e| e.to_string())?,
+                None,
+            )
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(Self {
+            hwnd,
+            parent,
+            icons: parent,
+            raised: false,
+        })
+    }
+    #[cfg(not(test))]
     pub fn create(rect: Rect) -> Result<Self, String> {
         // SAFETY: Win32 discovery and window creation on GUI thread, no foreign Rust pointers stored.
         unsafe {
@@ -236,6 +268,7 @@ impl Drop for Surface {
         }
     }
 }
+#[cfg(not(test))]
 unsafe extern "system" fn surface_proc(
     window: HWND,
     message: u32,

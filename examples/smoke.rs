@@ -60,13 +60,18 @@ fn main() -> Result<(), String> {
             None,
         )
         .map_err(|e| e.to_string())?;
-        let surface = if window_mode {
+        let surface: Option<desktop::Surface> = if window_mode {
             let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
             None
         } else {
-            Some(desktop::Surface::create(
-                desktop::monitors()?.remove(0).rect,
-            )?)
+            #[cfg(not(test))]
+            {
+                Some(desktop::Surface::create(
+                    desktop::monitors()?.remove(0).rect,
+                )?)
+            }
+            #[cfg(test)]
+            return Err("Desktop attachment is disabled in tests; use --window".into());
         };
         let host = surface.as_ref().map(|s| s.hwnd).unwrap_or(window);
         let player = mpv::Mpv::open_at(
@@ -90,8 +95,12 @@ fn main() -> Result<(), String> {
             DispatchMessageW(&msg);
             for event in player.poll() {
                 match event {
-                    mpv::Event::Loaded => println!("headers_loaded file={}", media.display()),
-                    mpv::Event::Ready => {
+                    mpv::Event::Loaded(_) => println!("headers_loaded file={}", media.display()),
+                    mpv::Event::LoadAccepted { request, entry } => {
+                        println!("load_accepted request={request} entry={entry}")
+                    }
+                    mpv::Event::Started(entry) => println!("start_file entry={entry}"),
+                    mpv::Event::Ready(_) => {
                         let format = player.property(c"video-format");
                         if format.is_none() {
                             continue;
@@ -127,7 +136,9 @@ fn main() -> Result<(), String> {
                             println!("{}={:?}", name.to_string_lossy(), player.property(name));
                         }
                     }
-                    mpv::Event::Failed(e) => failure = Some(e),
+                    mpv::Event::Failed(e)
+                    | mpv::Event::FrameRateFailed(e)
+                    | mpv::Event::FileFailed { error: e, .. } => failure = Some(e),
                     mpv::Event::Pause(value) => println!("pause={value}"),
                 }
             }

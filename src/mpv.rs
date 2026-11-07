@@ -2,6 +2,7 @@ use crate::core::Fit;
 #[path = "gpu.rs"]
 mod gpu;
 use std::{
+    cell::Cell,
     ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
     fs::OpenOptions,
     path::{Path, PathBuf},
@@ -53,18 +54,67 @@ struct LogMessage {
     log_level: c_int,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+union NodeValue {
+    integer: i64,
+    list: *const NodeList,
+}
+#[repr(C)]
+struct Node {
+    value: NodeValue,
+    format: c_int,
+}
+#[repr(C)]
+struct NodeList {
+    count: c_int,
+    values: *const Node,
+    keys: *const *const c_char,
+}
+unsafe fn load_entry(data: *const c_void) -> Option<i64> {
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: COMMAND_REPLY borrows mpv_event_command.result until the next wait_event.
+    unsafe {
+        let node = &*data.cast::<Node>();
+        if node.format != 8 || node.value.list.is_null() {
+            return None;
+        }
+        let list = &*node.value.list;
+        if !(1..=16).contains(&list.count) || list.values.is_null() || list.keys.is_null() {
+            return None;
+        }
+        for i in 0..list.count as usize {
+            let key = *list.keys.add(i);
+            if !key.is_null() && CStr::from_ptr(key) == c"playlist_entry_id" {
+                let value = &*list.values.add(i);
+                if value.format != 4 {
+                    return None;
+                }
+                return (value.value.integer >= 0).then_some(value.value.integer);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
-    Loaded,
-    Ready,
+    LoadAccepted { request: u64, entry: i64 },
+    Started(i64),
+    Loaded(Option<i64>),
+    Ready(Option<i64>),
+    FileFailed { entry: i64, error: String },
     Failed(String),
+    FrameRateFailed(String),
     Pause(bool),
 }
 impl Event {
-    fn video(id: c_int) -> Option<Self> {
+    fn video(id: c_int, entry: Option<i64>) -> Option<Self> {
         match id {
-            8 => Some(Self::Loaded),
-            17 => Some(Self::Ready),
+            8 => Some(Self::Loaded(entry)),
+            17 => Some(Self::Ready(entry)),
             _ => None,
         }
     }
@@ -533,8 +583,18 @@ pub fn encode(
 pub struct Mpv {
     handle: *mut c_void,
     api: Api,
+    load_request: Cell<u64>,
+    current_entry: Cell<Option<i64>>,
 }
 impl Mpv {
+    fn from_handle(handle: *mut c_void, api: Api) -> Self {
+        Self {
+            handle,
+            api,
+            load_request: Cell::new(15),
+            current_entry: Cell::new(None),
+        }
+    }
     fn headless(dll: &Path) -> Result<Self, String> {
         let api = Api::load(dll)?;
         // SAFETY: handle belongs to this isolated worker and is destroyed on every exit path.
@@ -542,7 +602,7 @@ impl Mpv {
         if handle.is_null() {
             return Err("Could not create decoder".into());
         }
-        let player = Self { handle, api };
+        let player = Self::from_handle(handle, api);
         for (name, value) in [
             ("config", "no"),
             ("load-scripts", "no"),
@@ -593,7 +653,7 @@ impl Mpv {
         if handle.is_null() {
             return Err("Could not create decoder".into());
         }
-        let player = Self { handle, api };
+        let player = Self::from_handle(handle, api);
         for (name, value) in [
             ("config", "no"),
             ("load-scripts", "no"),
@@ -663,7 +723,7 @@ impl Mpv {
                 )
             })
     }
-    pub fn load(&self, path: &Path) -> Result<(), String> {
+    pub fn load(&self, path: &Path) -> Result<u64, String> {
         let filename = CString::new(path.to_str().ok_or("Filename is not valid Unicode")?)
             .map_err(|_| "Invalid filename")?;
         let args = [
@@ -672,9 +732,37 @@ impl Mpv {
             c"replace".as_ptr(),
             ptr::null(),
         ];
-        // SAFETY: libmpv copies command args before returning, each string remains valid during call.
+        let request = self
+            .load_request
+            .get()
+            .checked_add(1)
+            .ok_or("Decoder load request overflow")?;
+        // SAFETY: arguments copied by async API; monotonic request rejects obsolete replies.
         self.api
-            .check(unsafe { (self.api.command)(self.handle, 1, args.as_ptr()) })
+            .check(unsafe { (self.api.command)(self.handle, request, args.as_ptr()) })?;
+        self.load_request.set(request);
+        Ok(request)
+    }
+    pub fn set_fps(&self, fps: u32, source_fps: f64) -> Result<(), String> {
+        if !crate::core::FPS_OPTIONS.contains(&fps) || !source_fps.is_finite() || source_fps <= 0.0
+        {
+            return Err("Invalid playback frame-rate limit or source rate".into());
+        }
+        let filter = if source_fps <= f64::from(fps) + 0.05 {
+            CString::new("").map_err(|_| "Invalid frame-rate filter")?
+        } else {
+            CString::new(format!("lavfi=[fps=fps={fps}:round=near]"))
+                .map_err(|_| "Invalid frame-rate filter")?
+        };
+        let args = [
+            c"vf".as_ptr(),
+            c"set".as_ptr(),
+            filter.as_ptr(),
+            ptr::null(),
+        ];
+        // SAFETY: async native API copies arguments; a pure FPS graph preserves hardware frame formats.
+        self.api
+            .check(unsafe { (self.api.command)(self.handle, 7, args.as_ptr()) })
     }
     pub fn seek(&self, position: f64) -> Result<(), String> {
         if !position.is_finite() || position < 0.0 {
@@ -752,6 +840,40 @@ impl Mpv {
             match event.id {
                 0 => break,
                 1 => output.push(Event::Failed("Decoder stopped".into())),
+                5 if event.request >= 16 => {
+                    if event.request != self.load_request.get() {
+                        continue;
+                    }
+                    if event.error < 0 {
+                        output.push(Event::Failed(
+                            self.api
+                                .check(event.error)
+                                .err()
+                                .unwrap_or_else(|| "Decoder load failed".into()),
+                        ));
+                    } else if let Some(entry) = unsafe { load_entry(event.data) } {
+                        output.push(Event::LoadAccepted {
+                            request: event.request,
+                            entry,
+                        });
+                    } else {
+                        output.push(Event::Failed(
+                            "Decoder load reply has no playlist entry identity".into(),
+                        ));
+                    }
+                }
+                6 if !event.data.is_null() => {
+                    // SAFETY: START_FILE contains one int64 playlist_entry_id.
+                    let entry = unsafe { *event.data.cast::<i64>() };
+                    self.current_entry.set(Some(entry));
+                    output.push(Event::Started(entry));
+                }
+                5 if event.request == 7 && event.error < 0 => output.push(Event::FrameRateFailed(
+                    self.api
+                        .check(event.error)
+                        .err()
+                        .unwrap_or_else(|| "Frame-rate filter failed".into()),
+                )),
                 4 | 5 if event.error < 0 => output.push(Event::Failed(
                     self.api
                         .check(event.error)
@@ -762,21 +884,24 @@ impl Mpv {
                     // SAFETY: END_FILE payload matches repr(C) header layout.
                     let end = unsafe { &*event.data.cast::<EndFile>() };
                     if end.reason == 4 {
-                        output.push(Event::Failed(
-                            self.api
+                        output.push(Event::FileFailed {
+                            entry: end.entry,
+                            error: self
+                                .api
                                 .check(end.error)
                                 .err()
                                 .unwrap_or_else(|| "Could not play file".into()),
-                        ));
+                        });
                     } else if end.reason == 5 {
-                        output.push(Event::Failed(
-                            "Playlists and external references are not allowed".into(),
-                        ));
+                        output.push(Event::FileFailed {
+                            entry: end.entry,
+                            error: "Playlists and external references are not allowed".into(),
+                        });
                     }
                 }
                 id @ (8 | 17) => {
                     // VIDEO_RECONFIG may repeat; consumers must verify current video output before showing.
-                    output.extend(Event::video(id));
+                    output.extend(Event::video(id, self.current_entry.get()));
                 }
                 22 if !event.data.is_null() => {
                     // SAFETY: observed only pause in FLAG format; payload valid until next wait.
@@ -832,20 +957,51 @@ unsafe extern "C" fn wakeup(data: *mut c_void) {
 mod tests {
     use super::*;
     #[test]
+    fn native_load_result_identity_is_typed_and_bounded() {
+        let parse = |integer, format| {
+            let keys = [c"playlist_entry_id".as_ptr()];
+            let value = Node {
+                value: NodeValue { integer },
+                format,
+            };
+            let list = NodeList {
+                count: 1,
+                values: &value,
+                keys: keys.as_ptr(),
+            };
+            let node = Node {
+                value: NodeValue { list: &list },
+                format: 8,
+            };
+            unsafe { load_entry((&node as *const Node).cast()) }
+        };
+        assert_eq!(std::mem::size_of::<Node>(), 16);
+        assert_eq!(std::mem::offset_of!(Node, format), 8);
+        assert_eq!(parse(42, 4), Some(42));
+        assert_eq!(parse(42, 1), None);
+        assert_eq!(parse(-1, 4), None);
+        assert_eq!(unsafe { load_entry(ptr::null()) }, None);
+        assert_eq!(Event::video(8, Some(42)), Some(Event::Loaded(Some(42))));
+        assert_eq!(Event::video(17, Some(42)), Some(Event::Ready(Some(42))));
+    }
+    #[test]
     fn video_events_preserve_order_and_reconfiguration() {
         let classify = |ids: &[c_int]| {
             ids.iter()
-                .filter_map(|id| Event::video(*id))
+                .filter_map(|id| Event::video(*id, None))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(classify(&[6, 8, 17, 21]), [Event::Loaded, Event::Ready]);
+        assert_eq!(
+            classify(&[6, 8, 17, 21]),
+            [Event::Loaded(None), Event::Ready(None)]
+        );
         assert_eq!(
             classify(&[17, 8, 17]),
-            [Event::Ready, Event::Loaded, Event::Ready]
+            [Event::Ready(None), Event::Loaded(None), Event::Ready(None)]
         );
         assert_eq!(
             classify(&[7, 6, 8, 17, 17]),
-            [Event::Loaded, Event::Ready, Event::Ready]
+            [Event::Loaded(None), Event::Ready(None), Event::Ready(None)]
         );
     }
     #[test]
@@ -857,7 +1013,7 @@ mod tests {
         if handle.is_null() {
             return Err("Could not create decoder".into());
         }
-        let player = Mpv { handle, api };
+        let player = Mpv::from_handle(handle, api);
         for name in ["config", "load-scripts", "osc", "ytdl", "audio", "terminal"] {
             player.option(name, "no")?;
         }
@@ -896,7 +1052,7 @@ mod tests {
         if handle.is_null() {
             return Err("Could not create decoder".into());
         }
-        let player = Mpv { handle, api };
+        let player = Mpv::from_handle(handle, api);
         for (name, value) in [
             ("config", "no"),
             ("load-scripts", "no"),
@@ -1000,7 +1156,7 @@ mod tests {
         if handle.is_null() {
             return Err("Could not create decoder".into());
         }
-        let player = Mpv { handle, api };
+        let player = Mpv::from_handle(handle, api);
         for (name, value) in [
             ("config", "no"),
             ("load-scripts", "no"),
@@ -1022,14 +1178,14 @@ mod tests {
         player
             .api
             .check(unsafe { (player.api.initialize)(handle) })?;
-        player.load(&path)?;
+        let request = player.load(&path)?;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let event = unsafe { &*(player.api.wait)(handle, 0.1) };
             if event.id == 8 {
                 break;
             }
-            if event.id == 5 && event.request == 1 {
+            if event.id == 5 && event.request == request {
                 player.api.check(event.error)?;
             }
             assert!(Instant::now() < deadline, "Native PCM did not load");

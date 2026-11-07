@@ -16,6 +16,7 @@ use windows::{
     core::PCWSTR,
 };
 
+pub const CACHE_FPS: u32 = 60;
 const MAX_OUTPUT: u64 = 512 * 1024 * 1024;
 const MAX_CACHE: u64 = 2 * 1024 * 1024 * 1024;
 const RESPONSE_LIMIT: u64 = 65536;
@@ -301,7 +302,7 @@ pub fn prepare_local(
     let modified = metadata.modified().map_err(|e| e.to_string())?;
     let hash = sha256(&source, cancelled)?;
     unchanged(&source, metadata.len(), modified)?;
-    let destination = directory.join(format!("wl-v1-{hash}-{}x{}-{fps}.mp4", target.0, target.1));
+    let destination = directory.join(format!("wl-v2-{hash}-{}x{}-{fps}.mp4", target.0, target.1));
     if destination.is_file() {
         if !(1..=MAX_OUTPUT).contains(&fs::metadata(&destination).map_err(|e| e.to_string())?.len())
         {
