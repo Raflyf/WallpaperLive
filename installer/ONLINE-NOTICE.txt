@@ -1,11 +1,9 @@
-WallpaperLive online setup
+WallpaperLive
 
-This installer installs WallpaperLive for the current Windows user without requesting administrator rights. It creates a Start menu shortcut and an uninstall entry. It does not launch WallpaperLive, start a wallpaper, enable startup, change the desktop background, restart Explorer, or install a system service.
+Install WallpaperLive for your Windows user. No administrator rights are requested. Setup adds a Start menu shortcut and uninstall entry; it does not launch the app, start a wallpaper, change the desktop, or enable automatic startup.
 
-Internet is required once. After you explicitly agree on the decoder page, Setup downloads the pinned 20261107 native libmpv archive directly from GitHub's shinchiro/mpv-winbuild-cmake release, checks the archive SHA256 and extracted DLL SHA256, and installs only libmpv-2.dll in the application's runtime directory. Approximately 31.8 MB is downloaded and 121.6 MB of decoder space is installed. Existing matching decoder bytes are reused; different existing bytes are not overwritten.
+Internet is required once. With your explicit consent, Setup downloads approximately 31.8 MB of native libmpv decoder files from the pinned 20261107 GitHub release, verifies SHA256 for both the archive and extracted DLL, and installs only libmpv-2.dll (about 121.6 MB). Matching existing decoder bytes are reused. Different existing bytes are left untouched. Download failure, checksum failure, or cancellation stops preparation before application files are installed.
 
-Downloads and extraction are prepared before application files are installed. A failed checksum, unavailable download, or cancellation stops preparation. You can retry or cancel. The native decoder is not a sandbox and runs with your Windows user privileges. Use only trusted local media.
+The installer is unsigned. Use only trusted local media: the native decoder runs with your user privileges and is not a sandbox. Do not disable security controls or run as administrator to bypass a warning.
 
-The installer does not bundle the decoder. Its full dependency/corresponding-source redistribution audit remains incomplete; see THIRD_PARTY.md. WallpaperLive source is GPL-3.0-or-later. The setup executable is unsigned; a successful compile does not establish publisher identity or desktop compatibility. Windows compatibility shims for setup.exe may load extra DLLs; run this file from a dedicated folder without unrelated DLLs. Do not disable security controls or run as administrator to bypass a containment warning.
-
-After installation, launch WallpaperLive from the Start menu when you are ready to choose a file and test desktop behavior. Startup remains opt-in within the application. The installer does not delete user media or preferences.
+After installation, open WallpaperLive from the Start menu, choose a file and monitor, and apply it. Automatic startup stays opt-in within the app. User media and preferences are not removed by Setup. Copyright and decoder license notices are included in THIRD_PARTY.md.

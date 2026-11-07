@@ -7,10 +7,13 @@ $root = Split-Path -Parent $PSScriptRoot
 if (-not $PSBoundParameters.ContainsKey('OutputDirectory')) { $OutputDirectory = Join-Path $root 'dist' }
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { throw 'OutputDirectory cannot be empty.' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
-$output = Join-Path $OutputDirectory 'setup.exe'
+$output = Join-Path $OutputDirectory 'wallpaperlivesetup.exe'
 if (Test-Path -LiteralPath $output) { throw "Existing installer left untouched: $output. Choose another -OutputDirectory." }
 $exe = Join-Path $root 'target\release\wallpaperlive.exe'
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Release executable missing. Run scripts/Build.ps1 first.' }
+if (-not (Test-Path -LiteralPath (Join-Path $root 'assets\wallpaperlive.ico') -PathType Leaf)) {
+    throw 'Product icon missing: assets/wallpaperlive.ico.'
+}
 
 $tools = Join-Path $root 'scratch\tools'
 $archive = Join-Path $tools 'tools.innosetup.7.1.0.nupkg'
@@ -36,7 +39,7 @@ foreach ($name in 'ISCC.exe', 'ISCmplr.dll', 'ISPP.dll', 'is7zxr-x64.dll') {
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 & $compiler --no-ide-signtools "--output-dir=$OutputDirectory" (Join-Path $root 'installer\WallpaperLive.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed (exit $LASTEXITCODE)." }
-if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'Compiler produced no setup.exe.' }
+if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'Compiler produced no wallpaperlivesetup.exe.' }
 $artifact = Get-Item -LiteralPath $output
 Write-Output "Installer: $output"
 Write-Output "Bytes: $($artifact.Length)"

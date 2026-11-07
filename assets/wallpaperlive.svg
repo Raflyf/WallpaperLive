@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">WallpaperLive</title>
+  <desc id="desc">An open landscape frame with a folded W ridge in graphite, white and ice blue.</desc>
+  <rect width="512" height="512" rx="108" fill="#181b20"/>
+  <path d="M100 114h268v28H114v228h284V234h28v142a22 22 0 0 1-22 22H108a22 22 0 0 1-22-22V136a22 22 0 0 1 14-22Z" fill="#f0f1f3"/>
+  <path d="m138 222 66 84 66-102 62 78 94-124v84l-94 124-62-78-66 102-66-84Z" fill="#a6c7df"/>
+  <path d="m270 204 62 78 94-124v42l-94 124-62-78Z" fill="#f0f1f3"/>
+</svg>

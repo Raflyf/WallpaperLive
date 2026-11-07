@@ -24,13 +24,14 @@ SetupMutex=Local\Raflyf.WallpaperLive.Setup
 CloseApplications=no
 RestartApplications=no
 AlwaysRestart=no
-UninstallDisplayIcon={app}\wallpaperlive.exe
+SetupIconFile=..\assets\wallpaperlive.ico
+UninstallDisplayIcon={app}\wallpaperlive.ico
 LicenseFile=..\LICENSE
 InfoBeforeFile=ONLINE-NOTICE.txt
 DisableProgramGroupPage=yes
 WizardStyle=modern
 OutputDir=..\dist
-OutputBaseFilename=setup
+OutputBaseFilename=wallpaperlivesetup
 Compression=lzma2
 SolidCompression=yes
 ArchiveExtraction=enhanced/nopassword
@@ -44,10 +45,11 @@ Source: "{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD_PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\wallpaperlive.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{tmp}\decoder\libmpv-2.dll"; DestDir: "{app}\runtime"; ExternalSize: 121624576; Hash: "{#DecoderSHA256}"; Flags: external ignoreversion onlyifdoesntexist; Check: NeedDecoder
 
 [Icons]
-Name: "{userprograms}\WallpaperLive"; Filename: "{app}\wallpaperlive.exe"; WorkingDir: "{app}"
+Name: "{userprograms}\WallpaperLive"; Filename: "{app}\wallpaperlive.exe"; WorkingDir: "{app}"; IconFilename: "{app}\wallpaperlive.ico"
 
 [Code]
 var

@@ -66,6 +66,33 @@ fn native_error(error: windows::core::Error) -> String {
     error.to_string()
 }
 
+struct Icon(HICON);
+impl Icon {
+    fn load(size: i32) -> Result<Self, String> {
+        // SAFETY: bundled PNG is immutable; this handle has one owner until its window is gone.
+        unsafe {
+            CreateIconFromResourceEx(
+                include_bytes!("../assets/wallpaperlive.png"),
+                true,
+                0x00030000,
+                size,
+                size,
+                LR_DEFAULTCOLOR,
+            )
+        }
+        .map(Self)
+        .map_err(native_error)
+    }
+}
+impl Drop for Icon {
+    fn drop(&mut self) {
+        // SAFETY: icons outlive the panel and tray, and are not shared system resources.
+        unsafe {
+            let _ = DestroyIcon(self.0);
+        }
+    }
+}
+
 struct Handle(HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -84,6 +111,8 @@ struct App {
     hwnd: HWND,
     controls: Vec<(usize, HWND)>,
     font: HFONT,
+    icon: Icon,
+    small_icon: Icon,
     monitors: Vec<Monitor>,
     settings: Settings,
     selected: Option<PathBuf>,
@@ -570,10 +599,7 @@ impl App {
             uCallbackMessage: TRAY_EVENT,
             ..Default::default()
         };
-        // SAFETY: shared system icon must not be destroyed; notification structure copied synchronously.
-        unsafe {
-            data.hIcon = LoadIconW(None, IDI_APPLICATION).map_err(native_error)?;
-        }
+        data.hIcon = self.small_icon.0;
         let tip = wide("WallpaperLive controls");
         data.szTip[..tip.len()].copy_from_slice(&tip);
         if !unsafe { Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data) }.as_bool() {
@@ -1207,12 +1233,13 @@ pub fn run() -> Result<(), String> {
             dwICC: ICC_STANDARD_CLASSES,
         });
         let instance = GetModuleHandleW(None).map_err(native_error)?;
+        let icon = Icon::load(GetSystemMetrics(SM_CXICON))?;
+        let small_icon = Icon::load(GetSystemMetrics(SM_CXSMICON))?;
         let wc = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
             lpszClassName: CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW).map_err(native_error)?,
-            hIcon: LoadIconW(None, IDI_APPLICATION).map_err(native_error)?,
             hbrBackground: visuals::brush(visuals::CANVAS),
             ..Default::default()
         };
@@ -1270,6 +1297,8 @@ pub fn run() -> Result<(), String> {
             hwnd,
             controls: vec![],
             font: HFONT::default(),
+            icon,
+            small_icon,
             monitors: desktop::monitors()?,
             settings,
             selected,
@@ -1291,6 +1320,18 @@ pub fn run() -> Result<(), String> {
             thumbnail_tx,
             thumbnail_rx,
         };
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            WPARAM(ICON_BIG as usize),
+            LPARAM(app.icon.0.0 as isize),
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            WPARAM(ICON_SMALL as usize),
+            LPARAM(app.small_icon.0.0 as isize),
+        );
         let dark = 1i32;
         let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
             hwnd,
@@ -1561,6 +1602,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_brand_icon_decodes_at_windows_sizes() {
+        for size in [16, 20, 24, 32, 48, 64, 256] {
+            let icon = Icon::load(size).expect("bundled logo must decode as a Windows icon");
+            assert!(!icon.0.0.is_null());
+        }
+    }
+
+    #[test]
     fn invalid_media_preserves_preview_and_last_good_recovery() {
         let active = PathBuf::from(r"C:\wallpaperlive-missing-regression-87b81342\active.mp4");
         let preview = PathBuf::from(r"C:\wallpaperlive-missing-regression-87b81342\preview.mp4");
@@ -1574,6 +1623,8 @@ mod tests {
             hwnd: HWND::default(),
             controls: vec![],
             font: HFONT::default(),
+            icon: Icon(HICON::default()),
+            small_icon: Icon(HICON::default()),
             monitors: vec![],
             settings: settings.clone(),
             selected: Some(preview.clone()),
