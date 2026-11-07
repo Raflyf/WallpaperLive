@@ -37,7 +37,7 @@ Except as contained in this notice, the name of a copyright holder shall not be 
 
 ## Native media decoder
 
-Playback uses libmpv, a native C library. Setup verifies and reuses an installed decoder or a user-provided pinned archive named `mpv-dev.7z` beside the installer. If neither is available, it obtains the pinned Windows build directly from its publisher after explicit consent. Neither the decoder archive nor DLL is included in WallpaperLive's source or installer.
+Playback and local cache encoding use libmpv, a native C library. Cache encoding invokes the H.264/AAC encoders already present in the user's installed decoder; no additional transcoder executable or decoder bytes are bundled. Setup verifies and reuses an installed decoder or a user-provided pinned archive named `mpv-dev.7z` beside the installer. If neither is available, it obtains the pinned Windows build directly from its publisher after explicit consent. Neither the decoder archive nor DLL is included in WallpaperLive's source or installer.
 
 Selected decoder: `mpv-dev-x86_64-20261107-git-9028187538.7z`.
 

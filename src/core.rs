@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+pub const FPS_OPTIONS: [u32; 4] = [24, 30, 45, 60];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Fit {
     #[default]
@@ -15,6 +17,7 @@ pub struct Settings {
     pub pause_battery: bool,
     pub audio_enabled: bool,
     pub pause_fullscreen: bool,
+    pub fps: u32,
 }
 
 impl Default for Settings {
@@ -26,6 +29,7 @@ impl Default for Settings {
             pause_battery: true,
             audio_enabled: false,
             pause_fullscreen: true,
+            fps: 30,
         }
     }
 }
@@ -44,8 +48,11 @@ impl Settings {
         {
             return Err("Configuration contains control characters".into());
         }
+        if !FPS_OPTIONS.contains(&self.fps) {
+            return Err("Invalid frame-rate limit".into());
+        }
         Ok(format!(
-            "version=2\nfit={}\nbattery={}\nmonitor={}\npath={}\naudio={}\nfullscreen={}\n",
+            "version=3\nfit={}\nbattery={}\nmonitor={}\npath={}\naudio={}\nfullscreen={}\nfps={}\n",
             if self.fit == Fit::Fill {
                 "fill"
             } else {
@@ -55,15 +62,27 @@ impl Settings {
             self.monitor,
             path,
             self.audio_enabled,
-            self.pause_fullscreen
+            self.pause_fullscreen,
+            self.fps
         ))
     }
     pub fn decode(text: &str) -> Result<Self, String> {
         let lines: Vec<_> = text.lines().collect();
         let legacy = lines.len() == 5 && lines[0] == "version=1";
-        if !legacy && !(lines.len() == 7 && lines[0] == "version=2") {
+        let previous = lines.len() == 7 && lines[0] == "version=2";
+        let current = lines.len() == 8 && lines[0] == "version=3";
+        if !legacy && !previous && !current {
             return Err("Invalid configuration version or contents".into());
         }
+        let fps = if current {
+            lines[7]
+                .strip_prefix("fps=")
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|f| FPS_OPTIONS.contains(f))
+                .ok_or("Invalid frame-rate limit")?
+        } else {
+            30
+        };
         let audio_enabled = if legacy {
             false
         } else {
@@ -114,6 +133,7 @@ impl Settings {
             pause_battery,
             audio_enabled,
             pause_fullscreen,
+            fps,
         })
     }
 }
@@ -128,6 +148,7 @@ pub struct PauseReasons {
     pub suspended: bool,
     pub battery: bool,
     pub fullscreen: bool,
+    pub maximized: bool,
 }
 impl PauseReasons {
     pub fn session_event(&mut self, event: u32) {
@@ -161,6 +182,8 @@ impl PauseReasons {
             Some("Paused manually")
         } else if self.battery {
             Some("Paused: on battery")
+        } else if self.maximized {
+            Some("Paused: maximized application")
         } else if self.fullscreen {
             Some("Paused: fullscreen application")
         } else {
@@ -177,6 +200,16 @@ pub struct Rect {
     pub bottom: i32,
 }
 impl Rect {
+    pub fn intersects(self, other: Self) -> bool {
+        self.right > self.left
+            && self.bottom > self.top
+            && other.right > other.left
+            && other.bottom > other.top
+            && self.left < other.right
+            && other.left < self.right
+            && self.top < other.bottom
+            && other.top < self.bottom
+    }
     pub fn covers(self, other: Self) -> bool {
         self.right > self.left
             && self.bottom > self.top
@@ -268,6 +301,7 @@ mod tests {
             pause_battery: false,
             audio_enabled: true,
             pause_fullscreen: false,
+            fps: 45,
         };
         assert_eq!(Settings::decode(&s.encode().unwrap()).unwrap(), s);
         let empty = Settings::default();
@@ -310,6 +344,66 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn frame_rate_preferences_migrate_and_validate() {
+        for fps in FPS_OPTIONS {
+            let settings = Settings {
+                fps,
+                ..Settings::default()
+            };
+            assert_eq!(
+                Settings::decode(&settings.encode().unwrap()).unwrap().fps,
+                fps
+            );
+        }
+        let old =
+            "version=2\nfit=fill\nbattery=true\nmonitor=\npath=\naudio=true\nfullscreen=true\n";
+        assert_eq!(Settings::decode(old).unwrap().fps, 30);
+        let settings = Settings {
+            fps: 120,
+            ..Settings::default()
+        };
+        assert!(settings.encode().is_err());
+        assert!(
+            Settings::decode(
+                &Settings::default()
+                    .encode()
+                    .unwrap()
+                    .replace("fps=30", "fps=120")
+            )
+            .is_err()
+        );
+        let display = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let maximized = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert!(!maximized.covers(display));
+        assert!(maximized.intersects(display));
+        assert!(!maximized.intersects(Rect {
+            left: 1920,
+            top: 0,
+            right: 3840,
+            bottom: 1080
+        }));
+        assert!(!Rect::default().intersects(display));
+        let mut reasons = PauseReasons {
+            maximized: true,
+            ..Default::default()
+        };
+        assert_eq!(reasons.reason(), Some("Paused: maximized application"));
+        reasons.manual = true;
+        reasons.maximized = false;
+        assert_eq!(reasons.reason(), Some("Paused manually"));
     }
 
     #[test]

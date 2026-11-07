@@ -1,9 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
+mod cache;
 mod core;
 mod desktop;
+mod library;
 mod mpv;
 mod thumbnail;
+mod tray;
+mod update;
 mod visuals;
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -20,6 +24,20 @@ fn main() {
                     .map_err(|e| e.to_string())
             });
         std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    if args.first().is_some_and(|arg| arg == "--prepare-cache") {
+        use std::io::Write;
+        match cache::worker(&args[1..]) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stdout().lock(),
+                    "error\n{}",
+                    error.replace(['\r', '\n'], " ")
+                );
+                std::process::exit(1);
+            }
+        }
     }
     if let Err(error) = app::run() {
         let message: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();

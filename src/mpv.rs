@@ -1,8 +1,13 @@
 use crate::core::Fit;
+#[path = "gpu.rs"]
+mod gpu;
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
-    path::Path,
+    fs::OpenOptions,
+    path::{Path, PathBuf},
     ptr,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
@@ -38,6 +43,14 @@ struct Property {
     name: *const c_char,
     format: c_int,
     data: *mut c_void,
+}
+
+#[repr(C)]
+struct LogMessage {
+    prefix: *const c_char,
+    level: *const c_char,
+    text: *const c_char,
+    log_level: c_int,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -81,6 +94,7 @@ struct Api {
         unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void),
     error: unsafe extern "C" fn(c_int) -> *const c_char,
     free: unsafe extern "C" fn(*mut c_void),
+    logs: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
     _library: Library,
 }
 
@@ -157,6 +171,10 @@ impl Api {
                 unsafe extern "C" fn(c_int) -> *const c_char
             ),
             free: symbol!("mpv_free", unsafe extern "C" fn(*mut c_void)),
+            logs: symbol!(
+                "mpv_request_log_messages",
+                unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int
+            ),
             _library: library,
         })
     }
@@ -170,12 +188,405 @@ impl Api {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct MediaInfo {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub duration: f64,
+    pub image: bool,
+    pub hdr: bool,
+    pub audio: bool,
+}
+
+fn display_dimensions(width: u32, height: u32, rotation: i32) -> Result<(u32, u32), String> {
+    if width == 0 || height == 0 || width > 32768 || height > 32768 {
+        return Err("Invalid video dimensions".into());
+    }
+    match rotation.rem_euclid(360) {
+        0 | 180 => Ok((width, height)),
+        90 | 270 => Ok((height, width)),
+        _ => Err("Video rotation must be a multiple of 90 degrees".into()),
+    }
+}
+
+fn conversion_plan(
+    info: &MediaInfo,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<(u32, u32, f64), String> {
+    if info.hdr {
+        return Err("HDR video is not supported by cache conversion; use the original".into());
+    }
+    if info.image {
+        return Err("Still images do not need video conversion".into());
+    }
+    if !info.duration.is_finite()
+        || info.duration <= 0.0
+        || !info.fps.is_finite()
+        || info.fps <= 0.0
+        || info.fps > 1000.0
+    {
+        return Err("Video duration or frame rate is invalid".into());
+    }
+    if !(2..=16384).contains(&width)
+        || !(2..=16384).contains(&height)
+        || ![24, 30, 45, 60].contains(&fps)
+    {
+        return Err("Invalid cache dimensions or frame rate".into());
+    }
+    if info.width < 2 || info.height < 2 {
+        return Err("Invalid video dimensions".into());
+    }
+    let (w, h) = if width <= info.width && height <= info.height {
+        (width & !1, height & !1)
+    } else {
+        let scale = (width as f64 / info.width as f64)
+            .min(height as f64 / info.height as f64)
+            .min(1.0);
+        (
+            ((info.width as f64 * scale).floor() as u32) & !1,
+            ((info.height as f64 * scale).floor() as u32) & !1,
+        )
+    };
+    if w < 2 || h < 2 {
+        return Err("Video aspect ratio is too narrow for this display".into());
+    }
+    Ok((w, h, info.fps.min(fps as f64)))
+}
+
+struct Probed {
+    info: MediaInfo,
+    rotation: i32,
+}
+
+fn probe(dll: &Path, source: &Path) -> Result<Probed, String> {
+    let source = crate::core::validate_media(source)?;
+    let player = Mpv::headless(dll)?;
+    for (name, value) in [
+        ("vo", "null"),
+        ("ao", "null"),
+        ("aid", "no"),
+        ("pause", "yes"),
+        ("keep-open", "yes"),
+        ("idle", "yes"),
+        ("video-rotate", "no"),
+    ] {
+        player.option(name, value)?;
+    }
+    // SAFETY: owned headless context initialized once with no output device or window.
+    player
+        .api
+        .check(unsafe { (player.api.initialize)(player.handle) })?;
+    player.load(&source)?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut loaded = false;
+    loop {
+        let event = unsafe { &*(player.api.wait)(player.handle, 0.05) };
+        worker_error(&player, event)?;
+        if event.id == 1 {
+            return Err("Video probe stopped before metadata was available".into());
+        }
+        loaded |= event.id == 8;
+        if loaded {
+            let property = |name: &str| {
+                CString::new(name)
+                    .ok()
+                    .and_then(|name| player.property(&name))
+            };
+            let number = |name: &str| property(name).and_then(|s| s.parse::<f64>().ok());
+            if let (Some(dw), Some(dh)) =
+                (number("video-out-params/dw"), number("video-out-params/dh"))
+            {
+                let rotation = number("video-dec-params/rotate").unwrap_or(0.0) as i32;
+                let (width, height) = display_dimensions(dw as u32, dh as u32, rotation)?;
+                let count = number("track-list/count").unwrap_or(0.0).clamp(0.0, 256.0) as usize;
+                let mut audio = false;
+                let mut image = false;
+                for n in 0..count {
+                    let kind = property(&format!("track-list/{n}/type"));
+                    audio |= kind.as_deref() == Some("audio");
+                    if kind.as_deref() == Some("video")
+                        && property(&format!("track-list/{n}/selected")).as_deref() == Some("yes")
+                    {
+                        image |= property(&format!("track-list/{n}/image")).as_deref()
+                            == Some("yes")
+                            || property(&format!("track-list/{n}/albumart")).as_deref()
+                                == Some("yes");
+                    }
+                }
+                let gamma = property("video-out-params/gamma")
+                    .or_else(|| property("video-dec-params/gamma"))
+                    .ok_or("Video color information is unavailable")?;
+                let hdr = matches!(gamma.as_str(), "pq" | "hlg" | "st2084" | "smpte2084")
+                    || number("video-out-params/sig-peak")
+                        .or_else(|| number("video-dec-params/sig-peak"))
+                        .is_some_and(|n| n > 1.0);
+                let fps = number("container-fps").unwrap_or(0.0);
+                let duration = number("duration").unwrap_or(0.0);
+                if !image
+                    && (!fps.is_finite() || fps <= 0.0 || !duration.is_finite() || duration <= 0.0)
+                {
+                    return Err("Video duration or frame rate is unavailable".into());
+                }
+                return Ok(Probed {
+                    info: MediaInfo {
+                        width,
+                        height,
+                        fps,
+                        duration,
+                        image,
+                        hdr,
+                        audio,
+                    },
+                    rotation,
+                });
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("Video probe timed out after 8 seconds".into());
+        }
+    }
+}
+
+pub fn probe_media(dll: &Path, source: &Path) -> Result<MediaInfo, String> {
+    probe(dll, source).map(|p| p.info)
+}
+
+fn worker_error(player: &Mpv, event: &RawEvent) -> Result<(), String> {
+    if matches!(event.id, 4 | 5) && event.error < 0 {
+        return player.api.check(event.error);
+    }
+    if event.id == 7 && !event.data.is_null() {
+        // SAFETY: END_FILE payload valid until the next wait on this owned context.
+        let end = unsafe { &*event.data.cast::<EndFile>() };
+        match end.reason {
+            4 => {
+                return Err(player
+                    .api
+                    .check(end.error)
+                    .err()
+                    .unwrap_or_else(|| "Could not decode video".into()));
+            }
+            5 => return Err("Playlists and external references are not allowed".into()),
+            _ => {}
+        }
+    }
+    if event.id == 2 && !event.data.is_null() {
+        // SAFETY: log payload and strings are borrowed from the current event only.
+        let log = unsafe { &*event.data.cast::<LogMessage>() };
+        if log.log_level <= 20 && !log.text.is_null() {
+            return Err(format!(
+                "Native conversion: {}",
+                unsafe { CStr::from_ptr(log.text) }.to_string_lossy().trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn encode(
+    dll: &Path,
+    source: &Path,
+    output: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Conversion cancelled".into());
+    }
+    if !output.is_absolute() || output.to_str().is_none() {
+        return Err("Cache output path must be absolute Unicode".into());
+    }
+    crate::core::validate_path_syntax(output)?;
+    if output.exists() {
+        return Err("Existing media or cache file will not be overwritten".into());
+    }
+    let source = crate::core::validate_media(source)?;
+    let parsed = probe(dll, &source)?;
+    let (width, height, rate) = conversion_plan(&parsed.info, width, height, fps)?;
+    let parent = output
+        .parent()
+        .ok_or("Cache output folder is missing")?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let parent = parent
+        .to_str()
+        .ok_or("Cache output folder is not Unicode")?;
+    let parent = PathBuf::from(parent.strip_prefix(r"\\?\").unwrap_or(parent));
+    crate::core::validate_path_syntax(&parent)?;
+    let output = parent.join(
+        output
+            .file_name()
+            .ok_or("Cache output filename is missing")?,
+    );
+    if output == source || output.exists() {
+        return Err("Existing media or cache file will not be overwritten".into());
+    }
+    let player = Mpv::headless(dll)?;
+    let rotate = match parsed.rotation.rem_euclid(360) {
+        90 => "transpose=clock,",
+        180 => "hflip,vflip,",
+        270 => "transpose=cclock,",
+        _ => "",
+    };
+    let filter = format!(
+        "lavfi=graph=[{rotate}scale=w={width}:h={height}:flags=bicubic,setsar=1,fps={rate:.6}:round=near,format=yuv420p]:o=[threads=2]"
+    );
+    for (name, value) in [
+        ("of", "mp4"),
+        ("ovc", "libx264"),
+        ("ovcopts", "preset=veryfast,crf=23,threads=2"),
+        ("oac", "aac"),
+        ("oacopts", "b=128000,threads=2"),
+        ("aid", "auto"),
+        ("vo", "lavc"),
+        ("ao", "lavc"),
+        ("video-rotate", "no"),
+        ("loop-file", "no"),
+        ("idle", "yes"),
+        ("keep-open", "no"),
+        ("pause", "no"),
+        ("ocopy-metadata", "no"),
+        ("untimed", "yes"),
+    ] {
+        player.option(name, value)?;
+    }
+    player.option("vf", &filter)?;
+    player.option(
+        "o",
+        output
+            .to_str()
+            .ok_or("Cache output filename is not Unicode")?,
+    )?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Conversion cancelled".into());
+    }
+    // Exclusive reservation avoids silently truncating any pre-existing user/cache file.
+    drop(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .map_err(|e| format!("Could not reserve cache output: {e}"))?,
+    );
+    // SAFETY: encoding options are set before initialization on a fresh headless context.
+    player
+        .api
+        .check(unsafe { (player.api.initialize)(player.handle) })?;
+    player.load(&source)?;
+    let deadline = Instant::now() + Duration::from_secs(15 * 60);
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("Conversion cancelled; partial cache is not reusable".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("Conversion timed out after 15 minutes".into());
+        }
+        if std::fs::metadata(&output).map_err(|e| e.to_string())?.len() > 512 * 1024 * 1024 {
+            return Err("Conversion exceeded the 512 MiB cache-file limit".into());
+        }
+        // SAFETY: one event consumer; event fields read before the next wait invalidates them.
+        let event = unsafe { &*(player.api.wait)(player.handle, 0.1) };
+        worker_error(&player, event)?;
+        if event.id == 7 && !event.data.is_null() {
+            let end = unsafe { &*event.data.cast::<EndFile>() };
+            if end.reason != 0 {
+                return Err("Conversion did not reach natural end of file".into());
+            }
+            break;
+        }
+        if event.id == 1 {
+            return Err("Encoder stopped before natural end of file".into());
+        }
+    }
+    // Destruction flushes delayed packets, writes the MP4 trailer and closes the file.
+    drop(player);
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Conversion cancelled; partial cache is not reusable".into());
+    }
+    let bytes = std::fs::metadata(&output).map_err(|e| e.to_string())?.len();
+    if !(1..=512 * 1024 * 1024).contains(&bytes) {
+        return Err("Encoded cache is empty or exceeds 512 MiB".into());
+    }
+    let cache = probe_media(dll, &output)?;
+    if cache.width != width
+        || cache.height != height
+        || cache.hdr
+        || cache.image
+        || cache.audio != parsed.info.audio
+        // mpv's MP4 tail can omit two frame durations; container-fps reports an inflated average on short loops.
+        || (cache.fps - rate).abs() > 0.2f64.max(2.0 / cache.duration)
+        || (cache.duration - parsed.info.duration).abs() > 0.5f64.max(2.0 / rate)
+    {
+        return Err(format!(
+            "Encoded cache metadata mismatch: output={cache:?}, source={:?}, target={width}x{height} at {rate} FPS",
+            parsed.info
+        ));
+    }
+    Ok(())
+}
+
 pub struct Mpv {
     handle: *mut c_void,
     api: Api,
 }
 impl Mpv {
+    fn headless(dll: &Path) -> Result<Self, String> {
+        let api = Api::load(dll)?;
+        // SAFETY: handle belongs to this isolated worker and is destroyed on every exit path.
+        let handle = unsafe { (api.create)() };
+        if handle.is_null() {
+            return Err("Could not create decoder".into());
+        }
+        let player = Self { handle, api };
+        for (name, value) in [
+            ("config", "no"),
+            ("load-scripts", "no"),
+            ("osc", "no"),
+            ("ytdl", "no"),
+            ("terminal", "no"),
+            ("media-controls", "no"),
+            ("stop-screensaver", "no"),
+            ("sid", "no"),
+            ("autoload-files", "no"),
+            ("access-references", "no"),
+            ("load-unsafe-playlists", "no"),
+            ("demuxer-lavf-o", "protocol_whitelist=[file]"),
+            ("cache", "no"),
+            ("demuxer-max-bytes", "8MiB"),
+            ("demuxer-max-back-bytes", "0"),
+            ("demuxer-readahead-secs", "0.5"),
+            ("vd-lavc-threads", "2"),
+            ("hwdec", "no"),
+        ] {
+            player.option(name, value)?;
+        }
+        // SAFETY: logs are copied from the event queue before the next native wait.
+        player
+            .api
+            .check(unsafe { (player.api.logs)(handle, c"error".as_ptr()) })?;
+        Ok(player)
+    }
     pub fn open_at(dll: &Path, host: HWND, notify: HWND, fit: Fit) -> Result<Self, String> {
+        if let Some(adapter) = gpu::preferred_adapter() {
+            match Self::open_with_adapter(dll, host, notify, fit, Some(&adapter)) {
+                Ok(player) => return Ok(player),
+                Err(_) => return Self::open_with_adapter(dll, host, notify, fit, None),
+            }
+        }
+        Self::open_with_adapter(dll, host, notify, fit, None)
+    }
+    fn open_with_adapter(
+        dll: &Path,
+        host: HWND,
+        notify: HWND,
+        fit: Fit,
+        adapter: Option<&str>,
+    ) -> Result<Self, String> {
         let api = Api::load(dll)?;
         // SAFETY: no concurrent access during initialization; libmpv handle owned by this object.
         let handle = unsafe { (api.create)() };
@@ -223,6 +634,9 @@ impl Mpv {
         ] {
             player.option(name, value)?;
         }
+        if let Some(adapter) = adapter {
+            player.option("d3d11-adapter", adapter)?;
+        }
         player.option("wid", &(host.0 as usize as u32).to_string())?;
         player.option("panscan", if fit == Fit::Fill { "1.0" } else { "0.0" })?;
         // SAFETY: initialized once on owning thread, wakeup only posts HWND notification.
@@ -241,6 +655,13 @@ impl Mpv {
         // SAFETY: arguments stay alive during call; no shell string parsing.
         self.api
             .check(unsafe { (self.api.option)(self.handle, name.as_ptr(), value.as_ptr()) })
+            .map_err(|error| {
+                format!(
+                    "Option {}={}: {error}",
+                    name.to_string_lossy(),
+                    value.to_string_lossy()
+                )
+            })
     }
     pub fn load(&self, path: &Path) -> Result<(), String> {
         let filename = CString::new(path.to_str().ok_or("Filename is not valid Unicode")?)
@@ -254,6 +675,21 @@ impl Mpv {
         // SAFETY: libmpv copies command args before returning, each string remains valid during call.
         self.api
             .check(unsafe { (self.api.command)(self.handle, 1, args.as_ptr()) })
+    }
+    pub fn seek(&self, position: f64) -> Result<(), String> {
+        if !position.is_finite() || position < 0.0 {
+            return Err("Seek position must be finite and nonnegative".into());
+        }
+        let position = CString::new(position.to_string()).map_err(|_| "Invalid seek position")?;
+        let args = [
+            c"seek".as_ptr(),
+            position.as_ptr(),
+            c"absolute+exact".as_ptr(),
+            ptr::null(),
+        ];
+        // SAFETY: async command copies the NUL-terminated argument list before returning.
+        self.api
+            .check(unsafe { (self.api.command)(self.handle, 6, args.as_ptr()) })
     }
     pub fn pause(&self, paused: bool) -> Result<(), String> {
         let mut flag: c_int = paused.into();
@@ -632,6 +1068,116 @@ mod tests {
         println!(
             "Native PCM audio toggle passed without reload; fixture={}",
             path.display()
+        );
+        Ok(())
+    }
+    #[test]
+    fn conversion_plan_caps_size_fps_and_rejects_unsafe_media() {
+        let mut info = MediaInfo {
+            width: 1920,
+            height: 1080,
+            fps: 60.0,
+            duration: 5.0,
+            image: false,
+            hdr: false,
+            audio: false,
+        };
+        assert_eq!(
+            conversion_plan(&info, 3840, 2160, 30).unwrap(),
+            (1920, 1080, 30.0)
+        );
+        assert_eq!(
+            conversion_plan(&info, 1280, 720, 45).unwrap(),
+            (1280, 720, 45.0)
+        );
+        info.fps = 23.976;
+        assert_eq!(conversion_plan(&info, 1280, 720, 30).unwrap().2, 23.976);
+        assert!(conversion_plan(&info, 1280, 720, 25).is_err());
+        assert!(conversion_plan(&info, 1, 720, 30).is_err());
+        info.hdr = true;
+        assert!(
+            conversion_plan(&info, 1280, 720, 30)
+                .unwrap_err()
+                .contains("HDR")
+        );
+        info.hdr = false;
+        info.image = true;
+        assert!(conversion_plan(&info, 1280, 720, 30).is_err());
+        info.image = false;
+        info.duration = f64::NAN;
+        assert!(conversion_plan(&info, 1280, 720, 30).is_err());
+    }
+    #[test]
+    fn display_dimensions_include_rotation_and_sample_aspect() {
+        assert_eq!(display_dimensions(1920, 1080, 90).unwrap(), (1080, 1920));
+        assert_eq!(display_dimensions(1024, 576, 180).unwrap(), (1024, 576));
+        assert!(display_dimensions(1920, 1080, 45).is_err());
+        assert!(display_dimensions(0, 1080, 0).is_err());
+    }
+    #[test]
+    fn cancelled_conversion_does_not_open_decoder_or_output() {
+        let cancelled = AtomicBool::new(true);
+        let error = encode(
+            Path::new(r"C:\missing\libmpv-2.dll"),
+            Path::new(r"C:\missing\input.mp4"),
+            Path::new(r"C:\missing\output.mp4"),
+            320,
+            180,
+            30,
+            &cancelled,
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"));
+    }
+    #[test]
+    #[ignore = "Requires pinned runtime DLL and owned scratch/media/sample.mp4; creates only a unique scratch cache copy"]
+    fn native_probe_encode_and_finalize() -> Result<(), String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dll = root.join("runtime/libmpv-2.dll");
+        let source = std::env::var_os("WALLPAPERLIVE_ENCODE_TEST_MEDIA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("scratch/media/sample.mp4"));
+        let original = std::fs::read(&source).map_err(|e| e.to_string())?;
+        let info = probe_media(&dll, &source)?;
+        assert!(info.width > 0 && info.height > 0 && info.fps > 0.0 && info.duration > 0.0);
+        assert!(!info.image && !info.hdr);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = root.join(format!(
+            "scratch/native-cache-{}-{stamp}.mp4",
+            std::process::id()
+        ));
+        encode(
+            &dll,
+            &source,
+            &output,
+            320,
+            180,
+            30,
+            &AtomicBool::new(false),
+        )?;
+        let cache = probe_media(&dll, &output)?;
+        assert!(cache.width <= 320 && cache.height <= 180);
+        assert!((cache.fps - info.fps.min(30.0)).abs() <= 0.2f64.max(2.0 / cache.duration));
+        assert!((cache.duration - info.duration).abs() < 0.5);
+        assert_eq!(std::fs::read(&source).map_err(|e| e.to_string())?, original);
+        assert!(
+            encode(
+                &dll,
+                &source,
+                &output,
+                320,
+                180,
+                30,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        println!(
+            "Native cache validated: {cache:?}; output={}",
+            output.display()
         );
         Ok(())
     }

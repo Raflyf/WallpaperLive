@@ -87,8 +87,11 @@ jobs:
           $notes = @"
           Windows x64 installer built by GitHub Actions after formatting, lint, tests and release compilation passed.
 
-          Fixes: visible Previous/Next navigation, working maximize, Sound On/Off, Remove from library without deleting media, and tray event handling that ignores hover/focus. Thumbnail extraction is serialized in a bounded child process and cancelled/reaped on normal app exit.
-          RAM is not globally capped. A single isolated 4K decoder comparison observed 478.955 MiB before and 467.783 MiB after the option changes; this is not a full-app or repeatability guarantee.
+          Features: automatic display-sized SDR video cache without changing originals; manual 24/30/45/60 FPS cap; detected dedicated GPU preference; folder/subfolder import and folder filter; Select all plus confirmed mass library removal.
+          Pause now releases decoder, video surface and thumbnail buffers, then reloads near the previous position on resume. Fullscreen and maximized foreground apps on the wallpaper display trigger automatic pause, and video conversion is cancelled/deferred while paused.
+          Tray context menus follow the Windows system dark/light theme without restart; high-contrast mode retains native system rendering.
+          The app checks GitHub once in the background per process for a newer stable release. A tray balloon and Pembaruan tersedia (vX.Y.Z) menu entry open the validated repository release page; no automatic download or installation.
+          RAM is not globally capped. UI/tray/resume detection still use resources; cache conversion is CPU/disk work performed once per profile. HDR and animated images retain their original media in this version.
 
           Unsigned build. Setup reuses a matching installed decoder or a checksum-verified mpv-dev.7z beside the installer without Internet access. Otherwise it asks for a one-time decoder download. No wallpaper or startup setting is applied by Setup.
           Installation, desktop playback and resource use still require manual testing. Use trusted local media; do not disable security protections or run as administrator to bypass warnings.

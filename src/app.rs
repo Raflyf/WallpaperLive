@@ -16,7 +16,7 @@ use windows::{
         Graphics::Gdi::*,
         Storage::FileSystem::*,
         System::{
-            LibraryLoader::GetModuleHandleW, Power::*, Registry::*, RemoteDesktop::*,
+            Com::*, LibraryLoader::GetModuleHandleW, Power::*, Registry::*, RemoteDesktop::*,
             SystemServices::*, Threading::*,
         },
         UI::{
@@ -25,7 +25,7 @@ use windows::{
                 INITCOMMONCONTROLSEX, InitCommonControlsEx,
             },
             HiDpi::*,
-            Input::KeyboardAndMouse::{EnableWindow, SetFocus},
+            Input::KeyboardAndMouse::{EnableWindow, GetKeyState, SetFocus, VK_CONTROL},
             Shell::*,
             WindowsAndMessaging::*,
         },
@@ -56,6 +56,9 @@ const FILE: usize = 112;
 const STATUS: usize = 113;
 const SETTINGS: usize = 114;
 const THUMBNAIL: u32 = WM_APP + 9;
+const PREPARED: u32 = WM_APP + 10;
+const UPDATE_READY: u32 = WM_APP + 11;
+const UPDATE_RELEASE: usize = 126;
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -70,6 +73,7 @@ fn native_error(error: windows::core::Error) -> String {
 enum TrayEvent {
     Open,
     Menu,
+    Update,
 }
 fn tray_event(payload: u32) -> Option<TrayEvent> {
     if payload >> 16 != 1 {
@@ -78,6 +82,7 @@ fn tray_event(payload: u32) -> Option<TrayEvent> {
     match payload & 0xffff {
         NIN_SELECT | 1025 => Some(TrayEvent::Open),
         WM_CONTEXTMENU => Some(TrayEvent::Menu),
+        NIN_BALLOONUSERCLICK => Some(TrayEvent::Update),
         _ => None,
     }
 }
@@ -123,6 +128,10 @@ struct Playback {
     surface: Surface,
     path: PathBuf,
 }
+struct Dormant {
+    path: PathBuf,
+    position: f64,
+}
 struct App {
     hwnd: HWND,
     controls: Vec<(usize, HWND)>,
@@ -136,15 +145,34 @@ struct App {
     config_valid: bool,
     playback: Option<Playback>,
     reasons: PauseReasons,
-    requested_pause: bool,
     actual_pause: bool,
     loaded: bool,
     loading_since: Option<Instant>,
     recovery: Option<(Instant, u8, PathBuf)>,
     power: Vec<HPOWERNOTIFY>,
     tray_present: bool,
+    update_tag: Option<String>,
+    update_label: String,
+    update_rx: std::sync::mpsc::Receiver<Result<Option<String>, String>>,
+    update_thread: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
     error: Option<String>,
     library: Vec<PathBuf>,
+    folder_filter: Option<PathBuf>,
+    folder_roots: Vec<PathBuf>,
+    marked: Vec<PathBuf>,
+    preparation: Option<(PathBuf, (u32, u32), u32)>,
+    preparation_thread: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    preparation_rx: std::sync::mpsc::Receiver<Result<crate::cache::Prepared, String>>,
+    preparation_tx: std::sync::mpsc::Sender<Result<crate::cache::Prepared, String>>,
+    playback_info: Option<crate::cache::Prepared>,
+    dormant: Option<Dormant>,
+    resume_position: f64,
     page: usize,
     settings_open: bool,
     thumbnail_pending: Option<PathBuf>,
@@ -173,6 +201,16 @@ impl App {
     }
     fn set_error(&mut self, error: String) {
         self.error = Some(error);
+        if self.playback.is_none()
+            && self.preparation.is_none()
+            && self.dormant.is_none()
+            && self.recovery.is_none()
+        {
+            // No wallpaper remains to resume after a failed preparation.
+            unsafe {
+                let _ = KillTimer(self.hwnd, 1);
+            }
+        }
         self.update_status();
     }
     fn screen(&self) -> &Monitor {
@@ -315,9 +353,33 @@ impl App {
                 ),
                 (visuals::PAGE, w!("STATIC"), "", 13),
                 (
+                    visuals::ADD_FOLDER,
+                    w!("BUTTON"),
+                    "Add folder",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::FOLDER_FILTER,
+                    w!("BUTTON"),
+                    "All folders",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::FPS,
+                    w!("BUTTON"),
+                    "Frame rate: 30 FPS",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::SELECT_ALL,
+                    w!("BUTTON"),
+                    "Select all",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
                     121,
                     w!("BUTTON"),
-                    "Pause for fullscreen apps",
+                    "Pause for fullscreen or maximized apps",
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -427,6 +489,20 @@ impl App {
         );
         Ok(())
     }
+    fn library_view(&self) -> Vec<PathBuf> {
+        crate::library::filtered(&self.library, self.folder_filter.as_deref())
+    }
+    fn folder_options(&self) -> Vec<PathBuf> {
+        let mut folders = crate::library::folders(&self.library);
+        for root in &self.folder_roots {
+            if !folders.contains(root)
+                && !crate::library::filtered(&self.library, Some(root)).is_empty()
+            {
+                folders.push(root.clone());
+            }
+        }
+        folders
+    }
     fn layout(&mut self) -> Result<(), String> {
         // SAFETY: layout uses logical pixels scaled once; native control HWNDs belong to App.
         unsafe {
@@ -477,23 +553,35 @@ impl App {
                     .map_err(native_error)?;
                 }
             }
+            let view = self.library_view();
             for i in 0..4 {
-                let visible = !self.settings_open && self.library.get(self.page * 4 + i).is_some();
+                let visible = !self.settings_open && view.get(self.page * 4 + i).is_some();
                 let _ = ShowWindow(
                     self.control(visuals::TILE_BASE + i),
                     if visible { SW_SHOWNA } else { SW_HIDE },
                 );
             }
-            for id in [BATTERY, STARTUP, 121] {
+            for id in [BATTERY, STARTUP, 121, visuals::FPS] {
                 let _ = ShowWindow(
                     self.control(id),
                     if self.settings_open { SW_SHOW } else { SW_HIDE },
                 );
             }
+            for id in [visuals::FOLDER_FILTER, visuals::SELECT_ALL] {
+                let _ = ShowWindow(
+                    self.control(id),
+                    if self.settings_open {
+                        SW_HIDE
+                    } else {
+                        SW_SHOWNA
+                    },
+                );
+            }
+            let _ = EnableWindow(self.control(visuals::SELECT_ALL), !view.is_empty());
             for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
                 let _ = ShowWindow(
                     self.control(id),
-                    if !self.settings_open && self.library.len() > 4 {
+                    if !self.settings_open && !view.is_empty() {
                         SW_SHOW
                     } else {
                         SW_HIDE
@@ -503,7 +591,7 @@ impl App {
             let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
             let _ = EnableWindow(
                 self.control(visuals::NEXT),
-                (self.page + 1) * 4 < self.library.len(),
+                (self.page + 1) * 4 < view.len(),
             );
             for (_, control) in &self.controls {
                 let _ = InvalidateRect(*control, None, true);
@@ -513,10 +601,26 @@ impl App {
         Ok(())
     }
     fn refresh_library(&mut self) -> Result<(), String> {
-        let pages = self.library.len().div_ceil(4).max(1);
+        let view = self.library_view();
+        let pages = view.len().div_ceil(4).max(1);
         self.page = self.page.min(pages - 1);
         let start = self.page * 4;
-        let paths: Vec<_> = self.library.iter().skip(start).take(4).cloned().collect();
+        let paths: Vec<_> = view.iter().skip(start).take(4).cloned().collect();
+        self.marked.retain(|p| self.library.contains(p));
+        visuals::marked(&self.marked);
+        self.text(visuals::REMOVE, &format!("Remove ({})", self.marked.len()));
+        self.text(
+            visuals::FPS,
+            &format!("Frame rate: {} FPS", self.settings.fps),
+        );
+        self.text(
+            visuals::FOLDER_FILTER,
+            &self
+                .folder_filter
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "All folders".into()),
+        );
         visuals::tiles(&paths);
         visuals::selected(self.selected.clone());
         visuals::playing(self.playback.as_ref().map(|p| p.path.clone()));
@@ -541,12 +645,7 @@ impl App {
         );
         unsafe {
             let _ = EnableWindow(self.control(APPLY), self.selected.is_some());
-            let _ = EnableWindow(
-                self.control(visuals::REMOVE),
-                self.selected
-                    .as_ref()
-                    .is_some_and(|path| self.library.contains(path)),
-            );
+            let _ = EnableWindow(self.control(visuals::REMOVE), !self.marked.is_empty());
             let _ = InvalidateRect(self.hwnd, None, false);
             for (_, h) in &self.controls {
                 let _ = InvalidateRect(*h, None, false);
@@ -560,9 +659,13 @@ impl App {
         let mut library = self.library.clone();
         library.retain(|p| p != &path);
         library.insert(0, path.clone());
-        library.truncate(12);
+        if library.len() > crate::library::MAX_FILES {
+            return Err("Library is full (4096 files); remove entries before adding more".into());
+        }
         self.save_library(&library)?;
         self.library = library;
+        self.folder_filter = None;
+        self.marked = vec![path.clone()];
         self.page = 0;
         self.selected = Some(path.clone());
         self.error = None;
@@ -573,6 +676,9 @@ impl App {
         Ok(())
     }
     fn save_library(&self, paths: &[PathBuf]) -> Result<(), String> {
+        if paths.len() > crate::library::MAX_FILES {
+            return Err("Library exceeds 4096 files; existing entries were kept".into());
+        }
         if !self.config_valid {
             return Err(
                 "Existing preferences could not be read; library was not overwritten.".into(),
@@ -580,10 +686,17 @@ impl App {
         }
         let parent = self.config.parent().ok_or("Invalid library directory")?;
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let mut recent = String::from("version=1\n");
+        let mut recent = String::from("version=2\n");
+        for root in &self.folder_roots {
+            crate::core::validate_path_syntax(root)?;
+            recent.push_str("folder=");
+            recent.push_str(root.to_str().ok_or("Folder name is not valid Unicode")?);
+            recent.push('\n');
+        }
         for path in paths {
             let text = path.to_str().ok_or("File name is not valid Unicode")?;
             crate::core::validate_path_syntax(path)?;
+            recent.push_str("file=");
             recent.push_str(text);
             recent.push('\n');
         }
@@ -615,45 +728,76 @@ impl App {
         .map_err(|e| format!("Previous library was kept: {e}"))
     }
     fn remove_selected(&mut self) -> Result<(), String> {
-        let path = self
-            .selected
-            .clone()
-            .ok_or("Select a wallpaper to remove")?;
+        let selected: Vec<_> = self
+            .marked
+            .iter()
+            .filter(|p| self.library.contains(p))
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            return Err("Select wallpapers to remove".into());
+        }
         let paths: Vec<_> = self
             .library
             .iter()
-            .filter(|p| *p != &path)
+            .filter(|p| !selected.contains(p))
             .cloned()
             .collect();
-        if paths.len() == self.library.len() {
-            return Ok(());
-        }
         self.save_library(&paths)?;
-        if self.settings.path.as_ref() == Some(&path)
-            || self.playback.as_ref().is_some_and(|p| p.path == path)
-            || self.recovery.as_ref().is_some_and(|(_, _, p)| p == &path)
-        {
+        let must_stop = self
+            .settings
+            .path
+            .as_ref()
+            .is_some_and(|p| selected.contains(p))
+            || self
+                .playback
+                .as_ref()
+                .is_some_and(|p| selected.contains(&p.path))
+            || self
+                .recovery
+                .as_ref()
+                .is_some_and(|(_, _, p)| selected.contains(p))
+            || self
+                .preparation
+                .as_ref()
+                .is_some_and(|(p, _, _)| selected.contains(p))
+            || self
+                .dormant
+                .as_ref()
+                .is_some_and(|p| selected.contains(&p.path));
+        self.library = paths;
+        self.marked.clear();
+        self.page = self
+            .page
+            .min(self.library_view().len().div_ceil(4).max(1) - 1);
+        if self.selected.as_ref().is_some_and(|p| selected.contains(p)) {
+            self.selected = self.library_view().first().cloned();
+        }
+        for path in &selected {
+            self.thumbnail_failed.remove(path);
+            visuals::remove_thumbnail(path);
+        }
+        if must_stop {
             self.stop()?;
         }
-        self.library = paths;
-        self.page = self.page.min(self.library.len().div_ceil(4).max(1) - 1);
-        self.selected = self.library.first().cloned();
-        self.thumbnail_failed.remove(&path);
-        visuals::remove_thumbnail(&path);
         Ok(())
     }
     fn thumbnail_paths(&self) -> Vec<PathBuf> {
-        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+        if self.reasons.reason().is_some()
+            || self.preparation.is_some()
+            || self.dormant.is_some()
+            || !unsafe { IsWindowVisible(self.hwnd) }.as_bool()
+            || unsafe { IsIconic(self.hwnd) }.as_bool()
+        {
             return Vec::new();
         }
         let mut paths: Vec<_> = if self.settings_open {
             Vec::new()
         } else {
-            self.library
-                .iter()
+            self.library_view()
+                .into_iter()
                 .skip(self.page * 4)
                 .take(4)
-                .cloned()
                 .collect()
         };
         if let Some(path) = &self.selected
@@ -722,6 +866,75 @@ impl App {
         }
         Ok(())
     }
+    fn update_ready(&mut self) -> Result<(), String> {
+        let Ok(result) = self.update_rx.try_recv() else {
+            return Ok(());
+        };
+        if let Some((_, worker)) = self.update_thread.take() {
+            let _ = worker.join();
+        }
+        match result {
+            Ok(Some(tag)) => {
+                self.update_label = format!("Pembaruan tersedia ({tag})");
+                self.update_tag = Some(tag);
+                self.notify_update()?;
+            }
+            Ok(None) => self.update_label = "Tidak ada pembaruan".into(),
+            Err(_) => self.update_label = "Pemeriksaan pembaruan gagal (lihat rilis)".into(),
+        }
+        Ok(())
+    }
+    fn notify_update(&self) -> Result<(), String> {
+        if !self.tray_present || self.update_tag.is_none() {
+            return Ok(());
+        }
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: 1,
+            uFlags: NIF_INFO,
+            dwInfoFlags: NIIF_INFO,
+            ..Default::default()
+        };
+        let title = wide(&self.update_label);
+        let info =
+            wide("Klik untuk membuka halaman rilis GitHub. Tidak ada unduh atau instal otomatis.");
+        let title_len = title.len().min(data.szInfoTitle.len() - 1);
+        data.szInfoTitle[..title_len].copy_from_slice(&title[..title_len]);
+        let info_len = info.len().min(data.szInfo.len() - 1);
+        data.szInfo[..info_len].copy_from_slice(&info[..info_len]);
+        // SAFETY: modifies only this application's existing tray icon with fixed-size terminated text.
+        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+            return Err(
+                "Windows could not show the update notification; use the tray release menu".into(),
+            );
+        }
+        Ok(())
+    }
+    fn open_release(&self) -> Result<(), String> {
+        let url = wide(
+            &self
+                .update_tag
+                .as_ref()
+                .map(|tag| format!("https://github.com/Raflyf/WallpaperLive/releases/tag/{tag}"))
+                .unwrap_or_else(|| "https://github.com/Raflyf/WallpaperLive/releases".into()),
+        );
+        // SAFETY: tag was validated by the update checker; no response-provided URL or command is executed.
+        let result = unsafe {
+            ShellExecuteW(
+                self.hwnd,
+                w!("open"),
+                PCWSTR(url.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if result.0 as isize <= 32 {
+            return Err("Windows could not open the GitHub release page".into());
+        }
+        Ok(())
+    }
     fn show(&mut self) {
         // SAFETY: own panel only; showing a hidden maximized window preserves its state.
         unsafe {
@@ -738,62 +951,41 @@ impl App {
         }
         self.request_thumbnails();
     }
-    fn tray_menu(&mut self) -> Result<bool, String> {
-        // SAFETY: native menu is synchronously tracked and destroyed before returning.
-        unsafe {
-            let menu = CreatePopupMenu().map_err(native_error)?;
-            let result = (|| {
-                for (id, label) in [
-                    (OPEN, "Open controls"),
-                    (
-                        PAUSE,
-                        if self.reasons.manual {
-                            "Resume"
-                        } else {
-                            "Pause"
-                        },
-                    ),
-                    (
-                        visuals::AUDIO,
-                        if self.settings.audio_enabled {
-                            "Turn sound off"
-                        } else {
-                            "Turn sound on"
-                        },
-                    ),
-                    (STOP, "Stop wallpaper"),
-                    (EXIT, "Exit"),
-                ] {
-                    let text = wide(label);
-                    AppendMenuW(menu, MF_STRING, id, PCWSTR(text.as_ptr()))
-                        .map_err(native_error)?;
-                }
-                let mut point = POINT::default();
-                GetCursorPos(&mut point).map_err(native_error)?;
-                let _ = SetForegroundWindow(self.hwnd);
-                let id = TrackPopupMenu(
-                    menu,
-                    TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                    point.x,
-                    point.y,
-                    0,
-                    self.hwnd,
-                    None,
-                )
-                .0 as usize;
-                let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-                self.action(id, 0)
-            })();
-            let _ = DestroyMenu(menu);
-            result
-        }
+    fn tray_menu(&mut self, anchor: WPARAM) -> Result<bool, String> {
+        let id = crate::tray::popup(
+            self.hwnd,
+            anchor,
+            &[
+                (OPEN, "Open controls"),
+                (
+                    PAUSE,
+                    if self.reasons.manual {
+                        "Resume"
+                    } else {
+                        "Pause"
+                    },
+                ),
+                (
+                    visuals::AUDIO,
+                    if self.settings.audio_enabled {
+                        "Turn sound off"
+                    } else {
+                        "Turn sound on"
+                    },
+                ),
+                (STOP, "Stop wallpaper"),
+                (UPDATE_RELEASE, self.update_label.as_str()),
+                (EXIT, "Exit"),
+            ],
+        )?;
+        self.action(id, 0)
     }
     fn release_playback(&mut self) {
         self.playback = None;
+        self.playback_info = None;
         visuals::playing(None);
         self.loaded = false;
         self.loading_since = None;
-        self.requested_pause = false;
         self.actual_pause = false;
         // SAFETY: teardown cancels only the timer owned by this controller.
         unsafe {
@@ -805,6 +997,7 @@ impl App {
             .selected
             .clone()
             .ok_or("Select a wallpaper file first")?;
+        self.resume_position = 0.0;
         self.start_path(&path)
     }
     fn start_path(&mut self, source: &Path) -> Result<(), String> {
@@ -817,30 +1010,126 @@ impl App {
         if !matches!(unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) }, 2 | 3 | 5) {
             return Err("Media must be on a local drive, not a network drive".into());
         }
+        let dll = decoder_path()?;
+        let rect = self.screen().rect;
+        let display = (
+            (rect.right - rect.left) as u32,
+            (rect.bottom - rect.top) as u32,
+        );
+        let fps = self.settings.fps;
+        let directory = self
+            .config
+            .parent()
+            .ok_or("Invalid cache directory")?
+            .join("video-cache");
+        self.cancel_preparation();
         self.release_playback();
-        let surface = Surface::create(self.screen().rect)?;
-        let player = Mpv::open_at(&decoder_path()?, surface.hwnd, self.hwnd, self.settings.fit)?;
+        self.dormant = None;
         self.update_reasons();
-        let pause = self.reasons.reason().is_some();
-        player.pause(pause)?;
+        if self.reasons.reason().is_some() {
+            self.dormant = Some(Dormant {
+                path,
+                position: self.resume_position,
+            });
+            self.arm_monitor()?;
+            self.update_status();
+            return Ok(());
+        }
+        if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = worker.join();
+            self.thumbnail_pending = None;
+            while self.thumbnail_rx.try_recv().is_ok() {}
+        }
+        self.preparation = Some((path.clone(), display, fps));
+        self.error = None;
+        visuals::retain_thumbnails(&[]);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let tx = self.preparation_tx.clone();
+        let hwnd = self.hwnd.0 as usize;
+        let worker = std::thread::spawn(move || {
+            let result = crate::cache::prepare(&dll, &path, &directory, display, fps, &flag);
+            let _ = tx.send(result);
+            unsafe {
+                let _ = PostMessageW(HWND(hwnd as *mut _), PREPARED, WPARAM(0), LPARAM(0));
+            }
+        });
+        self.preparation_thread = Some((cancelled, worker));
+        self.arm_monitor()?;
+        self.update_status();
+        Ok(())
+    }
+    fn cancel_preparation(&mut self) {
+        if let Some((cancelled, worker)) = self.preparation_thread.take() {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = worker.join();
+        }
+        self.preparation = None;
+        while self.preparation_rx.try_recv().is_ok() {}
+    }
+    fn prepared(&mut self) -> Result<(), String> {
+        let Ok(result) = self.preparation_rx.try_recv() else {
+            return Ok(());
+        };
+        if let Some((_, worker)) = self.preparation_thread.take() {
+            let _ = worker.join();
+        }
+        let Some((path, display, fps)) = self.preparation.take() else {
+            return Ok(());
+        };
+        let prepared = result?;
+        let rect = self.screen().rect;
+        if display
+            != (
+                (rect.right - rect.left) as u32,
+                (rect.bottom - rect.top) as u32,
+            )
+            || fps != self.settings.fps
+        {
+            return self.start_path(&path);
+        }
+        self.update_reasons();
+        if self.reasons.reason().is_some() {
+            self.dormant = Some(Dormant {
+                path,
+                position: self.resume_position,
+            });
+            self.arm_monitor()?;
+            self.update_status();
+            return Ok(());
+        }
+        self.load_prepared(path, prepared, self.resume_position)
+    }
+    fn load_prepared(
+        &mut self,
+        path: PathBuf,
+        prepared: crate::cache::Prepared,
+        position: f64,
+    ) -> Result<(), String> {
+        let rect = self.screen().rect;
+        let surface = Surface::create(rect)?;
+        let player = Mpv::open_at(&decoder_path()?, surface.hwnd, self.hwnd, self.settings.fit)?;
+        player.pause(true)?;
         player.set_audio(self.settings.audio_enabled)?;
-        player.load(&path)?;
+        player.load(&prepared.path)?;
         self.playback = Some(Playback {
             player,
             surface,
             path,
         });
-        self.requested_pause = pause;
+        self.playback_info = Some(prepared);
+        self.resume_position = position;
         self.loading_since = Some(Instant::now());
         self.error = None;
-        // SAFETY: timer exists only while playback/recovery needs low-rate monitoring, never drives rendering.
-        unsafe {
-            SetTimer(self.hwnd, 1, 500, None);
-        }
+        self.arm_monitor()?;
+        self.request_thumbnails();
         self.update_status();
         Ok(())
     }
     fn stop(&mut self) -> Result<(), String> {
+        self.cancel_preparation();
+        self.dormant = None;
         self.recovery = None;
         self.release_playback();
         self.reasons.manual = false;
@@ -854,6 +1143,9 @@ impl App {
         Ok(())
     }
     fn update_reasons(&mut self) {
+        if self.monitors.is_empty() {
+            return;
+        }
         let mut status = SYSTEM_POWER_STATUS::default();
         // SAFETY: valid output buffer, read-only system state.
         if unsafe { GetSystemPowerStatus(&mut status) }.is_ok() {
@@ -902,7 +1194,7 @@ impl App {
             let mut class = [0u16; 64];
             let n = GetClassNameW(foreground, &mut class).max(0) as usize;
             let class = String::from_utf16_lossy(&class[..n]);
-            self.reasons.fullscreen = self.settings.pause_fullscreen
+            let eligible = self.settings.pause_fullscreen
                 && pid != std::process::id()
                 && !foreground.0.is_null()
                 && !IsIconic(foreground).as_bool()
@@ -910,14 +1202,16 @@ impl App {
                     class.as_str(),
                     "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
                 )
-                && GetWindowRect(foreground, &mut rect).is_ok()
-                && Rect {
-                    left: rect.left,
-                    top: rect.top,
-                    right: rect.right,
-                    bottom: rect.bottom,
-                }
-                .covers(self.screen().rect);
+                && GetWindowRect(foreground, &mut rect).is_ok();
+            let area = Rect {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            self.reasons.fullscreen = eligible && area.covers(self.screen().rect);
+            self.reasons.maximized =
+                eligible && IsZoomed(foreground).as_bool() && area.intersects(self.screen().rect);
         }
     }
     fn arm_monitor(&self) -> Result<(), String> {
@@ -928,6 +1222,42 @@ impl App {
         Ok(())
     }
     fn tick(&mut self) -> Result<(), String> {
+        self.update_reasons();
+        if self.reasons.reason().is_some() {
+            if let Some(playback) = &self.playback {
+                let path = playback.path.clone();
+                let position = playback
+                    .player
+                    .property(c"time-pos")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|p| p.is_finite() && *p >= 0.0)
+                    .unwrap_or(self.resume_position);
+                self.release_playback();
+                self.dormant = Some(Dormant { path, position });
+                self.arm_monitor()?;
+            }
+            if let Some((path, _, _)) = self.preparation.take() {
+                self.cancel_preparation();
+                self.dormant = Some(Dormant {
+                    path,
+                    position: self.resume_position,
+                });
+                self.arm_monitor()?;
+            }
+            if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = worker.join();
+                self.thumbnail_pending = None;
+                while self.thumbnail_rx.try_recv().is_ok() {}
+            }
+            visuals::retain_thumbnails(&[]);
+            self.update_status();
+            return Ok(());
+        }
+        if let Some(dormant) = self.dormant.take() {
+            self.resume_position = dormant.position;
+            self.start_path(&dormant.path)?;
+        }
         if self
             .recovery
             .as_ref()
@@ -965,14 +1295,6 @@ impl App {
             self.update_status();
             return Ok(());
         }
-        self.update_reasons();
-        let paused = self.reasons.reason().is_some();
-        if paused != self.requested_pause
-            && let Some(playback) = &self.playback
-        {
-            playback.player.pause(paused)?;
-            self.requested_pause = paused;
-        }
         if self
             .loading_since
             .is_some_and(|s| s.elapsed() > Duration::from_secs(15))
@@ -1007,6 +1329,11 @@ impl App {
                         self.release_playback();
                         return Err(error);
                     }
+                    if self.resume_position > 0.0 {
+                        playback.player.seek(self.resume_position)?;
+                        self.resume_position = 0.0;
+                    }
+                    playback.player.pause(false)?;
                     playback.surface.show();
                     self.settings.path = Some(playback.path.clone());
                     self.loaded = true;
@@ -1040,6 +1367,14 @@ impl App {
             format!("Error: {error}")
         } else if self.recovery.is_some() {
             "Desktop changed. Restoring wallpaper...".into()
+        } else if self.preparation.is_some() {
+            "Preparing screen-sized video cache. Stop to cancel; original media stays unchanged."
+                .into()
+        } else if self.dormant.is_some() {
+            format!(
+                "{}. Decoder released; resume reloads wallpaper.",
+                self.reasons.reason().unwrap_or("Waiting to resume")
+            )
         } else if self.playback.is_none() {
             "Choose a file from your library, then Set wallpaper.".into()
         } else if !self.loaded {
@@ -1049,8 +1384,13 @@ impl App {
         } else if self.actual_pause {
             "Resuming playback...".into()
         } else {
+            let detail = self
+                .playback_info
+                .as_ref()
+                .map(|p| format!("{}: {} x {}, {:.1} FPS. ", p.note, p.width, p.height, p.fps))
+                .unwrap_or_default();
             format!(
-                "Playing. Sound: {}. Fullscreen pause: {}.",
+                "{detail}Sound: {}. Auto-pause: {}.",
                 if self.settings.audio_enabled {
                     "On"
                 } else {
@@ -1083,11 +1423,12 @@ impl App {
             self.text(visuals::AUDIO, sound);
         }
         unsafe {
-            let _ = EnableWindow(self.control(PAUSE), self.playback.is_some());
-            let _ = EnableWindow(
-                self.control(STOP),
-                self.playback.is_some() || self.recovery.is_some(),
-            );
+            let active = self.playback.is_some()
+                || self.recovery.is_some()
+                || self.preparation.is_some()
+                || self.dormant.is_some();
+            let _ = EnableWindow(self.control(PAUSE), active);
+            let _ = EnableWindow(self.control(STOP), active);
         }
     }
     fn pick(&mut self) -> Result<(), String> {
@@ -1113,6 +1454,80 @@ impl App {
             if error.0 != 0 {
                 return Err(format!("File picker failed ({})", error.0));
             }
+        }
+        Ok(())
+    }
+    fn import_folder(&mut self, source: &Path) -> Result<(), String> {
+        let files = crate::library::scan_folder(source)?;
+        if files.is_empty() {
+            return Err("No supported wallpaper files found in this folder".into());
+        }
+        let mut library = self.library.clone();
+        for file in &files {
+            if !library.contains(file) {
+                library.push(file.clone());
+            }
+        }
+        if library.len() > crate::library::MAX_FILES {
+            return Err("Library would exceed 4096 files; existing entries were kept".into());
+        }
+        let root = source.canonicalize().map_err(|e| e.to_string())?;
+        let root = root.to_str().ok_or("Folder name is not valid Unicode")?;
+        let root = PathBuf::from(root.strip_prefix(r"\\?\").unwrap_or(root));
+        let previous = self.folder_roots.clone();
+        if !self.folder_roots.contains(&root) {
+            self.folder_roots.push(root.clone());
+        }
+        if let Err(error) = self.save_library(&library) {
+            self.folder_roots = previous;
+            return Err(error);
+        }
+        self.library = library;
+        self.folder_filter = Some(root);
+        self.marked.clear();
+        self.selected = files.first().cloned();
+        self.page = 0;
+        self.error = None;
+        self.refresh_library()?;
+        self.update_status();
+        Ok(())
+    }
+    fn pick_folder(&mut self) -> Result<(), String> {
+        let folder = unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+                .ok()
+                .map_err(native_error)?;
+            let result = (|| -> Result<Option<PathBuf>, String> {
+                let dialog: IFileOpenDialog =
+                    CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+                        .map_err(native_error)?;
+                dialog
+                    .SetOptions(
+                        FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR,
+                    )
+                    .map_err(native_error)?;
+                dialog
+                    .SetTitle(w!("Add wallpaper folder"))
+                    .map_err(native_error)?;
+                if let Err(error) = dialog.Show(self.hwnd) {
+                    if error.code().0 == 0x800704c7u32 as i32 {
+                        return Ok(None);
+                    }
+                    return Err(native_error(error));
+                }
+                let item = dialog.GetResult().map_err(native_error)?;
+                let path = item
+                    .GetDisplayName(SIGDN_FILESYSPATH)
+                    .map_err(native_error)?;
+                let text = path.to_string().map_err(|e| e.to_string());
+                CoTaskMemFree(Some(path.0.cast()));
+                Ok(Some(PathBuf::from(text?)))
+            })();
+            CoUninitialize();
+            result?
+        };
+        if let Some(folder) = folder {
+            self.import_folder(&folder)?;
         }
         Ok(())
     }
@@ -1163,6 +1578,7 @@ impl App {
             return Ok(false);
         }
         match id {
+            UPDATE_RELEASE => self.open_release()?,
             SETTINGS => {
                 self.settings_open = !self.settings_open;
                 visuals::settings(self.settings_open);
@@ -1177,23 +1593,94 @@ impl App {
                 self.request_thumbnails();
                 self.layout()?;
             }
+            visuals::ADD_FOLDER => self.pick_folder()?,
+            visuals::FOLDER_FILTER => {
+                let folders = self.folder_options();
+                let labels: Vec<_> = std::iter::once("All folders".to_owned())
+                    .chain(folders.iter().map(|p| p.to_string_lossy().into_owned()))
+                    .collect();
+                let selected = self
+                    .folder_filter
+                    .as_ref()
+                    .and_then(|p| folders.iter().position(|f| f == p))
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                if let Some(index) = self.selector(visuals::FOLDER_FILTER, &labels, selected)? {
+                    self.folder_filter = index.checked_sub(1).and_then(|i| folders.get(i)).cloned();
+                    self.marked.clear();
+                    self.page = 0;
+                    self.selected = self.library_view().first().cloned();
+                    self.refresh_library()?;
+                }
+            }
+            visuals::SELECT_ALL => {
+                let view = self.library_view();
+                if view.iter().all(|p| self.marked.contains(p)) {
+                    self.marked.clear();
+                } else {
+                    self.marked = view;
+                }
+                self.refresh_library()?;
+            }
+            visuals::FPS => {
+                let labels: Vec<_> = crate::core::FPS_OPTIONS
+                    .iter()
+                    .map(|fps| format!("{fps} FPS"))
+                    .collect();
+                let selected = crate::core::FPS_OPTIONS
+                    .iter()
+                    .position(|fps| *fps == self.settings.fps)
+                    .unwrap_or(1);
+                if let Some(index) = self.selector(visuals::FPS, &labels, selected)?
+                    && let Some(fps) = crate::core::FPS_OPTIONS.get(index)
+                {
+                    let old = self.settings.fps;
+                    self.settings.fps = *fps;
+                    if let Err(error) = self.save() {
+                        self.settings.fps = old;
+                        return Err(error);
+                    }
+                    self.text(
+                        visuals::FPS,
+                        &format!("Frame rate: {} FPS", self.settings.fps),
+                    );
+                    let active = self
+                        .playback
+                        .as_ref()
+                        .map(|p| p.path.clone())
+                        .or_else(|| self.preparation.as_ref().map(|(p, _, _)| p.clone()))
+                        .or_else(|| self.dormant.as_ref().map(|p| p.path.clone()));
+                    if let Some(path) = active {
+                        self.start_path(&path)?;
+                    }
+                }
+            }
             visuals::PREVIOUS => {
                 self.page = self.page.saturating_sub(1);
                 self.refresh_library()?;
             }
             visuals::NEXT => {
-                if (self.page + 1) * 4 < self.library.len() {
+                if (self.page + 1) * 4 < self.library_view().len() {
                     self.page += 1;
                     self.refresh_library()?;
                 }
             }
             id if (visuals::TILE_BASE..visuals::TILE_BASE + 4).contains(&id) => {
                 if let Some(path) = self
-                    .library
+                    .library_view()
                     .get(self.page * 4 + id - visuals::TILE_BASE)
                     .cloned()
                 {
-                    self.selected = Some(path.clone());
+                    if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
+                        if let Some(index) = self.marked.iter().position(|p| p == &path) {
+                            self.marked.remove(index);
+                        } else {
+                            self.marked.push(path.clone());
+                        }
+                    } else {
+                        self.marked = vec![path.clone()];
+                    }
+                    self.selected = Some(path);
                     self.error = None;
                     self.refresh_library()?;
                 }
@@ -1217,9 +1704,13 @@ impl App {
                 self.update_status();
             }
             visuals::REMOVE => {
-                let prompt = wide(
-                    "Remove this wallpaper from the library?\n\nThe original media file will not be deleted. An active wallpaper will be stopped.",
-                );
+                if self.marked.is_empty() {
+                    return Ok(false);
+                }
+                let prompt = wide(&format!(
+                    "Remove {} selected wallpaper(s) from the library?\n\nOriginal media files will not be deleted. Any selected active or preparing wallpaper will be stopped.",
+                    self.marked.len()
+                ));
                 if unsafe {
                     MessageBoxW(
                         self.hwnd,
@@ -1277,12 +1768,22 @@ impl App {
                 if let Some(index) = self.selector(SCREEN, &labels, selected)?
                     && let Some(monitor) = self.monitors.get(index)
                 {
-                    if let Some(playback) = &self.playback {
-                        playback.surface.place(monitor.rect)?;
-                    }
+                    let active = self
+                        .playback
+                        .as_ref()
+                        .map(|p| p.path.clone())
+                        .or_else(|| self.preparation.as_ref().map(|(p, _, _)| p.clone()))
+                        .or_else(|| self.dormant.as_ref().map(|p| p.path.clone()));
+                    let old = self.settings.monitor.clone();
                     self.settings.monitor = monitor.name.clone();
+                    if let Err(error) = self.save() {
+                        self.settings.monitor = old;
+                        return Err(error);
+                    }
                     self.text(SCREEN, &labels[index]);
-                    self.save()?;
+                    if let Some(path) = active {
+                        self.start_path(&path)?;
+                    }
                     self.tick()?;
                 }
             }
@@ -1333,11 +1834,18 @@ impl App {
 }
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some((cancelled, _)) = &self.update_thread {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.cancel_preparation();
         if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
             cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = worker.join();
         }
         self.release_playback();
+        if let Some((_, worker)) = self.update_thread.take() {
+            let _ = worker.join();
+        }
         // SAFETY: unregister only notifications/timer/tray and HWND owned by this App.
         unsafe {
             let _ = KillTimer(self.hwnd, 1);
@@ -1552,34 +2060,32 @@ pub fn run() -> Result<(), String> {
             ),
         };
         let selected = settings.path.clone();
-        let (library, library_error) = match fs::read_to_string(config.with_file_name("recent.txt"))
-        {
-            Ok(text) if text.lines().next() == Some("version=1") => (
-                text.lines()
-                    .skip(1)
-                    .filter_map(|p| validate_media(Path::new(p)).ok())
-                    .take(12)
-                    .collect(),
-                None,
-            ),
-            Ok(_) => (
-                Vec::new(),
-                Some(
-                    "Existing library has an invalid format and will not be overwritten."
-                        .to_owned(),
+        let (library, folder_roots, library_error) =
+            match fs::read_to_string(config.with_file_name("recent.txt")) {
+                Ok(text) => match crate::library::decode(&text) {
+                    Ok((files, roots)) => (files, roots, None),
+                    Err(error) => (
+                        Vec::new(),
+                        Vec::new(),
+                        Some(format!("Existing library was kept: {error}")),
+                    ),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (Vec::new(), Vec::new(), None)
+                }
+                Err(error) => (
+                    Vec::new(),
+                    Vec::new(),
+                    Some(format!(
+                        "Could not read library; existing data was kept: {error}"
+                    )),
                 ),
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
-            Err(e) => (
-                Vec::new(),
-                Some(format!(
-                    "Could not read library; existing data was kept: {e}"
-                )),
-            ),
-        };
+            };
         let config_valid = config_valid && library_error.is_none();
         let error = error.or(library_error);
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
+        let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd,
             controls: vec![],
@@ -1593,15 +2099,28 @@ pub fn run() -> Result<(), String> {
             config_valid,
             playback: None,
             reasons: PauseReasons::default(),
-            requested_pause: false,
             actual_pause: false,
             loaded: false,
             loading_since: None,
             recovery: None,
             power: vec![],
             tray_present: false,
+            update_tag: None,
+            update_label: "Memeriksa pembaruan...".into(),
+            update_rx,
+            update_thread: None,
             error,
             library,
+            folder_filter: None,
+            folder_roots,
+            marked: vec![],
+            preparation: None,
+            preparation_thread: None,
+            preparation_rx,
+            preparation_tx,
+            playback_info: None,
+            dormant: None,
+            resume_position: 0.0,
             page: 0,
             settings_open: false,
             thumbnail_pending: None,
@@ -1660,6 +2179,26 @@ pub fn run() -> Result<(), String> {
             app.show();
         }
         app.update_status();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let notification_hwnd = hwnd.0 as usize;
+        app.update_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                let result = crate::update::check(&flag);
+                if !flag.load(std::sync::atomic::Ordering::Relaxed)
+                    && update_tx.send(result).is_ok()
+                {
+                    // SAFETY: background worker only posts to the owned panel, destroyed after joining this worker.
+                    let _ = PostMessageW(
+                        HWND(notification_hwnd as *mut _),
+                        UPDATE_READY,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }),
+        ));
         let mut message = MSG::default();
         loop {
             let result = GetMessageW(&mut message, None, 0, 0).0;
@@ -1704,8 +2243,13 @@ pub fn run() -> Result<(), String> {
                         }
                         Ok(false)
                     }
-                    LAYOUT => app.layout().map(|_| false),
-                    mpv::WM_MPV => app.events().map(|_| false),
+                    PREPARED => app.prepared().map(|_| false),
+                    UPDATE_READY => app.update_ready().map(|_| false),
+                    LAYOUT => {
+                        app.request_thumbnails();
+                        app.layout().map(|_| false)
+                    }
+                    mpv::WM_MPV => app.tick().map(|_| false),
                     WM_TIMER => app.tick().map(|_| false),
                     POWER => {
                         match message.wParam.0 {
@@ -1720,29 +2264,39 @@ pub fn run() -> Result<(), String> {
                         app.reasons.session_event(message.wParam.0 as u32);
                         app.tick().map(|_| false)
                     }
-                    DISPLAY => {
-                        if let Err(e) = app.refresh_monitors() {
-                            app.set_error(e);
-                        }
+                    DISPLAY => (|| {
+                        app.refresh_monitors()?;
                         if app.tray_present {
                             let _ = app.tray(true);
                         }
-                        if let Some(p) = &app.playback
-                            && let Err(e) = p.surface.place(app.screen().rect)
-                        {
-                            let path = p.path.clone();
+                        let active = app
+                            .playback
+                            .as_ref()
+                            .map(|p| p.path.clone())
+                            .or_else(|| app.preparation.as_ref().map(|(p, _, _)| p.clone()))
+                            .or_else(|| app.dormant.as_ref().map(|p| p.path.clone()))
+                            .or_else(|| app.recovery.as_ref().map(|(_, _, p)| p.clone()));
+                        if let Some(path) = active {
+                            app.resume_position = app
+                                .playback
+                                .as_ref()
+                                .and_then(|p| p.player.property(c"time-pos"))
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .filter(|p| p.is_finite() && *p >= 0.0)
+                                .or_else(|| app.dormant.as_ref().map(|p| p.position))
+                                .unwrap_or(app.resume_position);
+                            app.cancel_preparation();
+                            app.dormant = None;
                             app.release_playback();
                             app.recovery =
                                 Some((Instant::now() + Duration::from_millis(500), 0, path));
-                            if let Err(error) = app.arm_monitor() {
-                                app.set_error(error);
-                            }
-                            app.set_error(e);
+                            app.arm_monitor()?;
                         }
                         Ok(false)
-                    }
+                    })(),
                     TRAY => match tray_event(message.lParam.0 as u32) {
-                        Some(TrayEvent::Menu) => app.tray_menu(),
+                        Some(TrayEvent::Update) => app.action(UPDATE_RELEASE, BN_CLICKED),
+                        Some(TrayEvent::Menu) => app.tray_menu(message.wParam),
                         Some(TrayEvent::Open) => {
                             app.show();
                             Ok(false)
@@ -1802,8 +2356,20 @@ unsafe extern "system" fn window_proc(
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_DRAWITEM if lparam.0 != 0 => {
-                visuals::draw_item(&*(lparam.0 as *const DRAWITEMSTRUCT));
+                let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
+                if !crate::tray::draw(item) {
+                    visuals::draw_item(item);
+                }
                 LRESULT(1)
+            }
+            WM_MEASUREITEM if lparam.0 != 0 => {
+                if crate::tray::measure(
+                    &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT),
+                ) {
+                    LRESULT(1)
+                } else {
+                    DefWindowProcW(window, message, wparam, lparam)
+                }
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
                 visuals::control_colors(message, HDC(wparam.0 as *mut _), HWND(lparam.0 as *mut _))
@@ -1938,6 +2504,10 @@ mod tests {
         );
         assert_eq!(tray_event(event(WM_CONTEXTMENU)), Some(TrayEvent::Menu));
         assert_eq!(tray_event((2 << 16) | NIN_SELECT), None);
+        assert_eq!(
+            tray_event(event(NIN_BALLOONUSERCLICK)),
+            Some(TrayEvent::Update)
+        );
     }
 
     #[test]
@@ -1957,7 +2527,9 @@ mod tests {
             ..Settings::default()
         };
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
+        let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         // No windows or decoder are created: every exercised path fails validation first.
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd: HWND::default(),
             controls: vec![],
@@ -1971,15 +2543,28 @@ mod tests {
             config_valid: true,
             playback: None,
             reasons: PauseReasons::default(),
-            requested_pause: false,
             actual_pause: false,
             loaded: false,
             loading_since: None,
             recovery: None,
             power: vec![],
             tray_present: false,
+            update_tag: None,
+            update_label: "Memeriksa pembaruan...".into(),
+            update_rx,
+            update_thread: None,
             error: None,
             library: vec![],
+            folder_filter: None,
+            folder_roots: vec![],
+            marked: vec![],
+            preparation: None,
+            preparation_thread: None,
+            preparation_rx,
+            preparation_tx,
+            playback_info: None,
+            dormant: None,
+            resume_position: 0.0,
             page: 0,
             settings_open: false,
             thumbnail_pending: None,
@@ -1988,6 +2573,11 @@ mod tests {
             thumbnail_rx,
             thumbnail_tx,
         };
+        update_tx.send(Ok(Some("v0.1.2".into()))).unwrap();
+        app.update_ready().unwrap();
+        assert_eq!(app.update_label, "Pembaruan tersedia (v0.1.2)");
+        assert_eq!(app.update_tag.as_deref(), Some("v0.1.2"));
+        assert!(app.update_thread.is_none());
         assert!(
             app.add_media(PathBuf::from("https://example.invalid/file.mp4"))
                 .is_err()
@@ -2018,6 +2608,7 @@ mod tests {
         app.config = directory.join("settings.ini");
         app.library = vec![original.clone(), preview.clone()];
         app.selected = Some(original.clone());
+        app.marked = vec![original.clone()];
         app.page = 2;
         app.settings.path = None;
         app.save_library(&app.library).unwrap();
@@ -2033,12 +2624,35 @@ mod tests {
         assert!(!String::from_utf8_lossy(&saved).contains("original.mp4"));
         app.config_valid = false;
         app.selected = Some(preview.clone());
+        app.marked = vec![preview.clone()];
         assert!(app.remove_selected().is_err());
         assert_eq!(fs::read(directory.join("recent.txt")).unwrap(), saved);
-        assert_eq!(app.library, [preview]);
+        assert_eq!(app.library.as_slice(), std::slice::from_ref(&preview));
         assert!(!app.settings.audio_enabled);
         assert!(!app.action(visuals::AUDIO, BN_SETFOCUS).unwrap());
         assert!(!app.settings.audio_enabled);
+        app.config_valid = true;
+        app.library = vec![
+            original.clone(),
+            preview.clone(),
+            directory.join("third.mp4"),
+        ];
+        app.folder_filter = Some(directory.clone());
+        app.marked = app.library_view();
+        assert_eq!(app.marked.len(), 2);
+        app.remove_selected().unwrap();
+        assert_eq!(app.library.as_slice(), std::slice::from_ref(&preview));
+        assert_eq!(
+            fs::read(&original).unwrap(),
+            b"owned regression fixture, not decoder media"
+        );
+        app.reasons.manual = true;
+        app.preparation = Some((preview.clone(), (1920, 1080), 30));
+        app.resume_position = 1.25;
+        app.tick().unwrap();
+        assert!(app.preparation.is_none() && app.playback.is_none() && app.playback_info.is_none());
+        assert_eq!(app.dormant.as_ref().unwrap().path, preview);
+        assert_eq!(app.dormant.as_ref().unwrap().position, 1.25);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -2051,7 +2665,20 @@ mod tests {
                 finished_tx.send(()).unwrap();
             }),
         ));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let (prepare_finished_tx, prepare_finished_rx) = std::sync::mpsc::channel();
+        app.preparation_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                while !worker_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+                prepare_finished_tx.send(()).unwrap();
+            }),
+        ));
         drop(app);
+        assert_eq!(prepare_finished_rx.try_recv(), Ok(()));
         assert_eq!(finished_rx.try_recv(), Ok(()));
     }
 }

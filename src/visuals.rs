@@ -24,6 +24,10 @@ pub const NEXT: usize = 117;
 pub const AUDIO: usize = 118;
 pub const REMOVE: usize = 119;
 pub const PAGE: usize = 120;
+pub const ADD_FOLDER: usize = 122;
+pub const FOLDER_FILTER: usize = 123;
+pub const FPS: usize = 124;
+pub const SELECT_ALL: usize = 125;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 
@@ -43,7 +47,7 @@ pub struct Layout {
     pub settings_title: Rect,
     pub settings_note: Rect,
     pub tile_rects: [Rect; 4],
-    controls: [(usize, Rect); 19],
+    controls: [(usize, Rect); 23],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -56,7 +60,7 @@ impl Layout {
         let split = width - 344;
         let footer = r(0, height - 76, width, 76);
         let pager = r(24, footer.top - 48, split - 48, 36);
-        let library = r(24, 168, split - 48, pager.top - 184);
+        let library = r(24, 210, split - 48, pager.top - 226);
         let tile_width = (library.right - library.left - 16) / 2;
         let tile_height = (library.bottom - library.top - 16) / 2;
         let tile_rects = std::array::from_fn(|i| {
@@ -102,8 +106,10 @@ impl Layout {
             settings_note: r(24, 230, split - 48, 64),
             tile_rects,
             controls: [
-                (101, r(width - 338, 18, 194, 36)),
+                (101, r(width - 464, 18, 160, 36)),
+                (ADD_FOLDER, r(width - 292, 18, 148, 36)),
                 (114, r(width - 132, 18, 108, 36)),
+                (FOLDER_FILTER, r(24, 164, split - 48, 34)),
                 (PREVIEW, preview),
                 (112, file),
                 (105, display),
@@ -116,14 +122,16 @@ impl Layout {
                 (107, r(24, 316, split - 48, 32)),
                 (108, r(24, 366, split - 48, 32)),
                 (121, r(24, 416, split - 48, 32)),
-                (PREVIOUS, r(pager.left, pager.top, 108, 36)),
-                (NEXT, r(pager.left + 120, pager.top, 108, 36)),
+                (FPS, r(24, 458, 240, 34)),
+                (SELECT_ALL, r(pager.left, pager.top, 104, 36)),
+                (PREVIOUS, r(pager.left + 116, pager.top, 84, 36)),
+                (NEXT, r(pager.left + 212, pager.top, 84, 36)),
                 (
                     PAGE,
                     r(
-                        pager.left + 244,
+                        pager.left + 308,
                         pager.top,
-                        pager.right - pager.left - 244,
+                        pager.right - pager.left - 308,
                         36,
                     ),
                 ),
@@ -171,12 +179,16 @@ impl Drop for Bitmap {
 }
 struct Skin {
     selected: Option<PathBuf>,
+    marked: Vec<PathBuf>,
     playing: Option<PathBuf>,
     tiles: HashMap<usize, PathBuf>,
     thumbnails: HashMap<PathBuf, Bitmap>,
     settings: bool,
 }
-thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,playing:None,tiles:HashMap::new(),thumbnails:HashMap::new(),settings:false});}
+thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:None,tiles:HashMap::new(),thumbnails:HashMap::new(),settings:false});}
+pub fn marked(paths: &[PathBuf]) {
+    SKIN.with(|skin| skin.borrow_mut().marked = paths.to_vec());
+}
 pub fn playing(path: Option<PathBuf>) {
     SKIN.with(|s| s.borrow_mut().playing = path);
 }
@@ -240,6 +252,7 @@ pub fn clear() {
         skin.thumbnails.clear();
         skin.tiles.clear();
         skin.selected = None;
+        skin.marked.clear();
         skin.playing = None;
     });
     BRUSHES.with(|b| {
@@ -498,6 +511,29 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                     );
                 }
+                if id != PREVIEW
+                    && let Some(path) = path
+                {
+                    let checked = skin.marked.contains(path);
+                    let box_rect =
+                        rect(r.left + s(10), r.top + s(10), r.left + s(30), r.top + s(30));
+                    rounded(
+                        dc,
+                        box_rect,
+                        if checked { ACCENT } else { CANVAS },
+                        if checked { ACCENT } else { MUTED },
+                        s(4),
+                    );
+                    if checked {
+                        let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(CANVAS));
+                        let old = SelectObject(dc, pen);
+                        let _ = MoveToEx(dc, box_rect.left + s(4), box_rect.top + s(10), None);
+                        let _ = LineTo(dc, box_rect.left + s(8), box_rect.top + s(14));
+                        let _ = LineTo(dc, box_rect.left + s(16), box_rect.top + s(5));
+                        SelectObject(dc, old);
+                        let _ = DeleteObject(pen);
+                    }
+                }
                 if active {
                     let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(ACCENT));
                     let old_pen = SelectObject(dc, pen);
@@ -523,7 +559,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 0x303740
             };
             rounded(dc, r, color, if primary { color } else { 0x39424e }, s(6));
-            let selector = matches!(id, 105 | 106);
+            let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS);
             label(
                 dc,
                 &text,
@@ -610,7 +646,7 @@ pub unsafe fn paint(window: HWND) {
             if show_settings {
                 "Playback preferences"
             } else {
-                "Choose a thumbnail, then Set wallpaper."
+                "Preview a thumbnail. Ctrl-click marks files for removal."
             },
             pixels(layout.library_note),
             scale(13),
@@ -634,7 +670,7 @@ pub unsafe fn paint(window: HWND) {
             );
             label(
                 dc,
-                "Add a video, GIF or image. Your files stay where they are.",
+                "Add a media file or folder. Originals stay where they are.",
                 pixels(Rect {
                     top: area.top + 56,
                     bottom: area.top + 120,
@@ -782,7 +818,7 @@ mod tests {
                 for id in [PREVIEW, 112, 105, 106, AUDIO, REMOVE, 102, 103, 104] {
                     assert!(scale(layout.sidebar).covers(scale(layout.control(id).unwrap())));
                 }
-                for id in [PREVIOUS, NEXT, PAGE] {
+                for id in [SELECT_ALL, PREVIOUS, NEXT, PAGE] {
                     assert!(scale(layout.pager).covers(scale(layout.control(id).unwrap())));
                 }
             }

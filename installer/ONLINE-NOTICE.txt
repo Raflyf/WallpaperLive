@@ -6,4 +6,4 @@ First installation needs a native decoder. Setup reuses matching existing decode
 
 The installer is unsigned. Use only trusted local media: the native decoder runs with your user privileges and is not a sandbox. Do not disable security controls or run as administrator to bypass a warning.
 
-After installation, open WallpaperLive from the Start menu, choose a file and monitor, and apply it. Automatic startup stays opt-in within the app. User media and preferences are not removed by Setup. Copyright and decoder license notices are included in THIRD_PARTY.md.
+After installation, open WallpaperLive from the Start menu, choose a file and monitor, and apply it. Automatic startup stays opt-in within the app. Each new app process makes one background HTTPS request to api.github.com for the latest stable WallpaperLive release; its User-Agent includes the app version, never media paths or preferences. A newer release can show a tray notification; clicking opens its GitHub release page. No update is downloaded or installed automatically. User media and preferences are not removed by Setup. Copyright and decoder license notices are included in THIRD_PARTY.md.
