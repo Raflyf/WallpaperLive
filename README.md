@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows checks"></a>
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.0-alpha.2"><img src="https://img.shields.io/badge/release-v0.1.0--alpha.1-586575" alt="Release v0.1.0-alpha.2"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.0-alpha.2"><img src="https://img.shields.io/badge/release-v0.1.0--alpha.2-586575" alt="Release v0.1.0-alpha.2"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later license"></a>
 </p>
 
