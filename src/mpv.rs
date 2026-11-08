@@ -501,7 +501,11 @@ pub fn encode(
     for (name, value) in [
         ("of", "mp4"),
         ("ovc", "libx264"),
-        ("ovcopts", "preset=veryfast,crf=23,threads=2"),
+        // ponytail: rc-lookahead=10 and ref=1 bound frame buffer pools without visible quality impact on wallpaper loops.
+        (
+            "ovcopts",
+            "preset=veryfast,crf=23,threads=2,rc-lookahead=10,ref=1",
+        ),
         ("oac", "aac"),
         ("oacopts", "b=128000,threads=2"),
         ("aid", "auto"),
@@ -629,9 +633,9 @@ impl Mpv {
             ("load-unsafe-playlists", "no"),
             ("demuxer-lavf-o", "protocol_whitelist=[file]"),
             ("cache", "no"),
-            ("demuxer-max-bytes", "8MiB"),
+            ("demuxer-max-bytes", "4MiB"),
             ("demuxer-max-back-bytes", "0"),
-            ("demuxer-readahead-secs", "0.5"),
+            ("demuxer-readahead-secs", "0.2"),
             ("vd-lavc-threads", "2"),
             ("hwdec", "no"),
         ] {
@@ -686,11 +690,11 @@ impl Mpv {
             ("load-unsafe-playlists", "no"),
             ("demuxer-lavf-o", "protocol_whitelist=[file]"),
             ("cache", "no"),
-            ("demuxer-max-bytes", "8MiB"),
+            ("demuxer-max-bytes", "4MiB"),
             ("demuxer-max-back-bytes", "0"),
-            ("demuxer-readahead-secs", "0.5"),
-            // ponytail: four software decode threads bound frame pools; revisit for measured high-resolution drops.
-            ("vd-lavc-threads", "4"),
+            ("demuxer-readahead-secs", "0.2"),
+            // ponytail: two decode threads bound frame pools for entry-level dual-core CPUs.
+            ("vd-lavc-threads", "2"),
             ("loop-file", "inf"),
             ("image-display-duration", "inf"),
             ("keep-open", "yes"),
@@ -698,6 +702,9 @@ impl Mpv {
             ("gpu-api", "d3d11"),
             ("gpu-context", "d3d11"),
             ("hwdec", "auto-safe"),
+            ("scale", "bilinear"),
+            ("cscale", "bilinear"),
+            ("dscale", "bilinear"),
             ("d3d11-flip", "no"),
             ("border", "no"),
             ("osd-level", "0"),
@@ -1082,10 +1089,10 @@ mod tests {
             ("vo", "null"),
             ("ao", "null"),
             ("cache", "no"),
-            ("demuxer-max-bytes", "8MiB"),
+            ("demuxer-max-bytes", "4MiB"),
             ("demuxer-max-back-bytes", "0"),
-            ("demuxer-readahead-secs", "0.5"),
-            ("vd-lavc-threads", "4"),
+            ("demuxer-readahead-secs", "0.2"),
+            ("vd-lavc-threads", "2"),
         ] {
             player.option(name, value)?;
         }
@@ -1119,8 +1126,8 @@ mod tests {
             );
         }
         for (name, expected) in [
-            (c"options/vd-lavc-threads", "4"),
-            (c"options/demuxer-max-bytes", "8388608"),
+            (c"options/vd-lavc-threads", "2"),
+            (c"options/demuxer-max-bytes", "4194304"),
             (c"options/demuxer-max-back-bytes", "0"),
         ] {
             assert_eq!(player.property(name).as_deref(), Some(expected));
@@ -1131,7 +1138,7 @@ mod tests {
                 .unwrap()
                 .parse::<f64>()
                 .unwrap(),
-            0.5
+            0.2
         );
         Ok(())
     }

@@ -1843,6 +1843,10 @@ impl App {
             }
         }
         self.loading_since = None;
+        // ponytail: trim one-off decoder and startup allocations now that playback is active and steady.
+        unsafe {
+            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+        }
         if let Err(error) = self.save() {
             self.error = Some(format!("Playing, but settings were not saved: {error}"));
         }
@@ -2286,7 +2290,13 @@ impl App {
                     unsafe {
                         let _ = ShowWindow(self.hwnd, SW_HIDE);
                     }
-                    self.request_thumbnails();
+                    self.cancel_thumbnails();
+                    visuals::retain_thumbnails(&[]);
+                    // ponytail: trim panel memory while running in tray; active display keeps running.
+                    unsafe {
+                        let _ =
+                            SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+                    }
                 } else {
                     return Ok(true);
                 }
