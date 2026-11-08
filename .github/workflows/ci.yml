@@ -115,7 +115,7 @@ jobs:
 
           - Unsigned build. Keep Windows security protections enabled and use trusted local media.
           - Setup reuses a verified decoder or local archive; otherwise it asks before a one-time decoder download. No wallpapers or decoder binaries are bundled.
-          - Setup does not launch the app, apply a wallpaper or enable startup. Installation and live desktop testing remain manual.
+          - Setup can launch the app on completion, but does not apply a wallpaper or enable startup automatically. Installation and live desktop testing remain manual.
           "@
           $notes | Set-Content -LiteralPath .\dist\release-notes.md -Encoding utf8
           $arguments = @('release', 'create', $env:RELEASE_TAG, $installerPath, '.\dist\SHA256SUMS.txt', '--verify-tag', '--draft', '--title', "WallpaperLive $env:RELEASE_TAG", '--notes-file', '.\dist\release-notes.md')

@@ -14,6 +14,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
+- **Launch on Setup Finish:** Setup provides an option (checked by default) to immediately launch WallpaperLive upon installation completion.
 - **Installer Auto-Exit:** Setup and uninstaller automatically terminate any running WallpaperLive instance so users no longer have to manually exit from the system tray before updating or uninstalling.
 - **Live Diagnostics in Settings:** Settings view displays real-time memory usage (process working set and peak working set) and video cache storage usage.
 - **Cache Manager & Manual Cleanup:** Added a "Clear unused cache" button in Settings to purge obsolete and inactive video cache files with confirmation, protecting currently playing wallpaper files.

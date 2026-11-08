@@ -1,6 +1,6 @@
 WallpaperLive
 
-Install WallpaperLive for your Windows user. No administrator rights are requested. Setup adds a Start menu shortcut and uninstall entry; it does not launch the app, start a wallpaper, change the desktop, or enable automatic startup.
+Install WallpaperLive for your Windows user. No administrator rights are requested. Setup adds a Start menu shortcut, uninstall entry, and an option to launch the app on finish; it does not start a wallpaper, change the desktop, or enable automatic startup.
 
 First installation needs a native decoder. Setup reuses matching existing decoder bytes without a download prompt. It also accepts the pinned upstream archive named mpv-dev.7z beside this installer for offline preparation. Otherwise, with your explicit consent, Setup downloads approximately 31.8 MB from the pinned 20261107 GitHub release. SHA256 is verified for both archive and extracted DLL; only libmpv-2.dll (about 121.6 MB) is installed. Different existing bytes are left untouched. Download failure, checksum failure or cancellation stops preparation before application files are installed.
 

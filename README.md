@@ -104,7 +104,7 @@ Installer downloads include the release version, such as `wallpaperlivesetup-v0.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
-Setup installs per user without administrator rights. It does not launch the app, apply a wallpaper or enable startup. These builds are unsigned: keep Windows security protections enabled. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
+Setup installs per user without administrator rights. It provides an option to launch the app on completion, but does not apply a wallpaper or enable startup automatically. These builds are unsigned: keep Windows security protections enabled. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
 
 <details>
 <summary>Offline install or upgrade</summary>
