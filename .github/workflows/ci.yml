@@ -118,6 +118,14 @@ jobs:
           - Setup can launch the app on completion, but does not apply a wallpaper or enable startup automatically. Installation and live desktop testing remain manual.
           "@
           $notes | Set-Content -LiteralPath .\dist\release-notes.md -Encoding utf8
+          gh release view $env:RELEASE_TAG --json isDraft --jq '.isDraft' > $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $installerPath '.\dist\SHA256SUMS.txt' --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Release upload failed: $LASTEXITCODE" }
+            gh release edit $env:RELEASE_TAG --draft=false --notes-file '.\dist\release-notes.md'
+            if ($LASTEXITCODE -ne 0) { throw "Release update failed: $LASTEXITCODE" }
+            exit 0
+          }
           $arguments = @('release', 'create', $env:RELEASE_TAG, $installerPath, '.\dist\SHA256SUMS.txt', '--verify-tag', '--draft', '--title', "WallpaperLive $env:RELEASE_TAG", '--notes-file', '.\dist\release-notes.md')
           if ($env:RELEASE_TAG.Contains('-')) { $arguments += @('--prerelease', '--latest=false') }
           gh @arguments

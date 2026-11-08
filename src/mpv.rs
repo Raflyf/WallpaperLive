@@ -501,10 +501,10 @@ pub fn encode(
     for (name, value) in [
         ("of", "mp4"),
         ("ovc", "libx264"),
-        // ponytail: rc-lookahead=10 and ref=1 bound frame buffer pools without visible quality impact on wallpaper loops.
+        // FFmpeg names this AVOption "refs"; "ref" is only valid inside x264-params.
         (
             "ovcopts",
-            "preset=veryfast,crf=23,threads=2,rc-lookahead=10,ref=1",
+            "preset=veryfast,crf=23,threads=2,rc-lookahead=10,refs=1",
         ),
         ("oac", "aac"),
         ("oacopts", "b=128000,threads=2"),

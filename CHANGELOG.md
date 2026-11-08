@@ -12,6 +12,10 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ## v0.1.5
 
+### Fixed
+
+- **4K display-cache encoding:** Corrected the libavcodec option from `ref=1` to `refs=1`. The invalid name stopped conversion with `AVOption 'ref' not found`, leaving original high-resolution playback active. The preset, CRF, output resolution, FPS policy and audio handling are unchanged.
+
 ### Added
 
 - **Launch on Setup Finish:** Setup provides an option (checked by default) to immediately launch WallpaperLive upon installation completion.
@@ -27,10 +31,10 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 - **Simplified Decoder Download Step:** Removed the redundant consent checkbox. The installer displays the download notice and automatically downloads/verifies the decoder upon clicking Next, or skips the page entirely when upgrading.
 - **Low-Spec Hardware Optimizations:**
-  - Bounded x264 encoder lookahead (`rc-lookahead=10,ref=1`), cutting uncompressed frame buffer memory by ~75% during cache preparation.
-  - Switched renderer scalers to lightweight bilinear filtering (`scale=bilinear`, `cscale=bilinear`, `dscale=bilinear`), eliminating complex 3D shader load on integrated GPUs (Intel HD/UHD Graphics).
-  - Reduced demuxer cache buffer to 4 MiB (0.2s readahead) and decoder threads to 2 for entry-level dual-core/quad-thread CPUs.
-  - Automatic Working Set trimming (`SetProcessWorkingSetSize`) once playback stabilizes and when minimizing/hiding the panel to tray.
+  - Uses x264 `veryfast`, CRF 23, two encoder threads, lookahead 10 and one reference frame (`refs=1`). Lookahead/reference values already match `veryfast`; they do not establish an additional 75% RAM reduction.
+  - Uses bilinear renderer scalers (`scale=bilinear`, `cscale=bilinear`, `dscale=bilinear`). Scaling/chroma reconstruction still performs GPU work; zero GPU usage or identical output quality is not guaranteed.
+  - Forward packet budget is 4 MiB with 0.2-second readahead and two software-decode threads. These are limits/settings, not guaranteed total process memory or smooth 4K software decoding on every CPU.
+  - Requests a Windows working-set trim after load and when hiding the panel. This affects resident pages, not total private allocations; pages may return and page faults can increase.
 - Updated build package and installer metadata to `0.1.5`.
 
 ---
