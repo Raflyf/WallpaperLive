@@ -14,13 +14,29 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- **3x3 Wallpaper Library Grid:** Expanded library view from 4 to 9 wallpaper cards per page with 16:9 thumbnail previews, active playback badges, and multi-selection checkboxes for easy batch management.
+- **3x3 Wallpaper Library Grid:**
+  - Expanded the library browsing grid from 4 (2x2) to 9 (3x3) cards per page, allowing users to view more wallpapers simultaneously and reducing pagination.
+  - Cards feature responsive 16:9 thumbnail viewports with rounded corners, clean title labels, and an "Active" badge on the currently playing wallpaper.
+  - Integrated selection checkboxes for batch management, fully compatible with Ctrl-click and "Select all".
+  - Updated keyboard navigation (`←`/`→` arrow keys) to step across 9-card pages.
 
 ### Changed
 
-- **Refreshed Visual Theme:** Adopted a refined Cream, Ink Black, and Burnt Orange color palette (`#111111` canvas, `#F3EEE3` typography, and `#D9541E` accent highlights) across all controls, buttons, and status indicators.
-- **Header Navigation:** Clean segmented navigation tabs for `Library` and `Settings`.
+- **Visual Theme & Palette Overhaul:**
+  - Refined the interface with a modern Cream, Ink Black, and Burnt Orange color palette:
+    - **Ink Black (`#111111`):** Primary canvas, background panels, and footer.
+    - **Cream (`#F3EEE3`):** High-contrast typography, headings, and primary button labels.
+    - **Burnt Orange (`#D9541E`):** Accent highlights for active tabs, selected card borders, badges, and primary action buttons.
+  - Active card selection now uses a sleek accent border rather than an opaque full-card color fill.
+  - Removed standard Win32 dotted focus rectangle outlines (`DrawFocusRect`) on buttons and cards for a cleaner, unified presentation.
+- **Header Navigation:**
+  - Integrated top bar segmented control tabs for switching between `Library` and `Settings`.
+  - Clean view switching with proper native window visibility management (`ShowWindow`), preventing background control bleed-through.
 - Updated build package and installer metadata to `0.1.6`.
+
+### Known limitations
+
+- Library thumbnail extraction operates on local video files; thumbnails for very large or corrupted files fall back to extension labels until decoded.
 
 ---
 
