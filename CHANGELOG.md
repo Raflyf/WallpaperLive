@@ -10,6 +10,27 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## v0.1.4
+
+### Fixed
+
+- Setup now sets File version from the app version (`0.1.4.0`) instead of retaining the compiler's `0.0.0.0` default. Product version remains `0.1.4`.
+- Installer builds verify both PE version strings before publishing the output.
+
+### Changed
+
+- README now includes the author's real app/desktop screenshots and cache-preparation, cached-playback and auto-pause resource captures.
+- Resource tables distinguish the 420.1 MB app/worker preparation group from the 73.4 MB cached app; additional snapshots show 40.1 MB playback and 4.1 MB auto-pause.
+- Preview and comparison figures preserve original source screenshots and label compositions, cropped rows and snapshot limitations.
+- Long cache/build notes are collapsible so downloads, features and real usage are easier to find.
+
+### Known limitations
+
+- Screenshot values are momentary Task Manager observations, not a benchmark or fixed RAM ceiling. They do not establish total private memory, GPU utilization or VRAM savings.
+- Playback, cache and pause behavior are unchanged from v0.1.3. No new native performance tests or installed-app interaction were performed for this documentation/metadata patch.
+
+---
+
 ## v0.1.3
 
 ### Changed

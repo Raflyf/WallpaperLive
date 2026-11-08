@@ -41,6 +41,13 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed (exit $LASTEXITCODE)." }
 if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'Compiler produced no wallpaperlivesetup.exe.' }
 $artifact = Get-Item -LiteralPath $output
+$version = [regex]::Match((Get-Content -LiteralPath (Join-Path $root 'installer\WallpaperLive.iss') -Raw), '(?m)^#define AppVersion "(\d+\.\d+\.\d+)"\r?$').Groups[1].Value
+if (-not $version) { throw 'Installer AppVersion must be a numeric X.Y.Z version.' }
+$info = [Diagnostics.FileVersionInfo]::GetVersionInfo($output)
+if ($info.FileVersion -ne "$version.0" -or $info.ProductVersion -ne $version) {
+    throw "Installer metadata mismatch: File=$($info.FileVersion), Product=$($info.ProductVersion), expected=$version."
+}
+Write-Output "File version: $($info.FileVersion); Product version: $($info.ProductVersion)"
 Write-Output "Installer: $output"
 Write-Output "Bytes: $($artifact.Length)"
 Write-Output "SHA256: $((Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash)"

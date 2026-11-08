@@ -1,108 +1,154 @@
 <p align="center">
-  <img src="assets/wallpaperlive.png" width="112" height="112" alt="WallpaperLive logo">
+  <img src="assets/wallpaperlive.png" width="96" height="96" alt="WallpaperLive logo">
 </p>
+
 <h1 align="center">WallpaperLive</h1>
-<p align="center">Videos, GIFs and images as wallpaper, with a native Windows interface.</p>
+<p align="center"><strong>Your videos. Your desktop.</strong><br>Live wallpapers with a native Windows app, local files and a background display cache.</p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows checks"></a>
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.3"><img src="https://img.shields.io/badge/release-v0.1.3-586575" alt="Release v0.1.3"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later license"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.4"><img src="https://img.shields.io/badge/release-v0.1.4-586575" alt="Release v0.1.4"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.3/wallpaperlivesetup.exe">Download Windows installer</a>
-  &nbsp;·&nbsp;
-  <a href="https://github.com/Raflyf/WallpaperLive/releases">All releases</a>
-  &nbsp;·&nbsp;
-  <a href="CHANGELOG.md">Changelog</a>
-  &nbsp;·&nbsp;
-  <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/wallpaperlivesetup.exe"><strong>Download Windows installer</strong></a>
+  &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
+  &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
+  &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
 </p>
 
-WallpaperLive uses Rust and Win32 for its English interface, desktop integration and tray controls. The thumbnail library lets you preview a file before applying it. libmpv handles media decoding; the app does not require a browser engine or an account.
+WallpaperLive plays trusted local videos, GIFs and images on one display you choose. Browse your thumbnail library, set a wallpaper and control playback from the panel or tray. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
 
-> **Release v0.1.3:** unsigned. Native controls and source regressions have been checked; installation and live desktop playback still need your testing. A release tag does not establish compatibility with every Windows build, GPU or media file. Total RAM is not capped.
+> Windows 10/11 x64. Unsigned installer. Wallpapers and the native decoder are not bundled; Setup asks before downloading a decoder if none is available locally.
+
+## Preview
+
+<p align="center">
+  <img src="assets/screenshots/preview-v0.1.3.png" width="1200" alt="WallpaperLive playing a video on a Windows desktop, with the native thumbnail library shown as a separate inset">
+</p>
+
+*Real v0.1.3 screenshots supplied by the project author. The app inset is composed from a separate capture, not an overlay added by WallpaperLive. Wallpaper artwork belongs to its respective owners; no media is included in the download.*
+
+<details>
+<summary>View the native app at full size</summary>
+
+![WallpaperLive thumbnail library, folder filter and selected-wallpaper controls](assets/screenshots/library-v0.1.3.png)
+
+Select all sits beside the folder filter, away from Previous/Next. Display, Placement, FPS and Sound controls stay with the selected wallpaper. Choosing a thumbnail changes the preview; Set wallpaper changes the active wallpaper.
+
+</details>
 
 ## Features
 
-- Import a local folder, including subfolders, or add individual files. Browse up to 4096 wallpapers; four thumbnails are loaded per page. Originals stay in their original locations.
-- Filter the library by folder; imported folder roots remain available after restart. **Select all**, beside the folder filter rather than Previous/Next, selects every file in the current filter across all pages; Ctrl-click toggles individual files. **Remove (N)** confirms the count and removes library entries, never original media.
-- Start local media immediately. Oversized SDR videos get a display-sized cache in the background; original playback can temporarily use more RAM until the cache is ready. Choose **24, 30, 45 or 60 FPS** below Placement in the selected-wallpaper panel (30 default); FPS changes do not re-encode or reload the wallpaper. Smaller sources are never upscaled.
-- Prefer a detected dedicated GPU for D3D11 rendering and compatible hardware decoding; fall back to the default adapter when needed.
-- Apply one active wallpaper to one display you choose.
-- Choose **Fill** to crop to the screen or **Fit** to show the full frame.
-- Loop playback with sound off by default; toggle **Sound: On/Off** without reloading the wallpaper.
-- Pause, resume and stop from the panel or tray. The tray menu follows the Windows system dark/light theme on each open, without restarting; high-contrast mode uses the native system menu. Hovering the tray icon does not open the panel.
-- Remove a wallpaper from the library without deleting its original media file.
-- Resize or maximize the native window; library navigation stays below the thumbnails.
-- Pause for fullscreen or maximized apps on the wallpaper display, battery power, inactive sessions, display sleep and system suspend. The last frame and decoder stay attached; returning to the desktop resumes without cache preparation or a file reload. Pause stops animation/audio, drops thumbnail buffers, cancels/defer conversion and asks Windows once to trim resident RAM pages. Decoder/driver allocations remain for fast resume. Fullscreen/maximize and battery pause are configurable; manual pause remains until you clear it.
-- The tray always offers **Check for updates**. Clicking checks GitHub in the background and shows an English result dialog: latest version, newer version, or check failed. A newer version asks before opening its GitHub release page. The app also checks once at startup; no automatic retry, download or installation.
+- Import individual files or folders with subfolders. Keep up to 4096 library entries, filter by folder and browse four thumbnails per page. Original files stay where they are.
+- Start the original video immediately. Oversized SDR videos get a display-sized cache in the background; playback switches to the finished copy near the current position.
+- Choose 24, 30, 45 or 60 FPS below Placement. Changes use the running player without a file reload or another cache conversion. This is a cap, not frame interpolation.
+- Use Fill to crop or Fit to show the full frame. Prefer a detected dedicated GPU for compatible D3D11 rendering and hardware decoding, with fallback when needed.
+- Loop with sound off by default. Toggle Sound, pause, resume or stop from the app or tray.
+- Auto-pause for fullscreen/maximized apps on the wallpaper display, battery power, session lock, display sleep and system suspend. Keep the last frame and decoder attached for resume without reloading.
+- Select all within the current filter or Ctrl-click individual files. Remove confirms the count and removes library entries, never original media.
+- Keep playback in the tray after closing the panel. The tray follows the Windows dark/light theme; high-contrast mode uses the native system menu. Start with Windows remains opt-in.
+- Check for updates from the tray. A background check shows a native English result dialog; a newer release page opens only after confirmation. No automatic download or installation.
 
-## Requirements
+## Resource use
 
-- Windows 10 or Windows 11, x64.
-- Trusted local video, GIF or image files. The download does not include wallpapers.
-- A native libmpv decoder. Setup can reuse a matching installed decoder or the pinned local archive; otherwise first-time setup asks for Internet access and download consent.
+### Cache preparation costs more than cached playback
 
-Native media parsers run with your user privileges. WallpaperLive is not a sandbox: malformed files can crash the app. Use media you trust.
+The project author captured the same wallpaper while its cache was being built and after it finished. The app stays on the original during preparation rather than making you wait for conversion.
 
-## Install
+<p align="center">
+  <img src="assets/screenshots/cache-comparison-v0.1.3.png" width="1200" alt="Real cache preparation and completion screenshots: app and worker use 420.1 MB and 33.9 percent CPU while preparing; the app uses 73.4 MB and 1.8 percent CPU after the cache is ready">
+</p>
 
-1. [Download the installer](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.3/wallpaperlivesetup.exe) and run it as your normal Windows user.
-2. If a decoder download is needed, review the prompt and grant consent to proceed. Setup skips that prompt when it can verify an existing decoder or a local archive.
-3. Open WallpaperLive from the Start menu after installation.
+| State captured in Task Manager | Memory shown | CPU shown | What the row includes |
+| :--- | ---: | ---: | :--- |
+| Cache preparation in the background | 420.1 MB | 33.9% | App plus cache worker, grouped as two processes |
+| Cache ready, wallpaper playing | 73.4 MB | 1.8% | WallpaperLive app |
+| Another cached-playback snapshot | 40.1 MB | 2.0% | WallpaperLive app |
+| Fullscreen/maximized auto-pause | 4.1 MB | 0% | WallpaperLive app, paused |
 
-Setup installs per user without administrator rights. It asks before downloading libmpv and verifies SHA256 before installing it. Setup does not launch the app, change your wallpaper or enable startup.
+The author also reports roughly **100–200 MB after a fresh install or initial setup**, a temporary peak around **400 MB when preparing a wallpaper**, then around **100 MB or less after the cache is ready**, settling further in the supplied captures. These ranges describe that user's experience, not a memory limit or an average from a benchmark.
 
-For an offline upgrade, install into the same folder: Setup reuses a matching decoder. For a first install without an in-setup download, obtain the [pinned upstream archive](https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261107/mpv-dev-x86_64-20261107-git-9028187538.7z) beforehand, rename it `mpv-dev.7z` and place it beside the installer. Both archive and DLL checksums are verified. The single installer does not bundle the decoder; its complete dependency-source record has not been verified for redistribution.
+### Pause keeps the frame and stops animation
 
-Windows may show a publisher warning because this release is unsigned. Keep the installer in a dedicated folder without unrelated DLL files. Do not disable security protections or run the app as administrator to work around desktop access errors.
+<p align="center">
+  <img src="assets/screenshots/resource-use-v0.1.3.png" width="1200" alt="Additional Task Manager snapshots: cached playback shows 40.1 MB and 2.0 percent CPU; auto-paused playback shows 4.1 MB and zero percent CPU, with disk and network at zero in both captures">
+</p>
 
-## Set a wallpaper
+*Task Manager headers and selected rows are cropped and arranged for readability; displayed values are unchanged. These are separate moments, not a controlled before/after benchmark.*
 
-1. Choose **Add wallpaper**, **Add folder**, or drop a local media file into the window.
-2. Select its thumbnail, choose a display and select **Fill** or **Fit**. The selected-wallpaper panel offers **24, 30, 45 or 60 FPS** below Placement (cap, not interpolation).
-3. Choose **Set wallpaper**. The original starts immediately. A display-sized SDR cache is prepared in the background if needed, then playback switches to it near the current position. Changing FPS does not start another conversion; **Stop** cancels preparation. Originals are never modified.
+**Read the numbers in context.** These v0.1.3 snapshots were supplied on 8 November 2026. Task Manager rounds live values; displayed 0% CPU is not proof of zero work. Its Memory column is not total private allocation, all process-tree memory or dedicated VRAM. Media, codec, display resolution, driver and cache state affect usage. No fixed RAM ceiling or GPU/VRAM savings are guaranteed.
 
-Selecting a thumbnail changes the preview, not the active wallpaper. Use **Pause** or **Resume** to control playback. **Stop** removes the live wallpaper without changing your Windows static wallpaper settings. **Sound: On/Off** selects or disables the media's audio track; files without audio remain silent. **Remove** asks for confirmation and removes only the library entry; removing an active wallpaper also stops it.
+<details>
+<summary>Open the original screenshots</summary>
 
-Closing the window keeps playback in the tray when the tray is available. Choose **Exit** in the app or tray menu to close WallpaperLive. Media/display preferences are saved, and **Start with Windows** remains opt-in in Settings.
+- [Cache preparation: 420.1 MB, 33.9% CPU](assets/screenshots/cache-preparing-v0.1.3.png)
+- [Cache ready: 73.4 MB, 1.8% CPU](assets/screenshots/cache-ready-v0.1.3.png)
+- [Cached playback: 40.1 MB, 2.0% CPU](assets/screenshots/task-manager-playing-v0.1.3.png)
+- [Auto-paused: 4.1 MB, 0% CPU](assets/screenshots/task-manager-paused-v0.1.3.png)
 
-On each new application process, one background HTTPS request checks the latest stable release on GitHub. **Check for updates** starts a check on demand; repeated clicks while a check runs share its result instead of starting parallel requests. The check sends the application version in its User-Agent, not wallpaper paths or preferences. No periodic network polling or automatic retry runs. Offline, rate-limit and invalid-response errors appear in the manual result dialog, not as a false latest-version message. Opening a newer release page requires confirmation; no automatic download or installation runs. Windows notification settings or Focus Assist may hide the startup balloon; the fixed tray action remains available.
+The last two captures also show 0 MB/s disk and 0 Mbps network for the selected app row. They do not measure GPU utilization or VRAM.
 
-## Media formats
+</details>
 
-The file picker accepts:
+## Download and install
 
-`MP4` `GIF` `MKV` `WebM` `MOV` `AVI` `MPG` `MPEG` `M4V` `APNG` `PNG` `JPG` `JPEG` `BMP` `WebP`
+1. [Download wallpaperlivesetup.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/wallpaperlivesetup.exe) and run it as your normal Windows user.
+2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
+3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-Playback depends on the file's codec and the installed decoder. An accepted extension does not guarantee support for every codec or animated-image variant. WallpaperLive does not accept URLs, network paths, playlists, executable files or web wallpapers.
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
 
-Hardware decoding depends on the codec and GPU. A detected hardware adapter with dedicated VRAM is preferred through D3D11; this also selects the device for compatible D3D11VA decoding. Driver/codec failure may fall back. Dedicated GPU use can increase power consumption and does not eliminate system RAM allocations.
+Setup installs per user without administrator rights. It does not launch the app, apply a wallpaper or enable startup. These builds are unsigned: keep Windows security protections enabled. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
 
-Automatic cache conversion uses the installed libmpv encoder, not a separately downloaded FFmpeg program. It preserves the original file, audio, aspect ratio and playback speed. Cache copies are H.264/AAC MP4, keyed by source SHA256, display dimensions and a fixed source-rate profile capped at 60 FPS, independent of the runtime cap. Runtime FPS changes use a pure frame-rate filter without interpolation or playback-speed changes; CFR resampling can repeat existing frames around irregular timestamps. Decoding still processes the cached source rate. Old cache files remain untouched. HDR and image/animated-image inputs remain original in this release, with an explicit status note; no silent 8-bit HDR conversion. Conversion requires finite video up to one hour/16 GiB, runs one below-normal-priority worker, and stops at 15 minutes or 512 MiB per output. Total cache is limited to 2 GiB; a full cache reports an error rather than deleting original or cached files automatically. Cancelled partials are never used. Cache is in `%LOCALAPPDATA%\\WallpaperLive\\video-cache`; move unused cache files aside to free space.
+<details>
+<summary>Offline install or upgrade</summary>
 
-Pause keeps the decoder, rendering surface and last frame so wallpaper does not disappear or wait for a reload when the desktop returns. Audio/video playback stops, thumbnail buffers are released and cache conversion is cancelled/deferred. Windows gets one resident-page trim request per confirmed pause; this lowers the working set when pages can be reclaimed, not private allocations or dedicated VRAM. Do not expect zero resources or a fixed RAM ceiling. The native panel/tray and 500 ms pause monitor remain. An unfinished conversion restarts in the background after resume; active playback does not wait for it. A completed cache waits at least two seconds after resume before a separate handoff at the current media position.
+For an upgrade, install into the same folder; Setup reuses a matching decoder. For a first install without an in-setup download, obtain the [pinned upstream archive](https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261107/mpv-dev-x86_64-20261107-git-9028187538.7z), rename it `mpv-dev.7z` and place it beside the installer. Setup verifies both archive and DLL SHA256 values.
 
-Thumbnail extraction runs one at a time in a short-lived child; the panel retains only four visible thumbnails plus the selection, each at most 480 × 270 pixels, and drops them when hidden, minimized or paused. Decoder packet budgets remain 8 MiB forward, no backward cache, 0.5 seconds readahead and four software decode threads. Total RAM is not capped. Native libraries and GPU drivers allocate additional memory; reported improvements are fixture-specific, not a guarantee for every device.
+The decoder remains a separate download. Its complete dependency-source record has not been verified for redistribution; the installer does not republish it.
 
-Historical v0.1.1 measurement, not a retained-pause v0.1.3 result: one owned-fixture comparison on an RTX 3050 Laptop GPU used the same 1920 × 1080 native test window and D3D11VA decoding for 15 seconds per condition. Original 4K/60 FPS video used median **275.5 MiB working set / 856.3 MiB private bytes**; its 1080p/30 FPS cache used **187.1 MiB / 355.1 MiB**. Process CPU fell from **3.79% to 1.84%** of total machine capacity. After decoder destruction, working sets were about **57 MiB**, including the Python measurement host but excluding the app panel. This was one sequential pair, not a repeatability guarantee; VRAM and GPU utilization were not measured.
+</details>
 
-Desktop changes, HDR, virtual desktops and display reconnection can affect wallpaper attachment. If Windows blocks access to Explorer, leave playback stopped. When reporting a problem, include the app version, Windows build, GPU, media format and steps to reproduce.
+## Playback notes
+
+Selecting a thumbnail changes the preview, not active playback. Use Set wallpaper to apply it. Sound: On/Off selects or disables the media's audio track; files without audio stay silent. Stop removes the live wallpaper without changing your Windows static wallpaper settings. Exit closes the app; closing the panel keeps it in the tray when the tray is available.
+
+The picker accepts `MP4`, `GIF`, `MKV`, `WebM`, `MOV`, `AVI`, `MPG`, `MPEG`, `M4V`, `APNG`, `PNG`, `JPG`, `JPEG`, `BMP` and `WebP`. Codec support still depends on libmpv and your GPU. HDR and animated-image inputs use their original media rather than the SDR cache.
+
+<details>
+<summary>Cache, FPS and retained-pause details</summary>
+
+- Cache conversion uses the installed libmpv encoder. It preserves originals, audio, aspect ratio and playback speed; smaller sources are not upscaled. H.264/AAC MP4 copies are keyed by source SHA256, display dimensions and a source-rate profile capped at 60 FPS, independent of the runtime cap.
+- Runtime FPS changes use a pure frame-rate filter, without interpolation or playback-speed changes. CFR resampling can repeat frames around irregular timestamps; decoding still processes the cached source rate. One isolated native v0.1.3 test measured scheduled rates of 59.6 / 24.2 / 60.2 FPS for 60 / 24 / 60 choices, not physical display scanout.
+- Conversion accepts finite video up to one hour/16 GiB, uses one below-normal-priority worker and stops at 15 minutes or 512 MiB per output. Total cache is limited to 2 GiB; full cache reports an error instead of deleting media or cache files. Cancelled partials are never played. Cache lives in `%LOCALAPPDATA%\WallpaperLive\video-cache`.
+- Pause stops animation/audio, releases thumbnails and cancels/defer conversion. Windows receives one resident-page trim request per confirmed pause; this can reclaim resident pages without releasing private decoder allocations or dedicated VRAM. An unfinished conversion restarts in the background after resume. A completed cache waits at least two seconds after resume before a separate handoff near the current media position.
+- Only four visible thumbnails plus the selection are retained, each at most 480 × 270 pixels. Hidden, minimized or paused panels drop those buffers. Packet budgets are 8 MiB forward, no backward cache and 0.5 seconds readahead, with four software-decode threads.
+
+Historical v0.1.1 comparison, **not the screenshot results above**: one sequential RTX 3050 Laptop GPU fixture pair used a 1920 × 1080 native window with D3D11VA decoding for 15 seconds per condition. Original 4K/60 FPS used median 275.5 MiB working set / 856.3 MiB private bytes; 1080p/30 FPS cache used 187.1 MiB / 355.1 MiB. Process CPU was 3.79% / 1.84% of total machine capacity. After decoder destruction, working sets were about 57 MiB including the Python host, excluding the app panel. It was not a repeatability test; GPU utilization and VRAM were not measured.
+
+</details>
+
+## Safety and compatibility
+
+The native decoder runs with your user privileges, not in a sandbox. Use media you trust: malformed files can crash the app. URLs, network paths, playlists and executable files are not accepted.
+
+Desktop attachment can vary with Windows builds, HDR, virtual desktops, display reconnection and GPU drivers. The supplied screenshots establish one real setup, not compatibility with every device or media file. If Windows blocks Explorer access, leave playback stopped. Bug reports should include app version, Windows build, GPU, media format and reproduction steps.
 
 ## Build from source
 
-Install a Rust toolchain with its Windows linker prerequisites. Build the app and prepare its decoder:
+Install a Rust toolchain with its Windows linker prerequisites, then build the app and obtain its decoder:
 
 ```powershell
 cargo build --locked --release --bin wallpaperlive
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Get-Decoder.ps1 -Destination .\target\release\runtime
 ```
 
-[Get-Decoder.ps1](scripts/Get-Decoder.ps1) performs an explicit, checksum-verified decoder download. Release builds look for the decoder beside the executable, not in your media folder or on PATH.
+[Get-Decoder.ps1](scripts/Get-Decoder.ps1) performs an explicit checksum-verified download. Release builds load the decoder beside the executable, never from a media folder or PATH.
 
-Run source checks:
+<details>
+<summary>Source checks and installer delivery</summary>
 
 ```powershell
 cargo fmt --all -- --check
@@ -110,16 +156,20 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-To create the installer, run [Installer.ps1](scripts/Installer.ps1) after the release build:
+[Windows checks](.github/workflows/ci.yml) builds the application and installer on GitHub Actions. Download the installer and SHA256 manifest from the run's `wallpaperlive-windows-x64` artifact. Version tags beginning with `v` publish those same files after checks pass; tags containing `-` are prereleases. CI does not install the app or exercise live desktop playback.
+
+For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a release build and downloads a checksum-verified portable Inno Setup compiler when needed, without a global tool install:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 ```
 
-The script downloads and verifies a portable Inno Setup compiler when needed. It does not install tools globally.
+Setup File version is `0.1.4.0`; Product version is `0.1.4`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
 
-[Windows checks](.github/workflows/ci.yml) builds the application and `wallpaperlivesetup.exe` on every push, pull request and manual run. Download the installer and its SHA256 manifest from the run's **wallpaperlive-windows-x64** artifact. A pushed version tag beginning with `v` publishes those same verified files to GitHub Releases after all checks pass; tags containing `-` are prereleases. Builds remain unsigned. CI does not install the app or run desktop playback tests.
+</details>
 
 ## License
 
-WallpaperLive is licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE) for the license and [THIRD_PARTY.md](THIRD_PARTY.md) for dependency notices. libmpv is a separate native decoder, not Rust code or bundled wallpaper content.
+[GPL-3.0-or-later](LICENSE) · [Dependency notices](THIRD_PARTY.md) · [Screenshot sources](assets/screenshots/SOURCES.md)
+
+WallpaperLive's GPL license covers the app, not third-party wallpaper artwork shown in screenshots. libmpv is a separate native decoder; no wallpapers or decoder binaries are bundled.
