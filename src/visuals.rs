@@ -29,6 +29,9 @@ pub const FOLDER_FILTER: usize = 123;
 pub const FPS: usize = 124;
 pub const SELECT_ALL: usize = 125;
 pub const VERSION: usize = 127;
+pub const CACHE_INFO: usize = 128;
+pub const CLEAR_CACHE: usize = 129;
+pub const MEMORY_INFO: usize = 130;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 
@@ -47,7 +50,7 @@ pub struct Layout {
     pub fit_label: Rect,
     pub settings_note: Rect,
     pub tile_rects: [Rect; 4],
-    controls: [(usize, Rect); 24],
+    controls: [(usize, Rect); 27],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -121,7 +124,10 @@ impl Layout {
                 (107, r(24, 224, (split - 48).min(400), 32)),
                 (108, r(24, 304, (split - 48).min(400), 32)),
                 (121, r(24, 264, (split - 48).min(400), 32)),
-                (VERSION, r(24, 360, (split - 48).min(400), 24)),
+                (VERSION, r(24, 348, (split - 48).min(400), 22)),
+                (MEMORY_INFO, r(24, 374, (split - 48).min(400), 22)),
+                (CACHE_INFO, r(24, 400, (split - 48).min(400), 22)),
+                (CLEAR_CACHE, r(24, 430, 160, 32)),
                 (FPS, r(side_x, fit.bottom + 12, side_width, 34)),
                 (SELECT_ALL, r(split - 128, 164, 104, 34)),
                 (PREVIOUS, r(pager.left, pager.top, 104, 36)),
@@ -750,7 +756,7 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(
             dc,
-            rgb(if matches!(id, 113 | VERSION) {
+            rgb(if matches!(id, 113 | VERSION | MEMORY_INFO | CACHE_INFO) {
                 MUTED
             } else {
                 TEXT
@@ -758,7 +764,7 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
         );
         let color = if id == 113 {
             0x20252c
-        } else if matches!(id, 107 | 108 | 121 | VERSION) {
+        } else if matches!(id, 107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO) {
             CANVAS
         } else if matches!(id, 105 | 106) {
             0x303943
@@ -836,8 +842,31 @@ mod tests {
                 }
             }
             assert!(layout.control(VERSION).unwrap().top > layout.control(108).unwrap().bottom);
+            assert!(
+                layout.control(MEMORY_INFO).unwrap().top > layout.control(VERSION).unwrap().bottom
+            );
+            assert!(
+                layout.control(CACHE_INFO).unwrap().top
+                    > layout.control(MEMORY_INFO).unwrap().bottom
+            );
+            assert!(
+                layout.control(CLEAR_CACHE).unwrap().top
+                    > layout.control(CACHE_INFO).unwrap().bottom
+            );
             assert_eq!(
                 layout.control(VERSION).unwrap().left,
+                layout.control(108).unwrap().left
+            );
+            assert_eq!(
+                layout.control(MEMORY_INFO).unwrap().left,
+                layout.control(108).unwrap().left
+            );
+            assert_eq!(
+                layout.control(CACHE_INFO).unwrap().left,
+                layout.control(108).unwrap().left
+            );
+            assert_eq!(
+                layout.control(CLEAR_CACHE).unwrap().left,
                 layout.control(108).unwrap().left
             );
             assert!(layout.control(106).unwrap().bottom < layout.control(FPS).unwrap().top);

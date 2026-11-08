@@ -6,19 +6,19 @@
 <p align="center"><strong>Your videos. Your desktop.</strong><br>Live wallpapers with a native Windows app, local files and a background display cache.</p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.4"><img src="https://img.shields.io/badge/release-v0.1.4-586575" alt="Release v0.1.4"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.5"><img src="https://img.shields.io/badge/release-v0.1.5-586575" alt="Release v0.1.5"></a>
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/wallpaperlivesetup-v0.1.4.exe"><strong>Download Windows installer</strong></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.5/wallpaperlivesetup-v0.1.5.exe"><strong>Download Windows installer</strong></a>
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
 </p>
 
-WallpaperLive plays trusted local videos, GIFs and images on one display you choose. Browse your thumbnail library, set a wallpaper and control playback from the panel or tray. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
+WallpaperLive plays trusted local videos, GIFs and images on one display you choose. Browse your thumbnail library, set a wallpaper and control playback from the panel or tray. Right-click thumbnails for file actions, use hotkeys (`Space`, `←`/`→`), monitor live RAM and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
 
 > Windows 10/11 x64. Unsigned installer. Wallpapers and the native decoder are not bundled; Setup asks before downloading a decoder if none is available locally.
 
@@ -94,13 +94,13 @@ The last two captures also show 0 MB/s disk and 0 Mbps network for the selected 
 
 ## Download and install
 
-1. [Download wallpaperlivesetup-v0.1.4.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/wallpaperlivesetup-v0.1.4.exe) and run it as your normal Windows user.
+1. [Download wallpaperlivesetup-v0.1.5.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.5/wallpaperlivesetup-v0.1.5.exe) and run it as your normal Windows user.
 2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.5/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
 
-Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.4.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
+Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.5.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
@@ -168,7 +168,7 @@ For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a re
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 ```
 
-Setup File version is `0.1.4.0`; Product version is `0.1.4`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
+Setup File version is `0.1.5.0`; Product version is `0.1.5`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
 
 </details>
 

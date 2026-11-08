@@ -235,6 +235,89 @@ fn cache_bytes(directory: &Path) -> Result<u64, String> {
             .ok_or("Cache size overflow".into())
         })
 }
+pub fn cache_size(directory: &Path) -> u64 {
+    cache_bytes(directory).unwrap_or(0)
+}
+pub fn auto_prune_cache(directory: &Path, active_cache: Option<&Path>) -> Result<(), String> {
+    let mut current = cache_bytes(directory)?;
+    if current <= MAX_CACHE - MAX_OUTPUT {
+        return Ok(());
+    }
+    if let Ok(entries) = fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str())
+                && name.starts_with("partial-")
+                && let Ok(meta) = p.metadata()
+            {
+                let len = meta.len();
+                if fs::remove_file(&p).is_ok() {
+                    current = current.saturating_sub(len);
+                }
+            }
+        }
+    }
+    if current <= MAX_CACHE - MAX_OUTPUT {
+        return Ok(());
+    }
+    let mut files: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if active_cache.is_some_and(|active| active == p) {
+                continue;
+            }
+            if let Some(name) = p.file_name().and_then(|s| s.to_str())
+                && name.starts_with("wl-v2-")
+                && name.ends_with(".mp4")
+                && let Ok(meta) = p.metadata()
+            {
+                let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+                files.push((p, mtime, meta.len()));
+            }
+        }
+    }
+    files.sort_by_key(|(_, mtime, _)| *mtime);
+    for (path, _, size) in files {
+        if current <= MAX_CACHE - MAX_OUTPUT {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            current = current.saturating_sub(size);
+        }
+    }
+    Ok(())
+}
+pub fn clear_unused_cache(directory: &Path, preserve: &[PathBuf]) -> Result<(usize, u64), String> {
+    validate_path_syntax(directory)?;
+    if !directory.is_dir() {
+        return Ok((0, 0));
+    }
+    let mut count = 0;
+    let mut freed = 0;
+    for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_file() {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if (name.starts_with("wl-v2-") && name.ends_with(".mp4"))
+                || name.starts_with("partial-")
+            {
+                if preserve.iter().any(|p| p == &path) {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    let len = meta.len();
+                    if fs::remove_file(&path).is_ok() {
+                        count += 1;
+                        freed += len;
+                    }
+                }
+            }
+        }
+    }
+    Ok((count, freed))
+}
 fn unchanged(path: &Path, size: u64, modified: SystemTime) -> Result<(), String> {
     let now = fs::metadata(path).map_err(|e| e.to_string())?;
     if now.len() != size || now.modified().map_err(|e| e.to_string())? != modified {
@@ -321,6 +404,7 @@ pub fn prepare_local(
         prepared.note = "Screen-sized cache".into();
         return Ok(prepared);
     }
+    let _ = auto_prune_cache(directory, None);
     if cache_bytes(directory)? > MAX_CACHE - MAX_OUTPUT {
         return Err(
             "Video cache is full (2 GiB limit); move unused cache files aside before retrying"
@@ -554,5 +638,37 @@ mod tests {
         );
         assert!(sha256(&path, &AtomicBool::new(true)).is_err());
         assert_eq!(fs::read(path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn cache_clear_and_auto_prune() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!(
+                "test-cache-prune-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&dir).unwrap();
+        let file1 = dir.join("wl-v2-abc-1920x1080-60.mp4");
+        let file2 = dir.join("wl-v2-def-1920x1080-60.mp4");
+        let partial = dir.join("partial-1234-5678.mp4");
+        let other = dir.join("unrelated.txt");
+        fs::write(&file1, vec![0u8; 1000]).unwrap();
+        fs::write(&file2, vec![0u8; 2000]).unwrap();
+        fs::write(&partial, vec![0u8; 500]).unwrap();
+        fs::write(&other, vec![0u8; 300]).unwrap();
+        assert_eq!(cache_size(&dir), 3800);
+        let (count, freed) = clear_unused_cache(&dir, std::slice::from_ref(&file2)).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(freed, 1500);
+        assert!(!file1.exists());
+        assert!(!partial.exists());
+        assert!(file2.exists());
+        assert!(other.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

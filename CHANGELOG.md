@@ -10,6 +10,23 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## v0.1.5
+
+### Added
+
+- **Live Diagnostics in Settings:** Settings view now displays real-time memory usage (process working set and peak working set) and video cache storage usage.
+- **Cache Manager & Manual Cleanup:** Added a "Clear unused cache" button in Settings to purge obsolete and inactive video cache files with confirmation, protecting currently playing wallpaper files.
+- **Cache Auto-Eviction:** Video cache automatically prunes oldest unused cache files when near the 2 GiB limit before preparing new wallpapers, avoiding manual cache folder management.
+- **Thumbnail Context Menu:** Right-clicking any library thumbnail opens a native menu with "Set as wallpaper", "Open file location", "Copy file path", and "Remove from library".
+- **Double-Click to Apply:** Double-clicking any wallpaper thumbnail immediately starts and applies it as the active wallpaper.
+- **Keyboard Shortcuts:** `Space` toggles Pause/Resume, and `Left`/`Right` arrow keys navigate library pages when the control panel is focused.
+
+### Changed
+
+- Updated build package and installer metadata to `0.1.5`.
+
+---
+
 ## v0.1.4
 
 ### Fixed

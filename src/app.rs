@@ -16,8 +16,8 @@ use windows::{
         Graphics::Gdi::*,
         Storage::FileSystem::*,
         System::{
-            Com::*, LibraryLoader::GetModuleHandleW, Power::*, Registry::*, RemoteDesktop::*,
-            SystemServices::*, Threading::*,
+            Com::*, LibraryLoader::GetModuleHandleW, Power::*, ProcessStatus::*, Registry::*,
+            RemoteDesktop::*, SystemServices::*, Threading::*,
         },
         UI::{
             Controls::{
@@ -25,7 +25,10 @@ use windows::{
                 INITCOMMONCONTROLSEX, InitCommonControlsEx,
             },
             HiDpi::*,
-            Input::KeyboardAndMouse::{EnableWindow, GetKeyState, SetFocus, VK_CONTROL},
+            Input::KeyboardAndMouse::{
+                EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, SetFocus, VK_CONTROL,
+                VK_LEFT, VK_RIGHT, VK_SPACE,
+            },
             Shell::*,
             WindowsAndMessaging::*,
         },
@@ -59,6 +62,11 @@ const THUMBNAIL: u32 = WM_APP + 9;
 const PREPARED: u32 = WM_APP + 10;
 const UPDATE_READY: u32 = WM_APP + 11;
 const UPDATE_RELEASE: usize = 126;
+const CONTEXT_MENU: u32 = WM_APP + 12;
+const CTX_SET: usize = 201;
+const CTX_EXPLORER: usize = 202;
+const CTX_COPY_PATH: usize = 203;
+const CTX_REMOVE: usize = 204;
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -67,6 +75,34 @@ fn wide(text: &str) -> Vec<u16> {
 }
 fn native_error(error: windows::core::Error) -> String {
     error.to_string()
+}
+fn copy_to_clipboard(hwnd: HWND, text: &str) -> Result<(), String> {
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    let wide = wide(text);
+    let bytes = wide.len() * std::mem::size_of::<u16>();
+    unsafe {
+        OpenClipboard(hwnd).map_err(native_error)?;
+        let _ = EmptyClipboard();
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes).map_err(native_error)?;
+        let ptr = GlobalLock(hmem);
+        if ptr.is_null() {
+            let _ = GlobalFree(hmem);
+            let _ = CloseClipboard();
+            return Err("Could not lock clipboard memory".into());
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr.cast(), wide.len());
+        let _ = GlobalUnlock(hmem);
+        if SetClipboardData(13, HANDLE(hmem.0)).is_err() {
+            let _ = GlobalFree(hmem);
+            let _ = CloseClipboard();
+            return Err("Could not set clipboard data".into());
+        }
+        let _ = CloseClipboard();
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -191,6 +227,7 @@ struct App {
     thumbnail_failed: std::collections::HashSet<PathBuf>,
     thumbnail_rx: std::sync::mpsc::Receiver<(PathBuf, Result<Vec<u8>, String>)>,
     thumbnail_tx: std::sync::mpsc::Sender<(PathBuf, Result<Vec<u8>, String>)>,
+    last_tile_click: Option<(usize, Instant)>,
 }
 impl App {
     fn control(&self, id: usize) -> HWND {
@@ -400,6 +437,24 @@ impl App {
                     SS_ENDELLIPSIS.0,
                 ),
                 (
+                    visuals::MEMORY_INFO,
+                    w!("STATIC"),
+                    "Memory: measuring...",
+                    SS_ENDELLIPSIS.0,
+                ),
+                (
+                    visuals::CACHE_INFO,
+                    w!("STATIC"),
+                    "Video cache: measuring...",
+                    SS_ENDELLIPSIS.0,
+                ),
+                (
+                    visuals::CLEAR_CACHE,
+                    w!("BUTTON"),
+                    "Clear unused cache",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
                     EXIT,
                     w!("BUTTON"),
                     "Exit",
@@ -506,6 +561,155 @@ impl App {
         );
         Ok(())
     }
+    fn cache_directory(&self) -> Option<PathBuf> {
+        Some(self.config.parent()?.join("video-cache"))
+    }
+    fn active_cache(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .playback_info
+            .iter()
+            .filter(|p| p.cached)
+            .map(|p| p.path.clone())
+            .collect();
+        paths.extend(self.prepared_waiting.iter().map(|(_, _, p)| p.path.clone()));
+        paths
+    }
+    // Read-only diagnostics: one process query and one directory listing per Settings visit.
+    fn refresh_diagnostics(&self) {
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: current-process pseudo handle and correctly sized output struct.
+        let memory =
+            unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) }
+                .map(|_| {
+                    format!(
+                        "Memory: {:.0} MB in use (peak {:.0} MB). Task Manager may differ.",
+                        counters.WorkingSetSize as f64 / 1048576.0,
+                        counters.PeakWorkingSetSize as f64 / 1048576.0
+                    )
+                })
+                .unwrap_or_else(|_| "Memory: unavailable".into());
+        self.text(visuals::MEMORY_INFO, &memory);
+        let cache = self
+            .cache_directory()
+            .map(|d| crate::cache::cache_size(&d))
+            .unwrap_or(0);
+        self.text(
+            visuals::CACHE_INFO,
+            &format!("Video cache: {:.0} MB of 2048 MB", cache as f64 / 1048576.0),
+        );
+    }
+    fn clear_cache(&mut self) -> Result<(), String> {
+        if self.preparation.is_some() || self.preparation_thread.is_some() {
+            return Err("Wait for the background cache to finish before clearing cache".into());
+        }
+        let directory = self.cache_directory().ok_or("Invalid cache directory")?;
+        let active = self.active_cache();
+        let prompt = wide(
+            "Delete cached display copies that are not in use?\n\nOriginal media files are never touched. Caches are rebuilt automatically when needed.",
+        );
+        // SAFETY: modal confirmation owned by this window.
+        if unsafe {
+            MessageBoxW(
+                self.hwnd,
+                PCWSTR(prompt.as_ptr()),
+                w!("Clear unused cache"),
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+            )
+        } != IDYES
+        {
+            return Ok(());
+        }
+        let (count, freed) = crate::cache::clear_unused_cache(&directory, &active)?;
+        self.refresh_diagnostics();
+        self.error = None;
+        self.text(
+            STATUS,
+            &format!(
+                "Removed {count} cache file(s), freed {:.0} MB.",
+                freed as f64 / 1048576.0
+            ),
+        );
+        Ok(())
+    }
+    fn context_menu(&mut self, child: HWND, coord: LPARAM) -> Result<(), String> {
+        let id = unsafe { GetDlgCtrlID(child) as usize };
+        if !(visuals::TILE_BASE..visuals::TILE_BASE + 4).contains(&id) {
+            return Ok(());
+        }
+        let slot = id - visuals::TILE_BASE;
+        let index = self.page * 4 + slot;
+        let Some(path) = self.library_view().get(index).cloned() else {
+            return Ok(());
+        };
+        self.selected = Some(path.clone());
+        self.marked = vec![path.clone()];
+        self.refresh_library()?;
+
+        let mut pt = POINT {
+            x: (coord.0 as u16 as i16) as i32,
+            y: ((coord.0 >> 16) as u16 as i16) as i32,
+        };
+        if pt.x == -1 && pt.y == -1 {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(child, &mut r);
+            }
+            pt.x = (r.left + r.right) / 2;
+            pt.y = (r.top + r.bottom) / 2;
+        }
+
+        unsafe {
+            let menu = CreatePopupMenu().map_err(native_error)?;
+            for (item_id, text) in [
+                (CTX_SET, "Set as wallpaper"),
+                (CTX_EXPLORER, "Open file location"),
+                (CTX_COPY_PATH, "Copy file path"),
+                (CTX_REMOVE, "Remove from library"),
+            ] {
+                let text_wide = wide(text);
+                let _ = AppendMenuW(menu, MF_STRING, item_id, PCWSTR(text_wide.as_ptr()));
+            }
+            let _ = SetForegroundWindow(self.hwnd);
+            let chosen = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                pt.x,
+                pt.y,
+                0,
+                self.hwnd,
+                None,
+            )
+            .0 as usize;
+            let _ = DestroyMenu(menu);
+
+            match chosen {
+                CTX_SET => {
+                    self.recovery = None;
+                    self.start()?;
+                }
+                CTX_EXPLORER => {
+                    let _ = std::process::Command::new("explorer.exe")
+                        .arg(format!("/select,{}", path.display()))
+                        .spawn();
+                }
+                CTX_COPY_PATH => {
+                    if let Err(e) = copy_to_clipboard(self.hwnd, &path.to_string_lossy()) {
+                        self.set_error(e);
+                    } else {
+                        self.text(STATUS, "File path copied to clipboard.");
+                    }
+                }
+                CTX_REMOVE => {
+                    self.remove_selected()?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
     fn library_view(&self) -> Vec<PathBuf> {
         crate::library::filtered(&self.library, self.folder_filter.as_deref())
     }
@@ -578,7 +782,15 @@ impl App {
                     if visible { SW_SHOWNA } else { SW_HIDE },
                 );
             }
-            for id in [BATTERY, STARTUP, 121, visuals::VERSION] {
+            for id in [
+                BATTERY,
+                STARTUP,
+                121,
+                visuals::VERSION,
+                visuals::MEMORY_INFO,
+                visuals::CACHE_INFO,
+                visuals::CLEAR_CACHE,
+            ] {
                 let _ = ShowWindow(
                     self.control(id),
                     if self.settings_open { SW_SHOW } else { SW_HIDE },
@@ -1916,9 +2128,13 @@ impl App {
                         "Settings"
                     },
                 );
+                if self.settings_open {
+                    self.refresh_diagnostics();
+                }
                 self.request_thumbnails();
                 self.layout()?;
             }
+            visuals::CLEAR_CACHE => self.clear_cache()?,
             visuals::ADD_FOLDER => self.pick_folder()?,
             visuals::FOLDER_FILTER => {
                 let folders = self.folder_options();
@@ -1979,6 +2195,28 @@ impl App {
                     .get(self.page * 4 + id - visuals::TILE_BASE)
                     .cloned()
                 {
+                    let double_click =
+                        self.last_tile_click
+                            .as_ref()
+                            .is_some_and(|(prev_id, time)| {
+                                *prev_id == id
+                                    && time.elapsed()
+                                        <= Duration::from_millis(
+                                            unsafe { GetDoubleClickTime() } as u64
+                                        )
+                            });
+                    if double_click {
+                        self.last_tile_click = None;
+                        self.selected = Some(path.clone());
+                        self.marked = vec![path];
+                        self.error = None;
+                        self.refresh_library()?;
+                        self.recovery = None;
+                        self.start()?;
+                        return Ok(false);
+                    }
+                    self.last_tile_click = Some((id, Instant::now()));
+
                     if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
                         if let Some(index) = self.marked.iter().position(|p| p == &path) {
                             self.marked.remove(index);
@@ -2448,6 +2686,7 @@ pub fn run() -> Result<(), String> {
             thumbnail_failed: std::collections::HashSet::new(),
             thumbnail_tx,
             thumbnail_rx,
+            last_tile_click: None,
         };
         SendMessageW(
             hwnd,
@@ -2512,6 +2751,27 @@ pub fn run() -> Result<(), String> {
                 return Err("Windows message loop failed".into());
             }
             let _ = TranslateMessage(&message);
+            if message.message == WM_KEYDOWN {
+                let vk = message.wParam.0 as u16;
+                if vk == VK_SPACE.0 {
+                    let focus = GetFocus();
+                    if focus != app.control(STATUS) {
+                        app.reasons.manual = !app.reasons.manual;
+                        let _ = app.tick();
+                        continue;
+                    }
+                } else if vk == VK_LEFT.0 {
+                    app.page = app.page.saturating_sub(1);
+                    let _ = app.refresh_library();
+                    continue;
+                } else if vk == VK_RIGHT.0 {
+                    if (app.page + 1) * 4 < app.library_view().len() {
+                        app.page += 1;
+                        let _ = app.refresh_library();
+                    }
+                    continue;
+                }
+            }
             if (WM_KEYFIRST..=WM_KEYLAST).contains(&message.message)
                 && IsDialogMessageW(hwnd, &message).as_bool()
             {
@@ -2520,6 +2780,10 @@ pub fn run() -> Result<(), String> {
             let handled = message.hwnd == hwnd;
             let action: Result<bool, String> = if handled {
                 match message.message {
+                    CONTEXT_MENU => {
+                        app.context_menu(HWND(message.wParam.0 as *mut _), message.lParam)?;
+                        Ok(false)
+                    }
                     ACTION => app.action(
                         message.wParam.0 & 0xffff,
                         ((message.wParam.0 >> 16) & 0xffff) as u32,
@@ -2663,6 +2927,10 @@ unsafe extern "system" fn window_proc(
             }
             WM_COMMAND => {
                 post(ACTION, wparam, lparam);
+                LRESULT(0)
+            }
+            WM_CONTEXTMENU => {
+                post(CONTEXT_MENU, wparam, lparam);
                 LRESULT(0)
             }
             WM_CLOSE => {
@@ -2858,8 +3126,40 @@ mod tests {
             thumbnail_failed: std::collections::HashSet::new(),
             thumbnail_rx,
             thumbnail_tx,
+            last_tile_click: None,
         }
     }
+    #[test]
+    fn active_cache_protects_current_and_waiting_files() {
+        let mut app = fixture();
+        let current = PathBuf::from(r"C:\test\cache-playing.mp4");
+        let waiting = PathBuf::from(r"C:\test\cache-waiting.mp4");
+        app.playback_info = Some(crate::cache::Prepared {
+            path: current.clone(),
+            width: 1920,
+            height: 1080,
+            fps: 60.0,
+            cached: true,
+            note: "test".into(),
+        });
+        app.prepared_waiting = Some((
+            Instant::now(),
+            PathBuf::from(r"C:\test\source.mp4"),
+            crate::cache::Prepared {
+                path: waiting.clone(),
+                width: 1920,
+                height: 1080,
+                fps: 60.0,
+                cached: true,
+                note: "test".into(),
+            },
+        ));
+        let active = app.active_cache();
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&current));
+        assert!(active.contains(&waiting));
+    }
+
     #[test]
     fn manual_update_clicks_share_one_running_check() {
         let mut app = fixture();
@@ -3322,6 +3622,7 @@ mod tests {
             thumbnail_failed: std::collections::HashSet::new(),
             thumbnail_rx,
             thumbnail_tx,
+            last_tile_click: None,
         };
         update_tx.send(Ok(Some("v0.1.2".into()))).unwrap();
         app.update_ready().unwrap();
