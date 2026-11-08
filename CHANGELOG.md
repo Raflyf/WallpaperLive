@@ -10,6 +10,25 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## v0.1.6
+
+### Added
+
+- **Explore Online Tab:** Browse, search, preview, and download live video wallpapers directly inside the app without opening an external browser.
+  - Powered by the Pixabay Video API with dual-key rotation and zero third-party networking crates (100% native `WinHttp` and `windows::Data::Json`).
+  - Native Windows Imaging Component (WIC) thumbnail decoding for fast, zero-dependency JPEG previews.
+  - Quick-search genre chips (Anime, Cyberpunk, Nature, Space, Cars, Abstract, Gaming) and 3x3 video card browsing grid.
+  - Interactive video cards with duration badge, author credit, and `[ In Library ]` status badge for already downloaded wallpapers.
+  - "Download & Set" for one-click background download, library addition, and instant desktop wallpaper playback.
+  - "Download to Library" to queue downloads into the local collection without interrupting active playback.
+- **Export & Backup Wallpapers:** Added an "Export Library..." button in Settings allowing users to backup all downloaded wallpapers to any folder of their choice.
+
+### Changed
+
+- Updated build package and installer metadata to `0.1.6`.
+
+---
+
 ## v0.1.5
 
 ### Fixed
@@ -18,12 +37,6 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- **Explore Online Tab:** Browse, search, preview, and download live video wallpapers directly inside the app without opening an external browser.
-  - Powered by the Pixabay Video API with built-in key rotation and zero third-party networking crates (100% native `WinHttp` and `windows::Data::Json`).
-  - Native Windows Imaging Component (WIC) thumbnail decoding for fast, zero-dependency JPEG previews.
-  - Quick-search genre chips (Anime, Cyberpunk, Nature, Space, Cars, Abstract) and 3x3 video card browsing grid.
-  - "Download & Set" for one-click download, library addition, and instant wallpaper playback, as well as "Download to Library".
-- **Export & Backup Wallpapers:** Added an "Export Library..." button in Settings allowing users to backup all downloaded wallpapers to any folder of their choice.
 - **Launch on Setup Finish:** Setup provides an option (checked by default) to immediately launch WallpaperLive upon installation completion.
 - **Installer Auto-Exit:** Setup and uninstaller automatically terminate any running WallpaperLive instance so users no longer have to manually exit from the system tray before updating or uninstalling.
 - **Live Diagnostics in Settings:** Settings view displays real-time memory usage (process working set and peak working set) and video cache storage usage.
