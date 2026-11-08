@@ -25,10 +25,10 @@ WallpaperLive plays trusted local videos, GIFs and images on one display you cho
 ## Preview
 
 <p align="center">
-  <img src="assets/screenshots/preview-v0.1.5.png" width="1200" alt="WallpaperLive playing a video on a Windows desktop, with the native thumbnail library shown as a separate inset">
+  <img src="assets/screenshots/preview-v0.1.5.png" width="1200" alt="WallpaperLive playing a live video wallpaper on a Windows desktop with Task Manager showing 20.3 MB memory usage">
 </p>
 
-*Real v0.1.5 screenshots supplied by the project author on 8 November 2026. The app inset is composed from a separate capture, not an overlay added by WallpaperLive. Wallpaper artwork belongs to its respective owners; no media is included in the download.*
+*Real v0.1.5 desktop capture supplied by the project author on 8 November 2026, showing active live wallpaper playback. Wallpaper artwork belongs to its respective owners; no media is included in the download.*
 
 <details>
 <summary>View the native app at full size</summary>
