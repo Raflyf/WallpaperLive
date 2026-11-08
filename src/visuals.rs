@@ -1,7 +1,7 @@
 use crate::core::Rect;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 use windows::{
@@ -43,6 +43,7 @@ pub const TAG_NATURE: usize = 137;
 pub const TAG_SPACE: usize = 138;
 pub const TAG_CARS: usize = 139;
 pub const TAG_ABSTRACT: usize = 140;
+pub const TAG_GAMING: usize = 141;
 pub const EXPLORE_INFO: usize = 144;
 pub const DOWNLOAD_SET: usize = 145;
 pub const DOWNLOAD_LIB: usize = 146;
@@ -75,7 +76,7 @@ pub struct Layout {
     pub settings_note: Rect,
     pub tile_rects: [Rect; 4],
     pub explore_tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 38],
+    controls: [(usize, Rect); 39],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -160,6 +161,7 @@ impl Layout {
                 (TAG_SPACE, r(278, 130, 68, 28)),
                 (TAG_CARS, r(352, 130, 62, 28)),
                 (TAG_ABSTRACT, r(420, 130, 84, 28)),
+                (TAG_GAMING, r(510, 130, 78, 28)),
                 (FOLDER_FILTER, r(24, 164, split - 164, 34)),
                 (PREVIEW, preview),
                 (112, file),
@@ -261,8 +263,12 @@ struct Skin {
     explore_items: Vec<crate::online::OnlineVideo>,
     explore_selected: Option<usize>,
     explore_thumbnails: HashMap<u64, Bitmap>,
+    in_library: HashSet<u64>,
 }
-thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:None,tiles:HashMap::new(),thumbnails:HashMap::new(),tab:Tab::Library,explore_items:Vec::new(),explore_selected:None,explore_thumbnails:HashMap::new()});}
+thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:None,tiles:HashMap::new(),thumbnails:HashMap::new(),tab:Tab::Library,explore_items:Vec::new(),explore_selected:None,explore_thumbnails:HashMap::new(),in_library:HashSet::new()});}
+pub fn set_in_library_ids(ids: HashSet<u64>) {
+    SKIN.with(|s| s.borrow_mut().in_library = ids);
+}
 pub fn marked(paths: &[PathBuf]) {
     SKIN.with(|skin| skin.borrow_mut().marked = paths.to_vec());
 }
@@ -596,6 +602,27 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                     );
 
+                    if skin.in_library.contains(&vid.id) {
+                        let lib_w = s(58);
+                        let lib_h = s(16);
+                        let lib_rect = rect(
+                            area.left + s(4),
+                            area.top + s(4),
+                            area.left + lib_w + s(4),
+                            area.top + lib_h + s(4),
+                        );
+                        rounded(dc, lib_rect, 0x1b3547, 0x3d7099, s(3));
+                        label(
+                            dc,
+                            "In Library",
+                            lib_rect,
+                            s(9),
+                            true,
+                            ACCENT,
+                            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                        );
+                    }
+
                     let user_rect = rect(
                         r.left + s(6),
                         r.bottom - s(24),
@@ -808,7 +835,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
             let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
             let primary = id == 102 || id == DOWNLOAD_SET;
             let is_tab = matches!(id, TAB_LIBRARY | TAB_EXPLORE | TAB_SETTINGS);
-            let is_tag = (TAG_ANIME..=TAG_ABSTRACT).contains(&id);
+            let is_tag = (TAG_ANIME..=TAG_GAMING).contains(&id);
 
             let active_tab = is_tab
                 && SKIN.with(|s| {

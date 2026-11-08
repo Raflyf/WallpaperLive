@@ -457,6 +457,12 @@ impl App {
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::TAG_GAMING,
+                    w!("BUTTON"),
+                    "Gaming",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
                     visuals::DOWNLOAD_SET,
                     w!("BUTTON"),
                     "Download & Set",
@@ -949,6 +955,7 @@ impl App {
                 visuals::TAG_SPACE,
                 visuals::TAG_CARS,
                 visuals::TAG_ABSTRACT,
+                visuals::TAG_GAMING,
                 visuals::DOWNLOAD_SET,
                 visuals::DOWNLOAD_LIB,
                 visuals::EXPLORE_INFO,
@@ -1027,6 +1034,14 @@ impl App {
         visuals::tiles(&paths);
         visuals::selected(self.selected.clone());
         visuals::playing(self.playback.as_ref().map(|p| p.path.clone()));
+        let in_lib: std::collections::HashSet<u64> = self
+            .library
+            .iter()
+            .filter_map(|p| p.file_stem().and_then(|s| s.to_str()))
+            .filter_map(|s| s.strip_prefix("pixabay_"))
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+        visuals::set_in_library_ids(in_lib);
         self.text(visuals::PAGE, &format!("Page {} of {pages}", self.page + 1));
         for (i, path) in paths.iter().enumerate() {
             self.text(
@@ -2326,6 +2341,10 @@ impl App {
                 self.text(visuals::EXPLORE_SEARCH_BOX, "abstract");
                 self.start_explore_search("abstract".into(), 1)?;
             }
+            visuals::TAG_GAMING => {
+                self.text(visuals::EXPLORE_SEARCH_BOX, "gaming");
+                self.start_explore_search("gaming".into(), 1)?;
+            }
             id if (visuals::EXPLORE_TILE_BASE..visuals::EXPLORE_TILE_BASE + 9).contains(&id) => {
                 let index = id - visuals::EXPLORE_TILE_BASE;
                 let double_click = self
@@ -2694,6 +2713,14 @@ impl App {
                     self.explore_total_hits = page.total_hits;
                     self.explore_items = page.items.clone();
                     visuals::set_explore_items(page.items);
+                    let in_lib: std::collections::HashSet<u64> = self
+                        .library
+                        .iter()
+                        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()))
+                        .filter_map(|s| s.strip_prefix("pixabay_"))
+                        .filter_map(|s| s.parse::<u64>().ok())
+                        .collect();
+                    visuals::set_in_library_ids(in_lib);
                     self.update_explore_selection_info();
                     self.request_explore_thumbnails();
                     self.text(
