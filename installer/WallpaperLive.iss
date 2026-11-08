@@ -60,6 +60,7 @@ Filename: "{app}\wallpaperlive.exe"; Description: "{cm:LaunchProgram,WallpaperLi
 var
   DecoderInfoPage: TOutputMsgWizardPage;
   DownloadPage: TDownloadWizardPage;
+  ProgressPage: TOutputMarqueeProgressWizardPage;
   DecoderPrepared: Boolean;
   DownloadDecoder: Boolean;
 
@@ -97,6 +98,8 @@ begin
   DownloadPage := CreateDownloadPage('Preparing native decoder',
     'Downloading and verifying the pinned upstream build.', nil);
   DownloadPage.ShowBaseNameInsteadOfUrl := True;
+  ProgressPage := CreateOutputMarqueeProgressPage('Preparing native decoder',
+    'Downloading and verifying the pinned playback decoder (about 31.8 MB)...');
 end;
 
 function LocalDecoderAvailable: Boolean;
@@ -137,27 +140,26 @@ begin
         RaiseException('Local mpv-dev.7z checksum differs from the pinned decoder. Nothing installed; move that file aside or supply the correct upstream archive.');
     end else begin
       DecoderArchive := ExpandConstant('{tmp}\mpv-dev.7z');
-      DownloadPage.Clear;
-      DownloadPage.Add('{#DecoderURL}', 'mpv-dev.7z', '{#ArchiveSHA256}');
-      DownloadPage.Show;
+      ProgressPage.SetText('Downloading decoder from GitHub (about 31.8 MB)...', 'Please wait, this is only downloaded once.');
+      ProgressPage.Animate;
+      ProgressPage.Show;
       try
-        try
-          DownloadPage.Download;
-        except
-          Log('Built-in download failed: ' + GetExceptionMessage);
-        end;
-      finally
-        DownloadPage.Hide;
-      end;
-      if not FileExists(DecoderArchive) or (CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0) then begin
-        DeleteFile(DecoderArchive);
+        // Use system curl with browser User-Agent directly to connect in 0.5s without 30s GitHub timeout
         if FileExists(ExpandConstant('{sys}\curl.exe')) then begin
           Exec(ExpandConstant('{sys}\curl.exe'), '-f -s -S -L -A "Mozilla/5.0" -o "' + DecoderArchive + '" "{#DecoderURL}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
         end;
-      end;
-      if not FileExists(DecoderArchive) or (CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0) then begin
-        DeleteFile(DecoderArchive);
-        Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoProfile -NonInteractive -Command "(New-Object System.Net.WebClient).Headers.Add(''User-Agent'',''Mozilla/5.0''); (New-Object System.Net.WebClient).DownloadFile(''{#DecoderURL}'',''' + DecoderArchive + ''')"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+        if not FileExists(DecoderArchive) or (CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0) then begin
+          DeleteFile(DecoderArchive);
+          Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoProfile -NonInteractive -Command "(New-Object System.Net.WebClient).Headers.Add(''User-Agent'',''Mozilla/5.0''); (New-Object System.Net.WebClient).DownloadFile(''{#DecoderURL}'',''' + DecoderArchive + ''')"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+        end;
+        if not FileExists(DecoderArchive) or (CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0) then begin
+          DeleteFile(DecoderArchive);
+          DownloadPage.Clear;
+          DownloadPage.Add('{#DecoderURL}', 'mpv-dev.7z', '{#ArchiveSHA256}');
+          DownloadPage.Download;
+        end;
+      finally
+        ProgressPage.Hide;
       end;
       if not FileExists(DecoderArchive) then
         RaiseException('Could not download decoder. Check your Internet connection and retry Setup.');
