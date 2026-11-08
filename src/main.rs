@@ -5,6 +5,7 @@ mod core;
 mod desktop;
 mod library;
 mod mpv;
+mod online;
 mod thumbnail;
 mod tray;
 mod update;

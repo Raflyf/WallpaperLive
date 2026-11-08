@@ -32,8 +32,32 @@ pub const VERSION: usize = 127;
 pub const CACHE_INFO: usize = 128;
 pub const CLEAR_CACHE: usize = 129;
 pub const MEMORY_INFO: usize = 130;
+pub const TAB_LIBRARY: usize = 114;
+pub const TAB_EXPLORE: usize = 131;
+pub const TAB_SETTINGS: usize = 132;
+pub const EXPLORE_SEARCH_BOX: usize = 133;
+pub const EXPLORE_SEARCH_BTN: usize = 134;
+pub const TAG_ANIME: usize = 135;
+pub const TAG_CYBERPUNK: usize = 136;
+pub const TAG_NATURE: usize = 137;
+pub const TAG_SPACE: usize = 138;
+pub const TAG_CARS: usize = 139;
+pub const TAG_ABSTRACT: usize = 140;
+pub const EXPLORE_INFO: usize = 144;
+pub const DOWNLOAD_SET: usize = 145;
+pub const DOWNLOAD_LIB: usize = 146;
+pub const EXPORT_LIBRARY: usize = 147;
+pub const EXPLORE_TILE_BASE: usize = 500;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Tab {
+    #[default]
+    Library,
+    Explore,
+    Settings,
+}
 
 pub struct Layout {
     pub client: Rect,
@@ -50,7 +74,8 @@ pub struct Layout {
     pub fit_label: Rect,
     pub settings_note: Rect,
     pub tile_rects: [Rect; 4],
-    controls: [(usize, Rect); 27],
+    pub explore_tile_rects: [Rect; 9],
+    controls: [(usize, Rect); 38],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -72,6 +97,19 @@ impl Layout {
                 library.top + (i / 2) as i32 * (tile_height + 16),
                 tile_width,
                 tile_height,
+            )
+        });
+        let explore_grid = r(24, 168, split - 48, pager.top - 176);
+        let col_w = (explore_grid.right - explore_grid.left - 24) / 3;
+        let row_h = (explore_grid.bottom - explore_grid.top - 24) / 3;
+        let explore_tile_rects = std::array::from_fn(|i| {
+            let c = (i % 3) as i32;
+            let row = (i / 3) as i32;
+            r(
+                explore_grid.left + c * (col_w + 12),
+                explore_grid.top + row * (row_h + 12),
+                col_w,
+                row_h,
             )
         });
         let side_x = split + 24;
@@ -99,7 +137,7 @@ impl Layout {
             library,
             pager,
             sidebar: r(split, 72, width - split, footer.top - 72),
-            title: r(24, 18, 260, 36),
+            title: r(24, 18, 140, 36),
             library_title: r(24, 92, split - 48, 32),
             library_note: r(24, 132, split - 48, 24),
             preview_title: r(side_x, 88, side_width, 24),
@@ -107,10 +145,21 @@ impl Layout {
             fit_label,
             settings_note: r(24, 176, (split - 48).min(480), 36),
             tile_rects,
+            explore_tile_rects,
             controls: [
-                (101, r(width - 464, 18, 160, 36)),
-                (ADD_FOLDER, r(width - 292, 18, 148, 36)),
-                (114, r(width - 132, 18, 108, 36)),
+                (101, r(width - 272, 18, 118, 36)),
+                (ADD_FOLDER, r(width - 146, 18, 122, 36)),
+                (TAB_LIBRARY, r(176, 18, 88, 36)),
+                (TAB_EXPLORE, r(272, 18, 124, 36)),
+                (TAB_SETTINGS, r(404, 18, 96, 36)),
+                (EXPLORE_SEARCH_BOX, r(24, 88, split - 150, 34)),
+                (EXPLORE_SEARCH_BTN, r(split - 118, 88, 94, 34)),
+                (TAG_ANIME, r(24, 130, 68, 28)),
+                (TAG_CYBERPUNK, r(98, 130, 96, 28)),
+                (TAG_NATURE, r(200, 130, 72, 28)),
+                (TAG_SPACE, r(278, 130, 68, 28)),
+                (TAG_CARS, r(352, 130, 62, 28)),
+                (TAG_ABSTRACT, r(420, 130, 84, 28)),
                 (FOLDER_FILTER, r(24, 164, split - 164, 34)),
                 (PREVIEW, preview),
                 (112, file),
@@ -127,7 +176,8 @@ impl Layout {
                 (VERSION, r(24, 348, (split - 48).min(400), 22)),
                 (MEMORY_INFO, r(24, 374, (split - 48).min(400), 22)),
                 (CACHE_INFO, r(24, 400, (split - 48).min(400), 22)),
-                (CLEAR_CACHE, r(24, 430, 160, 32)),
+                (CLEAR_CACHE, r(24, 430, 156, 32)),
+                (EXPORT_LIBRARY, r(188, 430, 160, 32)),
                 (FPS, r(side_x, fit.bottom + 12, side_width, 34)),
                 (SELECT_ALL, r(split - 128, 164, 104, 34)),
                 (PREVIOUS, r(pager.left, pager.top, 104, 36)),
@@ -149,6 +199,24 @@ impl Layout {
     pub fn control(&self, id: usize) -> Option<Rect> {
         if (TILE_BASE..TILE_BASE + 4).contains(&id) {
             return Some(self.tile_rects[id - TILE_BASE]);
+        }
+        if (EXPLORE_TILE_BASE..EXPLORE_TILE_BASE + 9).contains(&id) {
+            return Some(self.explore_tile_rects[id - EXPLORE_TILE_BASE]);
+        }
+        if id == DOWNLOAD_SET {
+            return self.control(102);
+        }
+        if id == DOWNLOAD_LIB {
+            return self.control(103);
+        }
+        if id == EXPLORE_INFO {
+            let file = self.control(112)?;
+            return Some(Rect {
+                left: file.left,
+                top: file.bottom + 8,
+                right: file.right,
+                bottom: file.bottom + 52,
+            });
         }
         self.controls
             .iter()
@@ -189,9 +257,12 @@ struct Skin {
     playing: Option<PathBuf>,
     tiles: HashMap<usize, PathBuf>,
     thumbnails: HashMap<PathBuf, Bitmap>,
-    settings: bool,
+    tab: Tab,
+    explore_items: Vec<crate::online::OnlineVideo>,
+    explore_selected: Option<usize>,
+    explore_thumbnails: HashMap<u64, Bitmap>,
 }
-thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:None,tiles:HashMap::new(),thumbnails:HashMap::new(),settings:false});}
+thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:None,tiles:HashMap::new(),thumbnails:HashMap::new(),tab:Tab::Library,explore_items:Vec::new(),explore_selected:None,explore_thumbnails:HashMap::new()});}
 pub fn marked(paths: &[PathBuf]) {
     SKIN.with(|skin| skin.borrow_mut().marked = paths.to_vec());
 }
@@ -249,13 +320,59 @@ pub fn thumbnail(path: PathBuf, image: HBITMAP) {
         skin.thumbnails.insert(path, image);
     });
 }
-pub fn settings(value: bool) {
-    SKIN.with(|s| s.borrow_mut().settings = value);
+pub fn set_tab(tab: Tab) {
+    SKIN.with(|s| s.borrow_mut().tab = tab);
+}
+pub fn set_explore_items(items: Vec<crate::online::OnlineVideo>) {
+    SKIN.with(|s| {
+        let mut skin = s.borrow_mut();
+        skin.explore_items = items;
+        skin.explore_selected = if skin.explore_items.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+    });
+}
+pub fn select_explore(index: usize) {
+    SKIN.with(|s| {
+        let mut skin = s.borrow_mut();
+        if index < skin.explore_items.len() {
+            skin.explore_selected = Some(index);
+        }
+    });
+}
+pub fn selected_explore_video() -> Option<crate::online::OnlineVideo> {
+    SKIN.with(|s| {
+        let skin = s.borrow();
+        let idx = skin.explore_selected?;
+        skin.explore_items.get(idx).cloned()
+    })
+}
+pub fn explore_thumbnail(id: u64, image: HBITMAP) {
+    let image = Bitmap(image);
+    if image.0.0.is_null() {
+        return;
+    }
+    SKIN.with(|s| {
+        let mut skin = s.borrow_mut();
+        if skin.explore_thumbnails.len() >= 12 && !skin.explore_thumbnails.contains_key(&id) {
+            let victim = skin.explore_thumbnails.keys().next().copied();
+            if let Some(k) = victim {
+                skin.explore_thumbnails.remove(&k);
+            }
+        }
+        skin.explore_thumbnails.insert(id, image);
+    });
+}
+pub fn clear_explore_thumbnails() {
+    SKIN.with(|s| s.borrow_mut().explore_thumbnails.clear());
 }
 pub fn clear() {
     SKIN.with(|s| {
         let mut skin = s.borrow_mut();
         skin.thumbnails.clear();
+        skin.explore_thumbnails.clear();
         skin.tiles.clear();
         skin.selected = None;
         skin.marked.clear();
@@ -415,9 +532,144 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 MUTED,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
+        } else if (EXPLORE_TILE_BASE..EXPLORE_TILE_BASE + 9).contains(&id) {
+            let index = id - EXPLORE_TILE_BASE;
+            SKIN.with(|skin| {
+                let skin = skin.borrow();
+                let video = skin.explore_items.get(index);
+                let active = skin.explore_selected == Some(index);
+                rounded(
+                    dc,
+                    r,
+                    if active { 0x2c3843 } else { CARD },
+                    if active { ACCENT } else { CARD },
+                    s(6),
+                );
+                if let Some(vid) = video {
+                    let mut area = rect(
+                        r.left + s(2),
+                        r.top + s(2),
+                        r.right - s(2),
+                        r.bottom - s(26),
+                    );
+                    let width = (area.right - area.left).max(1);
+                    let height = (area.bottom - area.top).max(1);
+                    if i64::from(width) * 9 > i64::from(height) * 16 {
+                        let fitted = height * 16 / 9;
+                        area.left += (width - fitted) / 2;
+                        area.right = area.left + fitted;
+                    } else {
+                        let fitted = width * 9 / 16;
+                        area.top += (height - fitted) / 2;
+                        area.bottom = area.top + fitted;
+                    }
+                    if let Some(bitmap) = skin.explore_thumbnails.get(&vid.id) {
+                        image(dc, bitmap.0, area);
+                    } else {
+                        label(
+                            dc,
+                            "MP4",
+                            area,
+                            s(16),
+                            true,
+                            MUTED,
+                            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                        );
+                    }
+                    let dur = format!("{}:{:02}", vid.duration / 60, vid.duration % 60);
+                    let badge_w = s(34);
+                    let badge_h = s(16);
+                    let badge_rect = rect(
+                        area.right - badge_w - s(4),
+                        area.bottom - badge_h - s(4),
+                        area.right - s(4),
+                        area.bottom - s(4),
+                    );
+                    rounded(dc, badge_rect, 0x181b20, 0x181b20, s(3));
+                    label(
+                        dc,
+                        &dur,
+                        badge_rect,
+                        s(10),
+                        true,
+                        TEXT,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                    );
+
+                    let user_rect = rect(
+                        r.left + s(6),
+                        r.bottom - s(24),
+                        r.right - s(6),
+                        r.bottom - s(4),
+                    );
+                    label(
+                        dc,
+                        &vid.user,
+                        user_rect,
+                        s(11),
+                        false,
+                        if active { ACCENT } else { MUTED },
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                }
+                if active {
+                    let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(ACCENT));
+                    let old_pen = SelectObject(dc, pen);
+                    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                    let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, s(6), s(6));
+                    SelectObject(dc, old_brush);
+                    SelectObject(dc, old_pen);
+                    let _ = DeleteObject(pen);
+                }
+            });
         } else if id == PREVIEW || (TILE_BASE..TILE_BASE + 4).contains(&id) {
             SKIN.with(|skin| {
                 let skin = skin.borrow();
+                if id == PREVIEW && skin.tab == Tab::Explore {
+                    rounded(dc, r, CARD, CARD, s(8));
+                    if let Some(vid) = skin
+                        .explore_selected
+                        .and_then(|i| skin.explore_items.get(i))
+                    {
+                        let mut area =
+                            rect(r.left + s(1), r.top + s(1), r.right - s(1), r.bottom - s(1));
+                        let width = (area.right - area.left).max(1);
+                        let height = (area.bottom - area.top).max(1);
+                        if i64::from(width) * 9 > i64::from(height) * 16 {
+                            let fitted = height * 16 / 9;
+                            area.left += (width - fitted) / 2;
+                            area.right = area.left + fitted;
+                        } else {
+                            let fitted = width * 9 / 16;
+                            area.top += (height - fitted) / 2;
+                            area.bottom = area.top + fitted;
+                        }
+                        if let Some(bitmap) = skin.explore_thumbnails.get(&vid.id) {
+                            image(dc, bitmap.0, area);
+                        } else {
+                            label(
+                                dc,
+                                "Online Video",
+                                area,
+                                s(20),
+                                true,
+                                MUTED,
+                                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                            );
+                        }
+                    } else {
+                        label(
+                            dc,
+                            "Select a video",
+                            r,
+                            s(15),
+                            false,
+                            MUTED,
+                            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                        );
+                    }
+                    return;
+                }
                 let path = if id == PREVIEW {
                     skin.selected.as_ref()
                 } else {
@@ -554,17 +806,46 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
             let text = window_text(item.hwndItem).replace('&', "");
             let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
             let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
-            let primary = id == 102;
+            let primary = id == 102 || id == DOWNLOAD_SET;
+            let is_tab = matches!(id, TAB_LIBRARY | TAB_EXPLORE | TAB_SETTINGS);
+            let is_tag = (TAG_ANIME..=TAG_ABSTRACT).contains(&id);
+
+            let active_tab = is_tab
+                && SKIN.with(|s| {
+                    let tab = s.borrow().tab;
+                    (tab == Tab::Library && id == TAB_LIBRARY)
+                        || (tab == Tab::Explore && id == TAB_EXPLORE)
+                        || (tab == Tab::Settings && id == TAB_SETTINGS)
+                });
+
             let color = if disabled {
                 0x2a3038
+            } else if active_tab {
+                0x353f4c
             } else if primary {
                 if pressed { 0x8ab1cd } else { ACCENT }
             } else if pressed {
                 0x39434e
+            } else if is_tab {
+                0x1e2228
+            } else if is_tag {
+                0x262c34
             } else {
                 0x303740
             };
-            rounded(dc, r, color, if primary { color } else { 0x39424e }, s(6));
+            let border = if active_tab {
+                ACCENT
+            } else if is_tab {
+                0x2b323c
+            } else if is_tag {
+                0x38414e
+            } else if primary {
+                color
+            } else {
+                0x39424e
+            };
+            let radius = if is_tag { s(14) } else { s(6) };
+            rounded(dc, r, color, border, radius);
             let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS);
             label(
                 dc,
@@ -581,6 +862,10 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     0x9aa4b1
                 } else if primary {
                     0x18242e
+                } else if active_tab {
+                    TEXT
+                } else if is_tab || is_tag {
+                    MUTED
                 } else {
                     TEXT
                 },
@@ -634,110 +919,171 @@ pub unsafe fn paint(window: HWND) {
             TEXT,
             DT_SINGLELINE,
         );
-        let (show_settings, empty) = SKIN.with(|skin| {
+        let (tab, empty_lib, empty_explore) = SKIN.with(|skin| {
             let skin = skin.borrow();
-            (skin.settings, skin.tiles.is_empty())
+            (
+                skin.tab,
+                skin.tiles.is_empty(),
+                skin.explore_items.is_empty(),
+            )
         });
-        label(
-            dc,
-            if show_settings { "Settings" } else { "Library" },
-            pixels(layout.library_title),
-            scale(25),
-            true,
-            TEXT,
-            DT_SINGLELINE,
-        );
-        label(
-            dc,
-            if show_settings {
-                "Pause and startup preferences"
-            } else {
-                "Preview a thumbnail. Ctrl-click marks files for removal."
-            },
-            pixels(layout.library_note),
-            scale(13),
-            false,
-            MUTED,
-            DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
-        if empty && !show_settings {
-            let area = layout.library;
-            label(
-                dc,
-                "No wallpapers yet",
-                pixels(Rect {
-                    bottom: area.top + 40,
-                    ..area
-                }),
-                scale(23),
-                true,
-                TEXT,
-                DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
-            label(
-                dc,
-                "Add a media file or folder. Originals stay where they are.",
-                pixels(Rect {
-                    top: area.top + 56,
-                    bottom: area.top + 120,
-                    ..area
-                }),
-                scale(15),
-                false,
-                MUTED,
-                DT_WORDBREAK,
-            );
-            label(
-                dc,
-                "MP4  GIF  MKV  WebM  MOV  AVI",
-                pixels(Rect {
-                    top: area.top + 132,
-                    bottom: area.top + 156,
-                    ..area
-                }),
-                scale(13),
-                false,
-                MUTED,
-                DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
-        }
-        label(
-            dc,
-            "Selected wallpaper",
-            pixels(layout.preview_title),
-            scale(16),
-            true,
-            TEXT,
-            DT_SINGLELINE,
-        );
-        label(
-            dc,
-            "Display",
-            pixels(layout.display_label),
-            scale(13),
-            true,
-            MUTED,
-            DT_SINGLELINE,
-        );
-        label(
-            dc,
-            "Placement",
-            pixels(layout.fit_label),
-            scale(13),
-            true,
-            MUTED,
-            DT_SINGLELINE,
-        );
-        if show_settings {
-            label(
-                dc,
-                "Session lock and display sleep always pause playback.",
-                pixels(layout.settings_note),
-                scale(13),
-                false,
-                MUTED,
-                DT_WORDBREAK,
-            );
+        match tab {
+            Tab::Library => {
+                label(
+                    dc,
+                    "Library",
+                    pixels(layout.library_title),
+                    scale(25),
+                    true,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                label(
+                    dc,
+                    "Preview a thumbnail. Ctrl-click marks files for removal.",
+                    pixels(layout.library_note),
+                    scale(13),
+                    false,
+                    MUTED,
+                    DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+                if empty_lib {
+                    let area = layout.library;
+                    label(
+                        dc,
+                        "No wallpapers yet",
+                        pixels(Rect {
+                            bottom: area.top + 40,
+                            ..area
+                        }),
+                        scale(23),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                    label(
+                        dc,
+                        "Add a media file or folder. Originals stay where they are.",
+                        pixels(Rect {
+                            top: area.top + 56,
+                            bottom: area.top + 120,
+                            ..area
+                        }),
+                        scale(15),
+                        false,
+                        MUTED,
+                        DT_WORDBREAK,
+                    );
+                    label(
+                        dc,
+                        "MP4  GIF  MKV  WebM  MOV  AVI",
+                        pixels(Rect {
+                            top: area.top + 132,
+                            bottom: area.top + 156,
+                            ..area
+                        }),
+                        scale(13),
+                        false,
+                        MUTED,
+                        DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                }
+                label(
+                    dc,
+                    "Selected wallpaper",
+                    pixels(layout.preview_title),
+                    scale(16),
+                    true,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                label(
+                    dc,
+                    "Display",
+                    pixels(layout.display_label),
+                    scale(13),
+                    true,
+                    MUTED,
+                    DT_SINGLELINE,
+                );
+                label(
+                    dc,
+                    "Placement",
+                    pixels(layout.fit_label),
+                    scale(13),
+                    true,
+                    MUTED,
+                    DT_SINGLELINE,
+                );
+            }
+            Tab::Explore => {
+                label(
+                    dc,
+                    "Online wallpaper",
+                    pixels(layout.preview_title),
+                    scale(16),
+                    true,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                if empty_explore {
+                    let area = layout.library;
+                    label(
+                        dc,
+                        "Explore Pixabay Wallpapers",
+                        pixels(Rect {
+                            bottom: area.top + 40,
+                            ..area
+                        }),
+                        scale(23),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                    label(
+                        dc,
+                        "Search above or click quick tags to find live wallpapers.",
+                        pixels(Rect {
+                            top: area.top + 56,
+                            bottom: area.top + 120,
+                            ..area
+                        }),
+                        scale(15),
+                        false,
+                        MUTED,
+                        DT_WORDBREAK,
+                    );
+                }
+            }
+            Tab::Settings => {
+                label(
+                    dc,
+                    "Settings",
+                    pixels(layout.library_title),
+                    scale(25),
+                    true,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                label(
+                    dc,
+                    "Pause, startup and cache preferences",
+                    pixels(layout.library_note),
+                    scale(13),
+                    false,
+                    MUTED,
+                    DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+                label(
+                    dc,
+                    "Session lock and display sleep always pause playback.",
+                    pixels(layout.settings_note),
+                    scale(13),
+                    false,
+                    MUTED,
+                    DT_WORDBREAK,
+                );
+            }
         }
         let _ = EndPaint(window, &ps);
     }
@@ -756,15 +1102,22 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(
             dc,
-            rgb(if matches!(id, 113 | VERSION | MEMORY_INFO | CACHE_INFO) {
-                MUTED
-            } else {
-                TEXT
-            }),
+            rgb(
+                if matches!(id, 113 | VERSION | MEMORY_INFO | CACHE_INFO | EXPLORE_INFO) {
+                    MUTED
+                } else {
+                    TEXT
+                },
+            ),
         );
         let color = if id == 113 {
             0x20252c
-        } else if matches!(id, 107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO) {
+        } else if id == EXPLORE_SEARCH_BOX {
+            CARD
+        } else if matches!(
+            id,
+            107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO | EXPLORE_INFO
+        ) {
             CANVAS
         } else if matches!(id, 105 | 106) {
             0x303943
@@ -821,6 +1174,14 @@ mod tests {
                         assert!(!overlap(scale(*tile), scale(*other)));
                     }
                 }
+                for (i, tile) in layout.explore_tile_rects.iter().enumerate() {
+                    assert!(scale(layout.client).covers(scale(*tile)));
+                    assert!(!overlap(scale(*tile), scale(layout.pager)));
+                    assert!(!overlap(scale(*tile), scale(layout.footer)));
+                    for other in &layout.explore_tile_rects[i + 1..] {
+                        assert!(!overlap(scale(*tile), scale(*other)));
+                    }
+                }
                 for id in [PREVIEW, 112, 105, 106, FPS, AUDIO, REMOVE, 102, 103, 104] {
                     assert!(scale(layout.sidebar).covers(scale(layout.control(id).unwrap())));
                 }
@@ -852,6 +1213,18 @@ mod tests {
             assert!(
                 layout.control(CLEAR_CACHE).unwrap().top
                     > layout.control(CACHE_INFO).unwrap().bottom
+            );
+            assert!(
+                layout.control(EXPORT_LIBRARY).unwrap().top
+                    > layout.control(CACHE_INFO).unwrap().bottom
+            );
+            assert_eq!(
+                layout.control(EXPORT_LIBRARY).unwrap().top,
+                layout.control(CLEAR_CACHE).unwrap().top
+            );
+            assert!(
+                layout.control(EXPORT_LIBRARY).unwrap().left
+                    > layout.control(CLEAR_CACHE).unwrap().right
             );
             assert_eq!(
                 layout.control(VERSION).unwrap().left,
@@ -885,6 +1258,11 @@ mod tests {
             );
             assert_eq!(layout.control(TILE_BASE), Some(layout.tile_rects[0]));
             assert!(layout.control(TILE_BASE + 4).is_none());
+            assert_eq!(
+                layout.control(EXPLORE_TILE_BASE),
+                Some(layout.explore_tile_rects[0])
+            );
+            assert!(layout.control(EXPLORE_TILE_BASE + 9).is_none());
         }
     }
 }

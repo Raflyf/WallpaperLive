@@ -27,7 +27,7 @@ use windows::{
             HiDpi::*,
             Input::KeyboardAndMouse::{
                 EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, SetFocus, VK_CONTROL,
-                VK_LEFT, VK_RIGHT, VK_SPACE,
+                VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE,
             },
             Shell::*,
             WindowsAndMessaging::*,
@@ -57,12 +57,15 @@ const EXIT: usize = 110;
 const HIDE: usize = 111;
 const FILE: usize = 112;
 const STATUS: usize = 113;
-const SETTINGS: usize = 114;
 const THUMBNAIL: u32 = WM_APP + 9;
 const PREPARED: u32 = WM_APP + 10;
 const UPDATE_READY: u32 = WM_APP + 11;
 const UPDATE_RELEASE: usize = 126;
 const CONTEXT_MENU: u32 = WM_APP + 12;
+const EXPLORE_SEARCH_READY: u32 = WM_APP + 13;
+const EXPLORE_THUMB_READY: u32 = WM_APP + 14;
+const EXPLORE_DOWNLOAD_PROGRESS: u32 = WM_APP + 15;
+const EXPLORE_DOWNLOAD_DONE: u32 = WM_APP + 16;
 const CTX_SET: usize = 201;
 const CTX_EXPLORER: usize = 202;
 const CTX_COPY_PATH: usize = 203;
@@ -218,7 +221,31 @@ struct App {
     dormant: Option<Dormant>,
     resume_position: f64,
     page: usize,
-    settings_open: bool,
+    tab: visuals::Tab,
+    explore_query: String,
+    explore_page: u32,
+    explore_total_hits: u32,
+    explore_items: Vec<crate::online::OnlineVideo>,
+    explore_search_thread: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    explore_search_tx: std::sync::mpsc::Sender<Result<crate::online::SearchPage, String>>,
+    explore_search_rx: std::sync::mpsc::Receiver<Result<crate::online::SearchPage, String>>,
+    explore_thumb_thread: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    explore_thumb_tx: std::sync::mpsc::Sender<(u64, Result<Vec<u8>, String>)>,
+    explore_thumb_rx: std::sync::mpsc::Receiver<(u64, Result<Vec<u8>, String>)>,
+    explore_download_thread: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    explore_download_tx: std::sync::mpsc::Sender<Result<(PathBuf, bool), String>>,
+    explore_download_rx: std::sync::mpsc::Receiver<Result<(PathBuf, bool), String>>,
+    explore_progress_tx: std::sync::mpsc::Sender<(u64, u64)>,
+    explore_progress_rx: std::sync::mpsc::Receiver<(u64, u64)>,
     thumbnail_pending: Option<PathBuf>,
     thumbnail_thread: Option<(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -364,9 +391,88 @@ impl App {
                     ES_READONLY as u32 | ES_MULTILINE as u32 | WS_TABSTOP.0,
                 ),
                 (
-                    SETTINGS,
+                    visuals::TAB_LIBRARY,
+                    w!("BUTTON"),
+                    "Library",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAB_EXPLORE,
+                    w!("BUTTON"),
+                    "Explore Online",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAB_SETTINGS,
                     w!("BUTTON"),
                     "Settings",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::EXPLORE_SEARCH_BOX,
+                    w!("EDIT"),
+                    "cyberpunk",
+                    WS_BORDER.0 | ES_AUTOHSCROLL as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::EXPLORE_SEARCH_BTN,
+                    w!("BUTTON"),
+                    "Search",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAG_ANIME,
+                    w!("BUTTON"),
+                    "Anime",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAG_CYBERPUNK,
+                    w!("BUTTON"),
+                    "Cyberpunk",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAG_NATURE,
+                    w!("BUTTON"),
+                    "Nature",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAG_SPACE,
+                    w!("BUTTON"),
+                    "Space",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAG_CARS,
+                    w!("BUTTON"),
+                    "Cars",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAG_ABSTRACT,
+                    w!("BUTTON"),
+                    "Abstract",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::DOWNLOAD_SET,
+                    w!("BUTTON"),
+                    "Download & Set",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::DOWNLOAD_LIB,
+                    w!("BUTTON"),
+                    "Download to Library",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (visuals::EXPLORE_INFO, w!("STATIC"), "", SS_ENDELLIPSIS.0),
+                (
+                    visuals::EXPORT_LIBRARY,
+                    w!("BUTTON"),
+                    "Export Library...",
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -499,6 +605,24 @@ impl App {
                 )
                 .map_err(native_error)?;
                 self.controls.push((visuals::TILE_BASE + i, child));
+            }
+            for i in 0..9 {
+                let child = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("BUTTON"),
+                    w!("Explore video"),
+                    WS_CHILD | WINDOW_STYLE(BS_OWNERDRAW as u32) | WS_TABSTOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.hwnd,
+                    HMENU((visuals::EXPLORE_TILE_BASE + i) as *mut _),
+                    instance,
+                    None,
+                )
+                .map_err(native_error)?;
+                self.controls.push((visuals::EXPLORE_TILE_BASE + i, child));
             }
             self.text(
                 FIT,
@@ -774,11 +898,22 @@ impl App {
                     .map_err(native_error)?;
                 }
             }
+            let is_lib = self.tab == visuals::Tab::Library;
+            let is_explore = self.tab == visuals::Tab::Explore;
+            let is_settings = self.tab == visuals::Tab::Settings;
             let view = self.library_view();
+
             for i in 0..4 {
-                let visible = !self.settings_open && view.get(self.page * 4 + i).is_some();
+                let visible = is_lib && view.get(self.page * 4 + i).is_some();
                 let _ = ShowWindow(
                     self.control(visuals::TILE_BASE + i),
+                    if visible { SW_SHOWNA } else { SW_HIDE },
+                );
+            }
+            for i in 0..9 {
+                let visible = is_explore && i < self.explore_items.len();
+                let _ = ShowWindow(
+                    self.control(visuals::EXPLORE_TILE_BASE + i),
                     if visible { SW_SHOWNA } else { SW_HIDE },
                 );
             }
@@ -790,38 +925,77 @@ impl App {
                 visuals::MEMORY_INFO,
                 visuals::CACHE_INFO,
                 visuals::CLEAR_CACHE,
+                visuals::EXPORT_LIBRARY,
             ] {
                 let _ = ShowWindow(
                     self.control(id),
-                    if self.settings_open { SW_SHOW } else { SW_HIDE },
+                    if is_settings { SW_SHOW } else { SW_HIDE },
                 );
             }
-            for id in [visuals::FOLDER_FILTER, visuals::SELECT_ALL] {
-                let _ = ShowWindow(
-                    self.control(id),
-                    if self.settings_open {
-                        SW_HIDE
-                    } else {
-                        SW_SHOWNA
-                    },
-                );
+            for id in [
+                visuals::FOLDER_FILTER,
+                visuals::SELECT_ALL,
+                PICK,
+                visuals::ADD_FOLDER,
+            ] {
+                let _ = ShowWindow(self.control(id), if is_lib { SW_SHOWNA } else { SW_HIDE });
+            }
+            for id in [
+                visuals::EXPLORE_SEARCH_BOX,
+                visuals::EXPLORE_SEARCH_BTN,
+                visuals::TAG_ANIME,
+                visuals::TAG_CYBERPUNK,
+                visuals::TAG_NATURE,
+                visuals::TAG_SPACE,
+                visuals::TAG_CARS,
+                visuals::TAG_ABSTRACT,
+                visuals::DOWNLOAD_SET,
+                visuals::DOWNLOAD_LIB,
+                visuals::EXPLORE_INFO,
+            ] {
+                let _ = ShowWindow(self.control(id), if is_explore { SW_SHOW } else { SW_HIDE });
+            }
+            for id in [
+                SCREEN,
+                FIT,
+                visuals::FPS,
+                visuals::AUDIO,
+                visuals::REMOVE,
+                APPLY,
+                PAUSE,
+                STOP,
+            ] {
+                let _ = ShowWindow(self.control(id), if is_lib { SW_SHOW } else { SW_HIDE });
             }
             let _ = EnableWindow(self.control(visuals::SELECT_ALL), !view.is_empty());
-            for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
-                let _ = ShowWindow(
-                    self.control(id),
-                    if !self.settings_open && !view.is_empty() {
-                        SW_SHOW
-                    } else {
-                        SW_HIDE
-                    },
+
+            if is_lib {
+                let visible = !view.is_empty();
+                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
+                    let _ = ShowWindow(self.control(id), if visible { SW_SHOW } else { SW_HIDE });
+                }
+                let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
+                let _ = EnableWindow(
+                    self.control(visuals::NEXT),
+                    (self.page + 1) * 4 < view.len(),
                 );
+            } else if is_explore {
+                let visible = self.explore_total_hits > 0;
+                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
+                    let _ = ShowWindow(self.control(id), if visible { SW_SHOW } else { SW_HIDE });
+                }
+                let _ = EnableWindow(self.control(visuals::PREVIOUS), self.explore_page > 1);
+                let total_pages = ((self.explore_total_hits.saturating_sub(1)) / 9) + 1;
+                let _ = EnableWindow(self.control(visuals::NEXT), self.explore_page < total_pages);
+                self.text(
+                    visuals::PAGE,
+                    &format!("Page {} of {}", self.explore_page, total_pages.max(1)),
+                );
+            } else {
+                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
+                    let _ = ShowWindow(self.control(id), SW_HIDE);
+                }
             }
-            let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
-            let _ = EnableWindow(
-                self.control(visuals::NEXT),
-                (self.page + 1) * 4 < view.len(),
-            );
             for (_, control) in &self.controls {
                 let _ = InvalidateRect(*control, None, true);
             }
@@ -1020,7 +1194,7 @@ impl App {
         {
             return Vec::new();
         }
-        let mut paths: Vec<_> = if self.settings_open {
+        let mut paths: Vec<_> = if self.tab != visuals::Tab::Library {
             Vec::new()
         } else {
             self.library_view()
@@ -2121,22 +2295,66 @@ impl App {
         }
         match id {
             UPDATE_RELEASE => self.check_updates(true)?,
-            SETTINGS => {
-                self.settings_open = !self.settings_open;
-                visuals::settings(self.settings_open);
-                self.text(
-                    SETTINGS,
-                    if self.settings_open {
-                        "Library"
-                    } else {
-                        "Settings"
-                    },
-                );
-                if self.settings_open {
-                    self.refresh_diagnostics();
+            visuals::TAB_LIBRARY => self.switch_tab(visuals::Tab::Library)?,
+            visuals::TAB_EXPLORE => self.switch_tab(visuals::Tab::Explore)?,
+            visuals::TAB_SETTINGS => self.switch_tab(visuals::Tab::Settings)?,
+            visuals::EXPLORE_SEARCH_BTN => {
+                let q = window_text(self.control(visuals::EXPLORE_SEARCH_BOX));
+                self.start_explore_search(q, 1)?;
+            }
+            visuals::TAG_ANIME => {
+                self.text(visuals::EXPLORE_SEARCH_BOX, "anime");
+                self.start_explore_search("anime".into(), 1)?;
+            }
+            visuals::TAG_CYBERPUNK => {
+                self.text(visuals::EXPLORE_SEARCH_BOX, "cyberpunk");
+                self.start_explore_search("cyberpunk".into(), 1)?;
+            }
+            visuals::TAG_NATURE => {
+                self.text(visuals::EXPLORE_SEARCH_BOX, "nature");
+                self.start_explore_search("nature".into(), 1)?;
+            }
+            visuals::TAG_SPACE => {
+                self.text(visuals::EXPLORE_SEARCH_BOX, "space");
+                self.start_explore_search("space".into(), 1)?;
+            }
+            visuals::TAG_CARS => {
+                self.text(visuals::EXPLORE_SEARCH_BOX, "cars");
+                self.start_explore_search("cars".into(), 1)?;
+            }
+            visuals::TAG_ABSTRACT => {
+                self.text(visuals::EXPLORE_SEARCH_BOX, "abstract");
+                self.start_explore_search("abstract".into(), 1)?;
+            }
+            id if (visuals::EXPLORE_TILE_BASE..visuals::EXPLORE_TILE_BASE + 9).contains(&id) => {
+                let index = id - visuals::EXPLORE_TILE_BASE;
+                let double_click = self
+                    .last_tile_click
+                    .as_ref()
+                    .is_some_and(|(prev_id, time)| {
+                        *prev_id == id
+                            && time.elapsed()
+                                <= Duration::from_millis(unsafe { GetDoubleClickTime() } as u64)
+                    });
+                if double_click {
+                    self.last_tile_click = None;
+                    visuals::select_explore(index);
+                    self.update_explore_selection_info();
+                    self.start_download(true)?;
+                    return Ok(false);
                 }
-                self.request_thumbnails();
-                self.layout()?;
+                self.last_tile_click = Some((id, Instant::now()));
+                visuals::select_explore(index);
+                self.update_explore_selection_info();
+            }
+            visuals::DOWNLOAD_SET => {
+                self.start_download(true)?;
+            }
+            visuals::DOWNLOAD_LIB => {
+                self.start_download(false)?;
+            }
+            visuals::EXPORT_LIBRARY => {
+                self.export_library_dialog()?;
             }
             visuals::CLEAR_CACHE => self.clear_cache()?,
             visuals::ADD_FOLDER => self.pick_folder()?,
@@ -2184,13 +2402,30 @@ impl App {
                 }
             }
             visuals::PREVIOUS => {
-                self.page = self.page.saturating_sub(1);
-                self.refresh_library()?;
+                if self.tab == visuals::Tab::Explore {
+                    if self.explore_page > 1 {
+                        let page = self.explore_page - 1;
+                        let q = self.explore_query.clone();
+                        self.start_explore_search(q, page)?;
+                    }
+                } else {
+                    self.page = self.page.saturating_sub(1);
+                    self.refresh_library()?;
+                }
             }
             visuals::NEXT => {
-                if (self.page + 1) * 4 < self.library_view().len() {
-                    self.page += 1;
-                    self.refresh_library()?;
+                if self.tab == visuals::Tab::Explore {
+                    let total_pages = ((self.explore_total_hits.saturating_sub(1)) / 9) + 1;
+                    if self.explore_page < total_pages {
+                        let page = self.explore_page + 1;
+                        let q = self.explore_query.clone();
+                        self.start_explore_search(q, page)?;
+                    }
+                } else {
+                    if (self.page + 1) * 4 < self.library_view().len() {
+                        self.page += 1;
+                        self.refresh_library()?;
+                    }
                 }
             }
             id if (visuals::TILE_BASE..visuals::TILE_BASE + 4).contains(&id) => {
@@ -2387,9 +2622,337 @@ impl App {
         }
         Ok(false)
     }
+    fn switch_tab(&mut self, tab: visuals::Tab) -> Result<(), String> {
+        self.tab = tab;
+        visuals::set_tab(tab);
+        if tab == visuals::Tab::Settings {
+            self.refresh_diagnostics();
+        } else if tab == visuals::Tab::Explore {
+            if self.explore_items.is_empty() {
+                let q = self.explore_query.clone();
+                self.start_explore_search(q, 1)?;
+            } else {
+                self.update_explore_selection_info();
+            }
+        } else {
+            self.refresh_library()?;
+        }
+        self.request_thumbnails();
+        self.layout()?;
+        Ok(())
+    }
+    fn downloads_directory(&self) -> Result<PathBuf, String> {
+        let parent = self
+            .config
+            .parent()
+            .ok_or("Invalid configuration directory")?;
+        let dir = parent.join("downloads");
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("Could not create downloads directory: {e}"))?;
+        Ok(dir)
+    }
+    fn start_explore_search(&mut self, query: String, page: u32) -> Result<(), String> {
+        if let Some((cancelled, worker)) = self.explore_search_thread.take() {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = worker.join();
+        }
+        self.explore_query = query.clone();
+        self.explore_page = page;
+        self.explore_items.clear();
+        visuals::clear_explore_thumbnails();
+        visuals::set_explore_items(Vec::new());
+        self.update_explore_selection_info();
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let tx = self.explore_search_tx.clone();
+        let hwnd = self.hwnd.0 as usize;
+        let worker = std::thread::spawn(move || {
+            let res = crate::online::search_pixabay(&query, page, &flag);
+            let _ = tx.send(res);
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(hwnd as *mut _),
+                    EXPLORE_SEARCH_READY,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        });
+        self.explore_search_thread = Some((cancelled, worker));
+        self.text(STATUS, "Searching Pixabay for video wallpapers...");
+        self.layout()?;
+        Ok(())
+    }
+    fn on_explore_search_ready(&mut self) -> Result<(), String> {
+        if let Some((_, worker)) = self.explore_search_thread.take() {
+            let _ = worker.join();
+        }
+        while let Ok(res) = self.explore_search_rx.try_recv() {
+            match res {
+                Ok(page) => {
+                    self.explore_total_hits = page.total_hits;
+                    self.explore_items = page.items.clone();
+                    visuals::set_explore_items(page.items);
+                    self.update_explore_selection_info();
+                    self.request_explore_thumbnails();
+                    self.text(
+                        STATUS,
+                        &format!(
+                            "Found {} wallpapers on Pixabay. Page {}.",
+                            self.explore_total_hits, self.explore_page
+                        ),
+                    );
+                }
+                Err(e) => {
+                    self.set_error(e);
+                }
+            }
+        }
+        self.layout()?;
+        Ok(())
+    }
+    fn update_explore_selection_info(&mut self) {
+        if let Some(vid) = visuals::selected_explore_video() {
+            let dur = format!("{}:{:02}", vid.duration / 60, vid.duration % 60);
+            let mb = vid.size_bytes as f64 / 1048576.0;
+            let info = format!(
+                "{}x{} | {} | {:.1} MB | by {}",
+                vid.width, vid.height, dur, mb, vid.user
+            );
+            self.text(visuals::EXPLORE_INFO, &info);
+            self.text(
+                FILE,
+                if vid.tags.is_empty() {
+                    &vid.user
+                } else {
+                    &vid.tags
+                },
+            );
+        } else {
+            self.text(visuals::EXPLORE_INFO, "");
+            self.text(FILE, "No video selected");
+        }
+        unsafe {
+            let _ = InvalidateRect(self.hwnd, None, false);
+            let _ = InvalidateRect(self.control(visuals::PREVIEW), None, false);
+        }
+    }
+    fn request_explore_thumbnails(&mut self) {
+        if self.tab != visuals::Tab::Explore {
+            return;
+        }
+        if self
+            .explore_thumb_thread
+            .as_ref()
+            .is_some_and(|(_, w)| !w.is_finished())
+        {
+            return;
+        }
+        if let Some((_, w)) = self.explore_thumb_thread.take() {
+            let _ = w.join();
+        }
+        let items = self.explore_items.clone();
+        if items.is_empty() {
+            return;
+        }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let tx = self.explore_thumb_tx.clone();
+        let hwnd = self.hwnd.0 as usize;
+        let worker = std::thread::spawn(move || {
+            for item in items {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if !item.thumbnail_url.is_empty() {
+                    let res = crate::online::fetch_and_decode_thumbnail(&item.thumbnail_url, &flag);
+                    let _ = tx.send((item.id, res));
+                    unsafe {
+                        let _ = PostMessageW(
+                            HWND(hwnd as *mut _),
+                            EXPLORE_THUMB_READY,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+            }
+        });
+        self.explore_thumb_thread = Some((cancelled, worker));
+    }
+    fn on_explore_thumb_ready(&mut self) -> Result<(), String> {
+        while let Ok((id, res)) = self.explore_thumb_rx.try_recv() {
+            if let Ok(bytes) = res
+                && let Ok(bmp) = crate::thumbnail::bitmap(&bytes)
+            {
+                visuals::explore_thumbnail(id, bmp);
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(self.hwnd, None, false);
+            for i in 0..9 {
+                let _ = InvalidateRect(self.control(visuals::EXPLORE_TILE_BASE + i), None, false);
+            }
+            let _ = InvalidateRect(self.control(visuals::PREVIEW), None, false);
+        }
+        Ok(())
+    }
+    fn start_download(&mut self, set_wallpaper: bool) -> Result<(), String> {
+        if self.explore_download_thread.is_some() {
+            return Err("A download is already in progress. Please wait.".into());
+        }
+        let Some(vid) = visuals::selected_explore_video() else {
+            return Err("Please select a video from Explore first.".into());
+        };
+        let dl_dir = self.downloads_directory()?;
+        let dest = dl_dir.join(format!("pixabay_{}.mp4", vid.id));
+        if dest.is_file() {
+            self.add_media(dest.clone())?;
+            if set_wallpaper {
+                self.selected = Some(dest.clone());
+                self.recovery = None;
+                self.start_path(&dest)?;
+                self.text(STATUS, "Wallpaper is playing from Library!");
+            } else {
+                self.text(STATUS, "Wallpaper is already in your Library.");
+            }
+            return Ok(());
+        }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let tx = self.explore_download_tx.clone();
+        let p_tx = self.explore_progress_tx.clone();
+        let hwnd = self.hwnd.0 as usize;
+        let url = vid.video_url.clone();
+
+        let worker = std::thread::spawn(move || {
+            let res = crate::online::download_video_stream(&url, &dest, &p_tx, &flag)
+                .map(|p| (p, set_wallpaper));
+            let _ = tx.send(res);
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(hwnd as *mut _),
+                    EXPLORE_DOWNLOAD_DONE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        });
+        self.explore_download_thread = Some((cancelled, worker));
+        self.text(STATUS, "Starting download...");
+        Ok(())
+    }
+    fn on_explore_progress(&mut self) {
+        while let Ok((done, total)) = self.explore_progress_rx.try_recv() {
+            let done_mb = done as f64 / 1048576.0;
+            let msg = if total > 0 {
+                let total_mb = total as f64 / 1048576.0;
+                let pct = (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0);
+                format!("Downloading wallpaper: {done_mb:.1} MB of {total_mb:.1} MB ({pct:.0}%)")
+            } else {
+                format!("Downloading wallpaper: {done_mb:.1} MB")
+            };
+            self.text(STATUS, &msg);
+        }
+    }
+    fn on_explore_download_done(&mut self) -> Result<(), String> {
+        if let Some((_, worker)) = self.explore_download_thread.take() {
+            let _ = worker.join();
+        }
+        while let Ok(res) = self.explore_download_rx.try_recv() {
+            match res {
+                Ok((path, set_wallpaper)) => {
+                    self.add_media(path.clone())?;
+                    if set_wallpaper {
+                        self.selected = Some(path.clone());
+                        self.recovery = None;
+                        self.start_path(&path)?;
+                        self.text(
+                            STATUS,
+                            "Wallpaper downloaded, added to Library, and playing!",
+                        );
+                    } else {
+                        self.text(STATUS, "Wallpaper downloaded and added to Library.");
+                    }
+                }
+                Err(e) => {
+                    self.set_error(format!("Download failed: {e}"));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn export_library_dialog(&mut self) -> Result<(), String> {
+        let downloads = self.downloads_directory()?;
+        let folder = unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+                .ok()
+                .map_err(native_error)?;
+            let result = (|| -> Result<Option<PathBuf>, String> {
+                let dialog: IFileOpenDialog =
+                    CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+                        .map_err(native_error)?;
+                dialog
+                    .SetOptions(
+                        FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR,
+                    )
+                    .map_err(native_error)?;
+                dialog
+                    .SetTitle(w!("Select folder to export downloaded wallpapers"))
+                    .map_err(native_error)?;
+                if let Err(error) = dialog.Show(self.hwnd) {
+                    if error.code().0 == 0x800704c7u32 as i32 {
+                        return Ok(None);
+                    }
+                    return Err(native_error(error));
+                }
+                let item = dialog.GetResult().map_err(native_error)?;
+                let path = item
+                    .GetDisplayName(SIGDN_FILESYSPATH)
+                    .map_err(native_error)?;
+                let text = path.to_string().map_err(|e| e.to_string());
+                CoTaskMemFree(Some(path.0.cast()));
+                Ok(Some(PathBuf::from(text?)))
+            })();
+            CoUninitialize();
+            result?
+        };
+        if let Some(target) = folder {
+            let (count, bytes) = crate::online::export_library(&downloads, &target)?;
+            let mb = bytes as f64 / 1048576.0;
+            let msg = format!(
+                "Exported {count} wallpaper(s) ({mb:.1} MB) to {}",
+                target.display()
+            );
+            self.text(STATUS, &msg);
+            let wide_msg = wide(&format!(
+                "Backup complete!\n\n{count} wallpaper file(s) ({mb:.1} MB) were copied to:\n{}",
+                target.display()
+            ));
+            unsafe {
+                MessageBoxW(
+                    self.hwnd,
+                    PCWSTR(wide_msg.as_ptr()),
+                    w!("Export Wallpapers"),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+        }
+        Ok(())
+    }
 }
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some((cancelled, _)) = &self.explore_search_thread {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some((cancelled, _)) = &self.explore_thumb_thread {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some((cancelled, _)) = &self.explore_download_thread {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some((cancelled, _)) = &self.update_thread {
             cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2646,6 +3209,10 @@ pub fn run() -> Result<(), String> {
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (explore_search_tx, explore_search_rx) = std::sync::mpsc::channel();
+        let (explore_thumb_tx, explore_thumb_rx) = std::sync::mpsc::channel();
+        let (explore_download_tx, explore_download_rx) = std::sync::mpsc::channel();
+        let (explore_progress_tx, explore_progress_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd,
             controls: vec![],
@@ -2690,7 +3257,22 @@ pub fn run() -> Result<(), String> {
             dormant: None,
             resume_position: 0.0,
             page: 0,
-            settings_open: false,
+            tab: visuals::Tab::Library,
+            explore_query: "cyberpunk".into(),
+            explore_page: 1,
+            explore_total_hits: 0,
+            explore_items: Vec::new(),
+            explore_search_thread: None,
+            explore_search_tx,
+            explore_search_rx,
+            explore_thumb_thread: None,
+            explore_thumb_tx,
+            explore_thumb_rx,
+            explore_download_thread: None,
+            explore_download_tx,
+            explore_download_rx,
+            explore_progress_tx,
+            explore_progress_rx,
             thumbnail_pending: None,
             thumbnail_thread: None,
             thumbnail_failed: std::collections::HashSet::new(),
@@ -2763,21 +3345,45 @@ pub fn run() -> Result<(), String> {
             let _ = TranslateMessage(&message);
             if message.message == WM_KEYDOWN {
                 let vk = message.wParam.0 as u16;
+                let focus = GetFocus();
+                if vk == VK_RETURN.0 && focus == app.control(visuals::EXPLORE_SEARCH_BOX) {
+                    let q = window_text(focus);
+                    let _ = app.start_explore_search(q, 1);
+                    continue;
+                }
                 if vk == VK_SPACE.0 {
-                    let focus = GetFocus();
-                    if focus != app.control(STATUS) {
+                    if focus != app.control(STATUS)
+                        && focus != app.control(visuals::EXPLORE_SEARCH_BOX)
+                    {
                         app.reasons.manual = !app.reasons.manual;
                         let _ = app.tick();
                         continue;
                     }
-                } else if vk == VK_LEFT.0 {
-                    app.page = app.page.saturating_sub(1);
-                    let _ = app.refresh_library();
-                    continue;
-                } else if vk == VK_RIGHT.0 {
-                    if (app.page + 1) * 4 < app.library_view().len() {
-                        app.page += 1;
+                } else if vk == VK_LEFT.0 && focus != app.control(visuals::EXPLORE_SEARCH_BOX) {
+                    if app.tab == visuals::Tab::Explore {
+                        if app.explore_page > 1 {
+                            let page = app.explore_page - 1;
+                            let q = app.explore_query.clone();
+                            let _ = app.start_explore_search(q, page);
+                        }
+                    } else {
+                        app.page = app.page.saturating_sub(1);
                         let _ = app.refresh_library();
+                    }
+                    continue;
+                } else if vk == VK_RIGHT.0 && focus != app.control(visuals::EXPLORE_SEARCH_BOX) {
+                    if app.tab == visuals::Tab::Explore {
+                        let total_pages = ((app.explore_total_hits.saturating_sub(1)) / 9) + 1;
+                        if app.explore_page < total_pages {
+                            let page = app.explore_page + 1;
+                            let q = app.explore_query.clone();
+                            let _ = app.start_explore_search(q, page);
+                        }
+                    } else {
+                        if (app.page + 1) * 4 < app.library_view().len() {
+                            app.page += 1;
+                            let _ = app.refresh_library();
+                        }
                     }
                     continue;
                 }
@@ -2798,6 +3404,13 @@ pub fn run() -> Result<(), String> {
                         message.wParam.0 & 0xffff,
                         ((message.wParam.0 >> 16) & 0xffff) as u32,
                     ),
+                    EXPLORE_SEARCH_READY => app.on_explore_search_ready().map(|_| false),
+                    EXPLORE_THUMB_READY => app.on_explore_thumb_ready().map(|_| false),
+                    EXPLORE_DOWNLOAD_PROGRESS => {
+                        app.on_explore_progress();
+                        Ok(false)
+                    }
+                    EXPLORE_DOWNLOAD_DONE => app.on_explore_download_done().map(|_| false),
                     THUMBNAIL => {
                         app.request_thumbnails();
                         Ok(false)
@@ -3086,6 +3699,10 @@ mod tests {
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (explore_search_tx, explore_search_rx) = std::sync::mpsc::channel();
+        let (explore_thumb_tx, explore_thumb_rx) = std::sync::mpsc::channel();
+        let (explore_download_tx, explore_download_rx) = std::sync::mpsc::channel();
+        let (explore_progress_tx, explore_progress_rx) = std::sync::mpsc::channel();
         App {
             hwnd: HWND::default(),
             controls: vec![],
@@ -3130,7 +3747,22 @@ mod tests {
             dormant: None,
             resume_position: 0.0,
             page: 0,
-            settings_open: false,
+            tab: visuals::Tab::Library,
+            explore_query: "cyberpunk".into(),
+            explore_page: 1,
+            explore_total_hits: 0,
+            explore_items: Vec::new(),
+            explore_search_thread: None,
+            explore_search_tx,
+            explore_search_rx,
+            explore_thumb_thread: None,
+            explore_thumb_tx,
+            explore_thumb_rx,
+            explore_download_thread: None,
+            explore_download_tx,
+            explore_download_rx,
+            explore_progress_tx,
+            explore_progress_rx,
             thumbnail_pending: None,
             thumbnail_thread: None,
             thumbnail_failed: std::collections::HashSet::new(),
@@ -3582,6 +4214,10 @@ mod tests {
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         // No windows or decoder are created: every exercised path fails validation first.
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (explore_search_tx, explore_search_rx) = std::sync::mpsc::channel();
+        let (explore_thumb_tx, explore_thumb_rx) = std::sync::mpsc::channel();
+        let (explore_download_tx, explore_download_rx) = std::sync::mpsc::channel();
+        let (explore_progress_tx, explore_progress_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd: HWND::default(),
             controls: vec![],
@@ -3626,7 +4262,22 @@ mod tests {
             dormant: None,
             resume_position: 0.0,
             page: 0,
-            settings_open: false,
+            tab: visuals::Tab::Library,
+            explore_query: "cyberpunk".into(),
+            explore_page: 1,
+            explore_total_hits: 0,
+            explore_items: Vec::new(),
+            explore_search_thread: None,
+            explore_search_tx: explore_search_tx.clone(),
+            explore_search_rx,
+            explore_thumb_thread: None,
+            explore_thumb_tx: explore_thumb_tx.clone(),
+            explore_thumb_rx,
+            explore_download_thread: None,
+            explore_download_tx: explore_download_tx.clone(),
+            explore_download_rx,
+            explore_progress_tx: explore_progress_tx.clone(),
+            explore_progress_rx,
             thumbnail_pending: None,
             thumbnail_thread: None,
             thumbnail_failed: std::collections::HashSet::new(),
