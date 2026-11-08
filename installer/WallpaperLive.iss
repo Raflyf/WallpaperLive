@@ -136,15 +136,33 @@ begin
       if CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0 then
         RaiseException('Local mpv-dev.7z checksum differs from the pinned decoder. Nothing installed; move that file aside or supply the correct upstream archive.');
     end else begin
+      DecoderArchive := ExpandConstant('{tmp}\mpv-dev.7z');
       DownloadPage.Clear;
       DownloadPage.Add('{#DecoderURL}', 'mpv-dev.7z', '{#ArchiveSHA256}');
       DownloadPage.Show;
       try
-        DownloadPage.Download;
+        try
+          DownloadPage.Download;
+        except
+          Log('Built-in download failed: ' + GetExceptionMessage);
+        end;
       finally
         DownloadPage.Hide;
       end;
-      DecoderArchive := ExpandConstant('{tmp}\mpv-dev.7z');
+      if not FileExists(DecoderArchive) or (CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0) then begin
+        DeleteFile(DecoderArchive);
+        if FileExists(ExpandConstant('{sys}\curl.exe')) then begin
+          Exec(ExpandConstant('{sys}\curl.exe'), '-f -s -S -L -A "Mozilla/5.0" -o "' + DecoderArchive + '" "{#DecoderURL}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+        end;
+      end;
+      if not FileExists(DecoderArchive) or (CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0) then begin
+        DeleteFile(DecoderArchive);
+        Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoProfile -NonInteractive -Command "(New-Object System.Net.WebClient).Headers.Add(''User-Agent'',''Mozilla/5.0''); (New-Object System.Net.WebClient).DownloadFile(''{#DecoderURL}'',''' + DecoderArchive + ''')"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      end;
+      if not FileExists(DecoderArchive) then
+        RaiseException('Could not download decoder. Check your Internet connection and retry Setup.');
+      if CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0 then
+        RaiseException('Downloaded decoder checksum mismatch. Nothing installed.');
     end;
     DecoderDir := ExpandConstant('{tmp}\decoder');
     if not ForceDirectories(DecoderDir) then RaiseException('Could not create temporary decoder directory.');
