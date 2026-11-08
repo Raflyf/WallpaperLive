@@ -22,7 +22,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 AppMutex=Local\Raflyf.WallpaperLive
 SetupMutex=Local\Raflyf.WallpaperLive.Setup
-CloseApplications=no
+CloseApplications=yes
+CloseApplicationsFilter=*wallpaperlive.exe
 RestartApplications=no
 AlwaysRestart=no
 SetupIconFile=..\assets\wallpaperlive.ico
@@ -62,6 +63,25 @@ var
 function NeedDecoder: Boolean;
 begin
   Result := DownloadDecoder;
+end;
+
+function InitializeSetup: Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := True;
+  // Automatically terminate running wallpaperlive.exe so user does not have to exit from tray manually
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im wallpaperlive.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(250);
+end;
+
+function InitializeUninstall: Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := True;
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im wallpaperlive.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(250);
 end;
 
 procedure InitializeWizard;
@@ -104,9 +124,12 @@ var
   ExistingDecoder: String;
   DecoderDir: String;
   DecoderArchive: String;
+  ResultCode: Integer;
 begin
   Result := '';
   NeedsRestart := False;
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im wallpaperlive.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(150);
   if not LocalDecoderAvailable and not ConsentPage.Values[0] then begin
     Result := 'Decoder download consent was not granted. Nothing installed.';
     Exit;

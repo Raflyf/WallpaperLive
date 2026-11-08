@@ -14,7 +14,8 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- **Live Diagnostics in Settings:** Settings view now displays real-time memory usage (process working set and peak working set) and video cache storage usage.
+- **Installer Auto-Exit:** Setup and uninstaller automatically terminate any running WallpaperLive instance so users no longer have to manually exit from the system tray before updating or uninstalling.
+- **Live Diagnostics in Settings:** Settings view displays real-time memory usage (process working set and peak working set) and video cache storage usage.
 - **Cache Manager & Manual Cleanup:** Added a "Clear unused cache" button in Settings to purge obsolete and inactive video cache files with confirmation, protecting currently playing wallpaper files.
 - **Cache Auto-Eviction:** Video cache automatically prunes oldest unused cache files when near the 2 GiB limit before preparing new wallpapers, avoiding manual cache folder management.
 - **Thumbnail Context Menu:** Right-clicking any library thumbnail opens a native menu with "Set as wallpaper", "Open file location", "Copy file path", and "Remove from library".
@@ -23,6 +24,11 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Changed
 
+- **Low-Spec Hardware Optimizations:**
+  - Bounded x264 encoder lookahead (`rc-lookahead=10,ref=1`), cutting uncompressed frame buffer memory by ~75% during cache preparation.
+  - Switched renderer scalers to lightweight bilinear filtering (`scale=bilinear`, `cscale=bilinear`, `dscale=bilinear`), eliminating complex 3D shader load on integrated GPUs (Intel HD/UHD Graphics).
+  - Reduced demuxer cache buffer to 4 MiB (0.2s readahead) and decoder threads to 2 for entry-level dual-core/quad-thread CPUs.
+  - Automatic Working Set trimming (`SetProcessWorkingSetSize`) once playback stabilizes and when minimizing/hiding the panel to tray.
 - Updated build package and installer metadata to `0.1.5`.
 
 ---
