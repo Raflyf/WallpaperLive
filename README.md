@@ -18,7 +18,7 @@
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
 </p>
 
-WallpaperLive plays trusted local videos, GIFs and images on one display you choose, and lets you discover, preview and download free video wallpapers directly inside the app with the built-in Explore Online tab. Browse your thumbnail library, set a wallpaper and control playback from the panel or tray. Right-click thumbnails for file actions, use hotkeys (`Space`, `←`/`→`), monitor live RAM, export wallpaper backups and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
+WallpaperLive plays trusted local videos, GIFs and images on one display you choose. Browse your thumbnail library in a 3x3 grid, set a wallpaper and control playback from the panel or tray. Right-click thumbnails for file actions, use hotkeys (`Space`, `←`/`→`), monitor live RAM and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
 
 > Windows 10/11 x64. Unsigned installer. Wallpapers and the native decoder are not bundled; Setup asks before downloading a decoder if none is available locally.
 

@@ -14,17 +14,12 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- **Explore Online Tab:** Browse, search, preview, and download live video wallpapers directly inside the app without opening an external browser.
-  - Powered by the Pixabay Video API with dual-key rotation and zero third-party networking crates (100% native `WinHttp` and `windows::Data::Json`).
-  - Native Windows Imaging Component (WIC) thumbnail decoding for fast, zero-dependency JPEG previews.
-  - Quick-search genre chips (Anime, Cyberpunk, Nature, Space, Cars, Abstract, Gaming) and 3x3 video card browsing grid.
-  - Interactive video cards with duration badge, author credit, and `[ In Library ]` status badge for already downloaded wallpapers.
-  - "Download & Set" for one-click background download, library addition, and instant desktop wallpaper playback.
-  - "Download to Library" to queue downloads into the local collection without interrupting active playback.
-- **Export & Backup Wallpapers:** Added an "Export Library..." button in Settings allowing users to backup all downloaded wallpapers to any folder of their choice.
+- **3x3 Wallpaper Library Grid:** Expanded library view from 4 to 9 wallpaper cards per page with 16:9 thumbnail previews, active playback badges, and multi-selection checkboxes for easy batch management.
 
 ### Changed
 
+- **Refreshed Visual Theme:** Adopted a refined Cream, Ink Black, and Burnt Orange color palette (`#111111` canvas, `#F3EEE3` typography, and `#D9541E` accent highlights) across all controls, buttons, and status indicators.
+- **Header Navigation:** Clean segmented navigation tabs for `Library` and `Settings`.
 - Updated build package and installer metadata to `0.1.6`.
 
 ---
