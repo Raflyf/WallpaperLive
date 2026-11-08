@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/wallpaperlivesetup.exe"><strong>Download Windows installer</strong></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/wallpaperlivesetup-v0.1.4.exe"><strong>Download Windows installer</strong></a>
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
@@ -94,11 +94,15 @@ The last two captures also show 0 MB/s disk and 0 Mbps network for the selected 
 
 ## Download and install
 
-1. [Download wallpaperlivesetup.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/wallpaperlivesetup.exe) and run it as your normal Windows user.
+1. [Download wallpaperlivesetup-v0.1.4.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/wallpaperlivesetup-v0.1.4.exe) and run it as your normal Windows user.
 2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
 [Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.4/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
+
+Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.4.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
+
+Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
 Setup installs per user without administrator rights. It does not launch the app, apply a wallpaper or enable startup. These builds are unsigned: keep Windows security protections enabled. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
 

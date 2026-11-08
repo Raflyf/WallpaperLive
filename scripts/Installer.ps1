@@ -7,7 +7,9 @@ $root = Split-Path -Parent $PSScriptRoot
 if (-not $PSBoundParameters.ContainsKey('OutputDirectory')) { $OutputDirectory = Join-Path $root 'dist' }
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { throw 'OutputDirectory cannot be empty.' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
-$output = Join-Path $OutputDirectory 'wallpaperlivesetup.exe'
+$version = [regex]::Match((Get-Content -LiteralPath (Join-Path $root 'installer\WallpaperLive.iss') -Raw), '(?m)^#define AppVersion "(\d+\.\d+\.\d+)"\r?$').Groups[1].Value
+if (-not $version) { throw 'Installer AppVersion must be a numeric X.Y.Z version.' }
+$output = Join-Path $OutputDirectory "wallpaperlivesetup-v$version.exe"
 if (Test-Path -LiteralPath $output) { throw "Existing installer left untouched: $output. Choose another -OutputDirectory." }
 $exe = Join-Path $root 'target\release\wallpaperlive.exe'
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Release executable missing. Run scripts/Build.ps1 first.' }
@@ -39,15 +41,13 @@ foreach ($name in 'ISCC.exe', 'ISCmplr.dll', 'ISPP.dll', 'is7zxr-x64.dll') {
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 & $compiler --no-ide-signtools "--output-dir=$OutputDirectory" (Join-Path $root 'installer\WallpaperLive.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed (exit $LASTEXITCODE)." }
-if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'Compiler produced no wallpaperlivesetup.exe.' }
+if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "Compiler produced no installer: $output" }
 $artifact = Get-Item -LiteralPath $output
-$version = [regex]::Match((Get-Content -LiteralPath (Join-Path $root 'installer\WallpaperLive.iss') -Raw), '(?m)^#define AppVersion "(\d+\.\d+\.\d+)"\r?$').Groups[1].Value
-if (-not $version) { throw 'Installer AppVersion must be a numeric X.Y.Z version.' }
 $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($output)
-if ($info.FileVersion -ne "$version.0" -or $info.ProductVersion -ne $version) {
+if ($info.FileVersion.Trim() -ne "$version.0" -or $info.ProductVersion.Trim() -ne $version) {
     throw "Installer metadata mismatch: File=$($info.FileVersion), Product=$($info.ProductVersion), expected=$version."
 }
-Write-Output "File version: $($info.FileVersion); Product version: $($info.ProductVersion)"
+Write-Output "File version: $($info.FileVersion.Trim()); Product version: $($info.ProductVersion.Trim())"
 Write-Output "Installer: $output"
 Write-Output "Bytes: $($artifact.Length)"
 Write-Output "SHA256: $((Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash)"

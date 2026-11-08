@@ -28,6 +28,7 @@ pub const ADD_FOLDER: usize = 122;
 pub const FOLDER_FILTER: usize = 123;
 pub const FPS: usize = 124;
 pub const SELECT_ALL: usize = 125;
+pub const VERSION: usize = 127;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 
@@ -46,7 +47,7 @@ pub struct Layout {
     pub fit_label: Rect,
     pub settings_note: Rect,
     pub tile_rects: [Rect; 4],
-    controls: [(usize, Rect); 23],
+    controls: [(usize, Rect); 24],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -120,6 +121,7 @@ impl Layout {
                 (107, r(24, 224, (split - 48).min(400), 32)),
                 (108, r(24, 304, (split - 48).min(400), 32)),
                 (121, r(24, 264, (split - 48).min(400), 32)),
+                (VERSION, r(24, 360, (split - 48).min(400), 24)),
                 (FPS, r(side_x, fit.bottom + 12, side_width, 34)),
                 (SELECT_ALL, r(split - 128, 164, 104, 34)),
                 (PREVIOUS, r(pager.left, pager.top, 104, 36)),
@@ -746,10 +748,17 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
     unsafe {
         let id = GetDlgCtrlID(window) as usize;
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, rgb(if id == 113 { MUTED } else { TEXT }));
+        SetTextColor(
+            dc,
+            rgb(if matches!(id, 113 | VERSION) {
+                MUTED
+            } else {
+                TEXT
+            }),
+        );
         let color = if id == 113 {
             0x20252c
-        } else if matches!(id, 107 | 108 | 121) {
+        } else if matches!(id, 107 | 108 | 121 | VERSION) {
             CANVAS
         } else if matches!(id, 105 | 106) {
             0x303943
@@ -826,6 +835,11 @@ mod tests {
                     );
                 }
             }
+            assert!(layout.control(VERSION).unwrap().top > layout.control(108).unwrap().bottom);
+            assert_eq!(
+                layout.control(VERSION).unwrap().left,
+                layout.control(108).unwrap().left
+            );
             assert!(layout.control(106).unwrap().bottom < layout.control(FPS).unwrap().top);
             assert!(layout.control(FPS).unwrap().bottom < layout.control(AUDIO).unwrap().top);
             assert_eq!(

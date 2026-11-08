@@ -394,6 +394,12 @@ impl App {
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::VERSION,
+                    w!("STATIC"),
+                    concat!("Version ", env!("CARGO_PKG_VERSION")),
+                    SS_ENDELLIPSIS.0,
+                ),
+                (
                     EXIT,
                     w!("BUTTON"),
                     "Exit",
@@ -572,7 +578,7 @@ impl App {
                     if visible { SW_SHOWNA } else { SW_HIDE },
                 );
             }
-            for id in [BATTERY, STARTUP, 121] {
+            for id in [BATTERY, STARTUP, 121, visuals::VERSION] {
                 let _ = ShowWindow(
                     self.control(id),
                     if self.settings_open { SW_SHOW } else { SW_HIDE },
