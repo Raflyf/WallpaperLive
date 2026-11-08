@@ -48,6 +48,7 @@ pub const EXPLORE_INFO: usize = 144;
 pub const DOWNLOAD_SET: usize = 145;
 pub const DOWNLOAD_LIB: usize = 146;
 pub const EXPORT_LIBRARY: usize = 147;
+pub const EXPLORE_REFRESH_BTN: usize = 148;
 pub const EXPLORE_TILE_BASE: usize = 500;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
@@ -74,9 +75,9 @@ pub struct Layout {
     pub display_label: Rect,
     pub fit_label: Rect,
     pub settings_note: Rect,
-    pub tile_rects: [Rect; 4],
+    pub tile_rects: [Rect; 9],
     pub explore_tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 39],
+    controls: [(usize, Rect); 40],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -90,14 +91,16 @@ impl Layout {
         let footer = r(0, height - 76, width, 76);
         let pager = r(24, footer.top - 48, split - 48, 36);
         let library = r(24, 210, split - 48, pager.top - 226);
-        let tile_width = (library.right - library.left - 16) / 2;
-        let tile_height = (library.bottom - library.top - 16) / 2;
+        let tile_col_w = (library.right - library.left - 24) / 3;
+        let tile_row_h = (library.bottom - library.top - 24) / 3;
         let tile_rects = std::array::from_fn(|i| {
+            let c = (i % 3) as i32;
+            let row = (i / 3) as i32;
             r(
-                library.left + (i % 2) as i32 * (tile_width + 16),
-                library.top + (i / 2) as i32 * (tile_height + 16),
-                tile_width,
-                tile_height,
+                library.left + c * (tile_col_w + 12),
+                library.top + row * (tile_row_h + 12),
+                tile_col_w,
+                tile_row_h,
             )
         });
         let explore_grid = r(24, 168, split - 48, pager.top - 176);
@@ -153,8 +156,9 @@ impl Layout {
                 (TAB_LIBRARY, r(176, 18, 88, 36)),
                 (TAB_EXPLORE, r(272, 18, 124, 36)),
                 (TAB_SETTINGS, r(404, 18, 96, 36)),
-                (EXPLORE_SEARCH_BOX, r(24, 88, split - 150, 34)),
-                (EXPLORE_SEARCH_BTN, r(split - 118, 88, 94, 34)),
+                (EXPLORE_SEARCH_BOX, r(24, 88, split - 240, 34)),
+                (EXPLORE_SEARCH_BTN, r(split - 208, 88, 88, 34)),
+                (EXPLORE_REFRESH_BTN, r(split - 112, 88, 88, 34)),
                 (TAG_ANIME, r(24, 130, 68, 28)),
                 (TAG_CYBERPUNK, r(98, 130, 96, 28)),
                 (TAG_NATURE, r(200, 130, 72, 28)),
@@ -199,7 +203,7 @@ impl Layout {
         }
     }
     pub fn control(&self, id: usize) -> Option<Rect> {
-        if (TILE_BASE..TILE_BASE + 4).contains(&id) {
+        if (TILE_BASE..TILE_BASE + 9).contains(&id) {
             return Some(self.tile_rects[id - TILE_BASE]);
         }
         if (EXPLORE_TILE_BASE..EXPLORE_TILE_BASE + 9).contains(&id) {
@@ -209,7 +213,14 @@ impl Layout {
             return self.control(102);
         }
         if id == DOWNLOAD_LIB {
-            return self.control(103);
+            let apply = self.control(102)?;
+            let pause = self.control(103)?;
+            return Some(Rect {
+                left: apply.left,
+                top: pause.top,
+                right: apply.right,
+                bottom: pause.bottom,
+            });
         }
         if id == EXPLORE_INFO {
             let file = self.control(112)?;
@@ -227,12 +238,12 @@ impl Layout {
     }
 }
 
-pub const CANVAS: u32 = 0x181b20;
-pub const PANEL: u32 = 0x22272e;
-pub const CARD: u32 = 0x262c34;
-pub const TEXT: u32 = 0xf0f1f3;
-pub const MUTED: u32 = 0xb5bcc6;
-pub const ACCENT: u32 = 0xa6c7df;
+pub const CANVAS: u32 = 0x111111;
+pub const PANEL: u32 = 0x181818;
+pub const CARD: u32 = 0x202020;
+pub const TEXT: u32 = 0xf3eee3;
+pub const MUTED: u32 = 0xa39e93;
+pub const ACCENT: u32 = 0xd9541e;
 
 pub fn rgb(hex: u32) -> COLORREF {
     COLORREF(((hex >> 16) & 255) | (hex & 0xff00) | ((hex & 255) << 16))
@@ -547,7 +558,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 rounded(
                     dc,
                     r,
-                    if active { 0x2c3843 } else { CARD },
+                    if active { 0x3d1f14 } else { CARD },
                     if active { ACCENT } else { CARD },
                     s(6),
                 );
@@ -591,7 +602,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                         area.right - s(4),
                         area.bottom - s(4),
                     );
-                    rounded(dc, badge_rect, 0x181b20, 0x181b20, s(3));
+                    rounded(dc, badge_rect, 0x111111, 0x111111, s(3));
                     label(
                         dc,
                         &dur,
@@ -611,7 +622,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                             area.left + lib_w + s(4),
                             area.top + lib_h + s(4),
                         );
-                        rounded(dc, lib_rect, 0x1b3547, 0x3d7099, s(3));
+                        rounded(dc, lib_rect, 0x3d1f14, ACCENT, s(3));
                         label(
                             dc,
                             "In Library",
@@ -649,7 +660,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     let _ = DeleteObject(pen);
                 }
             });
-        } else if id == PREVIEW || (TILE_BASE..TILE_BASE + 4).contains(&id) {
+        } else if id == PREVIEW || (TILE_BASE..TILE_BASE + 9).contains(&id) {
             SKIN.with(|skin| {
                 let skin = skin.borrow();
                 if id == PREVIEW && skin.tab == Tab::Explore {
@@ -707,18 +718,18 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 rounded(
                     dc,
                     r,
-                    if active { 0x2c3843 } else { CARD },
+                    if active { 0x3d1f14 } else { CARD },
                     if active { ACCENT } else { CARD },
-                    s(8),
+                    s(6),
                 );
                 let mut area = rect(
-                    r.left + s(1),
-                    r.top + s(1),
-                    r.right - s(1),
+                    r.left + s(2),
+                    r.top + s(2),
+                    r.right - s(2),
                     if id == PREVIEW {
-                        r.bottom - s(1)
+                        r.bottom - s(2)
                     } else {
-                        r.bottom - s(58)
+                        r.bottom - s(26)
                     },
                 );
                 let width = (area.right - area.left).max(1);
@@ -747,43 +758,41 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                         );
                     }
                     if id != PREVIEW {
+                        let title_rect = rect(
+                            r.left + s(6),
+                            r.bottom - s(24),
+                            r.right - s(6),
+                            r.bottom - s(4),
+                        );
                         label(
                             dc,
                             &filename(path),
-                            rect(
-                                r.left + s(14),
-                                r.bottom - s(45),
-                                r.right - s(14),
-                                r.bottom - s(21),
-                            ),
-                            s(15),
+                            title_rect,
+                            s(11),
                             true,
-                            TEXT,
-                            DT_SINGLELINE | DT_END_ELLIPSIS,
+                            if active { ACCENT } else { TEXT },
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                         );
-                        label(
-                            dc,
-                            &format!(
-                                "{}  {}",
-                                extension(path),
-                                match (active, playing) {
-                                    (true, true) => "Selected · Active",
-                                    (true, false) => "Selected",
-                                    (false, true) => "Active",
-                                    (false, false) => "Local file",
-                                }
-                            ),
-                            rect(
-                                r.left + s(14),
-                                r.bottom - s(24),
-                                r.right - s(14),
-                                r.bottom - s(5),
-                            ),
-                            s(12),
-                            false,
-                            if active { ACCENT } else { MUTED },
-                            DT_SINGLELINE | DT_END_ELLIPSIS,
-                        );
+                        if playing {
+                            let badge_w = s(42);
+                            let badge_h = s(16);
+                            let badge_rect = rect(
+                                area.right - badge_w - s(4),
+                                area.bottom - badge_h - s(4),
+                                area.right - s(4),
+                                area.bottom - s(4),
+                            );
+                            rounded(dc, badge_rect, 0x3d1f14, ACCENT, s(3));
+                            label(
+                                dc,
+                                "Active",
+                                badge_rect,
+                                s(9),
+                                true,
+                                ACCENT,
+                                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                            );
+                        }
                     }
                 } else {
                     label(
@@ -800,21 +809,20 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     && let Some(path) = path
                 {
                     let checked = skin.marked.contains(path);
-                    let box_rect =
-                        rect(r.left + s(10), r.top + s(10), r.left + s(30), r.top + s(30));
+                    let box_rect = rect(r.left + s(6), r.top + s(6), r.left + s(22), r.top + s(22));
                     rounded(
                         dc,
                         box_rect,
                         if checked { ACCENT } else { CANVAS },
                         if checked { ACCENT } else { MUTED },
-                        s(4),
+                        s(3),
                     );
                     if checked {
                         let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(CANVAS));
                         let old = SelectObject(dc, pen);
-                        let _ = MoveToEx(dc, box_rect.left + s(4), box_rect.top + s(10), None);
-                        let _ = LineTo(dc, box_rect.left + s(8), box_rect.top + s(14));
-                        let _ = LineTo(dc, box_rect.left + s(16), box_rect.top + s(5));
+                        let _ = MoveToEx(dc, box_rect.left + s(3), box_rect.top + s(8), None);
+                        let _ = LineTo(dc, box_rect.left + s(6), box_rect.top + s(11));
+                        let _ = LineTo(dc, box_rect.left + s(13), box_rect.top + s(4));
                         SelectObject(dc, old);
                         let _ = DeleteObject(pen);
                     }
@@ -823,14 +831,14 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(ACCENT));
                     let old_pen = SelectObject(dc, pen);
                     let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                    let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, s(8), s(8));
+                    let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, s(6), s(6));
                     SelectObject(dc, old_brush);
                     SelectObject(dc, old_pen);
                     let _ = DeleteObject(pen);
                 }
             });
         } else {
-            let text = window_text(item.hwndItem).replace('&', "");
+            let text = window_text(item.hwndItem);
             let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
             let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
             let primary = id == 102 || id == DOWNLOAD_SET;
@@ -846,30 +854,30 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 });
 
             let color = if disabled {
-                0x2a3038
+                0x1c1c1c
             } else if active_tab {
-                0x353f4c
+                0x3a2118
             } else if primary {
-                if pressed { 0x8ab1cd } else { ACCENT }
+                if pressed { 0xb84314 } else { ACCENT }
             } else if pressed {
-                0x39434e
+                0x2c2c2c
             } else if is_tab {
-                0x1e2228
+                0x181818
             } else if is_tag {
-                0x262c34
+                0x1c1c1c
             } else {
-                0x303740
+                0x242424
             };
             let border = if active_tab {
                 ACCENT
             } else if is_tab {
-                0x2b323c
+                0x242424
             } else if is_tag {
-                0x38414e
+                0x2e2e2e
             } else if primary {
                 color
             } else {
-                0x39424e
+                0x303030
             };
             let radius = if is_tag { s(14) } else { s(6) };
             rounded(dc, r, color, border, radius);
@@ -886,11 +894,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 s(14),
                 true,
                 if disabled {
-                    0x9aa4b1
-                } else if primary {
-                    0x18242e
-                } else if active_tab {
-                    TEXT
+                    0x66635f
                 } else if is_tab || is_tag {
                     MUTED
                 } else {
@@ -899,7 +903,8 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 (if selector { DT_LEFT } else { DT_CENTER })
                     | DT_VCENTER
                     | DT_SINGLELINE
-                    | DT_END_ELLIPSIS,
+                    | DT_END_ELLIPSIS
+                    | DT_NOPREFIX,
             );
             if selector {
                 let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(MUTED));
@@ -936,7 +941,7 @@ pub unsafe fn paint(window: HWND) {
         fill(dc, pixels(layout.header), CANVAS);
         fill(dc, pixels(layout.sidebar), PANEL);
         fill(dc, pixels(layout.pager), CANVAS);
-        fill(dc, pixels(layout.footer), 0x20252c);
+        fill(dc, pixels(layout.footer), 0x161616);
         label(
             dc,
             "WallpaperLive",
@@ -1138,16 +1143,16 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
             ),
         );
         let color = if id == 113 {
-            0x20252c
+            0x161616
         } else if id == EXPLORE_SEARCH_BOX {
-            CARD
+            0x1c1c1c
         } else if matches!(
             id,
             107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO | EXPLORE_INFO
         ) {
             CANVAS
         } else if matches!(id, 105 | 106) {
-            0x303943
+            0x242424
         } else {
             PANEL
         };
@@ -1284,7 +1289,7 @@ mod tests {
                 34
             );
             assert_eq!(layout.control(TILE_BASE), Some(layout.tile_rects[0]));
-            assert!(layout.control(TILE_BASE + 4).is_none());
+            assert!(layout.control(TILE_BASE + 9).is_none());
             assert_eq!(
                 layout.control(EXPLORE_TILE_BASE),
                 Some(layout.explore_tile_rects[0])

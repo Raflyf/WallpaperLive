@@ -37,8 +37,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "tests failed: $LASTEXITCODE" }
       - name: Release application
         env:
-          PIXABAY_API_KEY_1: ${{ secrets.PIXABAY_API_KEY_1 }}
-          PIXABAY_API_KEY_2: ${{ secrets.PIXABAY_API_KEY_2 }}
+          PIXABAY_KEY_1: ${{ secrets.PIXABAY_KEY_1 || secrets.PIXABAY_API_KEY_1 }}
+          PIXABAY_KEY_2: ${{ secrets.PIXABAY_KEY_2 || secrets.PIXABAY_API_KEY_2 }}
+          PIXABAY_API_KEY_1: ${{ secrets.PIXABAY_KEY_1 || secrets.PIXABAY_API_KEY_1 }}
+          PIXABAY_API_KEY_2: ${{ secrets.PIXABAY_KEY_2 || secrets.PIXABAY_API_KEY_2 }}
         run: |
           cargo +stable build --locked --release --bin wallpaperlive
           if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }

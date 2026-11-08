@@ -421,6 +421,12 @@ impl App {
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::EXPLORE_REFRESH_BTN,
+                    w!("BUTTON"),
+                    "Refresh",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
                     visuals::TAG_ANIME,
                     w!("BUTTON"),
                     "Anime",
@@ -594,7 +600,7 @@ impl App {
                     let _ = windows::Win32::UI::Controls::SetWindowTheme(child, w!(""), w!(""));
                 }
             }
-            for i in 0..4 {
+            for i in 0..9 {
                 let child = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
                     w!("BUTTON"),
@@ -766,11 +772,11 @@ impl App {
     }
     fn context_menu(&mut self, child: HWND, coord: LPARAM) -> Result<(), String> {
         let id = unsafe { GetDlgCtrlID(child) as usize };
-        if !(visuals::TILE_BASE..visuals::TILE_BASE + 4).contains(&id) {
+        if !(visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id) {
             return Ok(());
         }
         let slot = id - visuals::TILE_BASE;
-        let index = self.page * 4 + slot;
+        let index = self.page * 9 + slot;
         let Some(path) = self.library_view().get(index).cloned() else {
             return Ok(());
         };
@@ -909,8 +915,8 @@ impl App {
             let is_settings = self.tab == visuals::Tab::Settings;
             let view = self.library_view();
 
-            for i in 0..4 {
-                let visible = is_lib && view.get(self.page * 4 + i).is_some();
+            for i in 0..9 {
+                let visible = is_lib && view.get(self.page * 9 + i).is_some();
                 let _ = ShowWindow(
                     self.control(visuals::TILE_BASE + i),
                     if visible { SW_SHOWNA } else { SW_HIDE },
@@ -949,6 +955,7 @@ impl App {
             for id in [
                 visuals::EXPLORE_SEARCH_BOX,
                 visuals::EXPLORE_SEARCH_BTN,
+                visuals::EXPLORE_REFRESH_BTN,
                 visuals::TAG_ANIME,
                 visuals::TAG_CYBERPUNK,
                 visuals::TAG_NATURE,
@@ -962,6 +969,13 @@ impl App {
             ] {
                 let _ = ShowWindow(self.control(id), if is_explore { SW_SHOW } else { SW_HIDE });
             }
+            let margin = scale(8) as usize;
+            let _ = SendMessageW(
+                self.control(visuals::EXPLORE_SEARCH_BOX),
+                0x00D3,        // EM_SETMARGINS
+                WPARAM(1 | 2), // EC_LEFTMARGIN | EC_RIGHTMARGIN
+                LPARAM((margin | (margin << 16)) as isize),
+            );
             for id in [
                 SCREEN,
                 FIT,
@@ -984,7 +998,7 @@ impl App {
                 let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
                 let _ = EnableWindow(
                     self.control(visuals::NEXT),
-                    (self.page + 1) * 4 < view.len(),
+                    (self.page + 1) * 9 < view.len(),
                 );
             } else if is_explore {
                 let visible = self.explore_total_hits > 0;
@@ -1012,10 +1026,10 @@ impl App {
     }
     fn refresh_library(&mut self) -> Result<(), String> {
         let view = self.library_view();
-        let pages = view.len().div_ceil(4).max(1);
+        let pages = view.len().div_ceil(9).max(1);
         self.page = self.page.min(pages - 1);
-        let start = self.page * 4;
-        let paths: Vec<_> = view.iter().skip(start).take(4).cloned().collect();
+        let start = self.page * 9;
+        let paths: Vec<_> = view.iter().skip(start).take(9).cloned().collect();
         self.marked.retain(|p| self.library.contains(p));
         visuals::marked(&self.marked);
         self.text(visuals::REMOVE, &format!("Remove ({})", self.marked.len()));
@@ -1187,7 +1201,7 @@ impl App {
         self.marked.clear();
         self.page = self
             .page
-            .min(self.library_view().len().div_ceil(4).max(1) - 1);
+            .min(self.library_view().len().div_ceil(9).max(1) - 1);
         if self.selected.as_ref().is_some_and(|p| selected.contains(p)) {
             self.selected = self.library_view().first().cloned();
         }
@@ -1214,8 +1228,8 @@ impl App {
         } else {
             self.library_view()
                 .into_iter()
-                .skip(self.page * 4)
-                .take(4)
+                .skip(self.page * 9)
+                .take(9)
                 .collect()
         };
         if let Some(path) = &self.selected
@@ -2420,6 +2434,11 @@ impl App {
                     self.change_fps(*fps)?;
                 }
             }
+            visuals::EXPLORE_REFRESH_BTN => {
+                let q = window_text(self.control(visuals::EXPLORE_SEARCH_BOX));
+                let page = self.explore_page;
+                self.start_explore_search(q, page)?;
+            }
             visuals::PREVIOUS => {
                 if self.tab == visuals::Tab::Explore {
                     if self.explore_page > 1 {
@@ -2441,16 +2460,16 @@ impl App {
                         self.start_explore_search(q, page)?;
                     }
                 } else {
-                    if (self.page + 1) * 4 < self.library_view().len() {
+                    if (self.page + 1) * 9 < self.library_view().len() {
                         self.page += 1;
                         self.refresh_library()?;
                     }
                 }
             }
-            id if (visuals::TILE_BASE..visuals::TILE_BASE + 4).contains(&id) => {
+            id if (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id) => {
                 if let Some(path) = self
                     .library_view()
-                    .get(self.page * 4 + id - visuals::TILE_BASE)
+                    .get(self.page * 9 + id - visuals::TILE_BASE)
                     .cloned()
                 {
                     let double_click =
@@ -3407,7 +3426,7 @@ pub fn run() -> Result<(), String> {
                             let _ = app.start_explore_search(q, page);
                         }
                     } else {
-                        if (app.page + 1) * 4 < app.library_view().len() {
+                        if (app.page + 1) * 9 < app.library_view().len() {
                             app.page += 1;
                             let _ = app.refresh_library();
                         }
