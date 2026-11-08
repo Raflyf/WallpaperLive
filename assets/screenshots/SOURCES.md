@@ -1,10 +1,29 @@
 # Screenshot sources
 
-The project author supplied these WallpaperLive v0.1.3 screenshots on 8 November 2026 and approved their use in the README. They show one Windows setup, not a benchmark or a guarantee for other media, hardware or releases.
+The project author supplied these WallpaperLive screenshots on 8 November 2026 and approved their use in the README. They show one Windows setup, not a benchmark or a guarantee for other media, hardware or releases.
 
-## Original captures
+## v0.1.5 captures
 
 Copies retain the supplied attachment bytes. SHA256 values below identify the normalized attachments used here, not an unobserved original capture file.
+
+| File | Content | SHA256 |
+| :--- | :--- | :--- |
+| [cache-preparing-v0.1.5.png](cache-preparing-v0.1.5.png) | Background cache preparation: 348.9 MB, 42.5% CPU | `1a25c7911ece87bb7f6f7dee21190cee07ee2b669f39297f3ecf1bbecd5a7c91` |
+| [cache-preparing-4k-v0.1.5.png](cache-preparing-4k-v0.1.5.png) | 4K cache preparation peak: 409.3 MB, 50.3% CPU | `bb9689818b2598c8cb69caebdf700b9621f60b3ca4cb1ea9276dd6d373534741` |
+| [cache-ready-v0.1.5.png](cache-ready-v0.1.5.png) | Cache ready, panel open: 43.1 MB, 1.3% CPU | `21f94c3077f2da806c650ac0445137376a0e6017cdb858698e978cda2fd6ec86` |
+| [desktop-playing-tray-v0.1.5.png](desktop-playing-tray-v0.1.5.png) | Live playback in tray (panel closed): 20.3 MB, 0.5% CPU | `30bb0fe548f778499f8cd5aa4236f48d6b059d65fd30bbe41040fee372d328ca` |
+| [task-manager-playing-v0.1.5.png](task-manager-playing-v0.1.5.png) | Playback snapshot: 45.4 MB, 2.6% CPU | `56291ae18f47b69e263e39445c2b2b8b1d56330a302f7d09b7e68eaef418e867` |
+| [task-manager-paused-v0.1.5.png](task-manager-paused-v0.1.5.png) | Fullscreen/maximized auto-pause: 4.5 MB, 0% CPU | `d8bc63444beddb4aae2f6f6d383207383e823b962fd6aa99721bffac9fcf65db` |
+
+## v0.1.5 README compositions
+
+Pillow composes these figures using the original captures. Segoe UI labels match the app's Windows typography; no screenshot values or app states are synthesized.
+
+- [preview-v0.1.5.png](preview-v0.1.5.png): desktop capture resized to 1600 × 900, with a separate app capture inset.
+- [cache-comparison-v0.1.5.png](cache-comparison-v0.1.5.png): complete preparation and completion captures resized side by side; annotations repeat the visible process values. Preparation groups the app and worker (348.9 MB); completion shows the app alone (43.1 MB).
+- [resource-use-v0.1.5.png](resource-use-v0.1.5.png): Task Manager headers and selected app rows cropped and arranged side by side: tray playback (20.3 MB / 0.5% CPU) and auto-pause (4.5 MB / 0% CPU).
+
+## Earlier captures (v0.1.3)
 
 | File | Content | SHA256 |
 | :--- | :--- | :--- |
@@ -13,15 +32,7 @@ Copies retain the supplied attachment bytes. SHA256 values below identify the no
 | [cache-preparing-v0.1.3.png](cache-preparing-v0.1.3.png) | Background cache preparation, app/worker group: 420.1 MB, 33.9% CPU | `7850ffe555d2e735dd49ef6cb9e5c0004b237687464ade57d62002bbc4763142` |
 | [cache-ready-v0.1.3.png](cache-ready-v0.1.3.png) | Cache ready, app: 73.4 MB, 1.8% CPU | `74872db170cbb7cfa73771a77946e5dbb5bafe671ebf2ff3a88366deee6d478d` |
 | [task-manager-playing-v0.1.3.png](task-manager-playing-v0.1.3.png) | Separate cached-playback snapshot: 40.1 MB, 2.0% CPU | `f021756b044edeca5848eb80b11667a9e8c4cd467bf232dfac375708330ed541` |
-| [task-manager-paused-v0.1.3.png](task-manager-paused-v0.1.3.png) | Fullscreen/maximized auto-pause, as described by the author: 4.1 MB, 0% CPU | `cb4a790548a284d743a73d2a8eec05d6f49c416305b2d27016ab1fd1fb22b662` |
-
-## README compositions
-
-Pillow composes these figures using the original captures. Segoe UI labels match the app's Windows typography; no screenshot values or app states are synthesized.
-
-- [preview-v0.1.3.png](preview-v0.1.3.png): desktop capture resized to 1600 × 900, with a separate resized app capture inset. WallpaperLive does not add that inset to the desktop.
-- [cache-comparison-v0.1.3.png](cache-comparison-v0.1.3.png): complete preparation/completion captures resized side by side; annotations repeat the visible process values. Preparation groups the app and worker; completion shows the app alone.
-- [resource-use-v0.1.3.png](resource-use-v0.1.3.png): Task Manager headers and selected app rows cropped and arranged side by side. Unrelated rows are omitted; displayed app values are unchanged.
+| [task-manager-paused-v0.1.3.png](task-manager-paused-v0.1.3.png) | Fullscreen/maximized auto-pause: 4.1 MB, 0% CPU | `cb4a790548a284d743a73d2a8eec05d6f49c416305b2d27016ab1fd1fb22b662` |
 
 Descriptions and source attribution are embedded in the PNG metadata. Original captures remain available above for review.
 

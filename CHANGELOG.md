@@ -34,6 +34,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
   - Uses bilinear renderer scalers (`scale=bilinear`, `cscale=bilinear`, `dscale=bilinear`). Scaling/chroma reconstruction still performs GPU work; zero GPU usage or identical output quality is not guaranteed.
   - Forward packet budget is 4 MiB with 0.2-second readahead and two software-decode threads. These are limits/settings, not guaranteed total process memory or smooth 4K software decoding on every CPU.
   - Requests a Windows working-set trim after load and when hiding the panel. This affects resident pages, not total private allocations; pages may return and page faults can increase.
+- **Updated Benchmark Showcase in README:** Updated resource usage tables and figures with real v0.1.5 author-supplied captures (reflecting ~348.9–409.3 MB temporary conversion peak, ~43.1–45.4 MB panel-open playback, 20.3 MB / 0.5% CPU tray playback, and 4.5 MB / 0% CPU auto-pause).
 - Updated build package and installer metadata to `0.1.5`.
 
 ---

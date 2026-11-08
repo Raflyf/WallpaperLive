@@ -25,15 +25,15 @@ WallpaperLive plays trusted local videos, GIFs and images on one display you cho
 ## Preview
 
 <p align="center">
-  <img src="assets/screenshots/preview-v0.1.3.png" width="1200" alt="WallpaperLive playing a video on a Windows desktop, with the native thumbnail library shown as a separate inset">
+  <img src="assets/screenshots/preview-v0.1.5.png" width="1200" alt="WallpaperLive playing a video on a Windows desktop, with the native thumbnail library shown as a separate inset">
 </p>
 
-*Real v0.1.3 screenshots supplied by the project author. The app inset is composed from a separate capture, not an overlay added by WallpaperLive. Wallpaper artwork belongs to its respective owners; no media is included in the download.*
+*Real v0.1.5 screenshots supplied by the project author on 8 November 2026. The app inset is composed from a separate capture, not an overlay added by WallpaperLive. Wallpaper artwork belongs to its respective owners; no media is included in the download.*
 
 <details>
 <summary>View the native app at full size</summary>
 
-![WallpaperLive thumbnail library, folder filter and selected-wallpaper controls](assets/screenshots/library-v0.1.3.png)
+![WallpaperLive thumbnail library, folder filter and selected-wallpaper controls](assets/screenshots/cache-ready-v0.1.5.png)
 
 Select all sits beside the folder filter, away from Previous/Next. Display, Placement, FPS and Sound controls stay with the selected wallpaper. Choosing a thumbnail changes the preview; Set wallpaper changes the active wallpaper.
 
@@ -55,42 +55,42 @@ Select all sits beside the folder filter, away from Previous/Next. Display, Plac
 
 ### Cache preparation costs more than cached playback
 
-The project author captured the same wallpaper while its cache was being built and after it finished. The app stays on the original during preparation rather than making you wait for conversion.
+The project author captured the same wallpaper while its display cache was being prepared and after it finished. The app plays the original media immediately in the foreground while conversion runs in the background.
 
 <p align="center">
-  <img src="assets/screenshots/cache-comparison-v0.1.3.png" width="1200" alt="Real cache preparation and completion screenshots: app and worker use 420.1 MB and 33.9 percent CPU while preparing; the app uses 73.4 MB and 1.8 percent CPU after the cache is ready">
+  <img src="assets/screenshots/cache-comparison-v0.1.5.png" width="1200" alt="Real v0.1.5 cache preparation and completion screenshots: app and worker use 348.9 MB and 42.5 percent CPU while preparing; the app uses 43.1 MB and 1.3 percent CPU after the cache is ready">
 </p>
 
 | State captured in Task Manager | Memory shown | CPU shown | What the row includes |
 | :--- | ---: | ---: | :--- |
-| Cache preparation in the background | 420.1 MB | 33.9% | App plus cache worker, grouped as two processes |
-| Cache ready, wallpaper playing | 73.4 MB | 1.8% | WallpaperLive app |
-| Another cached-playback snapshot | 40.1 MB | 2.0% | WallpaperLive app |
-| Fullscreen/maximized auto-pause | 4.1 MB | 0% | WallpaperLive app, paused |
+| Background cache preparation | 348.9 MB – 409.3 MB | 42.5% – 50.3% | App plus background cache worker, grouped as two processes (temporary conversion) |
+| Cache ready, panel open | 43.1 MB – 45.4 MB | 1.3% – 2.6% | WallpaperLive app with library and controls visible |
+| Minimized to tray (live playback) | 20.3 MB | 0.5% | WallpaperLive actively rendering live wallpaper on desktop with panel closed to tray |
+| Fullscreen/maximized auto-pause | 4.5 MB | 0% | WallpaperLive app, playback paused |
 
-The author also reports roughly **100–200 MB after a fresh install or initial setup**, a temporary peak around **400 MB when preparing a wallpaper**, then around **100 MB or less after the cache is ready**, settling further in the supplied captures. These ranges describe that user's experience, not a memory limit or an average from a benchmark.
+The author reports a temporary peak around **350–410 MB when preparing a wallpaper** (where two decoder/encoder processes run concurrently during initial cache generation), dropping to **~43–45 MB with the control panel open**, and settling to **20.3 MB / 0.5% CPU when minimized to the system tray**. When an application is maximized or fullscreen, auto-pause reclaims resident pages down to **4.5 MB / 0% CPU**. These ranges describe that user's experience on Windows 11, not a fixed memory ceiling or a synthetic benchmark.
 
-A v0.1.5 report observed roughly **50 MB for 1080p**, but **over 100 MB for 4K while cache encoding failed**. The `AVOption 'ref' not found` regression is corrected; failed conversion had left the original 4K video playing. No post-fix RAM figure is claimed. Conversion still decodes the original, and a 4K display retains 4K output rather than lowering resolution to meet a memory target.
-
-### Pause keeps the frame and stops animation
+### Tray playback efficiency and auto-pause
 
 <p align="center">
-  <img src="assets/screenshots/resource-use-v0.1.3.png" width="1200" alt="Additional Task Manager snapshots: cached playback shows 40.1 MB and 2.0 percent CPU; auto-paused playback shows 4.1 MB and zero percent CPU, with disk and network at zero in both captures">
+  <img src="assets/screenshots/resource-use-v0.1.5.png" width="1200" alt="Task Manager v0.1.5 snapshots: tray playback shows 20.3 MB and 0.5 percent CPU; auto-paused playback shows 4.5 MB and zero percent CPU, with disk and network at zero">
 </p>
 
 *Task Manager headers and selected rows are cropped and arranged for readability; displayed values are unchanged. These are separate moments, not a controlled before/after benchmark.*
 
-**Read the numbers in context.** These v0.1.3 snapshots were supplied on 8 November 2026. Task Manager rounds live values; displayed 0% CPU is not proof of zero work. Its Memory column is not total private allocation, all process-tree memory or dedicated VRAM. Media, codec, display resolution, driver and cache state affect usage. No fixed RAM ceiling or GPU/VRAM savings are guaranteed.
+**Read the numbers in context.** These v0.1.5 snapshots were supplied on 8 November 2026. Task Manager rounds live values; displayed 0% CPU is not proof of zero work. Its Memory column is not total private allocation, all process-tree memory or dedicated VRAM. Media, codec, display resolution, driver and cache state affect usage. No fixed RAM ceiling or GPU/VRAM savings are guaranteed.
 
 <details>
 <summary>Open the original screenshots</summary>
 
-- [Cache preparation: 420.1 MB, 33.9% CPU](assets/screenshots/cache-preparing-v0.1.3.png)
-- [Cache ready: 73.4 MB, 1.8% CPU](assets/screenshots/cache-ready-v0.1.3.png)
-- [Cached playback: 40.1 MB, 2.0% CPU](assets/screenshots/task-manager-playing-v0.1.3.png)
-- [Auto-paused: 4.1 MB, 0% CPU](assets/screenshots/task-manager-paused-v0.1.3.png)
+- [Cache preparation: 348.9 MB, 42.5% CPU](assets/screenshots/cache-preparing-v0.1.5.png)
+- [Cache preparation (4K): 409.3 MB, 50.3% CPU](assets/screenshots/cache-preparing-4k-v0.1.5.png)
+- [Cache ready, panel open: 43.1 MB, 1.3% CPU](assets/screenshots/cache-ready-v0.1.5.png)
+- [Tray playback on desktop: 20.3 MB, 0.5% CPU](assets/screenshots/desktop-playing-tray-v0.1.5.png)
+- [Panel playback snapshot: 45.4 MB, 2.6% CPU](assets/screenshots/task-manager-playing-v0.1.5.png)
+- [Auto-paused: 4.5 MB, 0% CPU](assets/screenshots/task-manager-paused-v0.1.5.png)
 
-The last two captures also show 0 MB/s disk and 0 Mbps network for the selected app row. They do not measure GPU utilization or VRAM.
+The tray capture also shows 0.5 MB/s disk and 0 Mbps network; paused shows 0 MB/s disk and 0 Mbps network. They do not measure GPU utilization or VRAM.
 
 </details>
 
