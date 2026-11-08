@@ -58,9 +58,8 @@ Filename: "{app}\wallpaperlive.exe"; Description: "{cm:LaunchProgram,WallpaperLi
 
 [Code]
 var
-  DecoderInfoPage: TOutputMsgWizardPage;
+  ConsentPage: TInputOptionWizardPage;
   DownloadPage: TDownloadWizardPage;
-  ProgressPage: TOutputMarqueeProgressWizardPage;
   DecoderPrepared: Boolean;
   DownloadDecoder: Boolean;
 
@@ -90,16 +89,16 @@ end;
 
 procedure InitializeWizard;
 begin
-  DecoderInfoPage := CreateOutputMsgPage(wpSelectDir,
+  ConsentPage := CreateInputOptionPage(wpSelectDir,
     'Native decoder download',
     'Internet access is required once to prepare playback.',
-    'Setup will download approximately 31.8 MB from GitHub (shinchiro/mpv-winbuild-cmake), verify SHA256 integrity, and install the native playback decoder.' + #13#10#13#10 +
-    'Click Next to continue and download the decoder, or Cancel to exit Setup.');
+    'Setup downloads approximately 31.8 MB from GitHub (shinchiro/mpv-winbuild-cmake), verifies SHA256, and installs the native decoder. No wallpaper, startup entry, or application is launched. Cancel Setup if you do not want this download.',
+    False, False);
+  ConsentPage.Add('I agree to download the pinned native decoder when required.');
+  ConsentPage.Values[0] := False;
   DownloadPage := CreateDownloadPage('Preparing native decoder',
     'Downloading and verifying the pinned upstream build.', nil);
   DownloadPage.ShowBaseNameInsteadOfUrl := True;
-  ProgressPage := CreateOutputMarqueeProgressPage('Preparing native decoder',
-    'Downloading and verifying the pinned playback decoder (about 31.8 MB)...');
 end;
 
 function LocalDecoderAvailable: Boolean;
@@ -110,7 +109,17 @@ end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := (PageID = DecoderInfoPage.ID) and LocalDecoderAvailable;
+  Result := (PageID = ConsentPage.ID) and LocalDecoderAvailable;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (CurPageID = ConsentPage.ID) and not LocalDecoderAvailable then
+    if not ConsentPage.Values[0] then begin
+      SuppressibleMsgBox('Decoder consent is required. Cancel Setup if you do not want this download.', mbInformation, MB_OK, IDOK);
+      Result := False;
+    end;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -124,6 +133,10 @@ begin
   NeedsRestart := False;
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im wallpaperlive.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(150);
+  if not LocalDecoderAvailable and not ConsentPage.Values[0] then begin
+    Result := 'Decoder download consent was not granted. Nothing installed.';
+    Exit;
+  end;
   try
     ExistingDecoder := ExpandConstant('{app}\runtime\libmpv-2.dll');
     if FileExists(ExistingDecoder) then begin
@@ -139,32 +152,17 @@ begin
       if CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0 then
         RaiseException('Local mpv-dev.7z checksum differs from the pinned decoder. Nothing installed; move that file aside or supply the correct upstream archive.');
     end else begin
-      DecoderArchive := ExpandConstant('{tmp}\mpv-dev.7z');
-      ProgressPage.SetText('Downloading decoder from GitHub (about 31.8 MB)...', 'Please wait, this is only downloaded once.');
-      ProgressPage.Animate;
-      ProgressPage.Show;
+      if not ConsentPage.Values[0] then
+        RaiseException('Decoder is not available locally and download consent was not granted.');
+      DownloadPage.Clear;
+      DownloadPage.Add('{#DecoderURL}', 'mpv-dev.7z', '{#ArchiveSHA256}');
+      DownloadPage.Show;
       try
-        // Use system curl with browser User-Agent directly to connect in 0.5s without 30s GitHub timeout
-        if FileExists(ExpandConstant('{sys}\curl.exe')) then begin
-          Exec(ExpandConstant('{sys}\curl.exe'), '-f -s -S -L -A "Mozilla/5.0" -o "' + DecoderArchive + '" "{#DecoderURL}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-        end;
-        if not FileExists(DecoderArchive) or (CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0) then begin
-          DeleteFile(DecoderArchive);
-          Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoProfile -NonInteractive -Command "(New-Object System.Net.WebClient).Headers.Add(''User-Agent'',''Mozilla/5.0''); (New-Object System.Net.WebClient).DownloadFile(''{#DecoderURL}'',''' + DecoderArchive + ''')"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-        end;
-        if not FileExists(DecoderArchive) or (CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0) then begin
-          DeleteFile(DecoderArchive);
-          DownloadPage.Clear;
-          DownloadPage.Add('{#DecoderURL}', 'mpv-dev.7z', '{#ArchiveSHA256}');
-          DownloadPage.Download;
-        end;
+        DownloadPage.Download;
       finally
-        ProgressPage.Hide;
+        DownloadPage.Hide;
       end;
-      if not FileExists(DecoderArchive) then
-        RaiseException('Could not download decoder. Check your Internet connection and retry Setup.');
-      if CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0 then
-        RaiseException('Downloaded decoder checksum mismatch. Nothing installed.');
+      DecoderArchive := ExpandConstant('{tmp}\mpv-dev.7z');
     end;
     DecoderDir := ExpandConstant('{tmp}\decoder');
     if not ForceDirectories(DecoderDir) then RaiseException('Could not create temporary decoder directory.');

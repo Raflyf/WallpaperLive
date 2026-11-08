@@ -97,7 +97,7 @@ The last two captures also show 0 MB/s disk and 0 Mbps network for the selected 
 ## Download and install
 
 1. [Download wallpaperlivesetup-v0.1.5.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.5/wallpaperlivesetup-v0.1.5.exe) and run it as your normal Windows user.
-2. If Setup needs a native decoder, clicking Next downloads and verifies the pinned decoder automatically. An existing installed decoder or verified local archive skips this step.
+2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
 [Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.5/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
