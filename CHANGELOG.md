@@ -25,6 +25,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Changed
 
+- **Simplified Decoder Download Step:** Removed the redundant consent checkbox. The installer displays the download notice and automatically downloads/verifies the decoder upon clicking Next, or skips the page entirely when upgrading.
 - **Low-Spec Hardware Optimizations:**
   - Bounded x264 encoder lookahead (`rc-lookahead=10,ref=1`), cutting uncompressed frame buffer memory by ~75% during cache preparation.
   - Switched renderer scalers to lightweight bilinear filtering (`scale=bilinear`, `cscale=bilinear`, `dscale=bilinear`), eliminating complex 3D shader load on integrated GPUs (Intel HD/UHD Graphics).

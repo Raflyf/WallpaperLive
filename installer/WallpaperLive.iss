@@ -58,7 +58,7 @@ Filename: "{app}\wallpaperlive.exe"; Description: "{cm:LaunchProgram,WallpaperLi
 
 [Code]
 var
-  ConsentPage: TInputOptionWizardPage;
+  DecoderInfoPage: TOutputMsgWizardPage;
   DownloadPage: TDownloadWizardPage;
   DecoderPrepared: Boolean;
   DownloadDecoder: Boolean;
@@ -89,13 +89,11 @@ end;
 
 procedure InitializeWizard;
 begin
-  ConsentPage := CreateInputOptionPage(wpSelectDir,
+  DecoderInfoPage := CreateOutputMsgPage(wpSelectDir,
     'Native decoder download',
     'Internet access is required once to prepare playback.',
-    'Setup downloads approximately 31.8 MB from GitHub (shinchiro/mpv-winbuild-cmake), verifies SHA256, and installs the native decoder. No wallpaper, startup entry, or application is launched. Cancel Setup if you do not want this download.',
-    False, False);
-  ConsentPage.Add('I agree to download the pinned native decoder when required.');
-  ConsentPage.Values[0] := False;
+    'Setup will download approximately 31.8 MB from GitHub (shinchiro/mpv-winbuild-cmake), verify SHA256 integrity, and install the native playback decoder.' + #13#10#13#10 +
+    'Click Next to continue and download the decoder, or Cancel to exit Setup.');
   DownloadPage := CreateDownloadPage('Preparing native decoder',
     'Downloading and verifying the pinned upstream build.', nil);
   DownloadPage.ShowBaseNameInsteadOfUrl := True;
@@ -109,17 +107,7 @@ end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := (PageID = ConsentPage.ID) and LocalDecoderAvailable;
-end;
-
-function NextButtonClick(CurPageID: Integer): Boolean;
-begin
-  Result := True;
-  if (CurPageID = ConsentPage.ID) and not LocalDecoderAvailable then
-    if not ConsentPage.Values[0] then begin
-      SuppressibleMsgBox('Decoder consent is required. Cancel Setup if you do not want this download.', mbInformation, MB_OK, IDOK);
-      Result := False;
-    end;
+  Result := (PageID = DecoderInfoPage.ID) and LocalDecoderAvailable;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -133,10 +121,6 @@ begin
   NeedsRestart := False;
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im wallpaperlive.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(150);
-  if not LocalDecoderAvailable and not ConsentPage.Values[0] then begin
-    Result := 'Decoder download consent was not granted. Nothing installed.';
-    Exit;
-  end;
   try
     ExistingDecoder := ExpandConstant('{app}\runtime\libmpv-2.dll');
     if FileExists(ExistingDecoder) then begin
@@ -152,8 +136,6 @@ begin
       if CompareText(GetSHA256OfFile(DecoderArchive), '{#ArchiveSHA256}') <> 0 then
         RaiseException('Local mpv-dev.7z checksum differs from the pinned decoder. Nothing installed; move that file aside or supply the correct upstream archive.');
     end else begin
-      if not ConsentPage.Values[0] then
-        RaiseException('Decoder is not available locally and download consent was not granted.');
       DownloadPage.Clear;
       DownloadPage.Add('{#DecoderURL}', 'mpv-dev.7z', '{#ArchiveSHA256}');
       DownloadPage.Show;
