@@ -1,10 +1,27 @@
 # Screenshot sources
 
-The project author supplied these WallpaperLive screenshots on 8 November 2026 and approved their use in the README. They show one Windows setup, not a benchmark or a guarantee for other media, hardware or releases.
+The project author supplied these WallpaperLive screenshots on 8–9 November 2026 and approved their use in the README. They show one Windows setup, not a benchmark or a guarantee for other media, hardware or releases.
 
-## v0.1.5 captures
+## v0.1.6 captures
 
 Copies retain the supplied attachment bytes. SHA256 values below identify the normalized attachments used here, not an unobserved original capture file.
+
+| File | Content | SHA256 |
+| :--- | :--- | :--- |
+| [cache-preparing-v0.1.6.png](cache-preparing-v0.1.6.png) | Background cache preparation: 437.5 MB, 42.4% CPU (two processes: app + cache worker) | `52c46ce0addfcfe312fb655b1239bbbab0987dd98500ca0adeda28898d012042` |
+| [cache-ready-v0.1.6.png](cache-ready-v0.1.6.png) | Cache ready, panel open: 41.4 MB, 2.5% CPU | `24154a4796db8ad4f2ef567b29ea636d70869c1d5aa1ef8a1261c2969790c2a5` |
+| [desktop-playing-tray-v0.1.6.png](desktop-playing-tray-v0.1.6.png) | Live playback on desktop: 37.8 MB, 1.5% CPU | `34ac3d66b12aaa20b738d8e3b07864bb637656ad1795bcae32068d4baa9165b3` |
+| [task-manager-playing-v0.1.6.png](task-manager-playing-v0.1.6.png) | WallpaperLive 3x3 library panel open: 47.4 MB, 1.3% CPU | `fc4b989156d002b146807d04ad58663326c6ac58b18054ebb4cb71f044093d51` |
+
+## v0.1.6 README compositions
+
+Pillow composes these figures using the original captures. Segoe UI labels match the app's Windows typography; no screenshot values or app states are synthesized.
+
+- [preview-v0.1.6.png](preview-v0.1.6.png): desktop capture resized to 1600 × 900 without synthetic overlays.
+- [cache-comparison-v0.1.6.png](cache-comparison-v0.1.6.png): complete preparation and completion captures resized side by side; annotations repeat the visible process values. Preparation groups the app and worker (437.5 MB); completion shows the app alone (41.4 MB).
+- [resource-use-v0.1.6.png](resource-use-v0.1.6.png): Task Manager headers and selected app rows cropped and arranged side by side: desktop playback (37.8 MB / 1.5% CPU) and auto-pause (4.5 MB / 0% CPU).
+
+## Earlier captures (v0.1.5)
 
 | File | Content | SHA256 |
 | :--- | :--- | :--- |
@@ -14,14 +31,6 @@ Copies retain the supplied attachment bytes. SHA256 values below identify the no
 | [desktop-playing-tray-v0.1.5.png](desktop-playing-tray-v0.1.5.png) | Live playback in tray (panel closed): 20.3 MB, 0.5% CPU | `30bb0fe548f778499f8cd5aa4236f48d6b059d65fd30bbe41040fee372d328ca` |
 | [task-manager-playing-v0.1.5.png](task-manager-playing-v0.1.5.png) | Playback snapshot: 45.4 MB, 2.6% CPU | `56291ae18f47b69e263e39445c2b2b8b1d56330a302f7d09b7e68eaef418e867` |
 | [task-manager-paused-v0.1.5.png](task-manager-paused-v0.1.5.png) | Fullscreen/maximized auto-pause: 4.5 MB, 0% CPU | `d8bc63444beddb4aae2f6f6d383207383e823b962fd6aa99721bffac9fcf65db` |
-
-## v0.1.5 README compositions
-
-Pillow composes these figures using the original captures. Segoe UI labels match the app's Windows typography; no screenshot values or app states are synthesized.
-
-- [preview-v0.1.5.png](preview-v0.1.5.png): desktop capture resized to 1600 × 900 without synthetic overlays.
-- [cache-comparison-v0.1.5.png](cache-comparison-v0.1.5.png): complete preparation and completion captures resized side by side; annotations repeat the visible process values. Preparation groups the app and worker (348.9 MB on 1080p; up to 409.3 MB when converting 4K media); completion shows the app alone (43.1 MB).
-- [resource-use-v0.1.5.png](resource-use-v0.1.5.png): Task Manager headers and selected app rows cropped and arranged side by side: tray playback (20.3 MB / 0.5% CPU) and auto-pause (4.5 MB / 0% CPU).
 
 ## Earlier captures (v0.1.3)
 

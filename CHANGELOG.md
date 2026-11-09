@@ -32,6 +32,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
 - **Header Navigation:**
   - Integrated top bar segmented control tabs for switching between `Library` and `Settings`.
   - Clean view switching with proper native window visibility management (`ShowWindow`), preventing background control bleed-through.
+- **Updated Benchmark Showcase in README:** Updated resource usage tables and figures with author-supplied v0.1.6 captures (reflecting ~437.5 MB temporary conversion peak during 4K preparation, ~41.4–47.4 MB panel-open playback, 37.8 MB / 1.5% CPU desktop live playback, and 4.5 MB / 0% CPU auto-pause).
 - Updated build package and installer metadata to `0.1.6`.
 
 ### Known limitations
