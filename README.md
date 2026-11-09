@@ -63,12 +63,12 @@ The project author captured the same wallpaper while its display cache was being
 
 | State captured in Task Manager | Memory shown | CPU shown | What the row includes |
 | :--- | ---: | ---: | :--- |
-| Background cache preparation | 348.9 MB – 409.3 MB | 42.5% – 50.3% | App plus background cache worker, grouped as two processes (temporary conversion) |
+| Background cache preparation | 348.9 MB – 409.3 MB | 42.5% – 50.3% | App plus background cache worker (temporary conversion; ~350 MB on 1080p, up to ~409 MB peak specifically when converting 4K media) |
 | Cache ready, panel open | 43.1 MB – 45.4 MB | 1.3% – 2.6% | WallpaperLive app with library and controls visible |
 | Minimized to tray (live playback) | 20.3 MB | 0.5% | WallpaperLive actively rendering live wallpaper on desktop with panel closed to tray |
 | Fullscreen/maximized auto-pause | 4.5 MB | 0% | WallpaperLive app, playback paused |
 
-The author reports a temporary peak around **350–410 MB when preparing a wallpaper** (where two decoder/encoder processes run concurrently during initial cache generation), dropping to **~43–45 MB with the control panel open**, and settling to **20.3 MB / 0.5% CPU when minimized to the system tray**. When an application is maximized or fullscreen, auto-pause reclaims resident pages down to **4.5 MB / 0% CPU**. These ranges describe that user's experience on Windows 11, not a fixed memory ceiling or a synthetic benchmark.
+The author reports a temporary peak around **350 MB for 1080p and up to ~409 MB specifically when converting high-resolution 4K wallpapers** (where two decoder/encoder processes run concurrently during initial background cache generation), dropping to **~43–45 MB with the control panel open**, and settling to **20.3 MB / 0.5% CPU when minimized to the system tray**. When an application is maximized or fullscreen, auto-pause reclaims resident pages down to **4.5 MB / 0% CPU**. These ranges describe that user's experience on Windows 11, not a fixed memory ceiling or a synthetic benchmark.
 
 ### Tray playback efficiency and auto-pause
 
@@ -78,13 +78,13 @@ The author reports a temporary peak around **350–410 MB when preparing a wallp
 
 *Task Manager headers and selected rows are cropped and arranged for readability; displayed values are unchanged. These are separate moments, not a controlled before/after benchmark.*
 
-**Read the numbers in context.** These v0.1.5 snapshots were supplied on 8 November 2026. Task Manager rounds live values; displayed 0% CPU is not proof of zero work. Its Memory column is not total private allocation, all process-tree memory or dedicated VRAM. Media, codec, display resolution, driver and cache state affect usage. No fixed RAM ceiling or GPU/VRAM savings are guaranteed.
+**Read the numbers in context.** These v0.1.5 snapshots were supplied on 8 November 2026. Initial conversion memory peaks (~350 MB for 1080p and ~409 MB for 4K) are strictly temporary while encoding the display cache; once prepared, playback uses only ~20.3 MB in tray. Task Manager rounds live values; displayed 0% CPU is not proof of zero work. Its Memory column is not total private allocation, all process-tree memory or dedicated VRAM. Media, codec, display resolution, driver and cache state affect usage. No fixed RAM ceiling or GPU/VRAM savings are guaranteed.
 
 <details>
 <summary>Open the original screenshots</summary>
 
-- [Cache preparation: 348.9 MB, 42.5% CPU](assets/screenshots/cache-preparing-v0.1.5.png)
-- [Cache preparation (4K): 409.3 MB, 50.3% CPU](assets/screenshots/cache-preparing-4k-v0.1.5.png)
+- [Cache preparation (1080p): 348.9 MB, 42.5% CPU](assets/screenshots/cache-preparing-v0.1.5.png)
+- [Cache preparation (4K wallpaper conversion): 409.3 MB, 50.3% CPU](assets/screenshots/cache-preparing-4k-v0.1.5.png)
 - [Cache ready, panel open: 43.1 MB, 1.3% CPU](assets/screenshots/cache-ready-v0.1.5.png)
 - [Tray playback on desktop: 20.3 MB, 0.5% CPU](assets/screenshots/desktop-playing-tray-v0.1.5.png)
 - [Panel playback snapshot: 45.4 MB, 2.6% CPU](assets/screenshots/task-manager-playing-v0.1.5.png)
