@@ -238,61 +238,15 @@ fn cache_bytes(directory: &Path) -> Result<u64, String> {
 pub fn cache_size(directory: &Path) -> u64 {
     cache_bytes(directory).unwrap_or(0)
 }
-pub fn auto_prune_cache(directory: &Path, active_cache: Option<&Path>) -> Result<(), String> {
-    let mut current = cache_bytes(directory)?;
-    if current <= MAX_CACHE - MAX_OUTPUT {
-        return Ok(());
-    }
-    if let Ok(entries) = fs::read_dir(directory) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Some(name) = p.file_name().and_then(|s| s.to_str())
-                && name.starts_with("partial-")
-                && let Ok(meta) = p.metadata()
-            {
-                let len = meta.len();
-                if fs::remove_file(&p).is_ok() {
-                    current = current.saturating_sub(len);
-                }
-            }
-        }
-    }
-    if current <= MAX_CACHE - MAX_OUTPUT {
-        return Ok(());
-    }
-    let mut files: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
-    if let Ok(entries) = fs::read_dir(directory) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if active_cache.is_some_and(|active| active == p) {
-                continue;
-            }
-            if let Some(name) = p.file_name().and_then(|s| s.to_str())
-                && name.starts_with("wl-v2-")
-                && name.ends_with(".mp4")
-                && let Ok(meta) = p.metadata()
-            {
-                let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-                files.push((p, mtime, meta.len()));
-            }
-        }
-    }
-    files.sort_by_key(|(_, mtime, _)| *mtime);
-    for (path, _, size) in files {
-        if current <= MAX_CACHE - MAX_OUTPUT {
-            break;
-        }
-        if fs::remove_file(&path).is_ok() {
-            current = current.saturating_sub(size);
-        }
-    }
-    Ok(())
-}
 pub fn clear_unused_cache(directory: &Path, preserve: &[PathBuf]) -> Result<(usize, u64), String> {
     validate_path_syntax(directory)?;
     if !directory.is_dir() {
         return Ok((0, 0));
     }
+    let protected: Vec<_> = preserve
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
     let mut count = 0;
     let mut freed = 0;
     for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
@@ -303,7 +257,21 @@ pub fn clear_unused_cache(directory: &Path, preserve: &[PathBuf]) -> Result<(usi
             if (name.starts_with("wl-v2-") && name.ends_with(".mp4"))
                 || name.starts_with("partial-")
             {
-                if preserve.iter().any(|p| p == &path) {
+                let actual = path
+                    .canonicalize()
+                    .map_err(|e| format!("Cache path could not be verified: {e}"))?;
+                if preserve.iter().any(|p| p == &path)
+                    || protected.iter().any(|p| {
+                        p.as_os_str()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&actual.as_os_str().to_string_lossy())
+                    })
+                {
+                    continue;
+                }
+                let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+                use std::os::windows::fs::MetadataExt;
+                if !meta.is_file() || meta.file_attributes() & 0x400 != 0 {
                     continue;
                 }
                 if let Ok(meta) = entry.metadata() {
@@ -404,7 +372,6 @@ pub fn prepare_local(
         prepared.note = "Screen-sized cache".into();
         return Ok(prepared);
     }
-    let _ = auto_prune_cache(directory, None);
     if cache_bytes(directory)? > MAX_CACHE - MAX_OUTPUT {
         return Err(
             "Video cache is full (2 GiB limit); move unused cache files aside before retrying"
@@ -601,7 +568,7 @@ mod tests {
                 &directory,
                 (320, 180),
                 30,
-                &AtomicBool::new(true)
+                &AtomicBool::new(true),
             )
             .is_err()
         );
@@ -641,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_clear_and_auto_prune() {
+    fn cache_clear_preserves_imported_files() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("scratch")
             .join(format!(
@@ -662,7 +629,8 @@ mod tests {
         fs::write(&partial, vec![0u8; 500]).unwrap();
         fs::write(&other, vec![0u8; 300]).unwrap();
         assert_eq!(cache_size(&dir), 3800);
-        let (count, freed) = clear_unused_cache(&dir, std::slice::from_ref(&file2)).unwrap();
+        let protected = PathBuf::from(file2.to_string_lossy().to_lowercase());
+        let (count, freed) = clear_unused_cache(&dir, std::slice::from_ref(&protected)).unwrap();
         assert_eq!(count, 2);
         assert_eq!(freed, 1500);
         assert!(!file1.exists());

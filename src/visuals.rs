@@ -34,6 +34,10 @@ pub const CLEAR_CACHE: usize = 129;
 pub const MEMORY_INFO: usize = 130;
 pub const TAB_LIBRARY: usize = 114;
 pub const TAB_SETTINGS: usize = 132;
+pub const SEARCH: usize = 133;
+pub const SORT: usize = 134;
+pub const FIND_WALLPAPERS: usize = 135;
+pub const PRODUCT_WEBSITE: usize = 136;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 
@@ -59,7 +63,7 @@ pub struct Layout {
     pub fit_label: Rect,
     pub settings_note: Rect,
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 28],
+    controls: [(usize, Rect); 32],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -72,7 +76,7 @@ impl Layout {
         let split = width - 344;
         let footer = r(0, height - 76, width, 76);
         let pager = r(24, footer.top - 48, split - 48, 36);
-        let library = r(24, 210, split - 48, pager.top - 226);
+        let library = r(24, 252, split - 48, pager.top - 268);
         let tile_col_w = (library.right - library.left - 24) / 3;
         let tile_row_h = (library.bottom - library.top - 24) / 3;
         let tile_rects = std::array::from_fn(|i| {
@@ -111,7 +115,7 @@ impl Layout {
             pager,
             sidebar: r(split, 72, width - split, footer.top - 72),
             title: r(24, 18, 140, 36),
-            library_title: r(24, 92, split - 48, 32),
+            library_title: r(24, 92, split - 264, 32),
             library_note: r(24, 132, split - 48, 24),
             preview_title: r(side_x, 88, side_width, 24),
             display_label,
@@ -123,7 +127,11 @@ impl Layout {
                 (ADD_FOLDER, r(width - 146, 18, 122, 36)),
                 (TAB_LIBRARY, r(176, 18, 96, 36)),
                 (TAB_SETTINGS, r(280, 18, 96, 36)),
-                (FOLDER_FILTER, r(24, 164, split - 164, 34)),
+                (SEARCH, r(24, 164, split - 336, 34)),
+                (SORT, r(split - 300, 164, 160, 34)),
+                (FOLDER_FILTER, r(24, 206, split - 48, 34)),
+                (FIND_WALLPAPERS, r(split - 228, 92, 204, 34)),
+                (PRODUCT_WEBSITE, r(24, 478, 168, 34)),
                 (PREVIEW, preview),
                 (112, file),
                 (105, display),
@@ -198,17 +206,24 @@ impl Drop for Bitmap {
 struct Skin {
     selected: Option<PathBuf>,
     marked: Vec<PathBuf>,
-    playing: Option<PathBuf>,
+    playing: Vec<PathBuf>,
+    library_empty: bool,
     tiles: HashMap<usize, PathBuf>,
     thumbnails: HashMap<PathBuf, Bitmap>,
     tab: Tab,
 }
-thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:None,tiles:HashMap::new(),thumbnails:HashMap::new(),tab:Tab::Library});}
+thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:Vec::new(),library_empty:true,tiles:HashMap::new(),thumbnails:HashMap::new(),tab:Tab::Library});}
+pub fn library_empty(value: bool) {
+    SKIN.with(|s| s.borrow_mut().library_empty = value);
+}
 pub fn marked(paths: &[PathBuf]) {
     SKIN.with(|skin| skin.borrow_mut().marked = paths.to_vec());
 }
 pub fn playing(path: Option<PathBuf>) {
-    SKIN.with(|s| s.borrow_mut().playing = path);
+    SKIN.with(|s| s.borrow_mut().playing = path.into_iter().collect());
+}
+pub fn playing_all(paths: &[PathBuf]) {
+    SKIN.with(|s| s.borrow_mut().playing = paths.to_vec());
 }
 pub fn selected(path: Option<PathBuf>) {
     SKIN.with(|s| s.borrow_mut().selected = path);
@@ -271,7 +286,8 @@ pub fn clear() {
         skin.tiles.clear();
         skin.selected = None;
         skin.marked.clear();
-        skin.playing = None;
+        skin.playing.clear();
+        skin.library_empty = true;
     });
     BRUSHES.with(|b| {
         for (_, brush) in b.borrow_mut().drain() {
@@ -436,7 +452,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     skin.tiles.get(&id)
                 };
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
-                let playing = path.is_some() && path == skin.playing.as_ref();
+                let playing = path.is_some_and(|path| skin.playing.contains(path));
                 rounded(dc, r, CARD, if active { ACCENT } else { 0x2c2c2c }, s(6));
                 let mut area = rect(
                     r.left + s(2),
@@ -590,7 +606,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 0x303030
             };
             rounded(dc, r, color, border, s(6));
-            let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS);
+            let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
             label(
                 dc,
                 &text,
@@ -655,9 +671,9 @@ pub unsafe fn paint(window: HWND) {
             TEXT,
             DT_SINGLELINE,
         );
-        let (tab, empty_lib) = SKIN.with(|skin| {
+        let (tab, empty_view, empty_library) = SKIN.with(|skin| {
             let skin = skin.borrow();
-            (skin.tab, skin.tiles.is_empty())
+            (skin.tab, skin.tiles.is_empty(), skin.library_empty)
         });
         match tab {
             Tab::Library => {
@@ -672,18 +688,22 @@ pub unsafe fn paint(window: HWND) {
                 );
                 label(
                     dc,
-                    "Preview a thumbnail. Ctrl-click marks files for removal.",
+                    "Bring your own live wallpapers.",
                     pixels(layout.library_note),
                     scale(13),
                     false,
                     MUTED,
                     DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
-                if empty_lib {
+                if empty_view {
                     let area = layout.library;
                     label(
                         dc,
-                        "No wallpapers yet",
+                        if empty_library {
+                            "No wallpapers yet"
+                        } else {
+                            "No matching wallpapers"
+                        },
                         pixels(Rect {
                             bottom: area.top + 40,
                             ..area
@@ -695,7 +715,11 @@ pub unsafe fn paint(window: HWND) {
                     );
                     label(
                         dc,
-                        "Add a media file or folder. Originals stay where they are.",
+                        if empty_library {
+                            "Add a media file or folder. Originals stay where they are."
+                        } else {
+                            "Clear the search or choose All folders to see your library."
+                        },
                         pixels(Rect {
                             top: area.top + 56,
                             bottom: area.top + 120,
@@ -708,7 +732,11 @@ pub unsafe fn paint(window: HWND) {
                     );
                     label(
                         dc,
-                        "MP4  GIF  MKV  WebM  MOV  AVI",
+                        if empty_library {
+                            "MP4  GIF  MKV  WebM  MOV  AVI"
+                        } else {
+                            "Your files remain in the library."
+                        },
                         pixels(Rect {
                             top: area.top + 132,
                             bottom: area.top + 156,
@@ -805,7 +833,7 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
             0x161616
         } else if matches!(id, 107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO) {
             CANVAS
-        } else if matches!(id, 105 | 106) {
+        } else if matches!(id, 105 | 106 | SEARCH) {
             0x242424
         } else {
             PANEL
@@ -853,6 +881,7 @@ mod tests {
                     );
                 }
                 for (i, tile) in layout.tile_rects.iter().enumerate() {
+                    assert!(tile.right - tile.left >= 168 && tile.bottom - tile.top >= 74);
                     assert!(scale(layout.library).covers(scale(*tile)));
                     assert!(!overlap(scale(*tile), scale(layout.pager)));
                     assert!(!overlap(scale(*tile), scale(layout.footer)));
@@ -867,13 +896,34 @@ mod tests {
                     assert!(scale(layout.pager).covers(scale(layout.control(id).unwrap())));
                 }
                 let selection = layout.control(SELECT_ALL).unwrap();
-                assert_eq!(selection.top, layout.control(FOLDER_FILTER).unwrap().top);
-                assert!(selection.bottom < layout.library.top);
+                assert_eq!(selection.top, layout.control(SEARCH).unwrap().top);
+                assert_eq!(selection.top, layout.control(SORT).unwrap().top);
+                let folder = layout.control(FOLDER_FILTER).unwrap();
+                assert!(selection.bottom < folder.top);
+                assert!(folder.bottom < layout.library.top);
+                assert!(layout.control(SEARCH).unwrap().right < layout.control(SORT).unwrap().left);
+                assert!(layout.control(SORT).unwrap().right < selection.left);
                 assert!(!overlap(scale(selection), scale(layout.pager)));
+                assert!(layout.control(FIND_WALLPAPERS).unwrap().left > layout.library_title.right);
+                assert!(
+                    layout.control(PRODUCT_WEBSITE).unwrap().top
+                        > layout.control(CLEAR_CACHE).unwrap().bottom
+                );
+                assert!(layout.control(PRODUCT_WEBSITE).unwrap().bottom <= layout.pager.top);
                 assert_eq!(layout.control(PREVIOUS).unwrap().left, layout.pager.left);
             }
+            let tab_only = |id| match id {
+                SEARCH | SORT | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS => Some(Tab::Library),
+                107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO | CLEAR_CACHE
+                | PRODUCT_WEBSITE => Some(Tab::Settings),
+                _ => None,
+            };
             for (i, (id, area)) in layout.controls.iter().enumerate() {
-                for (_, other) in &layout.controls[i + 1..] {
+                for (other_id, other) in &layout.controls[i + 1..] {
+                    if matches!((tab_only(*id), tab_only(*other_id)), (Some(a), Some(b)) if a != b)
+                    {
+                        continue;
+                    }
                     assert!(
                         !overlap(*area, *other),
                         "control {id} overlaps {other:?} at {width}x{height}"

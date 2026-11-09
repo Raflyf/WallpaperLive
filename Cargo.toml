@@ -1,10 +1,10 @@
 [package]
 name = "wallpaperlive"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 autoexamples = false
 license = "GPL-3.0-or-later"
-description = "Native Windows live wallpaper with essential controls"
+description = "Bring your own live wallpapers: apply local videos, GIFs and images to your Windows desktop"
 
 [[bin]]
 name = "native-smoke"

@@ -3,24 +3,34 @@
 </p>
 
 <h1 align="center">WallpaperLive</h1>
-<p align="center"><strong>Your videos. Your desktop.</strong><br>Live wallpapers with a native Windows app, local files and a background display cache.</p>
+<p align="center"><strong>Bring your own live wallpapers.</strong><br>A native Windows app for applying your local videos, GIFs and images as desktop wallpapers.</p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.7"><img src="https://img.shields.io/badge/release-v0.1.7-586575" alt="Release v0.1.7"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.8"><img src="https://img.shields.io/badge/release-v0.1.8-586575" alt="Release v0.1.8"></a>
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.7/wallpaperlivesetup-v0.1.7.exe"><strong>Download Windows installer</strong></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.8/wallpaperlivesetup-v0.1.8.exe"><strong>Download Windows installer</strong></a>
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
 </p>
 
-WallpaperLive plays trusted local videos, GIFs and images on one display you choose. Browse your thumbnail library in a 3x3 grid, set a wallpaper and control playback from the panel or tray. Right-click thumbnails for file actions, use hotkeys (`Space`, `←`/`→`), monitor live RAM and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
+WallpaperLive plays trusted local videos, GIFs and images on multiple displays. Apply the same wallpaper to All displays, or set a different file on each display without stopping the others. Search your thumbnail library in a 3x3 grid and control playback from the panel or tray. Right-click thumbnails for file actions or Retry thumbnail, use hotkeys (`Space`, `←`/`→`), monitor live RAM and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
 
 > Windows 10/11 x64. Unsigned installer. Wallpapers and the native decoder are not bundled; Setup asks before downloading a decoder if none is available locally.
+
+## Bring your own live wallpapers
+
+WallpaperLive is a player and desktop wallpaper controller, not a place to download live wallpapers. It does not host wallpaper files or offer an online gallery, catalog, marketplace or built-in wallpaper downloader. The **Library** contains only the local files and folders you import; it is not a collection supplied by this project.
+
+Create your own videos, GIFs or images, or obtain compatible files separately from creators or sources you trust. Save them on your PC, use **Add wallpaper** or **Add folder**, then choose a display or **All displays** and select **Set wallpaper**. WallpaperLive handles playback, placement, FPS limits and auto-pause. It does not create or supply the artwork.
+
+The main Library's **Where to find wallpapers** menu opens [MyLiveWallpapers](<https://mylivewallpapers.com>), [MoeWalls](<https://moewalls.com>), [MotionBgs](<https://motionbgs.com>) or [DesktopHut](<https://www.desktophut.com>) in your browser. These are third-party browsing shortcuts, not a built-in downloader or an endorsement of their content or safety. Obtain compatible media separately, check its license, then import only files you trust. Settings also links to [LiveBar](<https://livebar.vercel.app>), a separate product.
+
+Use media you have permission to use and respect each creator's license. Wallpapers visible in screenshots demonstrate the app; they are not bundled, hosted or offered for download by WallpaperLive. Links labeled **Download Windows installer** download the application, not wallpaper media. Any optional decoder download during Setup installs libmpv to play your files; it does not fetch a wallpaper.
 
 ## Preview
 
@@ -41,12 +51,14 @@ Select all sits beside the folder filter, away from Previous/Next. Display, Plac
 
 ## Features
 
-- Import individual files or folders with subfolders. Keep up to 4096 library entries, filter by folder and browse nine thumbnails per page. Original files stay where they are.
+- Import individual files or folders with subfolders. Keep up to 4096 library entries, search filenames without case sensitivity within the folder filter and browse nine thumbnails per page. Sort by newest imported, A-Z or Z-A. Original files stay where they are.
+- Set the same wallpaper on All displays or choose a file for one display without stopping the others. Each display keeps its own assignment.
+- Open Where to find wallpapers directly from the Library for third-party browsing links. Right-click a failed preview and choose Retry thumbnail.
 - Start the original video immediately. Oversized SDR videos get a display-sized cache in the background; playback switches to the finished copy near the current position.
-- Choose 24, 30, 45 or 60 FPS below Placement. Changes use the running player without a file reload or another cache conversion. This is a cap, not frame interpolation.
+- Choose 24, 30, 45 or 60 FPS below Placement. Changes use the running players without a file reload or another cache conversion. This is a cap, not frame interpolation.
 - Use Fill to crop or Fit to show the full frame. Prefer a detected dedicated GPU for compatible D3D11 rendering and hardware decoding, with fallback when needed.
-- Loop with sound off by default. Toggle Sound, pause, resume or stop from the app or tray.
-- Auto-pause for fullscreen/maximized apps on the wallpaper display, battery power, session lock, display sleep and system suspend. Keep the last frame and decoder attached for resume without reloading.
+- Loop with sound off by default. Toggle Sound for at most one wallpaper stream. Manual Pause/Resume and Stop affect all displays from the app or tray.
+- Auto-pause independently for fullscreen/maximized apps on each wallpaper display. Battery power, session lock, display sleep and system suspend also pause playback. Keep the last frame and decoder attached for resume without reloading.
 - Select all within the current filter or Ctrl-click individual files. Remove confirms the count and removes library entries, never original media.
 - Keep playback in the tray after closing the panel. The tray follows the Windows dark/light theme; high-contrast mode uses the native system menu. Start with Windows remains opt-in.
 - Check for updates from the tray. A background check shows a native English result dialog; a newer release page opens only after confirmation. No automatic download or installation.
@@ -97,13 +109,13 @@ The desktop capture also shows 0 MB/s disk and 0 Mbps network; paused shows 0 MB
 
 ## Download and install
 
-1. [Download wallpaperlivesetup-v0.1.7.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.7/wallpaperlivesetup-v0.1.7.exe) and run it as your normal Windows user.
+1. [Download wallpaperlivesetup-v0.1.8.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.8/wallpaperlivesetup-v0.1.8.exe) and run it as your normal Windows user.
 2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.7/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.8/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
 
-Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.7.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
+Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.8.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
@@ -120,7 +132,11 @@ The decoder remains a separate download. Its complete dependency-source record h
 
 ## Playback notes
 
-Selecting a thumbnail changes the preview, not active playback. Use Set wallpaper to apply it. Sound: On/Off selects or disables the media's audio track; files without audio stay silent. Stop removes the live wallpaper without changing your Windows static wallpaper settings. Exit closes the app; closing the panel keeps it in the tray when the tray is available.
+Selecting a thumbnail changes the preview, not active playback. Choose a display and use Set wallpaper to replace only that display's assignment, or choose All displays to apply the same file everywhere. Sound: On/Off selects or disables one wallpaper's audio track; only one stream plays audio at a time, and files without audio stay silent. Manual Pause/Resume affects all displays. Stop removes all live wallpapers without changing your Windows static wallpaper settings. Exit closes the app; closing the panel keeps it in the tray when the tray is available.
+
+Upgrading from settings versions 1-3 keeps the previous wallpaper assigned to the same saved monitor, or to the primary display when no monitor name was saved. Migration does not expand playback to All displays. Settings version 4 stores per-monitor assignments; existing media, preferences and cache directories stay in place.
+
+Each active display has an independent decoder. More displays can increase memory and GPU use, even when they show the same file. Frame-perfect synchronization between displays is not guaranteed. Cache preparation is serialized through one worker across all displays; the historical single-display resource captures above do not establish multi-display usage.
 
 The picker accepts `MP4`, `GIF`, `MKV`, `WebM`, `MOV`, `AVI`, `MPG`, `MPEG`, `M4V`, `APNG`, `PNG`, `JPG`, `JPEG`, `BMP` and `WebP`. Codec support still depends on libmpv and your GPU. HDR and animated-image inputs use their original media rather than the SDR cache.
 
@@ -129,7 +145,7 @@ The picker accepts `MP4`, `GIF`, `MKV`, `WebM`, `MOV`, `AVI`, `MPG`, `MPEG`, `M4
 
 - Cache conversion uses the installed libmpv encoder. It preserves originals, audio, aspect ratio and playback speed; smaller sources are not upscaled. H.264/AAC MP4 copies are keyed by source SHA256, display dimensions and a source-rate profile capped at 60 FPS, independent of the runtime cap.
 - Runtime FPS changes use a pure frame-rate filter, without interpolation or playback-speed changes. CFR resampling can repeat frames around irregular timestamps; decoding still processes the cached source rate. One isolated native v0.1.3 test measured scheduled rates of 59.6 / 24.2 / 60.2 FPS for 60 / 24 / 60 choices, not physical display scanout.
-- Conversion accepts finite video up to one hour/16 GiB, uses one below-normal-priority worker and stops at 15 minutes or 512 MiB per output. Cache budget is 2 GiB; unused generated copies may be evicted near that budget. Original media is never removed. Cancelled partials are never played. Cache lives in `%LOCALAPPDATA%\WallpaperLive\video-cache`.
+- Conversion accepts finite video up to one hour/16 GiB, uses one below-normal-priority worker and stops at 15 minutes or 512 MiB per output. Cache budget is 2 GiB; if another copy cannot fit within the budget, conversion is refused and original playback continues. No files are evicted automatically. Clear unused cache requires confirmation and protects imported library media, all active originals and active or waiting cache outputs. Original media is never removed. Cancelled partials are never played. Cache lives in `%LOCALAPPDATA%\WallpaperLive\video-cache`.
 - Pause stops animation/audio, releases thumbnails and cancels/defer conversion. Windows receives a resident-page trim request on confirmed pause, load completion and hiding the panel; this can reclaim resident pages without releasing private decoder allocations or dedicated VRAM. Pages can become resident again and page faults can increase. An unfinished conversion restarts in the background after resume. A completed cache waits at least two seconds after resume before a separate handoff near the current media position.
 - Only nine visible thumbnails plus the selection are retained, each at most 480 × 270 pixels. Hidden, minimized or paused panels drop those buffers. Packet settings are 4 MiB forward, no backward cache and 0.2 seconds readahead, with two software-decode threads. These are not a total RAM cap.
 - The encoder uses x264 `veryfast`, CRF 23, two threads, lookahead 10 and one reference frame (`refs=1`). Reference/lookahead values already match `veryfast`; an additional 75% memory saving was not measured. CRF encoding is lossy, not a guarantee of identical pixels.
@@ -172,9 +188,9 @@ For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a re
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 ```
 
-Setup File version is `0.1.7.0`; Product version is `0.1.7`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
+Setup File version is `0.1.8.0`; Product version is `0.1.8`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
 
-The app and Start-menu shortcut use the same stable taskbar identity, `Raflyf.WallpaperLive`. Large and small icons are registered before the panel window is created. This same-version taskbar fix is built and tested on GitHub Actions; download the replacement installer manually. CI does not prove how an existing Windows taskbar renders it.
+The app and Start-menu shortcut use the same stable taskbar identity, `Raflyf.WallpaperLive`. Large and small icons are registered before the panel window is created; the executable also embeds the product ICO for the Windows shell. CI does not prove how an existing Windows taskbar renders it.
 
 </details>
 

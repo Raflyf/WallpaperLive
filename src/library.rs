@@ -9,6 +9,25 @@ use windows::{Win32::Storage::FileSystem::GetDriveTypeW, core::PCWSTR};
 
 pub const MAX_FILES: usize = 4096;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Sort {
+    #[default]
+    Newest,
+    NameAsc,
+    NameDesc,
+}
+impl Sort {
+    pub const OPTIONS: [Self; 3] = [Self::Newest, Self::NameAsc, Self::NameDesc];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Newest => "Newest added",
+            Self::NameAsc => "Name: A to Z",
+            Self::NameDesc => "Name: Z to A",
+        }
+    }
+}
+
 fn key(path: &Path) -> String {
     path.components()
         .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
@@ -105,6 +124,27 @@ pub fn filtered(paths: &[PathBuf], folder: Option<&Path>) -> Vec<PathBuf> {
         .cloned()
         .collect()
 }
+pub fn view(paths: &[PathBuf], folder: Option<&Path>, query: &str, sort: Sort) -> Vec<PathBuf> {
+    let query = query.trim().to_lowercase();
+    let name = |path: &Path| {
+        path.file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .to_lowercase()
+    };
+    let mut result = filtered(paths, folder);
+    if !query.is_empty() {
+        result.retain(|path| name(path).contains(&query));
+    }
+    if sort != Sort::Newest {
+        result.sort_by_cached_key(|path| (name(path), key(path), path.clone()));
+        if sort == Sort::NameDesc {
+            result.reverse();
+        }
+    }
+    result
+}
+
 pub fn folders(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut folders = BTreeMap::new();
     for path in paths {
@@ -159,6 +199,47 @@ pub fn decode(text: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_combines_search_folder_and_stable_name_order() {
+        let paths = [
+            r"C:\media\Zulu.mp4",
+            r"C:\other\alpha.GIF",
+            r"C:\media\alpha.GIF",
+            r"C:\media\nested\ALPHA.GIF",
+        ]
+        .map(PathBuf::from);
+        assert_eq!(view(&paths, None, "", Sort::Newest), paths);
+        assert_eq!(
+            view(
+                &paths,
+                Some(Path::new(r"C:\MEDIA")),
+                " alpha ",
+                Sort::Newest
+            ),
+            paths[2..]
+        );
+        assert_eq!(
+            view(&paths, None, "", Sort::NameAsc),
+            [
+                paths[2].clone(),
+                paths[3].clone(),
+                paths[1].clone(),
+                paths[0].clone()
+            ]
+        );
+        assert_eq!(
+            view(&paths, None, "", Sort::NameDesc),
+            [
+                paths[0].clone(),
+                paths[1].clone(),
+                paths[3].clone(),
+                paths[2].clone()
+            ]
+        );
+        assert!(view(&paths, None, "not found", Sort::Newest).is_empty());
+        assert_eq!(paths[0], PathBuf::from(r"C:\media\Zulu.mp4"));
+    }
 
     #[test]
     fn library_versions_preserve_folder_roots_and_missing_files() {

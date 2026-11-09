@@ -5,8 +5,34 @@ Release history for WallpaperLive. Each version describes its own changes; older
 ## Downloads and installation
 
 - **Included:** Windows x64 installer, app, product icons, shortcuts and license notices.
+- **Bring your own live wallpapers:** WallpaperLive applies and plays your local files. It does not host wallpaper downloads or provide an online gallery, catalog or marketplace.
 - **Not bundled:** wallpapers, a browser engine or the native libmpv decoder. Setup reuses a verified decoder/local archive or asks before downloading the pinned decoder.
 - **Unsigned builds:** use trusted local media and keep Windows security protections enabled. No administrator bypass is required.
+
+---
+
+## v0.1.8
+
+### Added
+
+- Where to find wallpapers is visible in the main Library. Its menu opens [MyLiveWallpapers](<https://mylivewallpapers.com>), [MoeWalls](<https://moewalls.com>), [MotionBgs](<https://motionbgs.com>) or [DesktopHut](<https://www.desktophut.com>) in your browser.
+- Settings includes a link to [LiveBar](<https://livebar.vercel.app>).
+- Search filenames without case sensitivity within the selected folder filter. Sort by newest imported, A-Z or Z-A.
+- Right-click a library thumbnail and choose Retry thumbnail to request a new preview.
+- Play wallpapers on multiple displays. All displays applies the same selected file everywhere; applying to one display leaves other displays playing their assigned files.
+
+### Changed
+
+- Fullscreen/maximized auto-pause applies independently to each wallpaper display. Manual Pause/Resume and Stop affect all displays; sound uses at most one wallpaper stream.
+- Settings version 4 stores per-monitor wallpaper assignments. Existing settings versions 1-3 retain the saved wallpaper on the same saved monitor, or the primary display when the monitor name is blank; migration does not expand playback to All displays. Existing data directories stay unchanged.
+- Remove automatic cache eviction. When the 2 GiB budget cannot accommodate another copy, cache preparation refuses conversion and keeps original playback. Clear unused cache requires confirmation and protects imported library media, all active originals and active or waiting cache outputs.
+- Update current application and installer metadata to `0.1.8`.
+
+### Known limitations
+
+- Each active display uses its own decoder. More displays can increase memory and GPU use; frame-perfect synchronization is not promised. Cache preparation remains limited to one concurrent worker.
+- External links are browsing shortcuts, not an in-app gallery, hosted media or downloader. They do not establish third-party safety or endorsement. Obtain compatible media separately and respect the creator's license before importing it.
+- Resource screenshots and measurements retain their original version labels. They are not v0.1.8 performance results or resource-use guarantees.
 
 ---
 

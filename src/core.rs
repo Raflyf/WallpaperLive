@@ -13,6 +13,7 @@ pub enum Fit {
 pub struct Settings {
     pub path: Option<PathBuf>,
     pub monitor: String,
+    pub wallpapers: Vec<(String, PathBuf)>,
     pub fit: Fit,
     pub pause_battery: bool,
     pub audio_enabled: bool,
@@ -25,6 +26,7 @@ impl Default for Settings {
         Self {
             path: None,
             monitor: String::new(),
+            wallpapers: Vec::new(),
             fit: Fit::Fill,
             pause_battery: true,
             audio_enabled: false,
@@ -51,8 +53,11 @@ impl Settings {
         if !FPS_OPTIONS.contains(&self.fps) {
             return Err("Invalid frame-rate limit".into());
         }
-        Ok(format!(
-            "version=3\nfit={}\nbattery={}\nmonitor={}\npath={}\naudio={}\nfullscreen={}\nfps={}\n",
+        if self.wallpapers.len() > 64 {
+            return Err("Too many display wallpaper assignments".into());
+        }
+        let mut content = format!(
+            "version=4\nfit={}\nbattery={}\nmonitor={}\npath={}\naudio={}\nfullscreen={}\nfps={}\n",
             if self.fit == Fit::Fill {
                 "fill"
             } else {
@@ -64,17 +69,43 @@ impl Settings {
             self.audio_enabled,
             self.pause_fullscreen,
             self.fps
-        ))
+        );
+        let mut monitors = std::collections::HashSet::new();
+        for (monitor, path) in &self.wallpapers {
+            if monitor.is_empty()
+                || monitor == "*"
+                || monitor.chars().any(char::is_control)
+                || !monitors.insert(monitor.to_lowercase())
+            {
+                return Err("Invalid or duplicate display wallpaper assignment".into());
+            }
+            validate_path_syntax(path)?;
+            if !supported_extension(path) {
+                return Err("Invalid display wallpaper format".into());
+            }
+            content.push_str(&format!(
+                "display={monitor}\nwallpaper={}\n",
+                path.display()
+            ));
+        }
+        Ok(content)
     }
     pub fn decode(text: &str) -> Result<Self, String> {
+        if text.len() > 4 * 1024 * 1024 {
+            return Err("Configuration is too large".into());
+        }
         let lines: Vec<_> = text.lines().collect();
         let legacy = lines.len() == 5 && lines[0] == "version=1";
         let previous = lines.len() == 7 && lines[0] == "version=2";
         let current = lines.len() == 8 && lines[0] == "version=3";
-        if !legacy && !previous && !current {
+        let multiple = lines.len() >= 8
+            && lines[0] == "version=4"
+            && (lines.len() - 8).is_multiple_of(2)
+            && lines.len() <= 136;
+        if !legacy && !previous && !current && !multiple {
             return Err("Invalid configuration version or contents".into());
         }
-        let fps = if current {
+        let fps = if current || multiple {
             lines[7]
                 .strip_prefix("fps=")
                 .and_then(|s| s.parse::<u32>().ok())
@@ -122,6 +153,32 @@ impl Settings {
         if !path.is_empty() {
             validate_path_syntax(Path::new(path))?;
         }
+        let mut wallpapers = Vec::new();
+        if multiple {
+            for pair in lines[8..].chunks_exact(2) {
+                let display = pair[0]
+                    .strip_prefix("display=")
+                    .ok_or("Invalid display assignment")?;
+                let media = pair[1]
+                    .strip_prefix("wallpaper=")
+                    .ok_or("Invalid display wallpaper")?;
+                if display.is_empty()
+                    || display == "*"
+                    || display.chars().any(char::is_control)
+                    || wallpapers.iter().any(|(name, _): &(String, PathBuf)| {
+                        name.to_lowercase() == display.to_lowercase()
+                    })
+                {
+                    return Err("Invalid or duplicate display wallpaper assignment".into());
+                }
+                let media = PathBuf::from(media);
+                validate_path_syntax(&media)?;
+                if !supported_extension(&media) {
+                    return Err("Invalid display wallpaper format".into());
+                }
+                wallpapers.push((display.to_owned(), media));
+            }
+        }
         Ok(Self {
             path: if path.is_empty() {
                 None
@@ -129,6 +186,7 @@ impl Settings {
                 Some(PathBuf::from(path))
             },
             monitor,
+            wallpapers,
             fit,
             pause_battery,
             audio_enabled,
@@ -151,6 +209,10 @@ pub struct PauseReasons {
     pub maximized: bool,
 }
 impl PauseReasons {
+    pub fn foreground(&mut self, eligible: bool, maximized: bool, area: Rect, display: Rect) {
+        self.fullscreen = eligible && area.covers(display);
+        self.maximized = eligible && maximized && area.intersects(display);
+    }
     pub fn session_event(&mut self, event: u32) {
         match event {
             1 => {
@@ -297,6 +359,7 @@ mod tests {
         let s = Settings {
             path: Some(PathBuf::from(r"C:\media\pemandangan senja é.mp4")),
             monitor: r"\\.\DISPLAY1".into(),
+            wallpapers: Vec::new(),
             fit: Fit::Contain,
             pause_battery: false,
             audio_enabled: true,
@@ -306,6 +369,50 @@ mod tests {
         assert_eq!(Settings::decode(&s.encode().unwrap()).unwrap(), s);
         let empty = Settings::default();
         assert_eq!(Settings::decode(&empty.encode().unwrap()).unwrap(), empty);
+    }
+
+    #[test]
+    fn multi_display_settings_and_pause_stay_independent() {
+        let mut settings = Settings {
+            monitor: "*".into(),
+            wallpapers: vec![
+                (r"\\.\DISPLAY1".into(), PathBuf::from(r"C:\media\senja.mp4")),
+                (r"\\.\DISPLAY2".into(), PathBuf::from(r"C:\media\hujan.gif")),
+            ],
+            ..Default::default()
+        };
+        let encoded = settings.encode().unwrap();
+        assert_eq!(Settings::decode(&encoded).unwrap(), settings);
+        assert!(Settings::decode(&(encoded.clone() + "display=bad\n")).is_err());
+        assert!(Settings::decode(&encoded.replace(r"\\.\DISPLAY2", r"\\.\DISPLAY1")).is_err());
+        assert!(Settings::decode(&encoded.replace("hujan.gif", "hujan.exe")).is_err());
+        settings.wallpapers[0].0.push('\n');
+        assert!(settings.encode().is_err());
+        let old = "version=3\nfit=fill\nbattery=true\nmonitor=\\\\.\\DISPLAY2\npath=C:\\media\\senja.mp4\naudio=false\nfullscreen=true\nfps=30\n";
+        let migrated = Settings::decode(old).unwrap();
+        assert_eq!(migrated.monitor, r"\\.\DISPLAY2");
+        assert_eq!(migrated.path, Some(PathBuf::from(r"C:\media\senja.mp4")));
+        assert!(migrated.wallpapers.is_empty());
+        let first = Rect {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
+        let second = Rect {
+            left: 0,
+            top: 0,
+            right: 2712,
+            bottom: 1220,
+        };
+        let mut left = PauseReasons::default();
+        let mut right = PauseReasons::default();
+        left.foreground(true, true, first, first);
+        right.foreground(true, true, first, second);
+        assert!(left.reason().is_some() && right.reason().is_none());
+        right.manual = true;
+        right.foreground(false, false, first, second);
+        assert_eq!(right.reason(), Some("Paused manually"));
     }
 
     #[test]
