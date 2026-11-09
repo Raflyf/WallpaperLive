@@ -197,7 +197,9 @@ The app and Start-menu shortcut use the same stable taskbar identity, `Raflyf.Wa
 
 ## Support
 
-[Buy me a coffee](<https://yapp.ink/raflyf>) if you want to support development. Support is optional and does not unlock or restrict features. The same link is available in **Settings** and opens in your browser.
+Support development via [Buy me a coffee](<https://yapp.ink/raflyf>) or [Saweria](<https://saweria.co/BuyMatcha>). Support is optional and does not unlock or restrict features. Links open in your browser.
+
+Buy me a coffee is available in **Settings**. The Saweria button is prepared in source for the next feature or fix release; the current v0.1.9 installer is unchanged.
 
 ## License
 

@@ -75,6 +75,7 @@ const WALLPAPER_SITES: [(&str, &str); 4] = [
 ];
 const PRODUCT_URL: &str = "https://livebar.vercel.app";
 const SUPPORT_URL: &str = "https://yapp.ink/raflyf";
+const SAWERIA_URL: &str = "https://saweria.co/BuyMatcha";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -686,6 +687,12 @@ impl App {
                     visuals::SUPPORT,
                     w!("BUTTON"),
                     "Buy me a coffee",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::SAWERIA,
+                    w!("BUTTON"),
+                    "Saweria",
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -1821,6 +1828,7 @@ impl App {
     fn open_website(&self, url: &'static str) -> Result<(), String> {
         if url != PRODUCT_URL
             && url != SUPPORT_URL
+            && url != SAWERIA_URL
             && !WALLPAPER_SITES.iter().any(|(_, site)| *site == url)
         {
             return Err("Website is not in the recommendation list".into());
@@ -2852,6 +2860,7 @@ impl App {
             }
             visuals::PRODUCT_WEBSITE => self.open_website(PRODUCT_URL)?,
             visuals::SUPPORT => self.open_website(SUPPORT_URL)?,
+            visuals::SAWERIA => self.open_website(SAWERIA_URL)?,
             visuals::SORT => {
                 let options = crate::library::Sort::OPTIONS;
                 let labels: Vec<_> = options.iter().map(|sort| sort.label().to_owned()).collect();
@@ -4049,6 +4058,11 @@ mod tests {
             assert_eq!(
                 window_text(app.control(visuals::SUPPORT)),
                 "Buy me a coffee"
+            );
+            assert_eq!(window_text(app.control(visuals::SAWERIA)), "Saweria");
+            assert_ne!(
+                GetWindowLongW(app.control(visuals::SAWERIA), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0
             );
             app.action(visuals::FIND_WALLPAPERS, BN_CLICKED)?;
             app.action(visuals::SOURCES_BACK, BN_CLICKED)?;

@@ -44,6 +44,7 @@ pub const SOURCES_NOTE: usize = 144;
 pub const SETTINGS_NOTE: usize = 145;
 pub const SETTINGS_INFO: usize = 146;
 pub const SUPPORT: usize = 147;
+pub const SAWERIA: usize = 148;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 
@@ -62,7 +63,7 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
         id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
         107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO | CLEAR_CACHE | PRODUCT_WEBSITE
-        | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT => tab == Tab::Settings,
+        | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT | SAWERIA => tab == Tab::Settings,
         PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
         | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
             tab == Tab::Library
@@ -92,7 +93,7 @@ pub struct Layout {
     pub sources_title: Rect,
     pub sources_subtitle: Rect,
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 41],
+    controls: [(usize, Rect); 42],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -166,6 +167,7 @@ impl Layout {
                 (FIND_WALLPAPERS, r(split - 228, 96, 204, 32)),
                 (PRODUCT_WEBSITE, r(content_x, 448, column_width, 36)),
                 (SUPPORT, r(resources_x, 448, column_width, 36)),
+                (SAWERIA, r(resources_x, 496, column_width, 36)),
                 (PREVIEW, preview),
                 (112, file),
                 (105, display),
@@ -1042,6 +1044,13 @@ mod tests {
                 }
             }
             let area = |id| layout.control(id).unwrap();
+            assert!(visible_on(Tab::Settings, SAWERIA));
+            assert!(!visible_on(Tab::Library, SAWERIA));
+            assert!(!visible_on(Tab::Sources, SAWERIA));
+            assert_eq!(area(SAWERIA).left, area(SUPPORT).left);
+            assert_eq!(area(SAWERIA).right, area(SUPPORT).right);
+            assert_eq!(area(SAWERIA).top, area(SUPPORT).bottom + 12);
+            assert!(area(SAWERIA).bottom + 24 <= layout.footer.top);
             for (left, right) in [(AUDIO, REMOVE), (103, 104), (PRODUCT_WEBSITE, SUPPORT)] {
                 assert_eq!(area(left).top, area(right).top);
                 assert_eq!(area(left).bottom, area(right).bottom);

@@ -11,6 +11,12 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## Unreleased
+
+- Add [Saweria](<https://saweria.co/BuyMatcha>) to the README and alongside Buy me a coffee in Settings. The app change is queued for the next feature or fix release; v0.1.9 and its installer remain unchanged.
+
+---
+
 ## v0.1.9
 
 ### Changed
