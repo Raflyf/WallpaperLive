@@ -13,6 +13,10 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ## v0.1.8
 
+### Fixed
+
+- Show `WallpaperLive v0.1.8` when hovering over the tray icon. Enable the standard Windows tooltip with version-4 tray notifications; the version comes from the executable build.
+
 ### Added
 
 - Where to find wallpapers is visible in the main Library. Its menu opens [MyLiveWallpapers](<https://mylivewallpapers.com>), [MoeWalls](<https://moewalls.com>), [MotionBgs](<https://motionbgs.com>) or [DesktopHut](<https://www.desktophut.com>) in your browser.

@@ -1653,12 +1653,13 @@ impl App {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: self.hwnd,
             uID: 1,
-            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            // NOTIFYICON_VERSION_4 suppresses standard tooltips unless NIF_SHOWTIP is set.
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             uCallbackMessage: TRAY_EVENT,
             ..Default::default()
         };
         data.hIcon = self.small_icon.0;
-        let tip = wide("WallpaperLive controls");
+        let tip = wide(concat!("WallpaperLive v", env!("CARGO_PKG_VERSION")));
         data.szTip[..tip.len()].copy_from_slice(&tip);
         if !unsafe { Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data) }.as_bool() {
             return Err(
