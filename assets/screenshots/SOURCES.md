@@ -23,7 +23,9 @@ Pillow composes these figures using the original captures. Segoe UI labels match
 ## Retained tray and auto-pause figure (v0.1.5)
 
 - [resource-use-v0.1.5.png](resource-use-v0.1.5.png): existing figure kept unchanged. Both Task Manager strips show `wallpaperlive.exe`: tray playback (20.3 MB / 0.5% CPU) and auto-pause (4.5 MB / 0% CPU), supplied on 8 November 2026. README captions label the original version; these are not new v0.1.6 measurements.
-- Figure SHA256: `cd60990214fb034dbf28039684a9870b10fe9a9c15879739d0e156e017b795bc`.
+- Original figure SHA256: `cd60990214fb034dbf28039684a9870b10fe9a9c15879739d0e156e017b795bc`.
+- [resource-use-orange.png](resource-use-orange.png): derivative used in README. Only the large blue metric annotations are recolored `#D9541E`; the complete Task Manager photo band is pixel-identical to the original figure. No new crop, measurement, or version claim.
+- Orange figure SHA256: `03f5bc5e6280fc799e106af939a3d6edc9c6f9338e5758bba8b3f9e774e5f96d`.
 
 ## Earlier captures (v0.1.5)
 

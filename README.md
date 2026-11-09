@@ -74,10 +74,10 @@ The v0.1.6 snapshot shows **437.5 MB / 42.4% CPU during initial 4K wallpaper con
 ### Tray playback efficiency and auto-pause
 
 <p align="center">
-  <img src="assets/screenshots/resource-use-v0.1.5.png" width="1200" alt="Original v0.1.5 Task Manager photos: wallpaperlive.exe shows 20.3 MB and 0.5 percent CPU in tray, and 4.5 MB and zero percent CPU while auto-paused">
+  <img src="assets/screenshots/resource-use-orange.png" width="1200" alt="Original v0.1.5 Task Manager photos with orange annotations: wallpaperlive.exe shows 20.3 MB and 0.5 percent CPU in tray, and 4.5 MB and zero percent CPU while auto-paused">
 </p>
 
-*The tray and auto-pause figure retains the original v0.1.5 photos supplied on 8 November 2026, unchanged. Both strips show `wallpaperlive.exe`; their displayed values remain 20.3 MB / 0.5% CPU and 4.5 MB / 0% CPU. These are separate moments, not a controlled before/after benchmark.*
+*The tray and auto-pause figure retains the original v0.1.5 Task Manager photo strips supplied on 8 November 2026. Only the large metric annotations are recolored burnt orange (`#D9541E`); the photo pixels and displayed values remain unchanged. These are separate moments, not a controlled before/after benchmark.*
 
 **Read the numbers in context.** The new v0.1.6 captures were supplied on 9 November 2026; the retained tray and auto-pause photos are from v0.1.5. The roughly 400 MB conversion figure refers to initial 4K cache preparation, not steady playback; the v0.1.6 snapshot shows 437.5 MB for the app and worker together. Task Manager rounds live values; displayed 0% CPU is not proof of zero work. Its Memory column is not total private allocation, all process-tree memory or dedicated VRAM. Media, codec, display resolution, driver and cache state affect usage. No fixed RAM ceiling or GPU/VRAM savings are guaranteed.
 
