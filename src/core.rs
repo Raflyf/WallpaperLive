@@ -155,7 +155,7 @@ impl Settings {
         }
         let mut wallpapers = Vec::new();
         if multiple {
-            for pair in lines[8..].chunks_exact(2) {
+            for pair in lines[8..].as_chunks::<2>().0 {
                 let display = pair[0]
                     .strip_prefix("display=")
                     .ok_or("Invalid display assignment")?;

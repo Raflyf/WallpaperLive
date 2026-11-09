@@ -1517,11 +1517,20 @@ impl App {
                     || display
                         .recovery
                         .as_ref()
-                        .is_some_and(|(_, _, p)| selected.contains(p));
+                        .is_some_and(|(_, _, p)| selected.contains(p))
+                    || display
+                        .prepared_waiting
+                        .as_ref()
+                        .is_some_and(|(_, p, _)| selected.contains(p))
+                    || display
+                        .dormant
+                        .as_ref()
+                        .is_some_and(|p| selected.contains(&p.path));
                 if affected {
                     self.with_display(index, |app| {
                         app.cancel_preparation();
                         app.recovery = None;
+                        app.dormant = None;
                         app.release_playback();
                         Ok(())
                     })?;
@@ -2252,6 +2261,18 @@ impl App {
             self.requested_pause = paused;
         }
         if paused {
+            if let Some((_, path, _)) = self.prepared_waiting.take() {
+                self.cancel_preparation();
+                let rect = self.screen().rect;
+                self.preparation = Some((
+                    path,
+                    (
+                        (rect.right - rect.left) as u32,
+                        (rect.bottom - rect.top) as u32,
+                    ),
+                    crate::cache::CACHE_FPS,
+                ));
+            }
             if self.preparation.is_some()
                 && self
                     .preparation_thread
@@ -3987,6 +4008,54 @@ mod tests {
     }
 
     #[test]
+    fn removing_queued_wallpaper_keeps_other_display() {
+        let mut app = fixture();
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!(
+                "queued-remove-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&directory).unwrap();
+        app.config = directory.join("settings.ini");
+        let removed = PathBuf::from(r"C:\media\removed.mp4");
+        let keep = PathBuf::from(r"C:\media\keep.mp4");
+        app.library = vec![removed.clone(), keep.clone()];
+        app.marked = vec![removed.clone()];
+        app.settings.wallpapers = vec![
+            ("first".into(), removed.clone()),
+            ("second".into(), keep.clone()),
+        ];
+        let mut first = DisplayState::new("first".into());
+        first.prepared_waiting = Some((
+            Instant::now(),
+            removed,
+            crate::cache::Prepared {
+                path: directory.join("cache.mp4"),
+                width: 1920,
+                height: 1080,
+                fps: 30.0,
+                cached: true,
+                note: "test".into(),
+            },
+        ));
+        let mut second = DisplayState::new("second".into());
+        second.load_request = 20;
+        second.recovery = Some((Instant::now(), 0, keep.clone()));
+        app.displays = vec![first, second];
+        app.remove_selected().unwrap();
+        assert!(app.displays[0].prepared_waiting.is_none() && app.displays[0].dormant.is_none());
+        assert_eq!(app.displays[1].load_request, 20);
+        assert_eq!(app.displays[1].recovery.as_ref().unwrap().2, keep);
+        assert_eq!(app.settings.wallpapers.len(), 1);
+        assert_eq!(app.library.len(), 1);
+    }
+
+    #[test]
     fn active_cache_protects_current_and_waiting_files() {
         let mut app = fixture();
         let current = PathBuf::from(r"C:\test\cache-playing.mp4");
@@ -4152,7 +4221,8 @@ mod tests {
         assert!(app.preparation.is_none());
         assert_eq!(app.prepared_waiting.as_ref().unwrap().1, original);
         app.tick().unwrap();
-        assert!(app.prepared_waiting.is_some() && app.preparation_thread.is_none());
+        assert!(app.prepared_waiting.is_none() && app.preparation_thread.is_none());
+        assert_eq!(app.preparation.as_ref().unwrap().0, original);
         drop(app);
     }
     #[test]
