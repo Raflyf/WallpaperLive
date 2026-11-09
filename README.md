@@ -6,13 +6,13 @@
 <p align="center"><strong>Your videos. Your desktop.</strong><br>Live wallpapers with a native Windows app, local files and a background display cache.</p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.6"><img src="https://img.shields.io/badge/release-v0.1.6-586575" alt="Release v0.1.6"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.7"><img src="https://img.shields.io/badge/release-v0.1.7-586575" alt="Release v0.1.7"></a>
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.6/wallpaperlivesetup-v0.1.6.exe"><strong>Download Windows installer</strong></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.7/wallpaperlivesetup-v0.1.7.exe"><strong>Download Windows installer</strong></a>
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
@@ -97,13 +97,13 @@ The desktop capture also shows 0 MB/s disk and 0 Mbps network; paused shows 0 MB
 
 ## Download and install
 
-1. [Download wallpaperlivesetup-v0.1.6.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.6/wallpaperlivesetup-v0.1.6.exe) and run it as your normal Windows user.
+1. [Download wallpaperlivesetup-v0.1.7.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.7/wallpaperlivesetup-v0.1.7.exe) and run it as your normal Windows user.
 2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.6/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.7/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
 
-Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.6.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
+Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.7.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
@@ -131,7 +131,7 @@ The picker accepts `MP4`, `GIF`, `MKV`, `WebM`, `MOV`, `AVI`, `MPG`, `MPEG`, `M4
 - Runtime FPS changes use a pure frame-rate filter, without interpolation or playback-speed changes. CFR resampling can repeat frames around irregular timestamps; decoding still processes the cached source rate. One isolated native v0.1.3 test measured scheduled rates of 59.6 / 24.2 / 60.2 FPS for 60 / 24 / 60 choices, not physical display scanout.
 - Conversion accepts finite video up to one hour/16 GiB, uses one below-normal-priority worker and stops at 15 minutes or 512 MiB per output. Cache budget is 2 GiB; unused generated copies may be evicted near that budget. Original media is never removed. Cancelled partials are never played. Cache lives in `%LOCALAPPDATA%\WallpaperLive\video-cache`.
 - Pause stops animation/audio, releases thumbnails and cancels/defer conversion. Windows receives a resident-page trim request on confirmed pause, load completion and hiding the panel; this can reclaim resident pages without releasing private decoder allocations or dedicated VRAM. Pages can become resident again and page faults can increase. An unfinished conversion restarts in the background after resume. A completed cache waits at least two seconds after resume before a separate handoff near the current media position.
-- Only four visible thumbnails plus the selection are retained, each at most 480 × 270 pixels. Hidden, minimized or paused panels drop those buffers. Packet settings are 4 MiB forward, no backward cache and 0.2 seconds readahead, with two software-decode threads. These are not a total RAM cap.
+- Only nine visible thumbnails plus the selection are retained, each at most 480 × 270 pixels. Hidden, minimized or paused panels drop those buffers. Packet settings are 4 MiB forward, no backward cache and 0.2 seconds readahead, with two software-decode threads. These are not a total RAM cap.
 - The encoder uses x264 `veryfast`, CRF 23, two threads, lookahead 10 and one reference frame (`refs=1`). Reference/lookahead values already match `veryfast`; an additional 75% memory saving was not measured. CRF encoding is lossy, not a guarantee of identical pixels.
 
 Historical v0.1.1 comparison, **not the screenshot results above**: one sequential RTX 3050 Laptop GPU fixture pair used a 1920 × 1080 native window with D3D11VA decoding for 15 seconds per condition. Original 4K/60 FPS used median 275.5 MiB working set / 856.3 MiB private bytes; 1080p/30 FPS cache used 187.1 MiB / 355.1 MiB. Process CPU was 3.79% / 1.84% of total machine capacity. After decoder destruction, working sets were about 57 MiB including the Python host, excluding the app panel. It was not a repeatability test; GPU utilization and VRAM were not measured.
@@ -172,12 +172,12 @@ For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a re
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 ```
 
-Setup File version is `0.1.6.0`; Product version is `0.1.6`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
+Setup File version is `0.1.7.0`; Product version is `0.1.7`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
 
 </details>
 
 ## License
 
-[GPL-3.0-or-later](LICENSE) · [Dependency notices](THIRD_PARTY.md) · [Screenshot sources](assets/screenshots/SOURCES.md)
+[GPL-3.0-or-later](LICENSE) · [Dependency notices](THIRD_PARTY.md) · [Icon sources](assets/SOURCES.md) · [Screenshot sources](assets/screenshots/SOURCES.md)
 
 WallpaperLive's GPL license covers the app, not third-party wallpaper artwork shown in screenshots. libmpv is a separate native decoder; no wallpapers or decoder binaries are bundled.

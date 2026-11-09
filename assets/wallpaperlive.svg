@@ -1,8 +1,36 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
   <title id="title">WallpaperLive</title>
-  <desc id="desc">An open landscape frame with a folded W ridge in graphite, white and ice blue.</desc>
-  <rect width="512" height="512" rx="108" fill="#181b20"/>
-  <path d="M100 114h268v28H114v228h284V234h28v142a22 22 0 0 1-22 22H108a22 22 0 0 1-22-22V136a22 22 0 0 1 14-22Z" fill="#f0f1f3"/>
-  <path d="m138 222 66 84 66-102 62 78 94-124v84l-94 124-62-78-66 102-66-84Z" fill="#a6c7df"/>
-  <path d="m270 204 62 78 94-124v42l-94 124-62-78Z" fill="#f0f1f3"/>
+  <desc id="desc">A tilted graphite window with copper edges, a cream sunset and a winding light path through an orange canyon.</desc>
+  <defs>
+    <filter id="cast" x="-50%" y="-100%" width="200%" height="300%"><feGaussianBlur stdDeviation="13"/></filter>
+    <filter id="soft" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="9"/></filter>
+    <linearGradient id="charcoal" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#59504a"/><stop offset=".2" stop-color="#282522"/><stop offset=".75" stop-color="#121212"/><stop offset="1" stop-color="#3f3027"/></linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2=".3" y2="1"><stop stop-color="#ae7d57"/><stop offset=".48" stop-color="#63321f"/><stop offset="1" stop-color="#291813"/></linearGradient>
+    <linearGradient id="sky" x1="0" y1="0" x2=".25" y2="1"><stop stop-color="#211f23"/><stop offset=".4" stop-color="#793827"/><stop offset=".78" stop-color="#d9541e"/><stop offset="1" stop-color="#f6b570"/></linearGradient>
+    <linearGradient id="sand" x1="0" y1="0" x2=".3" y2="1"><stop stop-color="#f2a466"/><stop offset=".44" stop-color="#d9541e"/><stop offset="1" stop-color="#602416"/></linearGradient>
+    <linearGradient id="river" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#fff1d1"/><stop offset="1" stop-color="#e88345"/></linearGradient>
+    <clipPath id="view"><path d="M136 153 389 98Q401 96 402 108L409 331Q409 343 398 346L139 403Q126 406 126 391L123 170Q123 156 136 153Z"/></clipPath>
+  </defs>
+  <g transform="translate(-17 -5) scale(1.04)">
+    <ellipse cx="266" cy="447" rx="159" ry="23" fill="#111111" opacity=".3" filter="url(#cast)"/>
+    <path d="M109 141 405 80Q422 78 427 96L442 365Q443 383 427 387L136 449Q116 453 112 434L92 166Q90 146 109 141Z" fill="url(#edge)"/>
+    <path d="M99 126 394 65Q414 61 416 83L427 352Q428 369 409 373L120 435Q102 439 99 419L80 151Q79 132 99 126Z" fill="url(#charcoal)"/>
+    <path d="M102 130 394 69Q409 66 411 83" fill="none" stroke="#dcc0a1" stroke-width="3" opacity=".7"/>
+    <path d="M117 431 409 369Q424 365 422 349" fill="none" stroke="#8c4d2d" stroke-width="3"/>
+    <g clip-path="url(#view)">
+      <rect x="110" y="83" width="310" height="330" fill="url(#sky)"/>
+      <circle cx="318" cy="209" r="49" fill="#f3ba78" opacity=".38" filter="url(#soft)"/>
+      <circle cx="318" cy="209" r="31" fill="#ffedc8"/>
+      <path d="M104 269Q164 242 203 264T287 258Q337 227 433 244V424H104Z" fill="#ae562d"/>
+      <path d="M112 263Q141 211 156 188L170 191 172 247 202 275 214 342 139 409 111 395Z" fill="#5a3527"/>
+      <path d="m154 189 16 3 2 55 29 28-14-3-30-24Z" fill="#ac6440"/>
+      <path d="M424 239Q383 251 365 291Q347 326 365 372L424 388Z" fill="#3c2c26"/>
+      <path d="M106 344C182 280 255 283 319 287Q378 291 433 334V433H106Z" fill="url(#sand)"/>
+      <path d="M286 271C281 292 223 305 239 327S323 349 282 381L245 416 312 405C345 371 316 356 282 342S258 320 278 306 308 283 298 268Z" fill="url(#river)"/>
+      <path d="M105 364Q185 329 235 358T340 391L432 396V438H105Z" fill="#52281b"/>
+      <path d="M117 367Q182 337 235 358" fill="none" stroke="#f2ab65" stroke-width="3" opacity=".7"/>
+    </g>
+    <path d="M136 153 389 98Q401 96 402 108L409 331Q409 343 398 346L139 403Q126 406 126 391L123 170Q123 156 136 153Z" fill="none" stroke="#ddba8f" stroke-opacity=".45" stroke-width="2"/>
+    <path d="M100 419 409 354" stroke="#e87a3b" stroke-width="3" opacity=".45"/>
+  </g>
 </svg>

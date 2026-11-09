@@ -10,6 +10,20 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## v0.1.7
+
+### Changed
+
+- **Sunset Window App Icon:** Replaced the angular blue mark with a tilted graphite window, copper edges, a cream sunset, and a winding light path through an orange canyon. The same artwork supplies the app window/tray, installer, shortcut, and README logo.
+- **Orange Resource Annotations:** Recolored the large metric annotations to burnt orange (`#D9541E`). The v0.1.5 Task Manager photo strips, displayed measurements, and source attribution remain unchanged.
+- Updated app and installer metadata to `0.1.7`; previous release assets remain unchanged.
+
+### Known limitations
+
+- Performance screenshots still document v0.1.5/v0.1.6; they are not new v0.1.7 measurements. Playback, cache conversion, and pause behavior are unchanged.
+
+---
+
 ## v0.1.6
 
 ### Added
