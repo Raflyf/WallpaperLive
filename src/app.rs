@@ -67,6 +67,7 @@ const CTX_EXPLORER: usize = 202;
 const CTX_COPY_PATH: usize = 203;
 const CTX_REMOVE: usize = 204;
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
+const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn wide(text: &str) -> Vec<u16> {
@@ -2568,6 +2569,32 @@ fn set_startup(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn register_control_class(
+    instance: HINSTANCE,
+    icon: HICON,
+    small_icon: HICON,
+) -> Result<(), String> {
+    // SAFETY: called on the UI thread; icon owners outlive windows of this class.
+    unsafe {
+        SetCurrentProcessExplicitAppUserModelID(APP_ID).map_err(native_error)?;
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance,
+            lpszClassName: CLASS,
+            hIcon: icon,
+            hIconSm: small_icon,
+            hCursor: LoadCursorW(None, IDC_ARROW).map_err(native_error)?,
+            hbrBackground: visuals::brush(visuals::CANVAS),
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            return Err("Could not register the control window".into());
+        }
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<(), String> {
     // SAFETY: all GUI work below belongs to this UI thread; no Rust pointers shared through WndProc.
     unsafe {
@@ -2589,17 +2616,7 @@ pub fn run() -> Result<(), String> {
         let instance = GetModuleHandleW(None).map_err(native_error)?;
         let icon = Icon::load(GetSystemMetrics(SM_CXICON))?;
         let small_icon = Icon::load(GetSystemMetrics(SM_CXSMICON))?;
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(window_proc),
-            hInstance: instance.into(),
-            lpszClassName: CLASS,
-            hCursor: LoadCursorW(None, IDC_ARROW).map_err(native_error)?,
-            hbrBackground: visuals::brush(visuals::CANVAS),
-            ..Default::default()
-        };
-        if RegisterClassW(&wc) == 0 {
-            return Err("Could not register the control window".into());
-        }
+        register_control_class(instance.into(), icon.0, small_icon.0)?;
         let dpi = GetDpiForSystem() as i32;
         let hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT,
@@ -3095,6 +3112,35 @@ mod tests {
         for size in [16, 20, 24, 32, 48, 64, 256] {
             let icon = Icon::load(size).expect("bundled logo must decode as a Windows icon");
             assert!(!icon.0.0.is_null());
+        }
+    }
+
+    #[test]
+    fn taskbar_identity_and_class_icons_are_set_before_window_creation() {
+        let icon = Icon::load(32).expect("large icon");
+        let small_icon = Icon::load(16).expect("small icon");
+        // SAFETY: isolated test process registers then removes an unused class; no app window opens.
+        unsafe {
+            let instance: HINSTANCE = GetModuleHandleW(None).expect("module").into();
+            register_control_class(instance, icon.0, small_icon.0).expect("control class");
+            let mut registered = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                ..Default::default()
+            };
+            let class_result = GetClassInfoExW(instance, CLASS, &mut registered);
+            let identity = GetCurrentProcessExplicitAppUserModelID().expect("taskbar identity");
+            let text = identity.to_string();
+            CoTaskMemFree(Some(identity.0.cast()));
+            UnregisterClassW(CLASS, instance).expect("remove test class");
+            class_result.expect("read registered class");
+            assert_eq!(registered.hIcon, icon.0);
+            assert_eq!(registered.hIconSm, small_icon.0);
+            let id = text.expect("taskbar identity text");
+            assert_eq!(id, "Raflyf.WallpaperLive");
+            assert!(
+                include_str!("../installer/WallpaperLive.iss")
+                    .contains(&format!("AppUserModelID: \"{id}\""))
+            );
         }
     }
 

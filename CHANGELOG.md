@@ -14,6 +14,8 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Fixed
 
+- **Taskbar Identity:** Set the stable `Raflyf.WallpaperLive` AppUserModelID on both the native process and Start-menu shortcut. Register large and small class icons before creating the panel window, instead of leaving taskbar identity to Windows heuristics. No icon-cache deletion, Explorer restart, or media/settings changes.
+
 - **Executable Shell Icon:** The original v0.1.7 executable set window/tray icons at runtime but contained no Windows icon resources. Build and installer packaging now embed and byte-verify the nine-size ICO as `RT_GROUP_ICON`/`RT_ICON` while preserving the application manifest. This rebuild replaces the earlier v0.1.7 release; v0.1.6 and older releases remain unchanged.
 
 ### Changed

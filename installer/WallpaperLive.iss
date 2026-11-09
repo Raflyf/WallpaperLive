@@ -51,7 +51,7 @@ Source: "..\assets\wallpaperlive.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{tmp}\decoder\libmpv-2.dll"; DestDir: "{app}\runtime"; ExternalSize: 121624576; Hash: "{#DecoderSHA256}"; Flags: external ignoreversion onlyifdoesntexist; Check: NeedDecoder
 
 [Icons]
-Name: "{userprograms}\WallpaperLive"; Filename: "{app}\wallpaperlive.exe"; WorkingDir: "{app}"; IconFilename: "{app}\wallpaperlive.ico"
+Name: "{userprograms}\WallpaperLive"; Filename: "{app}\wallpaperlive.exe"; WorkingDir: "{app}"; IconFilename: "{app}\wallpaperlive.ico"; AppUserModelID: "Raflyf.WallpaperLive"
 
 [Run]
 Filename: "{app}\wallpaperlive.exe"; Description: "{cm:LaunchProgram,WallpaperLive}"; Flags: nowait postinstall skipifsilent

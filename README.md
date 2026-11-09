@@ -174,6 +174,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 
 Setup File version is `0.1.7.0`; Product version is `0.1.7`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
 
+The app and Start-menu shortcut use the same stable taskbar identity, `Raflyf.WallpaperLive`. Large and small icons are registered before the panel window is created. This same-version taskbar fix is built and tested on GitHub Actions; download the replacement installer manually. CI does not prove how an existing Windows taskbar renders it.
+
 </details>
 
 ## License
