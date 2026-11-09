@@ -149,7 +149,7 @@ Desktop attachment can vary with Windows builds, HDR, virtual desktops, display 
 Install a Rust toolchain with its Windows linker prerequisites, then build the app and obtain its decoder:
 
 ```powershell
-cargo build --locked --release --bin wallpaperlive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Get-Decoder.ps1 -Destination .\target\release\runtime
 ```
 

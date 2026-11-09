@@ -39,6 +39,7 @@ jobs:
         run: |
           cargo +stable build --locked --release --bin wallpaperlive
           if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
+          & .\scripts\Embed-Icon.ps1 -Executable .\target\release\wallpaperlive.exe
       - name: Delivery script syntax
         run: |
           foreach ($path in Get-ChildItem scripts/*.ps1) {

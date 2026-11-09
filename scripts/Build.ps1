@@ -15,6 +15,7 @@ try {
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
         throw "Build output not found at $exe. This helper expects the default Cargo target directory."
     }
+    & (Join-Path $PSScriptRoot 'Embed-Icon.ps1') -Executable $exe
     Write-Output "Built: $exe"
 }
 finally { Pop-Location }

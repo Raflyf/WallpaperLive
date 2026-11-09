@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 [CmdletBinding()]
-param([string]$OutputDirectory)
+param([string]$OutputDirectory, [string]$AppExe)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -11,7 +11,7 @@ $version = [regex]::Match((Get-Content -LiteralPath (Join-Path $root 'installer\
 if (-not $version) { throw 'Installer AppVersion must be a numeric X.Y.Z version.' }
 $output = Join-Path $OutputDirectory "wallpaperlivesetup-v$version.exe"
 if (Test-Path -LiteralPath $output) { throw "Existing installer left untouched: $output. Choose another -OutputDirectory." }
-$exe = Join-Path $root 'target\release\wallpaperlive.exe'
+$exe = if ($PSBoundParameters.ContainsKey('AppExe')) { (Resolve-Path -LiteralPath $AppExe).ProviderPath } else { Join-Path $root 'target\release\wallpaperlive.exe' }
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Release executable missing. Run scripts/Build.ps1 first.' }
 if (-not (Test-Path -LiteralPath (Join-Path $root 'assets\wallpaperlive.ico') -PathType Leaf)) {
     throw 'Product icon missing: assets/wallpaperlive.ico.'
@@ -39,7 +39,12 @@ foreach ($name in 'ISCC.exe', 'ISCmplr.dll', 'ISPP.dll', 'is7zxr-x64.dll') {
     }
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-& $compiler --no-ide-signtools "--output-dir=$OutputDirectory" (Join-Path $root 'installer\WallpaperLive.iss')
+$staging = Join-Path $tools ('installer-app-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $staging | Out-Null
+$packagedExe = Join-Path $staging 'wallpaperlive.exe'
+[IO.File]::Copy($exe, $packagedExe, $false)
+& (Join-Path $PSScriptRoot 'Embed-Icon.ps1') -Executable $packagedExe
+& $compiler --no-ide-signtools "--output-dir=$OutputDirectory" "/DAppExe=$packagedExe" (Join-Path $root 'installer\WallpaperLive.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed (exit $LASTEXITCODE)." }
 if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "Compiler produced no installer: $output" }
 $artifact = Get-Item -LiteralPath $output

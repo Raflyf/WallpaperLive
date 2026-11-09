@@ -12,11 +12,15 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ## v0.1.7
 
+### Fixed
+
+- **Executable Shell Icon:** The original v0.1.7 executable set window/tray icons at runtime but contained no Windows icon resources. Build and installer packaging now embed and byte-verify the nine-size ICO as `RT_GROUP_ICON`/`RT_ICON` while preserving the application manifest. This rebuild replaces the earlier v0.1.7 release; v0.1.6 and older releases remain unchanged.
+
 ### Changed
 
 - **Sunset Window App Icon:** Replaced the angular blue mark with a tilted graphite window, copper edges, a cream sunset, and a winding light path through an orange canyon. The same artwork supplies the app window/tray, installer, shortcut, and README logo.
 - **Orange Resource Annotations:** Recolored the large metric annotations to burnt orange (`#D9541E`). The v0.1.5 Task Manager photo strips, displayed measurements, and source attribution remain unchanged.
-- Updated app and installer metadata to `0.1.7`; previous release assets remain unchanged.
+- Updated app and installer metadata to `0.1.7`; v0.1.6 and older release assets remain unchanged.
 
 ### Known limitations
 
