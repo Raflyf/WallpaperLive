@@ -6,19 +6,20 @@
 <p align="center"><strong>Bring your own live wallpapers.</strong><br>A native Windows app for applying your local videos, GIFs and images as desktop wallpapers.</p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.8"><img src="https://img.shields.io/badge/release-v0.1.8-586575" alt="Release v0.1.8"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.9"><img src="https://img.shields.io/badge/release-v0.1.9-586575" alt="Release v0.1.9"></a>
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.8/wallpaperlivesetup-v0.1.8.exe"><strong>Download Windows installer</strong></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.9/wallpaperlivesetup-v0.1.9.exe"><strong>Download Windows installer</strong></a>
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
+  &nbsp;·&nbsp; <a href="https://yapp.ink/raflyf">Buy me a coffee</a>
 </p>
 
-WallpaperLive plays trusted local videos, GIFs and images on multiple displays. Apply the same wallpaper to All displays, or set a different file on each display without stopping the others. Search your thumbnail library in a 3x3 grid and control playback from the panel or tray. Right-click thumbnails for file actions or Retry thumbnail, use hotkeys (`Space`, `←`/`→`), monitor live RAM and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
+WallpaperLive plays trusted local videos, GIFs and images on multiple displays. Apply the same wallpaper to All displays, or set a different file on each display without stopping the others. Search your thumbnail library in a 3x3 grid and control playback from the panel or tray. Right-click thumbnails for file actions or Retry thumbnail, use Library hotkeys (`Space` on the grid, `←`/`→`), monitor live RAM and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
 
 > Windows 10/11 x64. Unsigned installer. Wallpapers and the native decoder are not bundled; Setup asks before downloading a decoder if none is available locally.
 
@@ -28,7 +29,7 @@ WallpaperLive is a player and desktop wallpaper controller, not a place to downl
 
 Create your own videos, GIFs or images, or obtain compatible files separately from creators or sources you trust. Save them on your PC, use **Add wallpaper** or **Add folder**, then choose a display or **All displays** and select **Set wallpaper**. WallpaperLive handles playback, placement, FPS limits and auto-pause. It does not create or supply the artwork.
 
-The main Library's **Where to find wallpapers** menu opens [MyLiveWallpapers](<https://mylivewallpapers.com>), [MoeWalls](<https://moewalls.com>), [MotionBgs](<https://motionbgs.com>) or [DesktopHut](<https://www.desktophut.com>) in your browser. These are third-party browsing shortcuts, not a built-in downloader or an endorsement of their content or safety. Obtain compatible media separately, check its license, then import only files you trust. Settings also links to [LiveBar](<https://livebar.vercel.app>), a separate product.
+The main Library's **Where to find wallpapers** opens an in-app panel with [MyLiveWallpapers](<https://mylivewallpapers.com>), [MoeWalls](<https://moewalls.com>), [MotionBGs](<https://motionbgs.com>) and [DesktopHut](<https://www.desktophut.com>). Choose a link to open your browser; no confirmation popup interrupts browsing. **Back to Library** or Escape restores the Library view and its filters, selection and page. These are third-party links, not a built-in downloader or safety endorsement. Obtain compatible media separately, check its license, then import only files you trust. Settings also links to [LiveBar](<https://livebar.vercel.app>), a separate product.
 
 Use media you have permission to use and respect each creator's license. Wallpapers visible in screenshots demonstrate the app; they are not bundled, hosted or offered for download by WallpaperLive. Links labeled **Download Windows installer** download the application, not wallpaper media. Any optional decoder download during Setup installs libmpv to play your files; it does not fetch a wallpaper.
 
@@ -109,13 +110,13 @@ The desktop capture also shows 0 MB/s disk and 0 Mbps network; paused shows 0 MB
 
 ## Download and install
 
-1. [Download wallpaperlivesetup-v0.1.8.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.8/wallpaperlivesetup-v0.1.8.exe) and run it as your normal Windows user.
+1. [Download wallpaperlivesetup-v0.1.9.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.9/wallpaperlivesetup-v0.1.9.exe) and run it as your normal Windows user.
 2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.8/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.1.9/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
 
-Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.8.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
+Installer downloads include the release version, such as `wallpaperlivesetup-v0.1.9.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
@@ -188,11 +189,15 @@ For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a re
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 ```
 
-Setup File version is `0.1.8.0`; Product version is `0.1.8`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
+Setup File version is `0.1.9.0`; Product version is `0.1.9`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
 
 The app and Start-menu shortcut use the same stable taskbar identity, `Raflyf.WallpaperLive`. Large and small icons are registered before the panel window is created; the executable also embeds the product ICO for the Windows shell. CI does not prove how an existing Windows taskbar renders it.
 
 </details>
+
+## Support
+
+[Buy me a coffee](<https://yapp.ink/raflyf>) if you want to support development. Support is optional and does not unlock or restrict features. The same link is available in **Settings** and opens in your browser.
 
 ## License
 

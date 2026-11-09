@@ -9,7 +9,7 @@ use windows::{
         Foundation::{COLORREF, HWND, LRESULT, RECT},
         Graphics::Gdi::*,
         UI::{
-            Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_SELECTED},
+            Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
             HiDpi::GetDpiForWindow,
             WindowsAndMessaging::*,
         },
@@ -38,6 +38,12 @@ pub const SEARCH: usize = 133;
 pub const SORT: usize = 134;
 pub const FIND_WALLPAPERS: usize = 135;
 pub const PRODUCT_WEBSITE: usize = 136;
+pub const SOURCES_BACK: usize = 137;
+pub const SITE_BASE: usize = 140;
+pub const SOURCES_NOTE: usize = 144;
+pub const SETTINGS_NOTE: usize = 145;
+pub const SETTINGS_INFO: usize = 146;
+pub const SUPPORT: usize = 147;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 
@@ -46,6 +52,24 @@ pub enum Tab {
     #[default]
     Library,
     Settings,
+    Sources,
+}
+
+pub fn visible_on(tab: Tab, id: usize) -> bool {
+    match id {
+        TAB_LIBRARY | TAB_SETTINGS | 110 | 113 => true,
+        101 | ADD_FOLDER => tab != Tab::Settings,
+        SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
+        id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
+        107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO | CLEAR_CACHE | PRODUCT_WEBSITE
+        | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT => tab == Tab::Settings,
+        PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
+        | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
+            tab == Tab::Library
+        }
+        id if (TILE_BASE..TILE_BASE + 9).contains(&id) => tab == Tab::Library,
+        _ => false,
+    }
 }
 
 pub struct Layout {
@@ -61,9 +85,14 @@ pub struct Layout {
     pub preview_title: Rect,
     pub display_label: Rect,
     pub fit_label: Rect,
-    pub settings_note: Rect,
+    pub settings_title: Rect,
+    pub settings_subtitle: Rect,
+    pub preferences_title: Rect,
+    pub resources_title: Rect,
+    pub sources_title: Rect,
+    pub sources_subtitle: Rect,
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 32],
+    controls: [(usize, Rect); 41],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -75,38 +104,37 @@ impl Layout {
         };
         let split = width - 344;
         let footer = r(0, height - 76, width, 76);
-        let pager = r(24, footer.top - 48, split - 48, 36);
-        let library = r(24, 252, split - 48, pager.top - 268);
+        let pause_y = footer.top - 52;
+        let pager = r(24, pause_y, split - 48, 36);
+        let library = r(24, 248, split - 48, pager.top - 264);
         let tile_col_w = (library.right - library.left - 24) / 3;
         let tile_row_h = (library.bottom - library.top - 24) / 3;
         let tile_rects = std::array::from_fn(|i| {
-            let c = (i % 3) as i32;
-            let row = (i / 3) as i32;
             r(
-                library.left + c * (tile_col_w + 12),
-                library.top + row * (tile_row_h + 12),
+                library.left + (i % 3) as i32 * (tile_col_w + 12),
+                library.top + (i / 3) as i32 * (tile_row_h + 12),
                 tile_col_w,
                 tile_row_h,
             )
         });
         let side_x = split + 24;
         let side_width = 296;
-        let preview_height = (height - 572).clamp(1, side_width * 9 / 16);
-        let preview_width = preview_height * 16 / 9;
-        let preview = r(
-            side_x + (side_width - preview_width) / 2,
-            120,
-            preview_width,
-            preview_height,
-        );
-        let file = r(side_x, preview.bottom + 12, side_width, 24);
-        let display_label = r(side_x, file.bottom + 12, side_width, 20);
-        let display = r(side_x, display_label.bottom + 4, side_width, 34);
-        let fit_label = r(side_x, display.bottom + 12, side_width, 20);
-        let fit = r(side_x, fit_label.bottom + 4, side_width, 34);
-        let pause_y = footer.top - 50;
-        let apply_y = pause_y - 48;
+        let apply_y = pause_y - 52;
         let audio_y = apply_y - 44;
+        let preview_height = (audio_y - 332).clamp(84, side_width * 9 / 16);
+        let preview = r(side_x, 128, side_width, preview_height);
+        let file = r(side_x, preview.bottom + 8, side_width, 20);
+        let display_label = r(side_x, file.bottom + 4, side_width, 16);
+        let display = r(side_x, display_label.bottom + 4, side_width, 32);
+        let fit_label = r(side_x, display.bottom + 4, side_width, 16);
+        let fit = r(side_x, fit_label.bottom + 4, side_width, 32);
+        let content_width = (width - 48).min(1040);
+        let content_x = (width - content_width) / 2;
+        let column_width = (content_width - 32) / 2;
+        let resources_x = content_x + column_width + 32;
+        let settings_note = r(content_x, 212, column_width, 40);
+        let source_width = (width - 48).min(840);
+        let source_x = (width - source_width) / 2;
         Self {
             client: r(0, 0, width, height),
             header: r(0, 0, width, 72),
@@ -115,54 +143,68 @@ impl Layout {
             pager,
             sidebar: r(split, 72, width - split, footer.top - 72),
             title: r(24, 18, 140, 36),
-            library_title: r(24, 92, split - 264, 32),
-            library_note: r(24, 132, split - 48, 24),
-            preview_title: r(side_x, 88, side_width, 24),
+            library_title: r(24, 96, split - 264, 32),
+            library_note: r(24, 136, split - 48, 20),
+            preview_title: r(side_x, 96, side_width, 24),
             display_label,
             fit_label,
-            settings_note: r(24, 176, (split - 48).min(480), 36),
+            settings_title: r(content_x, 96, content_width, 32),
+            settings_subtitle: r(content_x, 136, content_width, 20),
+            preferences_title: r(content_x, 184, column_width, 24),
+            resources_title: r(resources_x, 184, column_width, 24),
+            sources_title: r(source_x, 96, source_width - 196, 32),
+            sources_subtitle: r(source_x, 136, source_width, 24),
             tile_rects,
             controls: [
                 (101, r(width - 272, 18, 118, 36)),
                 (ADD_FOLDER, r(width - 146, 18, 122, 36)),
                 (TAB_LIBRARY, r(176, 18, 96, 36)),
                 (TAB_SETTINGS, r(280, 18, 96, 36)),
-                (SEARCH, r(24, 164, split - 336, 34)),
-                (SORT, r(split - 300, 164, 160, 34)),
-                (FOLDER_FILTER, r(24, 206, split - 48, 34)),
-                (FIND_WALLPAPERS, r(split - 228, 92, 204, 34)),
-                (PRODUCT_WEBSITE, r(24, 478, 168, 34)),
+                (SEARCH, r(24, 164, split - 336, 32)),
+                (SORT, r(split - 300, 164, 160, 32)),
+                (FOLDER_FILTER, r(24, 204, split - 48, 32)),
+                (FIND_WALLPAPERS, r(split - 228, 96, 204, 32)),
+                (PRODUCT_WEBSITE, r(content_x, 448, column_width, 36)),
+                (SUPPORT, r(resources_x, 448, column_width, 36)),
                 (PREVIEW, preview),
                 (112, file),
                 (105, display),
                 (106, fit),
-                (AUDIO, r(side_x, audio_y, 132, 32)),
-                (REMOVE, r(side_x + 144, audio_y, 152, 32)),
-                (102, r(side_x, apply_y, side_width, 38)),
-                (103, r(side_x, pause_y, 142, 34)),
-                (104, r(side_x + 154, pause_y, 142, 34)),
-                (107, r(24, 224, (split - 48).min(400), 32)),
-                (108, r(24, 304, (split - 48).min(400), 32)),
-                (121, r(24, 264, (split - 48).min(400), 32)),
-                (VERSION, r(24, 348, (split - 48).min(400), 22)),
-                (MEMORY_INFO, r(24, 374, (split - 48).min(400), 22)),
-                (CACHE_INFO, r(24, 400, (split - 48).min(400), 22)),
-                (CLEAR_CACHE, r(24, 430, 156, 32)),
+                (AUDIO, r(side_x, audio_y, 142, 32)),
+                (REMOVE, r(side_x + 154, audio_y, 142, 32)),
+                (102, r(side_x, apply_y, side_width, 40)),
+                (103, r(side_x, pause_y, 142, 36)),
+                (104, r(side_x + 154, pause_y, 142, 36)),
+                (107, r(content_x, 264, column_width, 40)),
+                (108, r(content_x, 368, column_width, 40)),
+                (121, r(content_x, 316, column_width, 40)),
+                (VERSION, r(resources_x, 212, column_width, 24)),
+                (MEMORY_INFO, r(resources_x, 248, column_width, 40)),
+                (CACHE_INFO, r(resources_x, 300, column_width, 24)),
+                (CLEAR_CACHE, r(resources_x, 336, column_width, 36)),
                 (FPS, r(side_x, fit.bottom + 12, side_width, 34)),
-                (SELECT_ALL, r(split - 128, 164, 104, 34)),
-                (PREVIOUS, r(pager.left, pager.top, 104, 36)),
-                (NEXT, r(pager.left + 116, pager.top, 104, 36)),
+                (SELECT_ALL, r(split - 128, 164, 104, 32)),
+                (PREVIOUS, r(pager.left, pager.top, 88, 36)),
+                (NEXT, r(pager.left + 100, pager.top, 88, 36)),
                 (
                     PAGE,
                     r(
-                        pager.left + 232,
+                        pager.left + 200,
                         pager.top,
-                        pager.right - pager.left - 232,
+                        pager.right - pager.left - 200,
                         36,
                     ),
                 ),
                 (110, r(width - 104, footer.top + 20, 80, 36)),
                 (113, r(24, footer.top + 12, width - 152, 52)),
+                (SOURCES_BACK, r(source_x + source_width - 180, 96, 180, 32)),
+                (SITE_BASE, r(source_x, 184, source_width, 44)),
+                (SITE_BASE + 1, r(source_x, 240, source_width, 44)),
+                (SITE_BASE + 2, r(source_x, 296, source_width, 44)),
+                (SITE_BASE + 3, r(source_x, 352, source_width, 44)),
+                (SOURCES_NOTE, r(source_x, 412, source_width, 112)),
+                (SETTINGS_NOTE, settings_note),
+                (SETTINGS_INFO, r(resources_x, 384, column_width, 48)),
             ],
         }
     }
@@ -454,27 +496,16 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
                 let playing = path.is_some_and(|path| skin.playing.contains(path));
                 rounded(dc, r, CARD, if active { ACCENT } else { 0x2c2c2c }, s(6));
-                let mut area = rect(
+                let area = rect(
                     r.left + s(2),
                     r.top + s(2),
                     r.right - s(2),
                     if id == PREVIEW {
                         r.bottom - s(2)
                     } else {
-                        r.bottom - s(26)
+                        r.bottom - s(28)
                     },
                 );
-                let width = (area.right - area.left).max(1);
-                let height = (area.bottom - area.top).max(1);
-                if i64::from(width) * 9 > i64::from(height) * 16 {
-                    let fitted = height * 16 / 9;
-                    area.left += (width - fitted) / 2;
-                    area.right = area.left + fitted;
-                } else {
-                    let fitted = width * 9 / 16;
-                    area.top += (height - fitted) / 2;
-                    area.bottom = area.top + fitted;
-                }
                 if let Some(path) = path {
                     if let Some(bitmap) = skin.thumbnails.get(path) {
                         image(dc, bitmap.0, area);
@@ -500,9 +531,9 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                             dc,
                             &filename(path),
                             title_rect,
-                            s(11),
+                            s(13),
                             true,
-                            if active { ACCENT } else { TEXT },
+                            TEXT,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                         );
                         if playing {
@@ -579,7 +610,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
             let active_tab = is_tab
                 && SKIN.with(|s| {
                     let tab = s.borrow().tab;
-                    (tab == Tab::Library && id == TAB_LIBRARY)
+                    (tab != Tab::Settings && id == TAB_LIBRARY)
                         || (tab == Tab::Settings && id == TAB_SETTINGS)
                 });
 
@@ -643,24 +674,56 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 let _ = DeleteObject(pen);
             }
         }
+        if item.itemState.0 & ODS_FOCUS.0 != 0 && item.itemState.0 & ODS_DISABLED.0 == 0 {
+            let focus = rect(r.left + s(3), r.top + s(3), r.right - s(3), r.bottom - s(3));
+            let pen = CreatePen(PS_SOLID, s(1).max(1), rgb(TEXT));
+            let old_pen = SelectObject(dc, pen);
+            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let _ = RoundRect(
+                dc,
+                focus.left,
+                focus.top,
+                focus.right,
+                focus.bottom,
+                s(4),
+                s(4),
+            );
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            let _ = DeleteObject(pen);
+        }
     }
 }
 
 pub unsafe fn paint(window: HWND) {
-    // SAFETY: UI-thread BeginPaint/EndPaint pair; drawing borrows shared logical layout only.
+    // SAFETY: UI-thread BeginPaint/EndPaint pair; supplied HDC is valid until EndPaint.
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let dc = BeginPaint(window, &mut ps);
+        paint_into(window, dc);
+        let _ = EndPaint(window, &ps);
+    }
+}
+
+pub unsafe fn paint_into(window: HWND, dc: HDC) {
+    // SAFETY: caller supplies a valid drawing HDC; this function owns no paint session.
+    unsafe {
         let mut client = RECT::default();
         let _ = GetClientRect(window, &mut client);
         let dpi = GetDpiForWindow(window).max(96) as i32;
         let scale = |n: i32| n * dpi / 96;
         let pixels = |r: Rect| rect(scale(r.left), scale(r.top), scale(r.right), scale(r.bottom));
         let layout = Layout::new(client.right * 96 / dpi, client.bottom * 96 / dpi);
+        let (tab, empty_view, empty_library) = SKIN.with(|skin| {
+            let skin = skin.borrow();
+            (skin.tab, skin.tiles.is_empty(), skin.library_empty)
+        });
         fill(dc, pixels(layout.client), CANVAS);
         fill(dc, pixels(layout.header), CANVAS);
-        fill(dc, pixels(layout.sidebar), PANEL);
-        fill(dc, pixels(layout.pager), CANVAS);
+        if tab == Tab::Library {
+            fill(dc, pixels(layout.sidebar), PANEL);
+            fill(dc, pixels(layout.pager), CANVAS);
+        }
         fill(dc, pixels(layout.footer), 0x161616);
         label(
             dc,
@@ -671,10 +734,6 @@ pub unsafe fn paint(window: HWND) {
             TEXT,
             DT_SINGLELINE,
         );
-        let (tab, empty_view, empty_library) = SKIN.with(|skin| {
-            let skin = skin.borrow();
-            (skin.tab, skin.tiles.is_empty(), skin.library_empty)
-        });
         match tab {
             Tab::Library => {
                 label(
@@ -780,7 +839,7 @@ pub unsafe fn paint(window: HWND) {
                 label(
                     dc,
                     "Settings",
-                    pixels(layout.library_title),
+                    pixels(layout.settings_title),
                     scale(25),
                     true,
                     TEXT,
@@ -788,25 +847,53 @@ pub unsafe fn paint(window: HWND) {
                 );
                 label(
                     dc,
-                    "Pause, startup and cache preferences",
-                    pixels(layout.library_note),
+                    "Playback preferences and application details",
+                    pixels(layout.settings_subtitle),
                     scale(13),
                     false,
                     MUTED,
-                    DT_SINGLELINE | DT_END_ELLIPSIS,
+                    DT_SINGLELINE,
                 );
                 label(
                     dc,
-                    "Session lock and display sleep always pause playback.",
-                    pixels(layout.settings_note),
-                    scale(13),
+                    "Playback & startup",
+                    pixels(layout.preferences_title),
+                    scale(16),
+                    true,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                label(
+                    dc,
+                    "Resources & support",
+                    pixels(layout.resources_title),
+                    scale(16),
+                    true,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+            }
+            Tab::Sources => {
+                label(
+                    dc,
+                    "Where to find wallpapers",
+                    pixels(layout.sources_title),
+                    scale(25),
+                    true,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                label(
+                    dc,
+                    "Browse in your browser, then import local media.",
+                    pixels(layout.sources_subtitle),
+                    scale(14),
                     false,
                     MUTED,
-                    DT_WORDBREAK,
+                    DT_SINGLELINE,
                 );
             }
         }
-        let _ = EndPaint(window, &ps);
     }
 }
 
@@ -823,15 +910,36 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(
             dc,
-            rgb(if matches!(id, 113 | VERSION | MEMORY_INFO | CACHE_INFO) {
-                MUTED
-            } else {
-                TEXT
-            }),
+            rgb(
+                if matches!(
+                    id,
+                    113 | VERSION
+                        | MEMORY_INFO
+                        | CACHE_INFO
+                        | SOURCES_NOTE
+                        | SETTINGS_NOTE
+                        | SETTINGS_INFO
+                ) {
+                    MUTED
+                } else {
+                    TEXT
+                },
+            ),
         );
         let color = if id == 113 {
             0x161616
-        } else if matches!(id, 107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO) {
+        } else if matches!(
+            id,
+            107 | 108
+                | 121
+                | VERSION
+                | MEMORY_INFO
+                | CACHE_INFO
+                | SOURCES_NOTE
+                | SETTINGS_NOTE
+                | SETTINGS_INFO
+                | PAGE
+        ) {
             CANVAS
         } else if matches!(id, 105 | 106 | SEARCH) {
             0x242424
@@ -861,6 +969,7 @@ mod tests {
     fn layout_reserves_pager_and_footer_at_all_supported_sizes() {
         for (width, height) in [
             (MIN_CLIENT_WIDTH, MIN_CLIENT_HEIGHT),
+            (1024, 680),
             (1080, 740),
             (1280, 720),
             (1920, 1080),
@@ -912,66 +1021,51 @@ mod tests {
                 assert!(layout.control(PRODUCT_WEBSITE).unwrap().bottom <= layout.pager.top);
                 assert_eq!(layout.control(PREVIOUS).unwrap().left, layout.pager.left);
             }
-            let tab_only = |id| match id {
-                SEARCH | SORT | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS => Some(Tab::Library),
-                107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO | CLEAR_CACHE
-                | PRODUCT_WEBSITE => Some(Tab::Settings),
-                _ => None,
-            };
-            for (i, (id, area)) in layout.controls.iter().enumerate() {
-                for (other_id, other) in &layout.controls[i + 1..] {
-                    if matches!((tab_only(*id), tab_only(*other_id)), (Some(a), Some(b)) if a != b)
-                    {
+            for tab in [Tab::Library, Tab::Settings, Tab::Sources] {
+                for (i, (id, area)) in layout.controls.iter().enumerate() {
+                    if !visible_on(tab, *id) {
                         continue;
                     }
-                    assert!(
-                        !overlap(*area, *other),
-                        "control {id} overlaps {other:?} at {width}x{height}"
-                    );
+                    for (other_id, other) in &layout.controls[i + 1..] {
+                        if visible_on(tab, *other_id) {
+                            assert!(
+                                !overlap(*area, *other),
+                                "{tab:?}: {id} overlaps {other_id} at {width}x{height}"
+                            );
+                        }
+                    }
+                    if tab == Tab::Library {
+                        for tile in layout.tile_rects {
+                            assert!(!overlap(*area, tile), "control {id} overlaps a tile");
+                        }
+                    }
                 }
             }
-            assert!(layout.control(VERSION).unwrap().top > layout.control(108).unwrap().bottom);
-            assert!(
-                layout.control(MEMORY_INFO).unwrap().top > layout.control(VERSION).unwrap().bottom
-            );
-            assert!(
-                layout.control(CACHE_INFO).unwrap().top
-                    > layout.control(MEMORY_INFO).unwrap().bottom
-            );
-            assert!(
-                layout.control(CLEAR_CACHE).unwrap().top
-                    > layout.control(CACHE_INFO).unwrap().bottom
-            );
-            assert_eq!(
-                layout.control(VERSION).unwrap().left,
-                layout.control(108).unwrap().left
-            );
-            assert_eq!(
-                layout.control(MEMORY_INFO).unwrap().left,
-                layout.control(108).unwrap().left
-            );
-            assert_eq!(
-                layout.control(CACHE_INFO).unwrap().left,
-                layout.control(108).unwrap().left
-            );
-            assert_eq!(
-                layout.control(CLEAR_CACHE).unwrap().left,
-                layout.control(108).unwrap().left
-            );
-            assert!(layout.control(106).unwrap().bottom < layout.control(FPS).unwrap().top);
-            assert!(layout.control(FPS).unwrap().bottom < layout.control(AUDIO).unwrap().top);
-            assert_eq!(
-                layout.control(107).unwrap().left,
-                layout.control(121).unwrap().left
-            );
-            assert_eq!(
-                layout.control(121).unwrap().left,
-                layout.control(108).unwrap().left
-            );
-            assert_eq!(
-                layout.control(105).unwrap().bottom - layout.control(105).unwrap().top,
-                34
-            );
+            let area = |id| layout.control(id).unwrap();
+            for (left, right) in [(AUDIO, REMOVE), (103, 104), (PRODUCT_WEBSITE, SUPPORT)] {
+                assert_eq!(area(left).top, area(right).top);
+                assert_eq!(area(left).bottom, area(right).bottom);
+                assert_eq!(
+                    area(left).right - area(left).left,
+                    area(right).right - area(right).left
+                );
+            }
+            assert_eq!(layout.pager.top, area(103).top);
+            assert_eq!(layout.preferences_title.top, layout.resources_title.top);
+            assert_eq!(area(107).left, area(108).left);
+            assert_eq!(area(107).left, area(121).left);
+            assert_eq!(area(MEMORY_INFO).left, area(CACHE_INFO).left);
+            assert!(area(FPS).bottom + 12 <= area(AUDIO).top);
+            assert_eq!(area(SOURCES_BACK).top, layout.sources_title.top);
+            for id in SITE_BASE..SITE_BASE + 4 {
+                assert_eq!(area(id).left, area(SOURCES_NOTE).left);
+                assert_eq!(area(id).right, area(SOURCES_NOTE).right);
+                assert_eq!(area(id).bottom - area(id).top, 44);
+                assert!(area(id).bottom < area(SOURCES_NOTE).top);
+            }
+            assert!(area(SOURCES_NOTE).bottom < layout.footer.top);
+            assert!(area(SETTINGS_INFO).bottom < area(SUPPORT).top);
+            assert_eq!(area(105).bottom - area(105).top, 32);
             assert_eq!(layout.control(TILE_BASE), Some(layout.tile_rects[0]));
             assert!(layout.control(TILE_BASE + 9).is_none());
         }

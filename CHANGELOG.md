@@ -11,6 +11,25 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## v0.1.9
+
+### Changed
+
+- Align the Library toolbars, nine-card grid, preview and playback controls with consistent spacing and equal-width paired buttons. Use the thumbnail image area without a second letterbox and increase filename readability.
+- Organize Settings into matching Playback & startup and Resources & support columns. Hide the unrelated wallpaper preview, filename and playback controls on this page.
+- Replace the Where to find wallpapers confirmation dialog and popup menu with an integrated page in the app. Four fixed website links open in the default browser; media and license guidance stays inline. Back to Library or Escape preserves the previous filter, selection and page.
+- Keep keyboard focus visible and let Space activate buttons and Settings checkboxes instead of triggering the Library pause shortcut.
+- Add [Buy me a coffee](<https://yapp.ink/raflyf>) in Settings and the README. Support is optional; the link opens in the browser and never submits a payment from the app.
+- Update application and installer metadata to `0.1.9`; the tray tooltip continues to use the executable's version.
+
+### Unchanged
+
+- Choosing a display only selects the target. Use Set wallpaper to apply; existing multi-display playback and saved media/preferences are unchanged.
+- No wallpaper gallery, embedded browser, wallpaper downloader or new runtime dependency. Existing destructive-action confirmations remain.
+- Historical screenshots and resource measurements keep their original version labels; they are not v0.1.9 measurements.
+
+---
+
 ## v0.1.8
 
 ### Fixed

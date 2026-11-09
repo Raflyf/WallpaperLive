@@ -27,7 +27,7 @@ use windows::{
             HiDpi::*,
             Input::KeyboardAndMouse::{
                 EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, SetFocus, VK_CONTROL,
-                VK_LEFT, VK_RIGHT, VK_SPACE,
+                VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SPACE,
             },
             Shell::*,
             WindowsAndMessaging::*,
@@ -74,6 +74,7 @@ const WALLPAPER_SITES: [(&str, &str); 4] = [
     ("DesktopHut", "https://www.desktophut.com"),
 ];
 const PRODUCT_URL: &str = "https://livebar.vercel.app";
+const SUPPORT_URL: &str = "https://yapp.ink/raflyf";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -682,6 +683,36 @@ impl App {
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::SUPPORT,
+                    w!("BUTTON"),
+                    "Buy me a coffee",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::SOURCES_BACK,
+                    w!("BUTTON"),
+                    "Back to Library",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::SOURCES_NOTE,
+                    w!("STATIC"),
+                    "WallpaperLive does not supply or download wallpapers.\r\nDownload media, not installers. Respect creator licenses and use files you trust. These third-party sites are not safety-verified.",
+                    SS_LEFT.0 | SS_NOPREFIX.0,
+                ),
+                (
+                    visuals::SETTINGS_NOTE,
+                    w!("STATIC"),
+                    "Session lock and display sleep always pause playback.",
+                    SS_LEFT.0 | SS_NOPREFIX.0,
+                ),
+                (
+                    visuals::SETTINGS_INFO,
+                    w!("STATIC"),
+                    "Memory readings may differ from Task Manager. Clear unused cache keeps imported media and active wallpapers.",
+                    SS_LEFT.0 | SS_NOPREFIX.0,
+                ),
+                (
                     FILE,
                     w!("STATIC"),
                     "No wallpaper selected",
@@ -824,7 +855,7 @@ impl App {
                     visuals::MEMORY_INFO,
                     w!("STATIC"),
                     "Memory: measuring...",
-                    SS_ENDELLIPSIS.0,
+                    SS_LEFT.0 | SS_NOPREFIX.0,
                 ),
                 (
                     visuals::CACHE_INFO,
@@ -865,6 +896,28 @@ impl App {
                 if matches!(id, BATTERY | STARTUP | 121) {
                     let _ = windows::Win32::UI::Controls::SetWindowTheme(child, w!(""), w!(""));
                 }
+            }
+            for (index, (name, url)) in WALLPAPER_SITES.iter().enumerate() {
+                let label = wide(&format!(
+                    "{name}  -  {}",
+                    url.trim_start_matches("https://")
+                ));
+                let child = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("BUTTON"),
+                    PCWSTR(label.as_ptr()),
+                    WS_CHILD | WINDOW_STYLE(BS_OWNERDRAW as u32) | WS_TABSTOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.hwnd,
+                    HMENU((visuals::SITE_BASE + index) as *mut _),
+                    instance,
+                    None,
+                )
+                .map_err(native_error)?;
+                self.controls.push((visuals::SITE_BASE + index, child));
             }
             let cue = wide("Search by filename");
             SendMessageW(
@@ -1016,7 +1069,7 @@ impl App {
             unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) }
                 .map(|_| {
                     format!(
-                        "Memory: {:.0} MB in use (peak {:.0} MB). Task Manager may differ.",
+                        "Memory: {:.0} MB in use\r\nPeak: {:.0} MB",
                         counters.WorkingSetSize as f64 / 1048576.0,
                         counters.PeakWorkingSetSize as f64 / 1048576.0
                     )
@@ -1227,72 +1280,24 @@ impl App {
                     .map_err(native_error)?;
                 }
             }
-            let is_lib = self.tab == visuals::Tab::Library;
-            let is_settings = self.tab == visuals::Tab::Settings;
             let view = self.library_view();
-
-            for i in 0..9 {
-                let visible = is_lib && view.get(self.page * 9 + i).is_some();
-                let _ = ShowWindow(
-                    self.control(visuals::TILE_BASE + i),
-                    if visible { SW_SHOWNA } else { SW_HIDE },
-                );
-            }
-            for id in [
-                BATTERY,
-                STARTUP,
-                121,
-                visuals::VERSION,
-                visuals::MEMORY_INFO,
-                visuals::CACHE_INFO,
-                visuals::CLEAR_CACHE,
-                visuals::PRODUCT_WEBSITE,
-            ] {
-                let _ = ShowWindow(
-                    self.control(id),
-                    if is_settings { SW_SHOW } else { SW_HIDE },
-                );
-            }
-            for id in [
-                visuals::FOLDER_FILTER,
-                visuals::SEARCH,
-                visuals::SORT,
-                visuals::FIND_WALLPAPERS,
-                visuals::SELECT_ALL,
-                PICK,
-                visuals::ADD_FOLDER,
-            ] {
-                let _ = ShowWindow(self.control(id), if is_lib { SW_SHOWNA } else { SW_HIDE });
-            }
-            for id in [
-                SCREEN,
-                FIT,
-                visuals::FPS,
-                visuals::AUDIO,
-                visuals::REMOVE,
-                APPLY,
-                PAUSE,
-                STOP,
-            ] {
-                let _ = ShowWindow(self.control(id), if is_lib { SW_SHOW } else { SW_HIDE });
+            for (id, control) in &self.controls {
+                let populated = if (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(id) {
+                    view.get(self.page * 9 + id - visuals::TILE_BASE).is_some()
+                } else if matches!(*id, visuals::PREVIOUS | visuals::NEXT | visuals::PAGE) {
+                    !view.is_empty()
+                } else {
+                    true
+                };
+                let visible = visuals::visible_on(self.tab, *id) && populated;
+                let _ = ShowWindow(*control, if visible { SW_SHOWNA } else { SW_HIDE });
             }
             let _ = EnableWindow(self.control(visuals::SELECT_ALL), !view.is_empty());
-
-            if is_lib {
-                let visible = !view.is_empty();
-                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
-                    let _ = ShowWindow(self.control(id), if visible { SW_SHOW } else { SW_HIDE });
-                }
-                let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
-                let _ = EnableWindow(
-                    self.control(visuals::NEXT),
-                    (self.page + 1) * 9 < view.len(),
-                );
-            } else {
-                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
-                    let _ = ShowWindow(self.control(id), SW_HIDE);
-                }
-            }
+            let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
+            let _ = EnableWindow(
+                self.control(visuals::NEXT),
+                (self.page + 1) * 9 < view.len(),
+            );
             for (_, control) in &self.controls {
                 let _ = InvalidateRect(*control, None, true);
             }
@@ -1545,7 +1550,8 @@ impl App {
         Ok(())
     }
     fn thumbnail_paths(&self) -> Vec<PathBuf> {
-        if self.reasons.reason().is_some()
+        if self.tab != visuals::Tab::Library
+            || self.reasons.reason().is_some()
             || self.preparation.is_some()
             || self
                 .displays
@@ -1562,15 +1568,12 @@ impl App {
         {
             return Vec::new();
         }
-        let mut paths: Vec<_> = if self.tab != visuals::Tab::Library {
-            Vec::new()
-        } else {
-            self.library_view()
-                .into_iter()
-                .skip(self.page * 9)
-                .take(9)
-                .collect()
-        };
+        let mut paths: Vec<_> = self
+            .library_view()
+            .into_iter()
+            .skip(self.page * 9)
+            .take(9)
+            .collect();
         if let Some(path) = &self.selected
             && !paths.contains(path)
         {
@@ -1816,7 +1819,10 @@ impl App {
         Ok(())
     }
     fn open_website(&self, url: &'static str) -> Result<(), String> {
-        if url != PRODUCT_URL && !WALLPAPER_SITES.iter().any(|(_, site)| *site == url) {
+        if url != PRODUCT_URL
+            && url != SUPPORT_URL
+            && !WALLPAPER_SITES.iter().any(|(_, site)| *site == url)
+        {
             return Err("Website is not in the recommendation list".into());
         }
         let url = wide(url);
@@ -1836,31 +1842,8 @@ impl App {
         }
         Ok(())
     }
-    fn find_wallpapers(&self) -> Result<(), String> {
-        let notice = wide(
-            "WallpaperLive does not supply or download wallpapers.\n\nThese independent third-party websites open in your browser. Download compatible media yourself, not installers for another app. Respect creator licenses; these links are not a safety guarantee.\n\nContinue to the website list?",
-        );
-        if unsafe {
-            MessageBoxW(
-                self.hwnd,
-                PCWSTR(notice.as_ptr()),
-                w!("Bring your own live wallpapers"),
-                MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2,
-            )
-        } != IDOK
-        {
-            return Ok(());
-        }
-        let labels: Vec<_> = WALLPAPER_SITES
-            .iter()
-            .map(|(name, _)| (*name).to_owned())
-            .collect();
-        if let Some(index) = self.selector(visuals::FIND_WALLPAPERS, &labels, usize::MAX)?
-            && let Some((_, url)) = WALLPAPER_SITES.get(index)
-        {
-            self.open_website(url)?;
-        }
-        Ok(())
+    fn find_wallpapers(&mut self) -> Result<(), String> {
+        self.switch_tab(visuals::Tab::Sources)
     }
     fn retry_thumbnail(&mut self, path: &Path) -> Result<(), String> {
         if !self.library.iter().any(|entry| entry == path) {
@@ -2861,7 +2844,14 @@ impl App {
         }
         match id {
             visuals::FIND_WALLPAPERS => self.find_wallpapers()?,
+            visuals::SOURCES_BACK => self.switch_tab(visuals::Tab::Library)?,
+            id if (visuals::SITE_BASE..visuals::SITE_BASE + WALLPAPER_SITES.len())
+                .contains(&id) =>
+            {
+                self.open_website(WALLPAPER_SITES[id - visuals::SITE_BASE].1)?;
+            }
             visuals::PRODUCT_WEBSITE => self.open_website(PRODUCT_URL)?,
+            visuals::SUPPORT => self.open_website(SUPPORT_URL)?,
             visuals::SORT => {
                 let options = crate::library::Sort::OPTIONS;
                 let labels: Vec<_> = options.iter().map(|sort| sort.label().to_owned()).collect();
@@ -3147,15 +3137,28 @@ impl App {
         Ok(false)
     }
     fn switch_tab(&mut self, tab: visuals::Tab) -> Result<(), String> {
+        let previous = self.tab;
         self.tab = tab;
         visuals::set_tab(tab);
-        if tab == visuals::Tab::Settings {
-            self.refresh_diagnostics();
-        } else {
+        if tab == visuals::Tab::Library {
             self.refresh_library()?;
+        } else {
+            self.cancel_thumbnails();
+            if tab == visuals::Tab::Settings {
+                self.refresh_diagnostics();
+            }
+            self.layout()?;
         }
-        self.request_thumbnails();
-        self.layout()?;
+        let focus = match tab {
+            visuals::Tab::Sources => visuals::SOURCES_BACK,
+            visuals::Tab::Settings => visuals::TAB_SETTINGS,
+            visuals::Tab::Library if previous == visuals::Tab::Sources => visuals::FIND_WALLPAPERS,
+            visuals::Tab::Library => visuals::TAB_LIBRARY,
+        };
+        // SAFETY: move focus off controls hidden by this tab change.
+        unsafe {
+            let _ = SetFocus(self.control(focus));
+        }
         Ok(())
     }
 }
@@ -3569,17 +3572,28 @@ pub fn run() -> Result<(), String> {
                     DispatchMessageW(&message);
                     continue;
                 }
-                if vk == VK_SPACE.0 {
-                    if focus != app.control(STATUS) {
+                if app.tab == visuals::Tab::Sources && vk == VK_ESCAPE.0 {
+                    if let Err(error) = app.switch_tab(visuals::Tab::Library) {
+                        app.set_error(error);
+                    }
+                    continue;
+                }
+                if app.tab == visuals::Tab::Library && vk == VK_SPACE.0 {
+                    let focused_id = GetDlgCtrlID(focus) as usize;
+                    if focus == hwnd
+                        || (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&focused_id)
+                    {
                         app.reasons.manual = !app.reasons.manual;
-                        let _ = app.tick();
+                        if let Err(error) = app.tick() {
+                            app.set_error(error);
+                        }
                         continue;
                     }
-                } else if vk == VK_LEFT.0 {
+                } else if app.tab == visuals::Tab::Library && vk == VK_LEFT.0 {
                     app.page = app.page.saturating_sub(1);
                     let _ = app.refresh_library();
                     continue;
-                } else if vk == VK_RIGHT.0 {
+                } else if app.tab == visuals::Tab::Library && vk == VK_RIGHT.0 {
                     if (app.page + 1) * 9 < app.library_view().len() {
                         app.page += 1;
                         let _ = app.refresh_library();
@@ -3958,6 +3972,189 @@ mod tests {
             last_tile_click: None,
         }
     }
+    #[test]
+    fn native_tabs_keep_library_state_and_capture_layouts() -> Result<(), String> {
+        // SAFETY: hidden test-owned window only; no app run(), tray, media decoder or desktop attachment.
+        unsafe {
+            let instance = GetModuleHandleW(None).map_err(native_error)?;
+            let class = w!("WallpaperLive.UiProof");
+            assert_ne!(
+                RegisterClassW(&WNDCLASSW {
+                    lpfnWndProc: Some(window_proc),
+                    hInstance: instance.into(),
+                    lpszClassName: class,
+                    ..Default::default()
+                }),
+                0
+            );
+            let mut app = fixture();
+            app.hwnd = CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                class,
+                w!("UI proof"),
+                WS_POPUP | WS_CLIPCHILDREN,
+                0,
+                0,
+                1080,
+                740,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .map_err(native_error)?;
+            app.reasons.manual = true;
+            app.config =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scratch/ui-proof/settings.ini");
+            app.create_controls()?;
+            let folder = PathBuf::from(r"C:\UI-proof");
+            app.library = (0..18)
+                .map(|i| folder.join(format!("Wallpaper {i:02}.mp4")))
+                .collect();
+            app.selected = Some(app.library[10].clone());
+            app.marked = vec![app.library[10].clone()];
+            app.folder_filter = Some(folder);
+            app.search = "Wallpaper".into();
+            app.sort = crate::library::Sort::NameAsc;
+            app.page = 1;
+            app.refresh_library()?;
+            let settings = app.settings.encode()?;
+            let selected = app.selected.clone();
+            let marked = app.marked.clone();
+            let filter = app.folder_filter.clone();
+            let visible =
+                |id| GetWindowLongW(app.control(id), GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+            assert!(visible(visuals::PREVIEW) && visible(FILE));
+            app.action(visuals::FIND_WALLPAPERS, BN_CLICKED)?;
+            assert_eq!(app.tab, visuals::Tab::Sources);
+            for id in visuals::SITE_BASE..visuals::SITE_BASE + WALLPAPER_SITES.len() {
+                assert!(GetWindowLongW(app.control(id), GWL_STYLE) as u32 & WS_VISIBLE.0 != 0);
+            }
+            for id in [visuals::PREVIEW, FILE, visuals::SEARCH, SCREEN] {
+                assert_eq!(
+                    GetWindowLongW(app.control(id), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                    0
+                );
+            }
+            app.action(visuals::TAB_SETTINGS, BN_CLICKED)?;
+            assert_eq!(app.tab, visuals::Tab::Settings);
+            assert_eq!(
+                GetWindowLongW(app.control(visuals::PREVIEW), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0
+            );
+            assert_eq!(
+                GetWindowLongW(app.control(FILE), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0
+            );
+            assert_eq!(
+                window_text(app.control(visuals::SUPPORT)),
+                "Buy me a coffee"
+            );
+            app.action(visuals::FIND_WALLPAPERS, BN_CLICKED)?;
+            app.action(visuals::SOURCES_BACK, BN_CLICKED)?;
+            assert_eq!(app.tab, visuals::Tab::Library);
+            assert_eq!(app.page, 1);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.marked, marked);
+            assert_eq!(app.folder_filter, filter);
+            assert_eq!(app.search, "Wallpaper");
+            assert_eq!(app.sort, crate::library::Sort::NameAsc);
+            assert_eq!(app.settings.encode()?, settings);
+            assert!(app.displays.is_empty() && app.playback.is_none());
+            assert!(app.open_website("https://invalid.example/").is_err());
+            assert_eq!(SUPPORT_URL, "https://yapp.ink/raflyf");
+            let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("scratch/ui-proof");
+            fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+            for (width, height) in [(920, 640), (1080, 740)] {
+                SetWindowPos(
+                    app.hwnd,
+                    None,
+                    0,
+                    0,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .map_err(native_error)?;
+                for (tab, name) in [
+                    (visuals::Tab::Library, "library"),
+                    (visuals::Tab::Settings, "settings"),
+                    (visuals::Tab::Sources, "sources"),
+                ] {
+                    app.switch_tab(tab)?;
+                    let dc = CreateCompatibleDC(None);
+                    assert!(!dc.0.is_null());
+                    let mut bits = std::ptr::null_mut();
+                    let bitmap = CreateDIBSection(
+                        dc,
+                        &BITMAPINFO {
+                            bmiHeader: BITMAPINFOHEADER {
+                                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                                biWidth: width,
+                                biHeight: -height,
+                                biPlanes: 1,
+                                biBitCount: 32,
+                                biCompression: BI_RGB.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        DIB_RGB_COLORS,
+                        &mut bits,
+                        None,
+                        0,
+                    )
+                    .map_err(native_error)?;
+                    let previous = SelectObject(dc, bitmap);
+                    visuals::paint_into(app.hwnd, dc);
+                    let layout = visuals::Layout::new(width, height);
+                    for (id, child) in &app.controls {
+                        if GetWindowLongW(*child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
+                            continue;
+                        }
+                        let r = layout
+                            .control(*id)
+                            .expect("every native control has a layout");
+                        let state = SaveDC(dc);
+                        let _ = SetViewportOrgEx(dc, r.left, r.top, None);
+                        SendMessageW(
+                            *child,
+                            WM_PRINT,
+                            WPARAM(dc.0 as usize),
+                            LPARAM((PRF_CLIENT | PRF_NONCLIENT | PRF_ERASEBKGND) as isize),
+                        );
+                        let _ = RestoreDC(dc, state);
+                    }
+                    let _ = GdiFlush();
+                    let pixels = std::slice::from_raw_parts(
+                        bits as *const u8,
+                        (width * height * 4) as usize,
+                    );
+                    let mut bmp = Vec::with_capacity(54 + pixels.len());
+                    bmp.extend_from_slice(b"BM");
+                    bmp.extend_from_slice(&(54 + pixels.len() as u32).to_le_bytes());
+                    bmp.extend_from_slice(&[0; 4]);
+                    bmp.extend_from_slice(&54u32.to_le_bytes());
+                    bmp.extend_from_slice(&40u32.to_le_bytes());
+                    bmp.extend_from_slice(&width.to_le_bytes());
+                    bmp.extend_from_slice(&(-height).to_le_bytes());
+                    bmp.extend_from_slice(&1u16.to_le_bytes());
+                    bmp.extend_from_slice(&32u16.to_le_bytes());
+                    bmp.extend_from_slice(&[0; 24]);
+                    bmp.extend_from_slice(pixels);
+                    SelectObject(dc, previous);
+                    let _ = DeleteObject(bitmap);
+                    let _ = DeleteDC(dc);
+                    fs::write(directory.join(format!("{name}-{width}.bmp")), bmp)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            drop(app);
+            UnregisterClassW(class, instance).map_err(native_error)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn display_target_and_state_survive_switching_and_errors() {
         let mut app = fixture();

@@ -35,6 +35,13 @@ jobs:
         run: |
           cargo +stable test --locked
           if ($LASTEXITCODE -ne 0) { throw "tests failed: $LASTEXITCODE" }
+      - name: Upload native UI proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wallpaperlive-native-ui-proof
+          path: scratch/ui-proof/*.bmp
+          if-no-files-found: warn
       - name: Release application
         run: |
           cargo +stable build --locked --release --bin wallpaperlive
