@@ -19,7 +19,11 @@ Pillow composes these figures using the original captures. Segoe UI labels match
 
 - [preview-v0.1.6.png](preview-v0.1.6.png): desktop capture resized to 1600 × 900 without synthetic overlays.
 - [cache-comparison-v0.1.6.png](cache-comparison-v0.1.6.png): complete preparation and completion captures resized side by side; annotations repeat the visible process values. Preparation groups the app and worker (437.5 MB); completion shows the app alone (41.4 MB).
-- [resource-use-v0.1.6.png](resource-use-v0.1.6.png): Task Manager headers and selected app rows cropped and arranged side by side: desktop playback (37.8 MB / 1.5% CPU) and auto-pause (4.5 MB / 0% CPU).
+
+## Retained tray and auto-pause figure (v0.1.5)
+
+- [resource-use-v0.1.5.png](resource-use-v0.1.5.png): existing figure kept unchanged. Both Task Manager strips show `wallpaperlive.exe`: tray playback (20.3 MB / 0.5% CPU) and auto-pause (4.5 MB / 0% CPU), supplied on 8 November 2026. README captions label the original version; these are not new v0.1.6 measurements.
+- Figure SHA256: `cd60990214fb034dbf28039684a9870b10fe9a9c15879739d0e156e017b795bc`.
 
 ## Earlier captures (v0.1.5)
 

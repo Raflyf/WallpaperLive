@@ -63,28 +63,30 @@ The project author captured the same wallpaper while its display cache was being
 
 | State captured in Task Manager | Memory shown | CPU shown | What the row includes |
 | :--- | ---: | ---: | :--- |
-| Background cache preparation | 437.5 MB | 42.4% | App plus background cache worker (temporary conversion; initial 4K media preparation) |
-| Cache ready, panel open | 41.4 MB – 47.4 MB | 1.3% – 2.5% | WallpaperLive app with 3x3 library grid and controls visible |
-| Desktop live playback | 37.8 MB | 1.5% | WallpaperLive actively rendering live wallpaper on desktop with Task Manager visible |
-| Fullscreen/maximized auto-pause | 4.5 MB | 0% | WallpaperLive app, playback paused |
+| Background cache preparation (v0.1.6, 4K source) | 437.5 MB | 42.4% | App plus background cache worker during initial conversion |
+| Cache ready, panel open (v0.1.6) | 41.4 MB – 47.4 MB | 1.3% – 2.5% | WallpaperLive app with library and controls visible |
+| Desktop live playback (v0.1.6) | 37.8 MB | 1.5% | WallpaperLive app with the control panel closed |
+| Minimized to tray (v0.1.5, retained photo) | 20.3 MB | 0.5% | WallpaperLive app with the control panel closed |
+| Fullscreen/maximized auto-pause (v0.1.5, retained photo) | 4.5 MB | 0% | WallpaperLive app, playback paused |
 
-The author reports a temporary peak around **437.5 MB / 42.4% CPU when preparing a high-resolution 4K wallpaper** (where two decoder/encoder processes run concurrently during initial background cache generation), dropping to **~41–47 MB with the control panel open**, and settling to **~37.8 MB / 1.5% CPU during desktop playback** (and **20.3 MB / 0.5% CPU when minimized to the system tray**). When an application is maximized or fullscreen, auto-pause reclaims resident pages down to **4.5 MB / 0% CPU**. These ranges describe that user's experience on Windows 11, not a fixed memory ceiling or a synthetic benchmark.
+The v0.1.6 snapshot shows **437.5 MB / 42.4% CPU during initial 4K wallpaper conversion**, including the app and its background cache worker. Later panel-open captures show **41.4–47.4 MB**; a separate desktop playback capture shows **37.8 MB / 1.5% CPU**. The retained v0.1.5 photos show **20.3 MB / 0.5% CPU** in tray and **4.5 MB / 0% CPU** while auto-paused. These are individual Task Manager observations on the author's Windows 11 setup, not averages or fixed memory ceilings.
 
 ### Tray playback efficiency and auto-pause
 
 <p align="center">
-  <img src="assets/screenshots/resource-use-v0.1.6.png" width="1200" alt="Task Manager v0.1.6 snapshots: desktop playback shows 37.8 MB and 1.5 percent CPU; auto-paused playback shows 4.5 MB and zero percent CPU, with disk and network at zero">
+  <img src="assets/screenshots/resource-use-v0.1.5.png" width="1200" alt="Original v0.1.5 Task Manager photos: wallpaperlive.exe shows 20.3 MB and 0.5 percent CPU in tray, and 4.5 MB and zero percent CPU while auto-paused">
 </p>
 
-*Task Manager headers and selected rows are cropped and arranged for readability; displayed values are unchanged. These are separate moments, not a controlled before/after benchmark.*
+*The tray and auto-pause figure retains the original v0.1.5 photos supplied on 8 November 2026, unchanged. Both strips show `wallpaperlive.exe`; their displayed values remain 20.3 MB / 0.5% CPU and 4.5 MB / 0% CPU. These are separate moments, not a controlled before/after benchmark.*
 
-**Read the numbers in context.** These v0.1.6 snapshots were supplied on 9 November 2026. Initial conversion memory peaks (~400–438 MB for high-resolution 4K media) are strictly temporary while encoding the display cache; once prepared, playback uses only ~37.8 MB on desktop and ~20.3 MB in tray. Task Manager rounds live values; displayed 0% CPU is not proof of zero work. Its Memory column is not total private allocation, all process-tree memory or dedicated VRAM. Media, codec, display resolution, driver and cache state affect usage. No fixed RAM ceiling or GPU/VRAM savings are guaranteed.
+**Read the numbers in context.** The new v0.1.6 captures were supplied on 9 November 2026; the retained tray and auto-pause photos are from v0.1.5. The roughly 400 MB conversion figure refers to initial 4K cache preparation, not steady playback; the v0.1.6 snapshot shows 437.5 MB for the app and worker together. Task Manager rounds live values; displayed 0% CPU is not proof of zero work. Its Memory column is not total private allocation, all process-tree memory or dedicated VRAM. Media, codec, display resolution, driver and cache state affect usage. No fixed RAM ceiling or GPU/VRAM savings are guaranteed.
 
 <details>
 <summary>Open the original screenshots</summary>
 
 - [Cache preparation (4K conversion): 437.5 MB, 42.4% CPU](assets/screenshots/cache-preparing-v0.1.6.png)
 - [Cache ready, panel open: 41.4 MB, 2.5% CPU](assets/screenshots/cache-ready-v0.1.6.png)
+- [Tray playback on desktop: 20.3 MB, 0.5% CPU](assets/screenshots/desktop-playing-tray-v0.1.5.png)
 - [Desktop live playback: 37.8 MB, 1.5% CPU](assets/screenshots/desktop-playing-tray-v0.1.6.png)
 - [3x3 Library panel open: 47.4 MB, 1.3% CPU](assets/screenshots/task-manager-playing-v0.1.6.png)
 - [Auto-paused: 4.5 MB, 0% CPU](assets/screenshots/task-manager-paused-v0.1.5.png)
