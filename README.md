@@ -9,6 +9,8 @@
   <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.1.9"><img src="https://img.shields.io/badge/release-v0.1.9-586575" alt="Release v0.1.9"></a>
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
+  <a href="https://saweria.co/BuyMatcha"><img src="https://img.shields.io/badge/Saweria-BuyMatcha-faae2b" alt="Saweria"></a>
+  <a href="https://yapp.ink/raflyf"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-raflyf-FFDD00" alt="Buy me a coffee"></a>
 </p>
 
 <p align="center">
@@ -16,6 +18,7 @@
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
+  &nbsp;·&nbsp; <a href="https://saweria.co/BuyMatcha">Saweria</a>
   &nbsp;·&nbsp; <a href="https://yapp.ink/raflyf">Buy me a coffee</a>
 </p>
 
