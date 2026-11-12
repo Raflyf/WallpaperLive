@@ -223,7 +223,7 @@ impl Layout {
 
 pub const CANVAS: u32 = 0x111111;
 pub const PANEL: u32 = 0x181818;
-pub const CARD: u32 = 0x202020;
+pub const CARD: u32 = 0x191919;
 pub const TEXT: u32 = 0xf3eee3;
 pub const MUTED: u32 = 0xa39e93;
 pub const ACCENT: u32 = 0xd9541e;
@@ -520,7 +520,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 };
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
                 let playing = path.is_some_and(|path| skin.playing.contains(path));
-                let card_color = if active { 0x241812 } else { 0x191919 };
+                let card_color = if active { 0x241812 } else { CARD };
                 let card_border = if active { ACCENT } else { 0x2c2a28 };
                 let card_highlight = if active { 0xeb6428 } else { 0x363330 };
                 glass_rounded(dc, r, card_color, card_border, card_highlight, s(10));
