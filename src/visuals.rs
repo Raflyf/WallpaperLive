@@ -364,6 +364,29 @@ unsafe fn rounded(dc: HDC, r: RECT, color: u32, border: u32, radius: i32) {
         let _ = DeleteObject(pen);
     }
 }
+unsafe fn glass_rounded(dc: HDC, r: RECT, color: u32, border: u32, highlight: u32, radius: i32) {
+    // SAFETY: restore native objects before deleting the created brush and pen.
+    unsafe {
+        let brush = CreateSolidBrush(rgb(color));
+        let pen = CreatePen(PS_SOLID, 1, rgb(border));
+        let b = SelectObject(dc, brush);
+        let p = SelectObject(dc, pen);
+        let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+        SelectObject(dc, b);
+        SelectObject(dc, p);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
+
+        if highlight != 0 && r.right - r.left > radius * 2 && r.bottom - r.top > radius {
+            let h_pen = CreatePen(PS_SOLID, 1, rgb(highlight));
+            let old = SelectObject(dc, h_pen);
+            let _ = MoveToEx(dc, r.left + radius / 2, r.top + 1, None);
+            let _ = LineTo(dc, r.right - radius / 2, r.top + 1);
+            SelectObject(dc, old);
+            let _ = DeleteObject(h_pen);
+        }
+    }
+}
 unsafe fn label(
     dc: HDC,
     text: &str,
@@ -497,13 +520,16 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 };
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
                 let playing = path.is_some_and(|path| skin.playing.contains(path));
-                rounded(dc, r, CARD, if active { ACCENT } else { 0x2c2c2c }, s(6));
+                let card_color = if active { 0x241812 } else { 0x191919 };
+                let card_border = if active { ACCENT } else { 0x2c2a28 };
+                let card_highlight = if active { 0xeb6428 } else { 0x363330 };
+                glass_rounded(dc, r, card_color, card_border, card_highlight, s(10));
                 let area = rect(
-                    r.left + s(2),
-                    r.top + s(2),
-                    r.right - s(2),
+                    r.left + s(3),
+                    r.top + s(3),
+                    r.right - s(3),
                     if id == PREVIEW {
-                        r.bottom - s(2)
+                        r.bottom - s(3)
                     } else {
                         r.bottom - s(28)
                     },
@@ -524,9 +550,9 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     }
                     if id != PREVIEW {
                         let title_rect = rect(
-                            r.left + s(6),
+                            r.left + s(8),
                             r.bottom - s(24),
-                            r.right - s(6),
+                            r.right - s(8),
                             r.bottom - s(4),
                         );
                         label(
@@ -539,22 +565,22 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                         );
                         if playing {
-                            let badge_w = s(42);
-                            let badge_h = s(16);
+                            let badge_w = s(46);
+                            let badge_h = s(18);
                             let badge_rect = rect(
-                                area.right - badge_w - s(4),
-                                area.bottom - badge_h - s(4),
-                                area.right - s(4),
-                                area.bottom - s(4),
+                                area.right - badge_w - s(5),
+                                area.bottom - badge_h - s(5),
+                                area.right - s(5),
+                                area.bottom - s(5),
                             );
-                            rounded(dc, badge_rect, 0x3d1f14, ACCENT, s(3));
+                            glass_rounded(dc, badge_rect, 0x3a190c, ACCENT, 0xf06228, s(4));
                             label(
                                 dc,
                                 "Active",
                                 badge_rect,
-                                s(9),
+                                s(10),
                                 true,
-                                ACCENT,
+                                TEXT,
                                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                             );
                         }
@@ -574,13 +600,13 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     && let Some(path) = path
                 {
                     let checked = skin.marked.contains(path);
-                    let box_rect = rect(r.left + s(6), r.top + s(6), r.left + s(22), r.top + s(22));
+                    let box_rect = rect(r.left + s(8), r.top + s(8), r.left + s(24), r.top + s(24));
                     rounded(
                         dc,
                         box_rect,
-                        if checked { ACCENT } else { CANVAS },
+                        if checked { ACCENT } else { 0x141414 },
                         if checked { ACCENT } else { MUTED },
-                        s(3),
+                        s(4),
                     );
                     if checked {
                         let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(CANVAS));
@@ -596,7 +622,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(ACCENT));
                     let old_pen = SelectObject(dc, pen);
                     let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                    let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, s(6), s(6));
+                    let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, s(10), s(10));
                     SelectObject(dc, old_brush);
                     SelectObject(dc, old_pen);
                     let _ = DeleteObject(pen);
@@ -616,29 +642,29 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                         || (tab == Tab::Settings && id == TAB_SETTINGS)
                 });
 
-            let color = if disabled {
-                0x1c1c1c
-            } else if active_tab {
-                0x3a2118
+            let radius = if is_tab { s(18) } else { s(8) };
+            let (color, border, highlight) = if disabled {
+                (0x191919, 0x222222, 0)
+            } else if is_tab {
+                if active_tab {
+                    (0x381f14, ACCENT, 0xeb6428)
+                } else if pressed {
+                    (0x222222, 0x2e2e2e, 0x333333)
+                } else {
+                    (0x161616, 0x282828, 0x2c2c2c)
+                }
             } else if primary {
-                if pressed { 0xb84314 } else { ACCENT }
+                if pressed {
+                    (0xb84314, 0x9a360f, 0)
+                } else {
+                    (ACCENT, 0xc44514, 0xf06a34)
+                }
             } else if pressed {
-                0x2c2c2c
-            } else if is_tab {
-                0x181818
+                (0x282828, 0x333333, 0)
             } else {
-                0x242424
+                (0x1f1f1f, 0x2e2e2e, 0x353535)
             };
-            let border = if active_tab {
-                ACCENT
-            } else if is_tab {
-                0x242424
-            } else if primary {
-                color
-            } else {
-                0x303030
-            };
-            rounded(dc, r, color, border, s(6));
+            glass_rounded(dc, r, color, border, highlight, radius);
             let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
             label(
                 dc,
@@ -650,10 +676,10 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     r.bottom,
                 ),
                 s(14),
-                true,
+                primary || active_tab,
                 if disabled {
                     0x66635f
-                } else if is_tab {
+                } else if is_tab && !active_tab {
                     MUTED
                 } else {
                     TEXT
@@ -677,6 +703,11 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
             }
         }
         if item.itemState.0 & ODS_FOCUS.0 != 0 && item.itemState.0 & ODS_DISABLED.0 == 0 {
+            let focus_r = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
+                s(14)
+            } else {
+                s(6)
+            };
             let focus = rect(r.left + s(3), r.top + s(3), r.right - s(3), r.bottom - s(3));
             let pen = CreatePen(PS_SOLID, s(1).max(1), rgb(TEXT));
             let old_pen = SelectObject(dc, pen);
@@ -687,8 +718,8 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 focus.top,
                 focus.right,
                 focus.bottom,
-                s(4),
-                s(4),
+                focus_r,
+                focus_r,
             );
             SelectObject(dc, old_brush);
             SelectObject(dc, old_pen);
@@ -722,11 +753,41 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
         });
         fill(dc, pixels(layout.client), CANVAS);
         fill(dc, pixels(layout.header), CANVAS);
+        fill(
+            dc,
+            rect(
+                0,
+                scale(layout.header.bottom - 1),
+                scale(layout.client.right),
+                scale(layout.header.bottom),
+            ),
+            0x242424,
+        );
         if tab == Tab::Library {
             fill(dc, pixels(layout.sidebar), PANEL);
+            fill(
+                dc,
+                rect(
+                    scale(layout.sidebar.left),
+                    scale(layout.header.bottom),
+                    scale(layout.sidebar.left + 1),
+                    scale(layout.footer.top),
+                ),
+                0x262626,
+            );
             fill(dc, pixels(layout.pager), CANVAS);
         }
         fill(dc, pixels(layout.footer), 0x161616);
+        fill(
+            dc,
+            rect(
+                0,
+                scale(layout.footer.top),
+                scale(layout.client.right),
+                scale(layout.footer.top + 1),
+            ),
+            0x242424,
+        );
         label(
             dc,
             "WallpaperLive",

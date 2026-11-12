@@ -3524,6 +3524,20 @@ pub fn run() -> Result<(), String> {
             (&dark as *const i32).cast(),
             4,
         );
+        let round = windows::Win32::Graphics::Dwm::DWMWCP_ROUND.0;
+        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&round as *const i32).cast(),
+            4,
+        );
+        let backdrop = 3i32;
+        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,
+            (&backdrop as *const i32).cast(),
+            4,
+        );
         app.create_controls()?;
         if let Err(e) = app.tray(true) {
             app.set_error(e);

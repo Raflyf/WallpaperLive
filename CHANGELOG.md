@@ -11,9 +11,19 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
-## Unreleased
+## v0.2.0
 
-- Add [Saweria](<https://saweria.co/BuyMatcha>) to the README and alongside Buy me a coffee in Settings. The app change is queued for the next feature or fix release; v0.1.9 and its installer remain unchanged.
+### Added
+
+- Translucent acrylic and glassmorphism UI styling across main panel, sidebar, cards, and modal dialogs.
+- Dual-tone etched glass border highlights and refined card rounding while strictly preserving the three core identity colors (Ink Black, Cream, Burnt Orange).
+- Pill-shaped capsule segmented tabs for seamless navigation between Library and Settings.
+- Integrated Saweria support button in Settings alongside Buy me a coffee.
+
+### Changed
+
+- Enhanced thumbnail card viewport and active playback indicator badge for improved visual contrast and hierarchy.
+- Updated application and installer metadata to `0.2.0`.
 
 ---
 
