@@ -903,12 +903,6 @@ impl App {
                 if matches!(id, BATTERY | STARTUP | 121) {
                     let _ = windows::Win32::UI::Controls::SetWindowTheme(child, w!(""), w!(""));
                 }
-                // Text-only children: WS_EX_TRANSPARENT lets the acrylic parent show
-                // through instead of the child erasing its own opaque rectangle.
-                if class == w!("STATIC") {
-                    let style = GetWindowLongPtrW(child, GWL_EXSTYLE);
-                    SetWindowLongPtrW(child, GWL_EXSTYLE, style | WS_EX_TRANSPARENT.0 as isize);
-                }
             }
             for (index, (name, url)) in WALLPAPER_SITES.iter().enumerate() {
                 let label = wide(&format!(
@@ -1314,7 +1308,8 @@ impl App {
             for (_, control) in &self.controls {
                 let _ = InvalidateRect(*control, None, true);
             }
-            let _ = InvalidateRect(self.hwnd, None, false);
+            let _ = InvalidateRect(self.hwnd, None, true);
+            let _ = UpdateWindow(self.hwnd);
         }
         Ok(())
     }
@@ -3170,9 +3165,11 @@ impl App {
             visuals::Tab::Library if previous == visuals::Tab::Sources => visuals::FIND_WALLPAPERS,
             visuals::Tab::Library => visuals::TAB_LIBRARY,
         };
-        // SAFETY: move focus off controls hidden by this tab change.
+        // SAFETY: move focus off controls hidden by this tab change and force clean repaint.
         unsafe {
             let _ = SetFocus(self.control(focus));
+            let _ = InvalidateRect(self.hwnd, None, true);
+            let _ = UpdateWindow(self.hwnd);
         }
         Ok(())
     }
@@ -3358,8 +3355,7 @@ fn register_control_class(
             hIcon: icon,
             hIconSm: small_icon,
             hCursor: LoadCursorW(None, IDC_ARROW).map_err(native_error)?,
-            // No class background: DWM acrylic shows through, WM_PAINT owns every pixel.
-            hbrBackground: HBRUSH::default(),
+            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             ..Default::default()
         };
         if RegisterClassExW(&wc) == 0 {
@@ -3524,7 +3520,7 @@ pub fn run() -> Result<(), String> {
             WPARAM(ICON_SMALL as usize),
             LPARAM(app.small_icon.0.0 as isize),
         );
-        visuals::enable_glass(hwnd);
+        let _ = visuals::enable_backdrop(hwnd);
         app.create_controls()?;
         if let Err(e) = app.tray(true) {
             app.set_error(e);

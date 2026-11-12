@@ -78,9 +78,6 @@ pub struct Layout {
     pub header: Rect,
     pub footer: Rect,
     pub library: Rect,
-    // Geometry only; the pager band is a transparent region over the glass, so no
-    // paint reads it. Layout tests still assert against it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub pager: Rect,
     pub sidebar: Rect,
     pub title: Rect,
@@ -93,6 +90,9 @@ pub struct Layout {
     pub settings_subtitle: Rect,
     pub preferences_title: Rect,
     pub resources_title: Rect,
+    pub settings_preferences_panel: Rect,
+    pub settings_resources_panel: Rect,
+    pub sources_panel: Rect,
     pub sources_title: Rect,
     pub sources_subtitle: Rect,
     pub tile_rects: [Rect; 9],
@@ -156,6 +156,9 @@ impl Layout {
             settings_subtitle: r(content_x, 136, content_width, 20),
             preferences_title: r(content_x, 184, column_width, 24),
             resources_title: r(resources_x, 184, column_width, 24),
+            settings_preferences_panel: r(content_x - 12, 172, column_width + 24, footer.top - 188),
+            settings_resources_panel: r(resources_x - 12, 172, column_width + 24, footer.top - 188),
+            sources_panel: r(source_x - 12, 168, source_width + 24, footer.top - 188),
             sources_title: r(source_x, 96, source_width - 196, 32),
             sources_subtitle: r(source_x, 136, source_width, 24),
             tile_rects,
@@ -224,12 +227,42 @@ impl Layout {
     }
 }
 
-pub const CANVAS: u32 = 0x111111;
-pub const PANEL: u32 = 0x181818;
-pub const CARD: u32 = 0x191919;
-pub const TEXT: u32 = 0xf3eee3;
-pub const MUTED: u32 = 0xa39e93;
-pub const ACCENT: u32 = 0xd9541e;
+// The three identity colours. Every other shade is mixed from these, so the
+// palette cannot drift and no fourth hue can creep in.
+pub const INK: u32 = 0x111111;
+pub const CREAM: u32 = 0xf3eee3;
+pub const ORANGE: u32 = 0xd9541e;
+
+const fn mix_channel(a: u32, b: u32, shift: u32, num: u32, den: u32) -> u32 {
+    let x = ((a >> shift) & 255) as i32;
+    let y = ((b >> shift) & 255) as i32;
+    ((x + (y - x) * num as i32 / den as i32) as u32) << shift
+}
+
+/// Linear blend `num/den` of the way from `a` towards `b`.
+const fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
+    mix_channel(a, b, 16, num, den)
+        | mix_channel(a, b, 8, num, den)
+        | mix_channel(a, b, 0, num, den)
+}
+
+pub const TEXT: u32 = CREAM;
+pub const MUTED: u32 = mix(CREAM, INK, 34, 100);
+pub const ACCENT: u32 = ORANGE;
+// Semantic shades. These remain mixtures of the three identity colours.
+pub const GLASS_KEY: u32 = 0;
+pub const CANVAS: u32 = mix(INK, CREAM, 4, 100);
+pub const FOOTER: u32 = mix(INK, CREAM, 2, 100);
+pub const PANEL: u32 = mix(INK, CREAM, 8, 100);
+pub const CARD: u32 = mix(INK, CREAM, 12, 100);
+pub const CARD_LIT: u32 = mix(INK, CREAM, 16, 100);
+pub const LINE: u32 = mix(INK, CREAM, 20, 100);
+pub const HIGHLIGHT: u32 = mix(INK, CREAM, 28, 100);
+pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 58, 100);
+pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 22, 100);
+pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
+pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
+pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
 
 pub fn rgb(hex: u32) -> COLORREF {
     COLORREF(((hex >> 16) & 255) | (hex & 0xff00) | ((hex & 255) << 16))
@@ -336,73 +369,26 @@ pub fn clear() {
         skin.playing.clear();
         skin.library_empty = true;
     });
+    BRUSHES.with(|b| {
+        for (_, brush) in b.borrow_mut().drain() {
+            unsafe {
+                let _ = DeleteObject(brush);
+            }
+        }
+    });
 }
 
 pub unsafe fn fill(dc: HDC, r: RECT, color: u32) {
-    // SAFETY: the HDC belongs to this Paint call. Every fill carries its own alpha
-    // byte and is written back premultiplied, so DWM sees true translucent glass.
+    // SAFETY: brush belongs to this synchronous drawing call.
     unsafe {
-        let alpha = (color >> 24) as u8;
         let brush = CreateSolidBrush(rgb(color));
         FillRect(dc, &r, brush);
         let _ = DeleteObject(brush);
-        premultiply(dc, r, color, alpha);
     }
 }
-
-/// Overwrite a rectangle with a premultiplied colour, including its alpha byte.
-/// GDI brushes always clear alpha, so the pixels are corrected directly.
-unsafe fn premultiply(dc: HDC, r: RECT, color: u32, alpha: u8) {
-    // SAFETY: writes only inside `r` and only when the DIB surface is selected.
-    unsafe {
-        let mut info = BITMAP::default();
-        let bitmap = GetCurrentObject(dc, OBJ_BITMAP);
-        if bitmap.0.is_null() {
-            return;
-        }
-        if GetObjectW(
-            bitmap,
-            std::mem::size_of::<BITMAP>() as i32,
-            Some((&mut info as *mut BITMAP).cast()),
-        ) == 0
-            || info.bmBits.is_null()
-        {
-            return;
-        }
-        let width = info.bmWidth;
-        let height = info.bmHeight.abs();
-        let stride = info.bmWidthBytes;
-        let pixels = info.bmBits.cast::<u8>();
-        let left = r.left.max(0).min(width);
-        let right = r.right.max(0).min(width);
-        let top = r.top.max(0).min(height);
-        let bottom = r.bottom.max(0).min(height);
-        if left >= right || top >= bottom {
-            return;
-        }
-        let a = alpha as u32;
-        let scale = |c: u32| (c * a / 255) as u8;
-        let r8 = scale((color >> 16) & 255);
-        let g8 = scale((color >> 8) & 255);
-        let b8 = scale(color & 255);
-        for y in top..bottom {
-            let row = pixels.add((y as usize) * stride as usize);
-            for x in left..right {
-                let px = row.add((x as usize) * 4);
-                px.write(b8);
-                px.add(1).write(g8);
-                px.add(2).write(r8);
-                px.add(3).write(alpha);
-            }
-        }
-    }
-}
-/// Rounded slab. `color` carries its alpha in the high byte; the alpha plane is
-/// restored after GDI clears it so the slab reads as frosted glass.
 unsafe fn rounded(dc: HDC, r: RECT, color: u32, border: u32, radius: i32) {
     // SAFETY: restore native objects before deleting the created brush and pen.
     unsafe {
-        let alpha = (color >> 24) as u8;
         let brush = CreateSolidBrush(rgb(color));
         let pen = CreatePen(PS_SOLID, 1, rgb(border));
         let b = SelectObject(dc, brush);
@@ -412,15 +398,20 @@ unsafe fn rounded(dc: HDC, r: RECT, color: u32, border: u32, radius: i32) {
         SelectObject(dc, p);
         let _ = DeleteObject(brush);
         let _ = DeleteObject(pen);
-        if alpha < 255 {
-            premultiply(dc, r, color, alpha);
-        }
     }
 }
 unsafe fn glass_rounded(dc: HDC, r: RECT, color: u32, border: u32, highlight: u32, radius: i32) {
     // SAFETY: restore native objects before deleting the created brush and pen.
     unsafe {
-        rounded(dc, r, color, border, radius);
+        let brush = CreateSolidBrush(rgb(color));
+        let pen = CreatePen(PS_SOLID, 1, rgb(border));
+        let b = SelectObject(dc, brush);
+        let p = SelectObject(dc, pen);
+        let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+        SelectObject(dc, b);
+        SelectObject(dc, p);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
 
         if highlight != 0 && r.right - r.left > radius * 2 && r.bottom - r.top > radius {
             let h_pen = CreatePen(PS_SOLID, 1, rgb(highlight));
@@ -545,7 +536,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
     // SAFETY: native DRAWITEMSTRUCT and HDC stay valid for this UI-thread dispatch only.
     unsafe {
         if id == PAGE {
-            fill(dc, r, 0);
+            fill(dc, r, CANVAS);
             label(
                 dc,
                 &window_text(item.hwndItem),
@@ -565,17 +556,9 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 };
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
                 let playing = path.is_some_and(|path| skin.playing.contains(path));
-                let card_color = if active {
-                    tint(0x241812, 0xcc)
-                } else {
-                    tint(CARD, 0xb0)
-                };
-                let card_border = if active { ACCENT } else { tint(0x2c2a28, 0x99) };
-                let card_highlight = if active {
-                    0xeb6428
-                } else {
-                    tint(0x363330, 0x88)
-                };
+                let card_color = if active { ACTIVE_SURFACE } else { CARD };
+                let card_border = if active { ACCENT } else { LINE };
+                let card_highlight = if active { ACCENT_SOFT } else { HIGHLIGHT };
                 glass_rounded(dc, r, card_color, card_border, card_highlight, s(10));
                 let area = rect(
                     r.left + s(3),
@@ -626,7 +609,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                                 area.right - s(5),
                                 area.bottom - s(5),
                             );
-                            glass_rounded(dc, badge_rect, 0x3a190c, ACCENT, 0xf06228, s(4));
+                            glass_rounded(dc, badge_rect, ACCENT_DEEP, ACCENT, ACCENT_SOFT, s(4));
                             label(
                                 dc,
                                 "Active",
@@ -657,7 +640,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                     rounded(
                         dc,
                         box_rect,
-                        if checked { ACCENT } else { 0x141414 },
+                        if checked { ACCENT } else { PANEL },
                         if checked { ACCENT } else { MUTED },
                         s(4),
                     );
@@ -696,40 +679,26 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 });
 
             let radius = if is_tab { s(18) } else { s(8) };
-            // Glass buttons: translucent body over the blur, opaque where the
-            // accent must stay readable (primary action, active tab).
             let (color, border, highlight) = if disabled {
-                (tint(0x191919, 0x66), tint(0x222222, 0x55), 0)
+                (CANVAS, PANEL, 0)
             } else if is_tab {
                 if active_tab {
-                    (tint(0x381f14, 0xd8), ACCENT, 0xeb6428)
+                    (ACTIVE_SURFACE, ACCENT, ACCENT_SOFT)
                 } else if pressed {
-                    (
-                        tint(0x222222, 0xaa),
-                        tint(0x2e2e2e, 0x88),
-                        tint(0x333333, 0x66),
-                    )
+                    (CARD, LINE, HIGHLIGHT)
                 } else {
-                    (
-                        tint(0x161616, 0x70),
-                        tint(0x282828, 0x77),
-                        tint(0x2c2c2c, 0x55),
-                    )
+                    (PANEL, LINE, HIGHLIGHT)
                 }
             } else if primary {
                 if pressed {
-                    (tint(0xb84314, 0xf0), 0x9a360f, 0)
+                    (ACCENT_DARK, ACCENT_DEEP, 0)
                 } else {
-                    (tint(ACCENT, 0xf2), 0xc44514, 0xf06a34)
+                    (ACCENT, ACCENT_DARK, ACCENT_SOFT)
                 }
             } else if pressed {
-                (tint(0x282828, 0xb4), tint(0x333333, 0x88), 0)
+                (CARD_LIT, HIGHLIGHT, 0)
             } else {
-                (
-                    tint(0x1f1f1f, 0x8a),
-                    tint(0x2e2e2e, 0x77),
-                    tint(0x353535, 0x62),
-                )
+                (CARD, LINE, HIGHLIGHT)
             };
             glass_rounded(dc, r, color, border, highlight, radius);
             let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
@@ -745,7 +714,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 s(14),
                 primary || active_tab,
                 if disabled {
-                    0x66635f
+                    DISABLED_TEXT
                 } else if is_tab && !active_tab {
                     MUTED
                 } else {
@@ -795,6 +764,45 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
     }
 }
 
+pub fn enable_backdrop(window: HWND) -> bool {
+    use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
+    // SAFETY: window is the app-owned top-level HWND; all payloads are POD values.
+    unsafe {
+        let dark = 1i32;
+        let round = DWMWCP_ROUND.0;
+        let acrylic = DWMSBT_TRANSIENTWINDOW.0;
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let dark_ok = DwmSetWindowAttribute(
+            window,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const i32).cast(),
+            std::mem::size_of_val(&dark) as u32,
+        )
+        .is_ok();
+        let round_ok = DwmSetWindowAttribute(
+            window,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&round as *const i32).cast(),
+            std::mem::size_of_val(&round) as u32,
+        )
+        .is_ok();
+        let acrylic_ok = DwmSetWindowAttribute(
+            window,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&acrylic as *const i32).cast(),
+            std::mem::size_of_val(&acrylic) as u32,
+        )
+        .is_ok();
+        let frame_ok = DwmExtendFrameIntoClientArea(window, &margins).is_ok();
+        dark_ok && round_ok && acrylic_ok && frame_ok
+    }
+}
+
 pub unsafe fn paint(window: HWND) {
     // SAFETY: UI-thread BeginPaint/EndPaint pair; supplied HDC is valid until EndPaint.
     unsafe {
@@ -802,151 +810,6 @@ pub unsafe fn paint(window: HWND) {
         let dc = BeginPaint(window, &mut ps);
         paint_into(window, dc);
         let _ = EndPaint(window, &ps);
-    }
-}
-
-/// Frosted glass backdrop via DWM. The client area becomes transparent to the
-/// compositor; panels below draw their own translucent tint.
-pub fn enable_glass(window: HWND) {
-    use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
-    // SAFETY: window is the app's own HWND; attribute payloads outlive each call.
-    unsafe {
-        let margin = MARGINS {
-            cxLeftWidth: -1,
-            cxRightWidth: -1,
-            cyTopHeight: -1,
-            cyBottomHeight: -1,
-        };
-        let _ = DwmExtendFrameIntoClientArea(window, &margin);
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            (&DWMSBT_TRANSIENTWINDOW.0 as *const i32).cast(),
-            4,
-        );
-        let dark = 1i32;
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            (&dark as *const i32).cast(),
-            4,
-        );
-        let round = DWMWCP_ROUND.0;
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            (&round as *const i32).cast(),
-            4,
-        );
-        let border = 0x0032201au32; // accent-tinted glass frame line
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_BORDER_COLOR,
-            (&border as *const u32).cast(),
-            4,
-        );
-        let caption = 0x00000000u32; // black caption blends into acrylic
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_CAPTION_COLOR,
-            (&caption as *const u32).cast(),
-            4,
-        );
-        let caption_text = 0x00f3eee3u32;
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_TEXT_COLOR,
-            (&caption_text as *const u32).cast(),
-            4,
-        );
-    }
-}
-
-/// Premultiplied-alpha tint composited over the DWM backdrop.
-/// `alpha` 0 leaves the blur untouched, 255 is opaque.
-fn tint(color: u32, alpha: u8) -> u32 {
-    let r = (color >> 16) & 255;
-    let g = (color >> 8) & 255;
-    let b = color & 255;
-    ((alpha as u32) << 24) | (r << 16) | (g << 8) | b
-}
-
-thread_local! {
-    static GLASS: RefCell<Option<Glass>> = const { RefCell::new(None) };
-}
-
-/// One reusable 32bpp top-down DIB plus the DC that draws into it.
-struct Glass {
-    bitmap: HBITMAP,
-    dc: HDC,
-    width: i32,
-    height: i32,
-}
-impl Drop for Glass {
-    fn drop(&mut self) {
-        // SAFETY: both handles were created here; nothing else references them.
-        unsafe {
-            let _ = DeleteObject(self.bitmap);
-            let _ = DeleteDC(self.dc);
-        }
-    }
-}
-impl Glass {
-    /// Reuse the surface while the client size is unchanged. Every paint clears
-    /// the full client first, so reuse needs no reset pass.
-    unsafe fn reserve(width: i32, height: i32) -> Option<HDC> {
-        if width <= 0 || height <= 0 {
-            return None;
-        }
-        // SAFETY: plain GDI allocation owned by this thread's cache.
-        unsafe {
-            GLASS.with(|slot| {
-                let mut slot = slot.borrow_mut();
-                if let Some(glass) = slot.as_ref()
-                    && glass.width == width
-                    && glass.height == height
-                {
-                    return Some(glass.dc);
-                }
-                *slot = None;
-                let dc = CreateCompatibleDC(None);
-                if dc.0.is_null() {
-                    return None;
-                }
-                let bitmap = CreateDIBSection(
-                    dc,
-                    &BITMAPINFO {
-                        bmiHeader: BITMAPINFOHEADER {
-                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                            biWidth: width,
-                            biHeight: -height,
-                            biPlanes: 1,
-                            biBitCount: 32,
-                            biCompression: BI_RGB.0,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                    DIB_RGB_COLORS,
-                    std::ptr::null_mut(),
-                    None,
-                    0,
-                )
-                .ok()?;
-                if SelectObject(dc, bitmap).0.is_null() {
-                    let _ = DeleteObject(bitmap);
-                    let _ = DeleteDC(dc);
-                    return None;
-                }
-                *slot = Some(Glass {
-                    bitmap,
-                    dc,
-                    width,
-                    height,
-                });
-                Some(dc)
-            })
-        }
     }
 }
 
@@ -959,37 +822,12 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
         let scale = |n: i32| n * dpi / 96;
         let pixels = |r: Rect| rect(scale(r.left), scale(r.top), scale(r.right), scale(r.bottom));
         let layout = Layout::new(client.right * 96 / dpi, client.bottom * 96 / dpi);
-        let Some(glass) = Glass::reserve(client.right, client.bottom) else {
-            paint_layer(window, dc, &layout, &scale, &pixels);
-            return;
-        };
-        paint_layer(window, glass, &layout, &scale, &pixels);
-        let _ = BitBlt(dc, 0, 0, client.right, client.bottom, glass, 0, 0, SRCCOPY);
-    }
-}
-
-unsafe fn paint_layer(
-    _window: HWND,
-    dc: HDC,
-    layout: &Layout,
-    scale: &impl Fn(i32) -> i32,
-    pixels: &impl Fn(Rect) -> RECT,
-) {
-    // SAFETY: HDC belongs to the paint session for the duration of this call.
-    unsafe {
         let (tab, empty_view, empty_library) = SKIN.with(|skin| {
             let skin = skin.borrow();
             (skin.tab, skin.tiles.is_empty(), skin.library_empty)
         });
-        // Clear to fully transparent first so DWM acrylic shows through everywhere.
-        fill(dc, pixels(layout.client), 0);
-        // Tinted glass slabs: alpha keeps the blur readable, values stay on brand.
-        fill(dc, pixels(layout.header), tint(CANVAS, 0x54));
-        if tab == Tab::Library {
-            fill(dc, pixels(layout.sidebar), tint(PANEL, 0x78));
-        }
-        fill(dc, pixels(layout.footer), tint(0x161616, 0x8c));
-        // One hairline per seam instead of opaque edge bands.
+        fill(dc, pixels(layout.client), GLASS_KEY);
+        fill(dc, pixels(layout.header), CANVAS);
         fill(
             dc,
             rect(
@@ -998,20 +836,53 @@ unsafe fn paint_layer(
                 scale(layout.client.right),
                 scale(layout.header.bottom),
             ),
-            tint(TEXT, 0x1f),
+            LINE,
         );
-        if tab == Tab::Library {
-            fill(
-                dc,
-                rect(
-                    scale(layout.sidebar.left),
-                    scale(layout.header.bottom),
-                    scale(layout.sidebar.left + 1),
-                    scale(layout.footer.top),
-                ),
-                tint(TEXT, 0x1f),
-            );
+        match tab {
+            Tab::Library => {
+                fill(dc, pixels(layout.sidebar), PANEL);
+                fill(
+                    dc,
+                    rect(
+                        scale(layout.sidebar.left),
+                        scale(layout.header.bottom),
+                        scale(layout.sidebar.left + 1),
+                        scale(layout.footer.top),
+                    ),
+                    LINE,
+                );
+                fill(dc, pixels(layout.pager), CANVAS);
+            }
+            Tab::Settings => {
+                glass_rounded(
+                    dc,
+                    pixels(layout.settings_preferences_panel),
+                    PANEL,
+                    LINE,
+                    HIGHLIGHT,
+                    scale(12),
+                );
+                glass_rounded(
+                    dc,
+                    pixels(layout.settings_resources_panel),
+                    PANEL,
+                    LINE,
+                    HIGHLIGHT,
+                    scale(12),
+                );
+            }
+            Tab::Sources => {
+                glass_rounded(
+                    dc,
+                    pixels(layout.sources_panel),
+                    PANEL,
+                    LINE,
+                    HIGHLIGHT,
+                    scale(12),
+                );
+            }
         }
+        fill(dc, pixels(layout.footer), FOOTER);
         fill(
             dc,
             rect(
@@ -1020,7 +891,7 @@ unsafe fn paint_layer(
                 scale(layout.client.right),
                 scale(layout.footer.top + 1),
             ),
-            tint(TEXT, 0x1f),
+            LINE,
         );
         label(
             dc,
@@ -1201,11 +1072,14 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
     ) {
         return None;
     }
-    // SAFETY: the DC belongs to the child control's paint; the returned brush is a
-    // process-lifetime stock object so nothing is freed while the control draws.
+    // SAFETY: native control requests a persistent UI-owned brush, deleted only after windows close.
     unsafe {
         let id = GetDlgCtrlID(window) as usize;
-        SetBkMode(dc, TRANSPARENT);
+        if id == 113 {
+            SetBkMode(dc, OPAQUE);
+        } else {
+            SetBkMode(dc, TRANSPARENT);
+        }
         SetTextColor(
             dc,
             rgb(
@@ -1224,11 +1098,37 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
                 },
             ),
         );
-        SetBkColor(dc, rgb(CANVAS));
-        // NULL_BRUSH: the child paints its text only, so the parent's acrylic stays
-        // visible behind labels, checkboxes and the read-only status box.
-        Some(LRESULT(GetStockObject(NULL_BRUSH).0 as isize))
+        let color = if id == 113 {
+            FOOTER
+        } else if matches!(
+            id,
+            107 | 108
+                | 121
+                | VERSION
+                | MEMORY_INFO
+                | CACHE_INFO
+                | SOURCES_NOTE
+                | SETTINGS_NOTE
+                | SETTINGS_INFO
+                | PAGE
+        ) {
+            PANEL
+        } else if matches!(id, 105 | 106 | SEARCH) {
+            CARD
+        } else {
+            PANEL
+        };
+        SetBkColor(dc, rgb(color));
+        Some(LRESULT(brush(color).0 as isize))
     }
+}
+thread_local! {static BRUSHES:RefCell<HashMap<u32,HBRUSH>>=RefCell::new(HashMap::new());}
+pub fn brush(color: u32) -> HBRUSH {
+    BRUSHES.with(|b| {
+        *b.borrow_mut()
+            .entry(color)
+            .or_insert_with(|| unsafe { CreateSolidBrush(rgb(color)) })
+    })
 }
 
 #[cfg(test)]
