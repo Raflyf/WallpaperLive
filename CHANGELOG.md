@@ -23,7 +23,14 @@ Release history for WallpaperLive. Each version describes its own changes; older
 ### Changed
 
 - Enhanced thumbnail card viewport and active playback indicator badge for improved visual contrast and hierarchy.
-- Updated application and installer metadata to `0.2.0`.
+
+### Fixed
+
+- The window client area now renders through a real DWM acrylic backdrop instead of an opaque fill, so the desktop blur is visible behind the interface.
+- Panels, buttons, tabs and cards are composited on a 32-bit alpha surface, so each surface carries its own translucency instead of covering the backdrop.
+- Removed the opaque window-class background brush and the opaque `WM_CTLCOLOR` brushes that painted solid rectangles over the glass.
+- Static labels and toggle controls no longer erase their own background rectangles.
+- Tinted glass slabs replace the flat fills for the title bar, sidebar and footer, keeping Ink Black, Cream and Burnt Orange as the only colours.
 
 ---
 

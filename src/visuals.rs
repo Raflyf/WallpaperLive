@@ -78,6 +78,9 @@ pub struct Layout {
     pub header: Rect,
     pub footer: Rect,
     pub library: Rect,
+    // Geometry only; the pager band is a transparent region over the glass, so no
+    // paint reads it. Layout tests still assert against it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub pager: Rect,
     pub sidebar: Rect,
     pub title: Rect,
@@ -333,26 +336,73 @@ pub fn clear() {
         skin.playing.clear();
         skin.library_empty = true;
     });
-    BRUSHES.with(|b| {
-        for (_, brush) in b.borrow_mut().drain() {
-            unsafe {
-                let _ = DeleteObject(brush);
-            }
-        }
-    });
 }
 
 pub unsafe fn fill(dc: HDC, r: RECT, color: u32) {
-    // SAFETY: brush belongs to this synchronous drawing call.
+    // SAFETY: the HDC belongs to this Paint call. Every fill carries its own alpha
+    // byte and is written back premultiplied, so DWM sees true translucent glass.
     unsafe {
+        let alpha = (color >> 24) as u8;
         let brush = CreateSolidBrush(rgb(color));
         FillRect(dc, &r, brush);
         let _ = DeleteObject(brush);
+        premultiply(dc, r, color, alpha);
     }
 }
+
+/// Overwrite a rectangle with a premultiplied colour, including its alpha byte.
+/// GDI brushes always clear alpha, so the pixels are corrected directly.
+unsafe fn premultiply(dc: HDC, r: RECT, color: u32, alpha: u8) {
+    // SAFETY: writes only inside `r` and only when the DIB surface is selected.
+    unsafe {
+        let mut info = BITMAP::default();
+        let bitmap = GetCurrentObject(dc, OBJ_BITMAP);
+        if bitmap.0.is_null() {
+            return;
+        }
+        if GetObjectW(
+            bitmap,
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&mut info as *mut BITMAP).cast()),
+        ) == 0
+            || info.bmBits.is_null()
+        {
+            return;
+        }
+        let width = info.bmWidth;
+        let height = info.bmHeight.abs();
+        let stride = info.bmWidthBytes;
+        let pixels = info.bmBits.cast::<u8>();
+        let left = r.left.max(0).min(width);
+        let right = r.right.max(0).min(width);
+        let top = r.top.max(0).min(height);
+        let bottom = r.bottom.max(0).min(height);
+        if left >= right || top >= bottom {
+            return;
+        }
+        let a = alpha as u32;
+        let scale = |c: u32| (c * a / 255) as u8;
+        let r8 = scale((color >> 16) & 255);
+        let g8 = scale((color >> 8) & 255);
+        let b8 = scale(color & 255);
+        for y in top..bottom {
+            let row = pixels.add((y as usize) * stride as usize);
+            for x in left..right {
+                let px = row.add((x as usize) * 4);
+                px.write(b8);
+                px.add(1).write(g8);
+                px.add(2).write(r8);
+                px.add(3).write(alpha);
+            }
+        }
+    }
+}
+/// Rounded slab. `color` carries its alpha in the high byte; the alpha plane is
+/// restored after GDI clears it so the slab reads as frosted glass.
 unsafe fn rounded(dc: HDC, r: RECT, color: u32, border: u32, radius: i32) {
     // SAFETY: restore native objects before deleting the created brush and pen.
     unsafe {
+        let alpha = (color >> 24) as u8;
         let brush = CreateSolidBrush(rgb(color));
         let pen = CreatePen(PS_SOLID, 1, rgb(border));
         let b = SelectObject(dc, brush);
@@ -362,20 +412,15 @@ unsafe fn rounded(dc: HDC, r: RECT, color: u32, border: u32, radius: i32) {
         SelectObject(dc, p);
         let _ = DeleteObject(brush);
         let _ = DeleteObject(pen);
+        if alpha < 255 {
+            premultiply(dc, r, color, alpha);
+        }
     }
 }
 unsafe fn glass_rounded(dc: HDC, r: RECT, color: u32, border: u32, highlight: u32, radius: i32) {
     // SAFETY: restore native objects before deleting the created brush and pen.
     unsafe {
-        let brush = CreateSolidBrush(rgb(color));
-        let pen = CreatePen(PS_SOLID, 1, rgb(border));
-        let b = SelectObject(dc, brush);
-        let p = SelectObject(dc, pen);
-        let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
-        SelectObject(dc, b);
-        SelectObject(dc, p);
-        let _ = DeleteObject(brush);
-        let _ = DeleteObject(pen);
+        rounded(dc, r, color, border, radius);
 
         if highlight != 0 && r.right - r.left > radius * 2 && r.bottom - r.top > radius {
             let h_pen = CreatePen(PS_SOLID, 1, rgb(highlight));
@@ -500,7 +545,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
     // SAFETY: native DRAWITEMSTRUCT and HDC stay valid for this UI-thread dispatch only.
     unsafe {
         if id == PAGE {
-            fill(dc, r, CANVAS);
+            fill(dc, r, 0);
             label(
                 dc,
                 &window_text(item.hwndItem),
@@ -520,9 +565,17 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 };
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
                 let playing = path.is_some_and(|path| skin.playing.contains(path));
-                let card_color = if active { 0x241812 } else { CARD };
-                let card_border = if active { ACCENT } else { 0x2c2a28 };
-                let card_highlight = if active { 0xeb6428 } else { 0x363330 };
+                let card_color = if active {
+                    tint(0x241812, 0xcc)
+                } else {
+                    tint(CARD, 0xb0)
+                };
+                let card_border = if active { ACCENT } else { tint(0x2c2a28, 0x99) };
+                let card_highlight = if active {
+                    0xeb6428
+                } else {
+                    tint(0x363330, 0x88)
+                };
                 glass_rounded(dc, r, card_color, card_border, card_highlight, s(10));
                 let area = rect(
                     r.left + s(3),
@@ -643,26 +696,40 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 });
 
             let radius = if is_tab { s(18) } else { s(8) };
+            // Glass buttons: translucent body over the blur, opaque where the
+            // accent must stay readable (primary action, active tab).
             let (color, border, highlight) = if disabled {
-                (0x191919, 0x222222, 0)
+                (tint(0x191919, 0x66), tint(0x222222, 0x55), 0)
             } else if is_tab {
                 if active_tab {
-                    (0x381f14, ACCENT, 0xeb6428)
+                    (tint(0x381f14, 0xd8), ACCENT, 0xeb6428)
                 } else if pressed {
-                    (0x222222, 0x2e2e2e, 0x333333)
+                    (
+                        tint(0x222222, 0xaa),
+                        tint(0x2e2e2e, 0x88),
+                        tint(0x333333, 0x66),
+                    )
                 } else {
-                    (0x161616, 0x282828, 0x2c2c2c)
+                    (
+                        tint(0x161616, 0x70),
+                        tint(0x282828, 0x77),
+                        tint(0x2c2c2c, 0x55),
+                    )
                 }
             } else if primary {
                 if pressed {
-                    (0xb84314, 0x9a360f, 0)
+                    (tint(0xb84314, 0xf0), 0x9a360f, 0)
                 } else {
-                    (ACCENT, 0xc44514, 0xf06a34)
+                    (tint(ACCENT, 0xf2), 0xc44514, 0xf06a34)
                 }
             } else if pressed {
-                (0x282828, 0x333333, 0)
+                (tint(0x282828, 0xb4), tint(0x333333, 0x88), 0)
             } else {
-                (0x1f1f1f, 0x2e2e2e, 0x353535)
+                (
+                    tint(0x1f1f1f, 0x8a),
+                    tint(0x2e2e2e, 0x77),
+                    tint(0x353535, 0x62),
+                )
             };
             glass_rounded(dc, r, color, border, highlight, radius);
             let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
@@ -738,6 +805,151 @@ pub unsafe fn paint(window: HWND) {
     }
 }
 
+/// Frosted glass backdrop via DWM. The client area becomes transparent to the
+/// compositor; panels below draw their own translucent tint.
+pub fn enable_glass(window: HWND) {
+    use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
+    // SAFETY: window is the app's own HWND; attribute payloads outlive each call.
+    unsafe {
+        let margin = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(window, &margin);
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&DWMSBT_TRANSIENTWINDOW.0 as *const i32).cast(),
+            4,
+        );
+        let dark = 1i32;
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const i32).cast(),
+            4,
+        );
+        let round = DWMWCP_ROUND.0;
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&round as *const i32).cast(),
+            4,
+        );
+        let border = 0x0032201au32; // accent-tinted glass frame line
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_BORDER_COLOR,
+            (&border as *const u32).cast(),
+            4,
+        );
+        let caption = 0x00000000u32; // black caption blends into acrylic
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_CAPTION_COLOR,
+            (&caption as *const u32).cast(),
+            4,
+        );
+        let caption_text = 0x00f3eee3u32;
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_TEXT_COLOR,
+            (&caption_text as *const u32).cast(),
+            4,
+        );
+    }
+}
+
+/// Premultiplied-alpha tint composited over the DWM backdrop.
+/// `alpha` 0 leaves the blur untouched, 255 is opaque.
+fn tint(color: u32, alpha: u8) -> u32 {
+    let r = (color >> 16) & 255;
+    let g = (color >> 8) & 255;
+    let b = color & 255;
+    ((alpha as u32) << 24) | (r << 16) | (g << 8) | b
+}
+
+thread_local! {
+    static GLASS: RefCell<Option<Glass>> = const { RefCell::new(None) };
+}
+
+/// One reusable 32bpp top-down DIB plus the DC that draws into it.
+struct Glass {
+    bitmap: HBITMAP,
+    dc: HDC,
+    width: i32,
+    height: i32,
+}
+impl Drop for Glass {
+    fn drop(&mut self) {
+        // SAFETY: both handles were created here; nothing else references them.
+        unsafe {
+            let _ = DeleteObject(self.bitmap);
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+impl Glass {
+    /// Reuse the surface while the client size is unchanged. Every paint clears
+    /// the full client first, so reuse needs no reset pass.
+    unsafe fn reserve(width: i32, height: i32) -> Option<HDC> {
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        // SAFETY: plain GDI allocation owned by this thread's cache.
+        unsafe {
+            GLASS.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if let Some(glass) = slot.as_ref()
+                    && glass.width == width
+                    && glass.height == height
+                {
+                    return Some(glass.dc);
+                }
+                *slot = None;
+                let dc = CreateCompatibleDC(None);
+                if dc.0.is_null() {
+                    return None;
+                }
+                let bitmap = CreateDIBSection(
+                    dc,
+                    &BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: width,
+                            biHeight: -height,
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    DIB_RGB_COLORS,
+                    std::ptr::null_mut(),
+                    None,
+                    0,
+                )
+                .ok()?;
+                if SelectObject(dc, bitmap).0.is_null() {
+                    let _ = DeleteObject(bitmap);
+                    let _ = DeleteDC(dc);
+                    return None;
+                }
+                *slot = Some(Glass {
+                    bitmap,
+                    dc,
+                    width,
+                    height,
+                });
+                Some(dc)
+            })
+        }
+    }
+}
+
 pub unsafe fn paint_into(window: HWND, dc: HDC) {
     // SAFETY: caller supplies a valid drawing HDC; this function owns no paint session.
     unsafe {
@@ -747,12 +959,37 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
         let scale = |n: i32| n * dpi / 96;
         let pixels = |r: Rect| rect(scale(r.left), scale(r.top), scale(r.right), scale(r.bottom));
         let layout = Layout::new(client.right * 96 / dpi, client.bottom * 96 / dpi);
+        let Some(glass) = Glass::reserve(client.right, client.bottom) else {
+            paint_layer(window, dc, &layout, &scale, &pixels);
+            return;
+        };
+        paint_layer(window, glass, &layout, &scale, &pixels);
+        let _ = BitBlt(dc, 0, 0, client.right, client.bottom, glass, 0, 0, SRCCOPY);
+    }
+}
+
+unsafe fn paint_layer(
+    _window: HWND,
+    dc: HDC,
+    layout: &Layout,
+    scale: &impl Fn(i32) -> i32,
+    pixels: &impl Fn(Rect) -> RECT,
+) {
+    // SAFETY: HDC belongs to the paint session for the duration of this call.
+    unsafe {
         let (tab, empty_view, empty_library) = SKIN.with(|skin| {
             let skin = skin.borrow();
             (skin.tab, skin.tiles.is_empty(), skin.library_empty)
         });
-        fill(dc, pixels(layout.client), CANVAS);
-        fill(dc, pixels(layout.header), CANVAS);
+        // Clear to fully transparent first so DWM acrylic shows through everywhere.
+        fill(dc, pixels(layout.client), 0);
+        // Tinted glass slabs: alpha keeps the blur readable, values stay on brand.
+        fill(dc, pixels(layout.header), tint(CANVAS, 0x54));
+        if tab == Tab::Library {
+            fill(dc, pixels(layout.sidebar), tint(PANEL, 0x78));
+        }
+        fill(dc, pixels(layout.footer), tint(0x161616, 0x8c));
+        // One hairline per seam instead of opaque edge bands.
         fill(
             dc,
             rect(
@@ -761,10 +998,9 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
                 scale(layout.client.right),
                 scale(layout.header.bottom),
             ),
-            0x242424,
+            tint(TEXT, 0x1f),
         );
         if tab == Tab::Library {
-            fill(dc, pixels(layout.sidebar), PANEL);
             fill(
                 dc,
                 rect(
@@ -773,11 +1009,9 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
                     scale(layout.sidebar.left + 1),
                     scale(layout.footer.top),
                 ),
-                0x262626,
+                tint(TEXT, 0x1f),
             );
-            fill(dc, pixels(layout.pager), CANVAS);
         }
-        fill(dc, pixels(layout.footer), 0x161616);
         fill(
             dc,
             rect(
@@ -786,7 +1020,7 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
                 scale(layout.client.right),
                 scale(layout.footer.top + 1),
             ),
-            0x242424,
+            tint(TEXT, 0x1f),
         );
         label(
             dc,
@@ -967,7 +1201,8 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
     ) {
         return None;
     }
-    // SAFETY: native control requests a persistent UI-owned brush, deleted only after windows close.
+    // SAFETY: the DC belongs to the child control's paint; the returned brush is a
+    // process-lifetime stock object so nothing is freed while the control draws.
     unsafe {
         let id = GetDlgCtrlID(window) as usize;
         SetBkMode(dc, TRANSPARENT);
@@ -989,37 +1224,11 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
                 },
             ),
         );
-        let color = if id == 113 {
-            0x161616
-        } else if matches!(
-            id,
-            107 | 108
-                | 121
-                | VERSION
-                | MEMORY_INFO
-                | CACHE_INFO
-                | SOURCES_NOTE
-                | SETTINGS_NOTE
-                | SETTINGS_INFO
-                | PAGE
-        ) {
-            CANVAS
-        } else if matches!(id, 105 | 106 | SEARCH) {
-            0x242424
-        } else {
-            PANEL
-        };
-        SetBkColor(dc, rgb(color));
-        Some(LRESULT(brush(color).0 as isize))
+        SetBkColor(dc, rgb(CANVAS));
+        // NULL_BRUSH: the child paints its text only, so the parent's acrylic stays
+        // visible behind labels, checkboxes and the read-only status box.
+        Some(LRESULT(GetStockObject(NULL_BRUSH).0 as isize))
     }
-}
-thread_local! {static BRUSHES:RefCell<HashMap<u32,HBRUSH>>=RefCell::new(HashMap::new());}
-pub fn brush(color: u32) -> HBRUSH {
-    BRUSHES.with(|b| {
-        *b.borrow_mut()
-            .entry(color)
-            .or_insert_with(|| unsafe { CreateSolidBrush(rgb(color)) })
-    })
 }
 
 #[cfg(test)]

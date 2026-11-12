@@ -903,6 +903,12 @@ impl App {
                 if matches!(id, BATTERY | STARTUP | 121) {
                     let _ = windows::Win32::UI::Controls::SetWindowTheme(child, w!(""), w!(""));
                 }
+                // Text-only children: WS_EX_TRANSPARENT lets the acrylic parent show
+                // through instead of the child erasing its own opaque rectangle.
+                if class == w!("STATIC") {
+                    let style = GetWindowLongPtrW(child, GWL_EXSTYLE);
+                    SetWindowLongPtrW(child, GWL_EXSTYLE, style | WS_EX_TRANSPARENT.0 as isize);
+                }
             }
             for (index, (name, url)) in WALLPAPER_SITES.iter().enumerate() {
                 let label = wide(&format!(
@@ -3352,7 +3358,8 @@ fn register_control_class(
             hIcon: icon,
             hIconSm: small_icon,
             hCursor: LoadCursorW(None, IDC_ARROW).map_err(native_error)?,
-            hbrBackground: visuals::brush(visuals::CANVAS),
+            // No class background: DWM acrylic shows through, WM_PAINT owns every pixel.
+            hbrBackground: HBRUSH::default(),
             ..Default::default()
         };
         if RegisterClassExW(&wc) == 0 {
@@ -3517,27 +3524,7 @@ pub fn run() -> Result<(), String> {
             WPARAM(ICON_SMALL as usize),
             LPARAM(app.small_icon.0.0 as isize),
         );
-        let dark = 1i32;
-        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
-            hwnd,
-            windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE,
-            (&dark as *const i32).cast(),
-            4,
-        );
-        let round = windows::Win32::Graphics::Dwm::DWMWCP_ROUND.0;
-        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
-            hwnd,
-            windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
-            (&round as *const i32).cast(),
-            4,
-        );
-        let backdrop = 3i32;
-        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
-            hwnd,
-            windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,
-            (&backdrop as *const i32).cast(),
-            4,
-        );
+        visuals::enable_glass(hwnd);
         app.create_controls()?;
         if let Err(e) = app.tray(true) {
             app.set_error(e);
