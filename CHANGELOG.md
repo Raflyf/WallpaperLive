@@ -15,7 +15,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- Translucent acrylic and glassmorphism UI styling across main panel, sidebar, cards, and modal dialogs.
+- Native acrylic styling in the header, paired with opaque Cream work surfaces and Ink Black media bezels.
 - Dual-tone etched glass border highlights and refined card rounding while strictly preserving the three core identity colors (Ink Black, Cream, Burnt Orange).
 - Pill-shaped capsule segmented tabs for seamless navigation between Library and Settings.
 - Integrated Saweria support button in Settings alongside Buy me a coffee.
@@ -26,11 +26,11 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Fixed
 
-- Window client area now integrates native DWM acrylic material with full-frame client extension, letting desktop wallpaper backdrop show through cleanly without degrading media playback.
-- Thumbnail cards, preview viewport, and native controls maintain full opacity and contrast without washed-out pixels or rendering artifacts.
-- Isolated Settings and Sources views onto dedicated frosted glass card panels, preventing background overlap from inactive tabs.
-- Corrected status text rendering in the footer to prevent overlapping character ghosting during status updates.
-- Strictly consolidated all UI colors into mathematical blends of the three core identity colors (Ink Black `#111111`, Cream `#F3EEE3`, Burnt Orange `#D9541E`).
+- Native DWM acrylic is limited to the header; the workspace, cards, preview, controls, and footer remain opaque for reliable contrast.
+- Ink Black (`#111111`) defines headers, text, media bezels, and the footer; Cream (`#F3EEE3`) defines the workspace and cards; Burnt Orange (`#D9541E`) is reserved for primary actions and active states.
+- Thumbnail and preview bitmaps use an unmodified `SRCCOPY` path, preserving their original RGB values without opacity or tint.
+- Settings and Sources use dedicated opaque card panels, preventing content from inactive tabs showing through.
+- Footer status updates repaint against an opaque Ink Black background to prevent overlapping character ghosting.
 
 ---
 

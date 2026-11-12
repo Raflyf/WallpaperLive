@@ -3758,6 +3758,11 @@ unsafe extern "system" fn window_proc(
                 post(LAYOUT, WPARAM(0), LPARAM(0));
                 LRESULT(0)
             }
+            WM_DWMCOMPOSITIONCHANGED => {
+                let _ = visuals::enable_backdrop(window);
+                let _ = InvalidateRect(window, None, true);
+                LRESULT(0)
+            }
             WM_DPICHANGED => {
                 if lparam.0 != 0 {
                     let rect = *(lparam.0 as *const RECT);
@@ -3771,6 +3776,7 @@ unsafe extern "system" fn window_proc(
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                 }
+                let _ = visuals::enable_backdrop(window);
                 post(LAYOUT, WPARAM(0), LPARAM(0));
                 LRESULT(0)
             }
@@ -3978,6 +3984,44 @@ mod tests {
             last_tile_click: None,
         }
     }
+    unsafe fn proof_thumbnail() -> Result<HBITMAP, String> {
+        let mut bits = std::ptr::null_mut();
+        let bitmap = unsafe {
+            CreateDIBSection(
+                None,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: 320,
+                        biHeight: -180,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .map_err(native_error)?
+        };
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits as *mut u32, 320 * 180) };
+        for y in 0..180 {
+            for x in 0..320 {
+                pixels[y * 320 + x] = match x / 80 {
+                    0 => 0x00e53935,
+                    1 => 0x0043a047,
+                    2 => 0x001e88e5,
+                    _ => 0x00fdd835,
+                };
+            }
+        }
+        Ok(bitmap)
+    }
+
     #[test]
     fn native_tabs_keep_library_state_and_capture_layouts() -> Result<(), String> {
         // SAFETY: hidden test-owned window only; no app run(), tray, media decoder or desktop attachment.
@@ -4076,7 +4120,10 @@ mod tests {
             assert_eq!(SUPPORT_URL, "https://yapp.ink/raflyf");
             let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("scratch/ui-proof");
             fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-            for (width, height) in [(920, 640), (1080, 740)] {
+            for (logical_width, logical_height) in [(920, 640), (1080, 740)] {
+                let dpi = GetDpiForWindow(app.hwnd).max(96) as i32;
+                let width = logical_width * dpi / 96;
+                let height = logical_height * dpi / 96;
                 SetWindowPos(
                     app.hwnd,
                     None,
@@ -4093,6 +4140,12 @@ mod tests {
                     (visuals::Tab::Sources, "sources"),
                 ] {
                     app.switch_tab(tab)?;
+                    if tab == visuals::Tab::Library {
+                        visuals::thumbnail(
+                            app.selected.clone().expect("selected fixture wallpaper"),
+                            proof_thumbnail()?,
+                        );
+                    }
                     let dc = CreateCompatibleDC(None);
                     assert!(!dc.0.is_null());
                     let mut bits = std::ptr::null_mut();
@@ -4118,16 +4171,38 @@ mod tests {
                     .map_err(native_error)?;
                     let previous = SelectObject(dc, bitmap);
                     visuals::paint_into(app.hwnd, dc);
-                    let layout = visuals::Layout::new(width, height);
-                    for (id, child) in &app.controls {
+                    let _ = GdiFlush();
+                    let pixels = std::slice::from_raw_parts(
+                        bits as *const u8,
+                        (width * height * 4) as usize,
+                    );
+                    let pixel = |x: i32, y: i32| {
+                        let i = ((y * width + x) * 4) as usize;
+                        u32::from(pixels[i + 2]) << 16
+                            | u32::from(pixels[i + 1]) << 8
+                            | u32::from(pixels[i])
+                    };
+                    let header_height =
+                        visuals::HEADER_HEIGHT * GetDpiForWindow(app.hwnd).max(96) as i32 / 96;
+                    assert_eq!(pixel(8, 8), visuals::GLASS_KEY, "header must stay acrylic");
+                    assert_eq!(
+                        pixel(8, header_height + 8),
+                        visuals::BODY,
+                        "body must stay opaque Cream"
+                    );
+                    for (_, child) in &app.controls {
                         if GetWindowLongW(*child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
                             continue;
                         }
-                        let r = layout
-                            .control(*id)
-                            .expect("every native control has a layout");
+                        let mut r = RECT::default();
+                        GetWindowRect(*child, &mut r).map_err(native_error)?;
+                        let mut point = POINT {
+                            x: r.left,
+                            y: r.top,
+                        };
+                        MapWindowPoints(None, app.hwnd, std::slice::from_mut(&mut point));
                         let state = SaveDC(dc);
-                        let _ = SetViewportOrgEx(dc, r.left, r.top, None);
+                        let _ = SetViewportOrgEx(dc, point.x, point.y, None);
                         SendMessageW(
                             *child,
                             WM_PRINT,
@@ -4156,7 +4231,7 @@ mod tests {
                     SelectObject(dc, previous);
                     let _ = DeleteObject(bitmap);
                     let _ = DeleteDC(dc);
-                    fs::write(directory.join(format!("{name}-{width}.bmp")), bmp)
+                    fs::write(directory.join(format!("{name}-{logical_width}.bmp")), bmp)
                         .map_err(|e| e.to_string())?;
                 }
             }

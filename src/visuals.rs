@@ -47,6 +47,7 @@ pub const SUPPORT: usize = 147;
 pub const SAWERIA: usize = 148;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
+pub const HEADER_HEIGHT: i32 = 72;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tab {
@@ -141,7 +142,7 @@ impl Layout {
         let source_x = (width - source_width) / 2;
         Self {
             client: r(0, 0, width, height),
-            header: r(0, 0, width, 72),
+            header: r(0, 0, width, HEADER_HEIGHT),
             footer,
             library,
             pager,
@@ -246,20 +247,24 @@ const fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
         | mix_channel(a, b, 0, num, den)
 }
 
-pub const TEXT: u32 = CREAM;
-pub const MUTED: u32 = mix(CREAM, INK, 34, 100);
+pub const TEXT: u32 = INK;
+pub const TEXT_ON_DARK: u32 = CREAM;
+pub const TEXT_ON_ACCENT: u32 = INK;
+pub const MUTED: u32 = mix(INK, CREAM, 32, 100);
+pub const MUTED_ON_DARK: u32 = mix(CREAM, INK, 24, 100);
 pub const ACCENT: u32 = ORANGE;
-// Semantic shades. These remain mixtures of the three identity colours.
+// Semantic roles. Body and cards stay opaque; only the header uses GLASS_KEY.
 pub const GLASS_KEY: u32 = 0;
-pub const CANVAS: u32 = mix(INK, CREAM, 4, 100);
-pub const FOOTER: u32 = mix(INK, CREAM, 2, 100);
-pub const PANEL: u32 = mix(INK, CREAM, 8, 100);
-pub const CARD: u32 = mix(INK, CREAM, 12, 100);
-pub const CARD_LIT: u32 = mix(INK, CREAM, 16, 100);
-pub const LINE: u32 = mix(INK, CREAM, 20, 100);
-pub const HIGHLIGHT: u32 = mix(INK, CREAM, 28, 100);
-pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 58, 100);
-pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 22, 100);
+pub const BODY: u32 = CREAM;
+pub const CANVAS: u32 = mix(CREAM, INK, 4, 100);
+pub const FOOTER: u32 = INK;
+pub const PANEL: u32 = mix(CREAM, INK, 7, 100);
+pub const CARD: u32 = CREAM;
+pub const CARD_LIT: u32 = mix(CREAM, INK, 3, 100);
+pub const LINE: u32 = mix(CREAM, INK, 20, 100);
+pub const HIGHLIGHT: u32 = CREAM;
+pub const DISABLED_TEXT: u32 = mix(INK, CREAM, 60, 100);
+pub const ACTIVE_SURFACE: u32 = mix(CREAM, ORANGE, 22, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
@@ -400,7 +405,7 @@ unsafe fn rounded(dc: HDC, r: RECT, color: u32, border: u32, radius: i32) {
         let _ = DeleteObject(pen);
     }
 }
-unsafe fn glass_rounded(dc: HDC, r: RECT, color: u32, border: u32, highlight: u32, radius: i32) {
+unsafe fn raised_rounded(dc: HDC, r: RECT, color: u32, border: u32, highlight: u32, radius: i32) {
     // SAFETY: restore native objects before deleting the created brush and pen.
     unsafe {
         let brush = CreateSolidBrush(rgb(color));
@@ -556,10 +561,22 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 };
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
                 let playing = path.is_some_and(|path| skin.playing.contains(path));
-                let card_color = if active { ACTIVE_SURFACE } else { CARD };
+                let card_color = if id == PREVIEW {
+                    INK
+                } else if active {
+                    ACTIVE_SURFACE
+                } else {
+                    CARD
+                };
                 let card_border = if active { ACCENT } else { LINE };
-                let card_highlight = if active { ACCENT_SOFT } else { HIGHLIGHT };
-                glass_rounded(dc, r, card_color, card_border, card_highlight, s(10));
+                let card_highlight = if id == PREVIEW {
+                    0
+                } else if active {
+                    ACCENT_SOFT
+                } else {
+                    HIGHLIGHT
+                };
+                raised_rounded(dc, r, card_color, card_border, card_highlight, s(10));
                 let area = rect(
                     r.left + s(3),
                     r.top + s(3),
@@ -580,7 +597,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                             area,
                             s(24),
                             true,
-                            MUTED,
+                            if id == PREVIEW { MUTED_ON_DARK } else { MUTED },
                             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                         );
                     }
@@ -609,14 +626,14 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                                 area.right - s(5),
                                 area.bottom - s(5),
                             );
-                            glass_rounded(dc, badge_rect, ACCENT_DEEP, ACCENT, ACCENT_SOFT, s(4));
+                            raised_rounded(dc, badge_rect, ACCENT_DEEP, ACCENT, ACCENT_SOFT, s(4));
                             label(
                                 dc,
                                 "Active",
                                 badge_rect,
                                 s(10),
                                 true,
-                                TEXT,
+                                TEXT_ON_DARK,
                                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                             );
                         }
@@ -628,7 +645,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                         area,
                         s(15),
                         false,
-                        MUTED,
+                        if id == PREVIEW { MUTED_ON_DARK } else { MUTED },
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                     );
                 }
@@ -683,11 +700,11 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 (CANVAS, PANEL, 0)
             } else if is_tab {
                 if active_tab {
-                    (ACTIVE_SURFACE, ACCENT, ACCENT_SOFT)
+                    (ACCENT, ACCENT_DARK, ACCENT_SOFT)
                 } else if pressed {
-                    (CARD, LINE, HIGHLIGHT)
+                    (mix(INK, CREAM, 8, 100), LINE, 0)
                 } else {
-                    (PANEL, LINE, HIGHLIGHT)
+                    (INK, LINE, 0)
                 }
             } else if primary {
                 if pressed {
@@ -700,7 +717,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
             } else {
                 (CARD, LINE, HIGHLIGHT)
             };
-            glass_rounded(dc, r, color, border, highlight, radius);
+            raised_rounded(dc, r, color, border, highlight, radius);
             let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
             label(
                 dc,
@@ -715,8 +732,12 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 primary || active_tab,
                 if disabled {
                     DISABLED_TEXT
-                } else if is_tab && !active_tab {
-                    MUTED
+                } else if primary && pressed {
+                    TEXT_ON_DARK
+                } else if primary || (is_tab && active_tab) {
+                    TEXT_ON_ACCENT
+                } else if is_tab {
+                    TEXT_ON_DARK
                 } else {
                     TEXT
                 },
@@ -745,7 +766,20 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 s(6)
             };
             let focus = rect(r.left + s(3), r.top + s(3), r.right - s(3), r.bottom - s(3));
-            let pen = CreatePen(PS_SOLID, s(1).max(1), rgb(TEXT));
+            let focus_color = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
+                if SKIN.with(|s| {
+                    let tab = s.borrow().tab;
+                    (id == TAB_LIBRARY && tab != Tab::Settings)
+                        || (id == TAB_SETTINGS && tab == Tab::Settings)
+                }) {
+                    INK
+                } else {
+                    TEXT_ON_DARK
+                }
+            } else {
+                INK
+            };
+            let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(focus_color));
             let old_pen = SelectObject(dc, pen);
             let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
             let _ = RoundRect(
@@ -771,11 +805,12 @@ pub fn enable_backdrop(window: HWND) -> bool {
         let dark = 1i32;
         let round = DWMWCP_ROUND.0;
         let acrylic = DWMSBT_TRANSIENTWINDOW.0;
+        let header_height = HEADER_HEIGHT * GetDpiForWindow(window).max(96) as i32 / 96;
         let margins = MARGINS {
-            cxLeftWidth: -1,
-            cxRightWidth: -1,
-            cyTopHeight: -1,
-            cyBottomHeight: -1,
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: header_height,
+            cyBottomHeight: 0,
         };
         let dark_ok = DwmSetWindowAttribute(
             window,
@@ -826,8 +861,8 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
             let skin = skin.borrow();
             (skin.tab, skin.tiles.is_empty(), skin.library_empty)
         });
-        fill(dc, pixels(layout.client), GLASS_KEY);
-        fill(dc, pixels(layout.header), CANVAS);
+        fill(dc, pixels(layout.client), BODY);
+        fill(dc, pixels(layout.header), GLASS_KEY);
         fill(
             dc,
             rect(
@@ -840,7 +875,7 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
         );
         match tab {
             Tab::Library => {
-                fill(dc, pixels(layout.sidebar), PANEL);
+                fill(dc, pixels(layout.sidebar), CARD);
                 fill(
                     dc,
                     rect(
@@ -851,31 +886,31 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
                     ),
                     LINE,
                 );
-                fill(dc, pixels(layout.pager), CANVAS);
+                fill(dc, pixels(layout.pager), PANEL);
             }
             Tab::Settings => {
-                glass_rounded(
+                raised_rounded(
                     dc,
                     pixels(layout.settings_preferences_panel),
-                    PANEL,
+                    CARD,
                     LINE,
                     HIGHLIGHT,
                     scale(12),
                 );
-                glass_rounded(
+                raised_rounded(
                     dc,
                     pixels(layout.settings_resources_panel),
-                    PANEL,
+                    CARD,
                     LINE,
                     HIGHLIGHT,
                     scale(12),
                 );
             }
             Tab::Sources => {
-                glass_rounded(
+                raised_rounded(
                     dc,
                     pixels(layout.sources_panel),
-                    PANEL,
+                    CARD,
                     LINE,
                     HIGHLIGHT,
                     scale(12),
@@ -899,7 +934,7 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
             pixels(layout.title),
             scale(21),
             true,
-            TEXT,
+            TEXT_ON_DARK,
             DT_SINGLELINE,
         );
         match tab {
@@ -1082,21 +1117,16 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
         }
         SetTextColor(
             dc,
-            rgb(
-                if matches!(
-                    id,
-                    113 | VERSION
-                        | MEMORY_INFO
-                        | CACHE_INFO
-                        | SOURCES_NOTE
-                        | SETTINGS_NOTE
-                        | SETTINGS_INFO
-                ) {
-                    MUTED
-                } else {
-                    TEXT
-                },
-            ),
+            rgb(if id == 113 {
+                TEXT_ON_DARK
+            } else if matches!(
+                id,
+                VERSION | MEMORY_INFO | CACHE_INFO | SOURCES_NOTE | SETTINGS_NOTE | SETTINGS_INFO
+            ) {
+                MUTED
+            } else {
+                TEXT
+            }),
         );
         let color = if id == 113 {
             FOOTER
@@ -1137,6 +1167,54 @@ mod tests {
     fn overlap(a: Rect, b: Rect) -> bool {
         a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
     }
+    #[test]
+    fn identity_colors_anchor_semantic_roles() {
+        assert_eq!((INK, CREAM, ORANGE), (0x111111, 0xf3eee3, 0xd9541e));
+        assert_eq!((BODY, CARD, HIGHLIGHT), (CREAM, CREAM, CREAM));
+        assert_eq!((TEXT, TEXT_ON_ACCENT, FOOTER), (INK, INK, INK));
+        assert_eq!((TEXT_ON_DARK, ACCENT), (CREAM, ORANGE));
+    }
+
+    #[test]
+    fn thumbnail_blit_preserves_source_rgb() {
+        // SAFETY: test owns both memory DCs and DIB sections for the whole draw.
+        unsafe {
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 4,
+                    biHeight: -4,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let target_dc = CreateCompatibleDC(None);
+            assert!(!target_dc.0.is_null());
+            let mut source_bits = std::ptr::null_mut();
+            let mut target_bits = std::ptr::null_mut();
+            let source = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut source_bits, None, 0)
+                .expect("source DIB");
+            let target =
+                CreateDIBSection(target_dc, &info, DIB_RGB_COLORS, &mut target_bits, None, 0)
+                    .expect("target DIB");
+            std::slice::from_raw_parts_mut(source_bits as *mut u32, 16).fill(0xff2a7bc4);
+            let old_target = SelectObject(target_dc, target);
+            image(target_dc, source, rect(0, 0, 4, 4));
+            let _ = GdiFlush();
+            let pixel = *std::slice::from_raw_parts(target_bits as *const u32, 16)
+                .get(5)
+                .unwrap();
+            assert_eq!(pixel & 0x00ff_ffff, 0x002a_7bc4);
+            SelectObject(target_dc, old_target);
+            let _ = DeleteObject(source);
+            let _ = DeleteObject(target);
+            let _ = DeleteDC(target_dc);
+        }
+    }
+
     #[test]
     fn layout_reserves_pager_and_footer_at_all_supported_sizes() {
         for (width, height) in [
