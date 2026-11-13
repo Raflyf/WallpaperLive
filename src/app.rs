@@ -6148,9 +6148,18 @@ mod tests {
                 right: 1140,
                 bottom: 820,
             };
+            let mut wp = windows::Win32::UI::WindowsAndMessaging::WINDOWPOS {
+                hwnd,
+                hwndInsertAfter: HWND::default(),
+                x: initial.left,
+                y: initial.top,
+                cx: initial.right - initial.left,
+                cy: initial.bottom - initial.top,
+                flags: SWP_FRAMECHANGED,
+            };
             let mut params = NCCALCSIZE_PARAMS {
                 rgrc: [initial, RECT::default(), RECT::default()],
-                lppos: std::ptr::null_mut(),
+                lppos: &mut wp,
             };
             assert_eq!(
                 SendMessageW(

@@ -4813,8 +4813,18 @@ mod tests {
                     pixels[idx..idx + 4].try_into().unwrap()
                 };
                 assert_eq!(at(0, 0)[3], CARD_ALPHA);
-                if matches!(btn, CaptionButton::Close | CaptionButton::Minimize) {
-                    assert!(at(w as usize / 2, h as usize / 2)[3] > 200);
+                match btn {
+                    CaptionButton::Minimize => {
+                        let a_lo = at(w as usize / 2, h as usize / 2)[3];
+                        let a_hi = at(w as usize / 2, h as usize / 2 - 1)[3];
+                        assert!(a_lo >= 180 && a_lo == a_hi);
+                    }
+                    CaptionButton::Maximize => {
+                        assert_eq!(at(w as usize / 2, h as usize / 2)[3], CARD_ALPHA);
+                    }
+                    CaptionButton::Close => {
+                        assert!(at(w as usize / 2, h as usize / 2)[3] > 200);
+                    }
                 }
                 assert!(
                     pixels
