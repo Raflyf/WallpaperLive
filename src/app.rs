@@ -100,6 +100,216 @@ fn effective_source_fps(info: Option<&crate::cache::Prepared>, playback: &Playba
         })
         .unwrap_or(0.0)
 }
+fn is_page_control(id: usize) -> bool {
+    (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id)
+        || matches!(id, visuals::PREVIOUS | visuals::NEXT | visuals::PAGE)
+}
+fn format_codec_label(raw: &str) -> Option<String> {
+    let token = raw
+        .trim()
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ',')
+        .find(|part| !part.is_empty())?;
+    let label = match token.to_ascii_lowercase().as_str() {
+        "h264" | "avc" | "avc1" => "H.264".into(),
+        "hevc" | "h265" | "hvc1" | "hev1" => "HEVC".into(),
+        "av1" | "av01" | "libaom-av1" | "dav1d" => "AV1".into(),
+        "vp9" | "vp09" => "VP9".into(),
+        "vp8" => "VP8".into(),
+        "prores" => "ProRes".into(),
+        "mjpeg" => "MJPEG".into(),
+        "png" => "PNG".into(),
+        "apng" => "APNG".into(),
+        "webp" => "WebP".into(),
+        "gif" => "GIF".into(),
+        "jpg" | "jpeg" => "JPEG".into(),
+        "bmp" => "BMP".into(),
+        other if other.is_ascii() && other.len() <= 16 => other.to_ascii_uppercase(),
+        _ => return None,
+    };
+    Some(label)
+}
+fn read_playback_specs(
+    player: &Mpv,
+    source_path: &Path,
+    playing_path: &Path,
+) -> (Option<u32>, Option<u32>, PlaybackSpecs) {
+    let parse_dim = |name: &std::ffi::CStr| {
+        player
+            .property(name)
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+    };
+    let width = parse_dim(c"video-params/w").or_else(|| parse_dim(c"video-out-params/dw"));
+    let height = parse_dim(c"video-params/h").or_else(|| parse_dim(c"video-out-params/dh"));
+    let track_count = player
+        .property(c"track-list/count")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        .clamp(0.0, 256.0) as usize;
+    let mut raw_codec = None;
+    let mut has_audio = false;
+    let mut still_image = false;
+    for i in 0..track_count {
+        let prop = |suffix: &str| -> Option<String> {
+            std::ffi::CString::new(format!("track-list/{i}/{suffix}"))
+                .ok()
+                .and_then(|c| player.property(&c))
+        };
+        match prop("type").as_deref() {
+            Some("audio") => has_audio = true,
+            Some("video") if prop("selected").as_deref() == Some("yes") => {
+                still_image |= prop("image").as_deref() == Some("yes")
+                    || prop("albumart").as_deref() == Some("yes");
+                if raw_codec.is_none() {
+                    raw_codec = prop("codec");
+                }
+            }
+            _ => {}
+        }
+    }
+    let codec = raw_codec
+        .or_else(|| player.property(c"video-codec"))
+        .or_else(|| {
+            source_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned)
+        })
+        .and_then(|c| format_codec_label(&c));
+    let gamma = player
+        .property(c"video-out-params/gamma")
+        .or_else(|| player.property(c"video-dec-params/gamma"));
+    let sig_peak = player
+        .property(c"video-out-params/sig-peak")
+        .or_else(|| player.property(c"video-dec-params/sig-peak"))
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let hdr = matches!(
+        gamma.as_deref(),
+        Some("pq" | "hlg" | "st2084" | "smpte2084")
+    ) || (sig_peak.is_finite() && sig_peak > 1.0);
+    let duration_secs = if still_image {
+        None
+    } else {
+        player
+            .property(c"duration")
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|d| d.is_finite() && *d > 0.0)
+    };
+    let file_bytes = fs::metadata(source_path)
+        .or_else(|_| fs::metadata(playing_path))
+        .ok()
+        .map(|m| m.len())
+        .filter(|&b| b > 0);
+    (
+        width,
+        height,
+        PlaybackSpecs {
+            codec,
+            duration_secs,
+            file_bytes,
+            has_audio,
+            hdr,
+            still_image,
+        },
+    )
+}
+fn format_fps_value(fps: f64) -> String {
+    if !fps.is_finite() || fps <= 0.0 {
+        return String::new();
+    }
+    if (fps - fps.round()).abs() < 0.01 {
+        format!("{:.0}", fps.round())
+    } else {
+        let mut s = format!("{fps:.2}");
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+        s
+    }
+}
+fn format_fps_summary(source_fps: f64, limit_fps: u32, still_image: bool) -> String {
+    if still_image {
+        return "Still image".into();
+    }
+    if !source_fps.is_finite() || source_fps <= 0.0 {
+        return format!("Limit {limit_fps} FPS");
+    }
+    let limit = f64::from(limit_fps);
+    let actual = format_fps_value(source_fps);
+    if (source_fps - limit).abs() <= 0.05 {
+        format!("{actual} FPS")
+    } else if source_fps < limit {
+        format!("{actual} FPS native (limit {limit_fps})")
+    } else {
+        format!("{limit_fps} FPS capped (source {actual})")
+    }
+}
+fn format_duration(secs: f64) -> String {
+    let total = secs.round().max(1.0) as u64;
+    if total >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            total / 3600,
+            (total % 3600) / 60,
+            total % 60
+        )
+    } else {
+        format!("{}:{:02}", total / 60, total % 60)
+    }
+}
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+fn format_playback_specs(
+    info: &crate::cache::Prepared,
+    specs: Option<&PlaybackSpecs>,
+    limit_fps: u32,
+    include_note: bool,
+) -> String {
+    let mut parts = Vec::with_capacity(6);
+    if info.width > 0 && info.height > 0 {
+        parts.push(format!("{}x{}", info.width, info.height));
+    }
+    parts.push(format_fps_summary(
+        info.fps,
+        limit_fps,
+        specs.is_some_and(|s| s.still_image),
+    ));
+    match (
+        specs.and_then(|s| s.codec.as_deref()),
+        specs.is_some_and(|s| s.hdr),
+    ) {
+        (Some(codec), true) => parts.push(format!("{codec} HDR")),
+        (Some(codec), false) => parts.push(codec.into()),
+        (None, true) => parts.push("HDR".into()),
+        (None, false) => {}
+    }
+    if let Some(secs) = specs.and_then(|s| s.duration_secs) {
+        parts.push(format_duration(secs));
+    }
+    if let Some(bytes) = specs.and_then(|s| s.file_bytes) {
+        parts.push(format_bytes(bytes));
+    }
+    if specs.is_some_and(|s| s.has_audio) {
+        parts.push("Audio".into());
+    }
+    if include_note && !info.note.is_empty() {
+        parts.push(info.note.clone());
+    }
+    parts.join(", ")
+}
 fn dormant_grace(reasons: &PauseReasons) -> Option<Duration> {
     if reasons.manual {
         None
@@ -216,11 +426,21 @@ impl Drop for Handle {
         }
     }
 }
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PlaybackSpecs {
+    codec: Option<String>,
+    duration_secs: Option<f64>,
+    file_bytes: Option<u64>,
+    has_audio: bool,
+    hdr: bool,
+    still_image: bool,
+}
 struct Playback {
     player: Mpv,
     surface: Surface,
     path: PathBuf,
     audio_enabled: bool,
+    specs: PlaybackSpecs,
 }
 struct Dormant {
     path: PathBuf,
@@ -371,6 +591,7 @@ struct App {
     thumbnail_rx: std::sync::mpsc::Receiver<(PathBuf, Result<Vec<u8>, String>)>,
     thumbnail_tx: std::sync::mpsc::Sender<(PathBuf, Result<Vec<u8>, String>)>,
     last_tile_click: Option<(usize, Instant)>,
+    layout_state: Option<(i32, i32, i32)>,
 }
 impl App {
     fn swap_display(&mut self, state: &mut DisplayState) {
@@ -1320,37 +1541,41 @@ impl App {
         unsafe {
             let dpi = GetDpiForWindow(self.hwnd).max(96) as i32;
             let scale = |n: i32| n * dpi / 96;
-            let font = CreateFontW(
-                -scale(14),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET.0 as u32,
-                0,
-                0,
-                CLEARTYPE_QUALITY.0 as u32,
-                0,
-                w!("Segoe UI"),
-            );
-            if font.0.is_null() {
-                return Err("Could not create the Windows font".into());
-            }
-            for (_, control) in &self.controls {
-                SendMessageW(
-                    *control,
-                    WM_SETFONT,
-                    WPARAM(font.0 as usize),
-                    LPARAM(isize::from(repaint)),
+            let font_dirty =
+                self.font.0.is_null() || self.layout_state.is_none_or(|(d, _, _)| d != dpi);
+            if font_dirty {
+                let font = CreateFontW(
+                    -scale(14),
+                    0,
+                    0,
+                    0,
+                    400,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET.0 as u32,
+                    0,
+                    0,
+                    CLEARTYPE_QUALITY.0 as u32,
+                    0,
+                    w!("Segoe UI"),
                 );
+                if font.0.is_null() {
+                    return Err("Could not create the Windows font".into());
+                }
+                for (_, control) in &self.controls {
+                    SendMessageW(
+                        *control,
+                        WM_SETFONT,
+                        WPARAM(font.0 as usize),
+                        LPARAM(isize::from(repaint)),
+                    );
+                }
+                if !self.font.0.is_null() {
+                    let _ = DeleteObject(self.font);
+                }
+                self.font = font;
             }
-            if !self.font.0.is_null() {
-                let _ = DeleteObject(self.font);
-            }
-            self.font = font;
             if IsIconic(self.hwnd).as_bool() {
                 return Ok(());
             }
@@ -1361,26 +1586,29 @@ impl App {
             }
             let width = r.right * 96 / dpi;
             let height = r.bottom * 96 / dpi;
-            let layout = visuals::Layout::new(width, height);
             let noredraw = if repaint {
                 SET_WINDOW_POS_FLAGS(0)
             } else {
                 SWP_NOREDRAW
             };
-            for (id, control) in &self.controls {
-                if let Some(area) = layout.control(*id) {
-                    SetWindowPos(
-                        *control,
-                        None,
-                        scale(area.left),
-                        scale(area.top),
-                        scale(area.right - area.left),
-                        scale(area.bottom - area.top),
-                        SWP_NOZORDER | SWP_NOACTIVATE | noredraw,
-                    )
-                    .map_err(native_error)?;
-                    visuals::round_control(*control)?;
+            if font_dirty || self.layout_state != Some((dpi, width, height)) {
+                let layout = visuals::Layout::new(width, height);
+                for (id, control) in &self.controls {
+                    if let Some(area) = layout.control(*id) {
+                        SetWindowPos(
+                            *control,
+                            None,
+                            scale(area.left),
+                            scale(area.top),
+                            scale(area.right - area.left),
+                            scale(area.bottom - area.top),
+                            SWP_NOZORDER | SWP_NOACTIVATE | noredraw,
+                        )
+                        .map_err(native_error)?;
+                        visuals::round_control(*control)?;
+                    }
                 }
+                self.layout_state = Some((dpi, width, height));
             }
             let view = self.library_view();
             let _ = EnableWindow(self.control(visuals::SELECT_ALL), !view.is_empty());
@@ -1548,34 +1776,39 @@ impl App {
         self.request_thumbnails();
         self.apply_layout_with_visibility(repaint, sync_visibility)
     }
-    fn freeze_visible_controls(&self) -> Vec<bool> {
+    fn freeze_controls_matching(&self, include: fn(usize) -> bool) -> Vec<bool> {
         let mut frozen = Vec::with_capacity(self.controls.len());
-        // SAFETY: suppresses synchronous child paints during control updates without mutating self.hwnd visibility.
+        let view = self.library_view();
+        // SAFETY: suppresses synchronous paints only on matching controls that stay visible; excludes WS_EX_LAYERED SEARCH.
         unsafe {
-            for &(_, child) in &self.controls {
-                let visible = !child.0.is_null()
-                    && GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
-                if visible {
+            for &(id, child) in &self.controls {
+                let freeze = id != visuals::SEARCH
+                    && include(id)
+                    && !child.0.is_null()
+                    && GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0
+                    && self.control_visible(id, &view);
+                if freeze {
                     let _ = SendMessageW(child, WM_SETREDRAW, WPARAM(0), LPARAM(0));
                 }
-                frozen.push(visible);
+                frozen.push(freeze);
             }
         }
         frozen
     }
-    fn unfreeze_controls(&self, frozen: &[bool]) {
+    fn unfreeze_controls_matching(&self, frozen: &[bool], include: fn(usize) -> bool) {
         if self.hwnd.0.is_null() {
             return;
         }
         let view = self.library_view();
-        // SAFETY: restores WM_SETREDRAW only on originally-visible children and applies target visibility silently.
+        // SAFETY: restores WM_SETREDRAW only on frozen children and applies target visibility without toggling SEARCH.
         unsafe {
-            for (&(id, child), &was_visible) in self.controls.iter().zip(frozen.iter()) {
-                if child.0.is_null() {
+            for (&(id, child), &was_frozen) in self.controls.iter().zip(frozen.iter()) {
+                if !include(id) || child.0.is_null() {
                     continue;
                 }
+                let was_visible = GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
                 let visible = self.control_visible(id, &view);
-                if was_visible {
+                if was_frozen {
                     let _ = SendMessageW(child, WM_SETREDRAW, WPARAM(1), LPARAM(0));
                 }
                 if was_visible != visible {
@@ -1598,11 +1831,82 @@ impl App {
                             },
                     );
                 }
-                if was_visible || visible {
+                if was_frozen || visible {
                     let _ = ValidateRect(child, None);
                 }
             }
             let _ = ValidateRect(self.hwnd, None);
+        }
+    }
+    fn update_page_controls(&mut self, repaint: bool, sync_visibility: bool) {
+        let view = self.library_view();
+        let pages = view.len().div_ceil(9).max(1);
+        self.page = self.page.min(pages - 1);
+        let start = self.page * 9;
+        let paths: Vec<_> = view.iter().skip(start).take(9).cloned().collect();
+        visuals::tiles(&paths);
+        visuals::playing_all(&self.active_paths());
+        self.text(visuals::PAGE, &format!("Page {} of {pages}", self.page + 1));
+        for (i, path) in paths.iter().enumerate() {
+            self.text(
+                visuals::TILE_BASE + i,
+                &path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Wallpaper".into()),
+            );
+        }
+        self.request_thumbnails();
+        // SAFETY: updates only pager and tile controls so Search keeps its layered surface undisturbed.
+        unsafe {
+            let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
+            let _ = EnableWindow(
+                self.control(visuals::NEXT),
+                (self.page + 1) * 9 < view.len(),
+            );
+            if sync_visibility {
+                let noredraw = if repaint {
+                    SET_WINDOW_POS_FLAGS(0)
+                } else {
+                    SWP_NOREDRAW
+                };
+                for i in 0..9 {
+                    let id = visuals::TILE_BASE + i;
+                    let child = self.control(id);
+                    if child.0.is_null() {
+                        continue;
+                    }
+                    let visible = self.control_visible(id, &view);
+                    let was_visible = GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+                    if was_visible != visible {
+                        let _ = SetWindowPos(
+                            child,
+                            None,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE
+                                | SWP_NOSIZE
+                                | SWP_NOZORDER
+                                | SWP_NOACTIVATE
+                                | noredraw
+                                | if visible {
+                                    SWP_SHOWWINDOW
+                                } else {
+                                    SWP_HIDEWINDOW
+                                },
+                        );
+                    }
+                }
+            }
+            if repaint {
+                for &(id, child) in &self.controls {
+                    if is_page_control(id) {
+                        let _ = InvalidateRect(child, None, false);
+                    }
+                }
+            }
         }
     }
     fn step_page(&mut self, delta: isize) -> Result<(), String> {
@@ -1616,12 +1920,16 @@ impl App {
         let old_layer = clip.and_then(|c| visuals::capture_region(self.hwnd, c, &self.controls));
         self.page = next_page;
         if old_layer.is_none() {
-            return self.refresh_library();
+            self.update_page_controls(true, true);
+            // SAFETY: updates client area synchronously when page transition layer is unavailable.
+            unsafe {
+                let _ = UpdateWindow(self.hwnd);
+            }
+            return Ok(());
         }
-        let frozen = self.freeze_visible_controls();
-        let refresh = self.refresh_library_with_options(false, false);
-        self.unfreeze_controls(&frozen);
-        refresh?;
+        let frozen = self.freeze_controls_matching(is_page_control);
+        self.update_page_controls(false, false);
+        self.unfreeze_controls_matching(&frozen, is_page_control);
         let hidden = self.visible_controls_for(false);
         if let (Some(c), Some(old)) = (clip, old_layer)
             && let Some(new) = visuals::capture_region(self.hwnd, c, &self.controls)
@@ -2426,6 +2734,7 @@ impl App {
             let _ = playback.player.poll();
             playback.player.set_audio(audio_enabled)?;
             playback.audio_enabled = audio_enabled;
+            playback.specs = PlaybackSpecs::default();
             request = playback.player.load(&prepared.path)?;
             playback.path = path;
         } else {
@@ -2443,6 +2752,7 @@ impl App {
                 surface,
                 path,
                 audio_enabled,
+                specs: PlaybackSpecs::default(),
             });
         }
         self.playback_info = Some(prepared);
@@ -2841,36 +3151,39 @@ impl App {
         }
         let source_fps = effective_source_fps(self.playback_info.as_ref(), playback);
         playback.player.set_fps(self.settings.fps, source_fps)?;
-        if let Some(info) = &mut self.playback_info {
-            info.fps = source_fps;
-            if let Some(width) = playback
-                .player
-                .property(c"video-params/w")
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                info.width = width;
-            }
-            if let Some(height) = playback
-                .player
-                .property(c"video-params/h")
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                info.height = height;
-            }
-        }
+        let info_path = self
+            .playback_info
+            .as_ref()
+            .map(|info| info.path.clone())
+            .unwrap_or_else(|| playback.path.clone());
+        let (width, height, specs) =
+            read_playback_specs(&playback.player, &playback.path, &info_path);
         let paused = self.reasons.reason().is_some();
         playback.player.pause(paused)?;
         self.requested_pause = paused;
         playback.surface.show();
-        self.settings.path = Some(playback.path.clone());
+        let playing_path = playback.path.clone();
+        self.settings.path = Some(playing_path.clone());
         if let Some(monitor) = &self.active_monitor {
             self.settings.wallpapers.retain(|(name, _)| name != monitor);
             self.settings
                 .wallpapers
-                .push((monitor.clone(), playback.path.clone()));
+                .push((monitor.clone(), playing_path.clone()));
+        }
+        if let Some(playback) = &mut self.playback {
+            playback.specs = specs;
+        }
+        if let Some(info) = &mut self.playback_info {
+            info.fps = source_fps;
+            if let Some(width) = width {
+                info.width = width;
+            }
+            if let Some(height) = height {
+                info.height = height;
+            }
         }
         self.loaded = true;
-        visuals::playing(Some(playback.path.clone()));
+        visuals::playing(Some(playing_path));
         for i in 0..9 {
             unsafe {
                 let _ = InvalidateRect(self.control(visuals::TILE_BASE + i), None, false);
@@ -2885,6 +3198,56 @@ impl App {
             self.error = Some(format!("Playing, but settings were not saved: {error}"));
         }
         Ok(())
+    }
+    fn format_display_specs(&self) -> Option<String> {
+        let mut entries = Vec::new();
+        for (idx, display) in self.displays.iter().enumerate() {
+            let Some(info) = display.playback_info.as_ref() else {
+                continue;
+            };
+            let specs = display.playback.as_ref().map(|p| &p.specs);
+            let display_number = self
+                .monitors
+                .iter()
+                .position(|m| m.name == display.monitor)
+                .unwrap_or(idx)
+                + 1;
+            entries.push((display_number, info, specs));
+        }
+        let (first_num, first_info, first_specs) = entries.first()?;
+        let single_line = format_playback_specs(first_info, *first_specs, self.settings.fps, true);
+        if entries.len() == 1 {
+            let _ = first_num;
+            return Some(format!("Wallpaper: {single_line}."));
+        }
+        let first_key = (
+            first_info.width,
+            first_info.height,
+            first_info.fps.to_bits(),
+            first_info.cached,
+            first_info.note.as_str(),
+            *first_specs,
+        );
+        let all_same = entries[1..].iter().all(|(_, info, specs)| {
+            (
+                info.width,
+                info.height,
+                info.fps.to_bits(),
+                info.cached,
+                info.note.as_str(),
+                *specs,
+            ) == first_key
+        });
+        if all_same {
+            Some(format!("Wallpaper: {single_line}."))
+        } else {
+            let mut per_display = Vec::with_capacity(entries.len());
+            for (display_number, info, specs) in entries {
+                let compact = format_playback_specs(info, specs, self.settings.fps, false);
+                per_display.push(format!("D{display_number}: {compact}"));
+            }
+            Some(per_display.join(" | "))
+        }
     }
     fn update_status(&self) {
         if self.multi_dispatch {
@@ -2927,16 +3290,25 @@ impl App {
                 .reason()
                 .or_else(|| self.displays.iter().find_map(|d| d.pause_reason))
                 .unwrap_or("Auto-pause per display");
-            format!(
-                "{} playing, {paused} paused, {loading} loading, {waiting} waiting. {} FPS. Sound: {}. {reason}.{preparation}",
+            let spec_line = self.format_display_specs();
+            let limit_note = if spec_line.is_none() {
+                format!(" Limit {} FPS.", self.settings.fps)
+            } else {
+                String::new()
+            };
+            let line1 = format!(
+                "{} playing, {paused} paused, {loading} loading, {waiting} waiting.{limit_note} Sound: {}. {reason}.{preparation}",
                 ready.saturating_sub(paused),
-                self.settings.fps,
                 if self.settings.audio_enabled {
                     "On (one display)"
                 } else {
                     "Off"
                 }
-            )
+            );
+            match spec_line {
+                Some(line2) => format!("{line1}\r\n{line2}"),
+                None => line1,
+            }
         } else if self.recovery.is_some() {
             "Desktop changed. Restoring wallpaper...".into()
         } else if self.reasons.reason().is_some() && self.playback.is_some() {
@@ -2961,25 +3333,8 @@ impl App {
         } else if self.actual_pause {
             "Resuming playback...".into()
         } else {
-            let detail = self
-                .playback_info
-                .as_ref()
-                .map(|p| {
-                    format!(
-                        "{}: {} x {}, cap {:.1} FPS. ",
-                        p.note,
-                        p.width,
-                        p.height,
-                        if p.fps > 0.0 {
-                            p.fps.min(f64::from(self.settings.fps))
-                        } else {
-                            f64::from(self.settings.fps)
-                        }
-                    )
-                })
-                .unwrap_or_default();
-            format!(
-                "{detail}Sound: {}. Auto-pause: {}.",
+            let line1 = format!(
+                "Sound: {}. Auto-pause: {}.",
                 if self.settings.audio_enabled {
                     "On"
                 } else {
@@ -2990,7 +3345,19 @@ impl App {
                 } else {
                     "Off"
                 }
-            )
+            );
+            match self.playback_info.as_ref() {
+                Some(info) => format!(
+                    "{line1}\r\nWallpaper: {}.",
+                    format_playback_specs(
+                        info,
+                        self.playback.as_ref().map(|p| &p.specs),
+                        self.settings.fps,
+                        true,
+                    )
+                ),
+                None => line1,
+            }
         };
         if self.status_cache.borrow().0 != status {
             self.text(STATUS, &status);
@@ -3503,7 +3870,7 @@ impl App {
         let frozen = if repaint_now {
             None
         } else {
-            Some(self.freeze_visible_controls())
+            Some(self.freeze_controls_matching(|_| true))
         };
         let update_result = if tab == visuals::Tab::Library {
             self.refresh_library_with_options(repaint_now, repaint_now)
@@ -3514,7 +3881,7 @@ impl App {
             self.apply_layout_with_visibility(repaint_now, repaint_now)
         };
         if let Some(frozen) = frozen.as_deref() {
-            self.unfreeze_controls(frozen);
+            self.unfreeze_controls_matching(frozen, |_| true);
         }
         update_result?;
         let focus = match tab {
@@ -3923,6 +4290,7 @@ pub fn run() -> Result<(), String> {
             thumbnail_tx,
             thumbnail_rx,
             last_tile_click: None,
+            layout_state: None,
         };
         SendMessageW(
             hwnd,
@@ -4579,6 +4947,7 @@ mod tests {
             thumbnail_rx,
             thumbnail_tx,
             last_tile_click: None,
+            layout_state: None,
         }
     }
     unsafe fn proof_thumbnail() -> Result<HBITMAP, String> {
@@ -5703,6 +6072,7 @@ mod tests {
             surface,
             path: source.clone(),
             audio_enabled: false,
+            specs: PlaybackSpecs::default(),
         });
         let original = || crate::cache::Prepared {
             path: source.clone(),
@@ -5992,6 +6362,7 @@ mod tests {
             thumbnail_rx,
             thumbnail_tx,
             last_tile_click: None,
+            layout_state: None,
         };
         update_tx.send(Ok(Some("v0.1.2".into()))).unwrap();
         app.update_ready().unwrap();
@@ -6376,6 +6747,10 @@ mod tests {
             };
 
             assert_settled_visibility(&app, "initial Library p0");
+            assert!(!is_page_control(visuals::SEARCH));
+            let initial_font = app.font;
+            let search_hwnd = app.control(visuals::SEARCH);
+            let search_font = SendMessageW(search_hwnd, WM_GETFONT, WPARAM(0), LPARAM(0)).0;
 
             // Page 0 (9 tiles) -> Page 1 (3 tiles) while window is visible so body slide capture runs.
             app.action(visuals::NEXT, BN_CLICKED)?;
@@ -6384,6 +6759,19 @@ mod tests {
                 "expected active page slide transition on visible HWND"
             );
             assert_eq!(app.page, 1);
+            assert_eq!(
+                app.font, initial_font,
+                "step_page must not recreate fonts or relayout unchanged controls"
+            );
+            assert_eq!(
+                SendMessageW(search_hwnd, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
+                search_font
+            );
+            assert_ne!(
+                GetWindowLongW(search_hwnd, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0,
+                "Search bar must stay visible and undisturbed mid page slide"
+            );
             // Non-body controls must keep exact tab visibility even mid-slide.
             let mid_view = app.library_view();
             for &(id, child) in &app.controls {
@@ -6448,6 +6836,14 @@ mod tests {
             app.action(visuals::PREVIOUS, BN_CLICKED)?;
             visuals::cancel_transition(app.hwnd);
             assert_eq!(app.page, 0);
+            assert_eq!(
+                app.font, initial_font,
+                "tab/page transitions at fixed size must preserve font handle"
+            );
+            assert_eq!(
+                SendMessageW(search_hwnd, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
+                search_font
+            );
             assert_settled_visibility(&app, "Library p0 restored");
 
             let _ = DestroyWindow(app.hwnd);
@@ -6456,5 +6852,105 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn playback_specs_and_fps_summary_formatting() {
+        assert_eq!(
+            format_fps_summary(30.0, 60, false),
+            "30 FPS native (limit 60)"
+        );
+        assert_eq!(
+            format_fps_summary(29.97, 60, false),
+            "29.97 FPS native (limit 60)"
+        );
+        assert_eq!(
+            format_fps_summary(60.0, 30, false),
+            "30 FPS capped (source 60)"
+        );
+        assert_eq!(format_fps_summary(60.0, 60, false), "60 FPS");
+        assert_eq!(format_fps_summary(1.0, 60, true), "Still image");
+
+        let info = crate::cache::Prepared {
+            path: PathBuf::from(r"C:\Walls\black-hole.mp4"),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            cached: false,
+            note: "Original media".into(),
+        };
+        let specs = PlaybackSpecs {
+            codec: Some("HEVC".into()),
+            duration_secs: Some(15.0),
+            file_bytes: Some(18 * 1024 * 1024),
+            has_audio: true,
+            hdr: true,
+            still_image: false,
+        };
+        assert_eq!(
+            format_playback_specs(&info, Some(&specs), 60, true),
+            "1920x1080, 30 FPS native (limit 60), HEVC HDR, 0:15, 18.0 MB, Audio, Original media"
+        );
+    }
+
+    #[test]
+    fn update_status_reports_wallpaper_specs_and_native_fps() {
+        let mut app = fixture();
+        app.settings.fps = 60;
+        let mon1 = app.monitors[0].name.clone();
+        let mut first = DisplayState::new(mon1);
+        first.recovery = Some((Instant::now(), 0, PathBuf::from(r"C:\Walls\a.mp4")));
+        first.playback_info = Some(crate::cache::Prepared {
+            path: PathBuf::from(r"C:\Walls\a.mp4"),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            cached: false,
+            note: "Original media".into(),
+        });
+        app.displays = vec![first];
+        app.update_status();
+        let single_status = app.status_cache.borrow().0.clone();
+        assert!(single_status.contains("Sound: Off. Auto-pause per display."));
+        assert!(
+            single_status
+                .contains("\r\nWallpaper: 1920x1080, 30 FPS native (limit 60), Original media."),
+            "unexpected single-display status: {single_status}"
+        );
+
+        let mut second_same = DisplayState::new("\\\\.\\DISPLAY2".into());
+        second_same.recovery = Some((Instant::now(), 0, PathBuf::from(r"C:\Walls\a.mp4")));
+        second_same.playback_info = Some(crate::cache::Prepared {
+            path: PathBuf::from(r"C:\Walls\a.mp4"),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            cached: false,
+            note: "Original media".into(),
+        });
+        app.displays.push(second_same);
+        app.update_status();
+        let shared_status = app.status_cache.borrow().0.clone();
+        assert!(
+            shared_status
+                .contains("\r\nWallpaper: 1920x1080, 30 FPS native (limit 60), Original media."),
+            "identical multi-display specs should deduplicate: {shared_status}"
+        );
+
+        app.displays[1].playback_info = Some(crate::cache::Prepared {
+            path: PathBuf::from(r"C:\Walls\b.mp4"),
+            width: 2560,
+            height: 1440,
+            fps: 60.0,
+            cached: true,
+            note: "Display cache".into(),
+        });
+        app.update_status();
+        let distinct_status = app.status_cache.borrow().0.clone();
+        assert!(
+            distinct_status
+                .contains("\r\nD1: 1920x1080, 30 FPS native (limit 60) | D2: 2560x1440, 60 FPS"),
+            "distinct multi-display specs should show per-display details: {distinct_status}"
+        );
     }
 }
