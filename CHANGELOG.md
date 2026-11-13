@@ -26,7 +26,10 @@ Release history for WallpaperLive. Each version describes its own changes; older
 ### Fixed
 
 - Supply premultiplied alpha for acrylic panels and composite text after their tint. Keep media and owner-drawn controls opaque; no global window opacity or bitmap tint.
-- Clip rounded controls to their native regions so white corners do not surround the Library/Settings buttons.
+- Replace residual corner fills on rounded buttons, tabs, tiles, and pager controls using host-aware SDF corner masking and `CS_PARENTDC` removal without altering button hit-testing.
+- Remove the floating pager background card, suppress click-triggered focus rings via `ODS_NOFOCUSRECT`/`UISF_HIDEFOCUS`, draw dark custom checkboxes in Settings, and route dropdown/tile context menus through dark owner-drawn popups.
+- Update the Settings Product website link to `https://livelydesk.vercel.app`.
+- Reduce idle CPU/RAM/GPU overhead on low-spec hardware: release paused playback decoders after grace periods (`Dormant` auto-resume), throttle WTS queries, cache status/font/brush GDI objects, run thumbnail ffmpeg/ffprobe extraction at below-normal priority, and configure lightweight libmpv output buffers.
 - Keep search typing, selection, and caret painting in an opaque native child surface so direct edit repaints do not turn white over acrylic.
 - Repaint the whole workspace in opaque dark colors if backdrop or buffered painting is unavailable. Hidden tabs remain hidden; choosing a display still does not apply a wallpaper.
 

@@ -34,7 +34,7 @@ pub fn capture(path: &Path, cancelled: &std::sync::atomic::AtomicBool) -> Result
         Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
             .arg("--thumbnail")
             .arg(path)
-            .creation_flags(0x08000000)
+            .creation_flags(0x08004000)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -234,7 +234,7 @@ mod tests {
         let command = std::env::var_os("ComSpec").expect("Windows command processor");
         let child = Command::new(command)
             .args(["/D", "/Q", "/C", "set /p wallpaperlive_test_wait="])
-            .creation_flags(0x08000000)
+            .creation_flags(0x08004000)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

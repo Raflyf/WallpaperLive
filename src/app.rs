@@ -73,12 +73,59 @@ const WALLPAPER_SITES: [(&str, &str); 4] = [
     ("MotionBGs", "https://motionbgs.com"),
     ("DesktopHut", "https://www.desktophut.com"),
 ];
-const PRODUCT_URL: &str = "https://livebar.vercel.app";
+const PRODUCT_URL: &str = "https://livelydesk.vercel.app";
 const SUPPORT_URL: &str = "https://yapp.ink/raflyf";
 const SAWERIA_URL: &str = "https://saweria.co/BuyMatcha";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn playback_position(playback: &Playback) -> Option<f64> {
+    playback
+        .player
+        .property(c"time-pos")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p >= 0.0)
+}
+fn effective_source_fps(info: Option<&crate::cache::Prepared>, playback: &Playback) -> f64 {
+    info.map(|p| p.fps)
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .or_else(|| {
+            playback
+                .player
+                .property(c"container-fps")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|f| f.is_finite() && *f > 0.0)
+        })
+        .unwrap_or(0.0)
+}
+fn dormant_grace(reasons: &PauseReasons) -> Option<Duration> {
+    if reasons.manual {
+        None
+    } else if reasons.locked
+        || reasons.remote
+        || reasons.disconnected
+        || reasons.suspended
+        || reasons.display_off
+    {
+        Some(Duration::from_secs(3))
+    } else if reasons.battery || reasons.fullscreen || reasons.maximized {
+        Some(Duration::from_secs(8))
+    } else {
+        None
+    }
+}
+fn is_shell_class(class: &[u16]) -> bool {
+    const SHELL: [&str; 4] = [
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+    ];
+    SHELL.iter().any(|name| {
+        class.len() == name.len() && class.iter().copied().eq(name.bytes().map(u16::from))
+    })
+}
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -204,6 +251,7 @@ struct DisplayState {
     playback_info: Option<crate::cache::Prepared>,
     dormant: Option<Dormant>,
     resume_position: f64,
+    paused_since: Option<Instant>,
 }
 impl DisplayState {
     fn new(monitor: String) -> Self {
@@ -230,6 +278,7 @@ impl DisplayState {
             playback_info: None,
             dormant: None,
             resume_position: 0.0,
+            paused_since: None,
         }
     }
     fn active(&self) -> bool {
@@ -305,6 +354,9 @@ struct App {
     playback_info: Option<crate::cache::Prepared>,
     dormant: Option<Dormant>,
     resume_position: f64,
+    paused_since: Option<Instant>,
+    wts_tick: u8,
+    status_cache: std::cell::RefCell<(String, &'static str, &'static str, Option<bool>)>,
     page: usize,
     tab: visuals::Tab,
     thumbnail_pending: Option<PathBuf>,
@@ -339,7 +391,8 @@ impl App {
             prepared_waiting,
             playback_info,
             dormant,
-            resume_position
+            resume_position,
+            paused_since
         );
     }
     fn with_display<T>(
@@ -565,9 +618,7 @@ impl App {
                     app.resume_position = app
                         .playback
                         .as_ref()
-                        .and_then(|p| p.player.property(c"time-pos"))
-                        .and_then(|p| p.parse::<f64>().ok())
-                        .filter(|p| p.is_finite() && *p >= 0.0)
+                        .and_then(playback_position)
                         .unwrap_or(app.resume_position);
                     app.cancel_preparation();
                     app.release_playback();
@@ -587,6 +638,13 @@ impl App {
             .unwrap_or_default()
     }
     fn text(&self, id: usize, text: &str) {
+        if id == STATUS {
+            self.status_cache.borrow_mut().0 = text.to_owned();
+        } else if id == PAUSE {
+            self.status_cache.borrow_mut().1 = "";
+        } else if id == visuals::AUDIO {
+            self.status_cache.borrow_mut().2 = "";
+        }
         let text = wide(text);
         // SAFETY: synchronous native text copy into owned control.
         unsafe {
@@ -960,6 +1018,12 @@ impl App {
             for (_, control) in &self.controls {
                 visuals::prepare_control(*control)?;
             }
+            SendMessageW(
+                self.hwnd,
+                WM_CHANGEUISTATE,
+                WPARAM(UIS_SET as usize | ((UISF_HIDEFOCUS as usize) << 16)),
+                LPARAM(0),
+            );
             self.text(
                 FIT,
                 if self.settings.fit == Fit::Contain {
@@ -1170,54 +1234,40 @@ impl App {
             pt.y = (r.top + r.bottom) / 2;
         }
 
-        unsafe {
-            let menu = CreatePopupMenu().map_err(native_error)?;
-            for (item_id, text) in [
+        let chosen = crate::tray::popup_at(
+            self.hwnd,
+            pt,
+            &[
                 (CTX_SET, "Set as wallpaper"),
                 (CTX_EXPLORER, "Open file location"),
                 (CTX_COPY_PATH, "Copy file path"),
                 (CTX_RETRY_THUMBNAIL, "Retry thumbnail"),
                 (CTX_REMOVE, "Remove from library"),
-            ] {
-                let text_wide = wide(text);
-                let _ = AppendMenuW(menu, MF_STRING, item_id, PCWSTR(text_wide.as_ptr()));
+            ],
+            None,
+        )?;
+        match chosen {
+            CTX_SET => {
+                self.recovery = None;
+                self.start()?;
             }
-            let _ = SetForegroundWindow(self.hwnd);
-            let chosen = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                pt.x,
-                pt.y,
-                0,
-                self.hwnd,
-                None,
-            )
-            .0 as usize;
-            let _ = DestroyMenu(menu);
-
-            match chosen {
-                CTX_SET => {
-                    self.recovery = None;
-                    self.start()?;
-                }
-                CTX_EXPLORER => {
-                    let _ = std::process::Command::new("explorer.exe")
-                        .arg(format!("/select,{}", path.display()))
-                        .spawn();
-                }
-                CTX_COPY_PATH => {
-                    if let Err(e) = copy_to_clipboard(self.hwnd, &path.to_string_lossy()) {
-                        self.set_error(e);
-                    } else {
-                        self.text(STATUS, "File path copied to clipboard.");
-                    }
-                }
-                CTX_RETRY_THUMBNAIL => self.retry_thumbnail(&path)?,
-                CTX_REMOVE => {
-                    self.remove_selected()?;
-                }
-                _ => {}
+            CTX_EXPLORER => {
+                let _ = std::process::Command::new("explorer.exe")
+                    .arg(format!("/select,{}", path.display()))
+                    .spawn();
             }
+            CTX_COPY_PATH => {
+                if let Err(e) = copy_to_clipboard(self.hwnd, &path.to_string_lossy()) {
+                    self.set_error(e);
+                } else {
+                    self.text(STATUS, "File path copied to clipboard.");
+                }
+            }
+            CTX_RETRY_THUMBNAIL => self.retry_thumbnail(&path)?,
+            CTX_REMOVE => {
+                self.remove_selected()?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1881,6 +1931,12 @@ impl App {
                 },
             );
             let _ = SetForegroundWindow(self.hwnd);
+            SendMessageW(
+                self.hwnd,
+                WM_CHANGEUISTATE,
+                WPARAM(UIS_SET as usize | ((UISF_HIDEFOCUS as usize) << 16)),
+                LPARAM(0),
+            );
             let _ = SetFocus(self.control(PICK));
         }
         self.request_thumbnails();
@@ -1924,6 +1980,7 @@ impl App {
         self.file_loaded = None;
         self.video_ready = None;
         self.loading_since = None;
+        self.paused_since = None;
         self.actual_pause = false;
         self.requested_pause = false;
         // SAFETY: teardown cancels only the timer owned by this controller.
@@ -1963,6 +2020,7 @@ impl App {
         self.cancel_preparation();
         self.cancel_thumbnails();
         self.dormant = None;
+        self.paused_since = None;
         self.update_reasons();
         let prepared = crate::cache::Prepared {
             path: path.clone(),
@@ -2165,62 +2223,62 @@ impl App {
         if self.monitors.is_empty() {
             return;
         }
-        let mut status = SYSTEM_POWER_STATUS::default();
-        // SAFETY: valid output buffer, read-only system state.
-        if unsafe { GetSystemPowerStatus(&mut status) }.is_ok() {
-            self.reasons.battery = self.settings.pause_battery && status.ACLineStatus == 0;
-        }
-        // SAFETY: window handles queried only; never injects into foreground process.
+        // SAFETY: read-only system and window queries; never injects into other processes.
         unsafe {
-            self.reasons.remote = GetSystemMetrics(SM_REMOTESESSION) != 0;
-            let mut protocol = windows::core::PWSTR::null();
-            let mut bytes = 0;
-            if WTSQuerySessionInformationW(
-                WTS_CURRENT_SERVER_HANDLE,
-                WTS_CURRENT_SESSION,
-                WTSClientProtocolType,
-                &mut protocol,
-                &mut bytes,
-            )
-            .is_ok()
-            {
-                if bytes >= 2 && !protocol.0.is_null() {
-                    self.reasons.remote |= std::ptr::read_unaligned(protocol.0) != 0;
+            if !self.multi_dispatch {
+                let mut status = SYSTEM_POWER_STATUS::default();
+                if GetSystemPowerStatus(&mut status).is_ok() {
+                    self.reasons.battery = self.settings.pause_battery && status.ACLineStatus == 0;
                 }
-                WTSFreeMemory(protocol.0.cast());
-            }
-            let mut state = windows::core::PWSTR::null();
-            bytes = 0;
-            if WTSQuerySessionInformationW(
-                WTS_CURRENT_SERVER_HANDLE,
-                WTS_CURRENT_SESSION,
-                WTSConnectState,
-                &mut state,
-                &mut bytes,
-            )
-            .is_ok()
-            {
-                if bytes >= 4 && !state.0.is_null() {
-                    self.reasons.disconnected =
-                        std::ptr::read_unaligned(state.0.cast::<u32>()) != 0;
+                self.reasons.remote = GetSystemMetrics(SM_REMOTESESSION) != 0;
+                if self.wts_tick == 0 || self.reasons.remote || self.reasons.disconnected {
+                    let mut protocol = windows::core::PWSTR::null();
+                    let mut bytes = 0;
+                    if WTSQuerySessionInformationW(
+                        WTS_CURRENT_SERVER_HANDLE,
+                        WTS_CURRENT_SESSION,
+                        WTSClientProtocolType,
+                        &mut protocol,
+                        &mut bytes,
+                    )
+                    .is_ok()
+                    {
+                        if bytes >= 2 && !protocol.0.is_null() {
+                            self.reasons.remote |= std::ptr::read_unaligned(protocol.0) != 0;
+                        }
+                        WTSFreeMemory(protocol.0.cast());
+                    }
+                    let mut state = windows::core::PWSTR::null();
+                    bytes = 0;
+                    if WTSQuerySessionInformationW(
+                        WTS_CURRENT_SERVER_HANDLE,
+                        WTS_CURRENT_SESSION,
+                        WTSConnectState,
+                        &mut state,
+                        &mut bytes,
+                    )
+                    .is_ok()
+                    {
+                        if bytes >= 4 && !state.0.is_null() {
+                            self.reasons.disconnected =
+                                std::ptr::read_unaligned(state.0.cast::<u32>()) != 0;
+                        }
+                        WTSFreeMemory(state.0.cast());
+                    }
                 }
-                WTSFreeMemory(state.0.cast());
+                self.wts_tick = (self.wts_tick + 1) % 10;
             }
             let foreground = GetForegroundWindow();
             let mut pid = 0;
             GetWindowThreadProcessId(foreground, Some(&mut pid));
             let mut rect = RECT::default();
             let mut class = [0u16; 64];
-            let n = GetClassNameW(foreground, &mut class).max(0) as usize;
-            let class = String::from_utf16_lossy(&class[..n]);
+            let n = GetClassNameW(foreground, &mut class).clamp(0, class.len() as i32) as usize;
             let eligible = self.settings.pause_fullscreen
                 && pid != std::process::id()
                 && !foreground.0.is_null()
                 && !IsIconic(foreground).as_bool()
-                && !matches!(
-                    class.as_str(),
-                    "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-                )
+                && !is_shell_class(&class[..n])
                 && GetWindowRect(foreground, &mut rect).is_ok();
             let area = Rect {
                 left: rect.left,
@@ -2287,9 +2345,35 @@ impl App {
             }
             self.launch_preparation()?;
             self.request_thumbnails();
+            if let Some(grace) = dormant_grace(&self.reasons)
+                && self.loaded
+                && self.requested_pause
+                && self.dormant.is_none()
+            {
+                let since = *self.paused_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= grace
+                    && let Some(playback) = &self.playback
+                {
+                    let position = playback_position(playback).unwrap_or(0.0);
+                    let path = playback.path.clone();
+                    self.release_playback();
+                    self.dormant = Some(Dormant { path, position });
+                    if !self.multi_dispatch {
+                        self.arm_monitor()?;
+                    }
+                    // SAFETY: pseudo-handle for current process; best-effort working-set trim when idle.
+                    unsafe {
+                        let _ =
+                            SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+                    }
+                }
+            } else {
+                self.paused_since = None;
+            }
             self.update_status();
             return Ok(());
         }
+        self.paused_since = None;
         if (self.playback.is_none() || self.loaded)
             && !self.requested_pause
             && self
@@ -2301,9 +2385,7 @@ impl App {
             let position = self
                 .playback
                 .as_ref()
-                .and_then(|p| p.player.property(c"time-pos"))
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|p| p.is_finite() && *p >= 0.0)
+                .and_then(playback_position)
                 .unwrap_or(0.0);
             self.load_prepared(path, prepared, position)?;
         }
@@ -2458,19 +2540,7 @@ impl App {
             playback.player.seek(self.resume_position)?;
             self.resume_position = 0.0;
         }
-        let source_fps = self
-            .playback_info
-            .as_ref()
-            .map(|p| p.fps)
-            .filter(|f| f.is_finite() && *f > 0.0)
-            .or_else(|| {
-                playback
-                    .player
-                    .property(c"container-fps")
-                    .and_then(|s| s.parse::<f64>().ok())
-            })
-            .filter(|f| f.is_finite() && *f > 0.0)
-            .unwrap_or(0.0);
+        let source_fps = effective_source_fps(self.playback_info.as_ref(), playback);
         playback.player.set_fps(self.settings.fps, source_fps)?;
         if let Some(info) = &mut self.playback_info {
             info.fps = source_fps;
@@ -2623,7 +2693,7 @@ impl App {
                 }
             )
         };
-        if window_text(self.control(STATUS)) != status {
+        if self.status_cache.borrow().0 != status {
             self.text(STATUS, &status);
         }
         let label = if self.reasons.manual {
@@ -2631,25 +2701,30 @@ impl App {
         } else {
             "Pause"
         };
-        if window_text(self.control(PAUSE)) != label {
+        if self.status_cache.borrow().1 != label {
             self.text(PAUSE, label);
+            self.status_cache.borrow_mut().1 = label;
         }
         let sound = if self.settings.audio_enabled {
             "Sound: On"
         } else {
             "Sound: Off"
         };
-        if window_text(self.control(visuals::AUDIO)) != sound {
+        if self.status_cache.borrow().2 != sound {
             self.text(visuals::AUDIO, sound);
+            self.status_cache.borrow_mut().2 = sound;
         }
-        unsafe {
-            let active = self.playback.is_some()
-                || self.recovery.is_some()
-                || self.preparation.is_some()
-                || self.dormant.is_some()
-                || self.displays.iter().any(DisplayState::active);
-            let _ = EnableWindow(self.control(PAUSE), active);
-            let _ = EnableWindow(self.control(STOP), active);
+        let active = self.playback.is_some()
+            || self.recovery.is_some()
+            || self.preparation.is_some()
+            || self.dormant.is_some()
+            || self.displays.iter().any(DisplayState::active);
+        if self.status_cache.borrow().3 != Some(active) {
+            unsafe {
+                let _ = EnableWindow(self.control(PAUSE), active);
+                let _ = EnableWindow(self.control(STOP), active);
+            }
+            self.status_cache.borrow_mut().3 = Some(active);
         }
     }
     fn pick(&mut self) -> Result<(), String> {
@@ -2759,41 +2834,26 @@ impl App {
         labels: &[String],
         selected: usize,
     ) -> Result<Option<usize>, String> {
+        let mut rect = RECT::default();
+        // SAFETY: read-only screen bounds of owned child selector button.
         unsafe {
-            let menu = CreatePopupMenu().map_err(native_error)?;
-            let result = (|| {
-                for (index, label) in labels.iter().enumerate() {
-                    let text = wide(label);
-                    AppendMenuW(
-                        menu,
-                        if index == selected {
-                            MF_STRING | MF_CHECKED
-                        } else {
-                            MF_STRING
-                        },
-                        index + 1,
-                        PCWSTR(text.as_ptr()),
-                    )
-                    .map_err(native_error)?;
-                }
-                let mut rect = RECT::default();
-                GetWindowRect(self.control(id), &mut rect).map_err(native_error)?;
-                let choice = TrackPopupMenu(
-                    menu,
-                    TPM_RETURNCMD | TPM_NONOTIFY,
-                    rect.left,
-                    rect.bottom,
-                    0,
-                    self.hwnd,
-                    None,
-                )
-                .0 as usize;
-                let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-                Ok(choice.checked_sub(1))
-            })();
-            let _ = DestroyMenu(menu);
-            result
+            GetWindowRect(self.control(id), &mut rect).map_err(native_error)?;
         }
+        let items: Vec<(usize, &str)> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| (index + 1, label.as_str()))
+            .collect();
+        let choice = crate::tray::popup_at(
+            self.hwnd,
+            POINT {
+                x: rect.left,
+                y: rect.bottom,
+            },
+            &items,
+            Some(selected + 1),
+        )?;
+        Ok(choice.checked_sub(1))
     }
     fn change_fps(&mut self, fps: u32) -> Result<(), String> {
         if !crate::core::FPS_OPTIONS.contains(&fps) {
@@ -2822,19 +2882,7 @@ impl App {
         if self.loaded
             && let Some(playback) = &self.playback
         {
-            let source_fps = self
-                .playback_info
-                .as_ref()
-                .map(|p| p.fps)
-                .filter(|f| f.is_finite() && *f > 0.0)
-                .or_else(|| {
-                    playback
-                        .player
-                        .property(c"container-fps")
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .filter(|f| f.is_finite() && *f > 0.0)
-                })
-                .unwrap_or(0.0);
+            let source_fps = effective_source_fps(self.playback_info.as_ref(), playback);
             playback.player.set_fps(fps, source_fps)?;
         }
         self.update_status();
@@ -3503,6 +3551,9 @@ pub fn run() -> Result<(), String> {
             playback_info: None,
             dormant: None,
             resume_position: 0.0,
+            paused_since: None,
+            wts_tick: 0,
+            status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             page: 0,
             tab: visuals::Tab::Library,
             thumbnail_pending: None,
@@ -3642,6 +3693,7 @@ pub fn run() -> Result<(), String> {
                     WM_TIMER if message.wParam.0 == 2 => app.update_ready().map(|_| false),
                     WM_TIMER => app.tick().map(|_| false),
                     POWER => {
+                        app.wts_tick = 0;
                         match message.wParam.0 {
                             1 => app.update_reasons(),
                             2 => app.reasons.display_off = message.lParam.0 == 0,
@@ -3651,6 +3703,7 @@ pub fn run() -> Result<(), String> {
                         app.tick().map(|_| false)
                     }
                     SESSION => {
+                        app.wts_tick = 0;
                         app.reasons.session_event(message.wParam.0 as u32);
                         app.tick().map(|_| false)
                     }
@@ -3978,6 +4031,9 @@ mod tests {
             playback_info: None,
             dormant: None,
             resume_position: 0.0,
+            paused_since: None,
+            wts_tick: 0,
+            status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             page: 0,
             tab: visuals::Tab::Library,
             thumbnail_pending: None,
@@ -4325,6 +4381,7 @@ mod tests {
             assert_eq!(app.settings.encode()?, settings);
             assert!(app.displays.is_empty() && app.playback.is_none());
             assert!(app.open_website("https://invalid.example/").is_err());
+            assert_eq!(PRODUCT_URL, "https://livelydesk.vercel.app");
             assert_eq!(SUPPORT_URL, "https://yapp.ink/raflyf");
             let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("scratch/ui-proof");
             fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
@@ -5233,6 +5290,9 @@ mod tests {
             playback_info: None,
             dormant: None,
             resume_position: 0.0,
+            paused_since: None,
+            wts_tick: 0,
+            status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             page: 0,
             tab: visuals::Tab::Library,
             thumbnail_pending: None,
@@ -5355,5 +5415,27 @@ mod tests {
         drop(app);
         assert_eq!(prepare_finished_rx.try_recv(), Ok(()));
         assert_eq!(finished_rx.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn dormant_grace_and_shell_class_rules() {
+        let mut reasons = PauseReasons::default();
+        assert_eq!(dormant_grace(&reasons), None);
+
+        reasons.battery = true;
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(8)));
+
+        reasons.locked = true;
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(3)));
+
+        reasons.manual = true;
+        assert_eq!(dormant_grace(&reasons), None);
+
+        let progman: Vec<u16> = "Progman".encode_utf16().collect();
+        let tray: Vec<u16> = "Shell_SecondaryTrayWnd".encode_utf16().collect();
+        let app_win: Vec<u16> = "Notepad".encode_utf16().collect();
+        assert!(is_shell_class(&progman));
+        assert!(is_shell_class(&tray));
+        assert!(!is_shell_class(&app_win));
     }
 }

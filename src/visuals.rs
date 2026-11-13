@@ -85,6 +85,7 @@ pub struct Layout {
     pub header: Rect,
     pub footer: Rect,
     pub library: Rect,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub pager: Rect,
     pub sidebar: Rect,
     pub title: Rect,
@@ -268,11 +269,60 @@ pub const CARD_LIT: u32 = mix(INK, CREAM, 14, 100);
 pub const LINE: u32 = mix(INK, CREAM, 24, 100);
 pub const HIGHLIGHT: u32 = mix(INK, CREAM, 38, 100);
 pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 48, 100);
+const DISABLED_FILL: u32 = mix(INK, CREAM, 4, 100);
+const DISABLED_BORDER: u32 = mix(INK, CREAM, 12, 100);
 pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 16, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
 const PANEL_ALPHA: u8 = 196;
+const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
+const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
+
+fn control_corner_ellipse(id: usize, dpi: i32) -> i32 {
+    let base = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
+        18
+    } else if id == PREVIEW || (TILE_BASE..TILE_BASE + 9).contains(&id) {
+        12
+    } else {
+        10
+    };
+    base * dpi.max(96) / 96
+}
+
+fn control_surface(id: usize) -> (u32, bool) {
+    if matches!(
+        id,
+        PREVIEW
+            | 112
+            | 105
+            | 106
+            | FPS
+            | AUDIO
+            | REMOVE
+            | 102
+            | 103
+            | 104
+            | 107
+            | 108
+            | 121
+            | PRODUCT_WEBSITE
+            | CLEAR_CACHE
+            | SUPPORT
+            | SAWERIA
+            | VERSION
+            | MEMORY_INFO
+            | CACHE_INFO
+            | SETTINGS_NOTE
+            | SETTINGS_INFO
+            | SOURCES_NOTE
+    ) || (SITE_BASE..SITE_BASE + 4).contains(&id)
+    {
+        (CARD, true)
+    } else {
+        (INK, false)
+    }
+}
 const GLASS_PROPERTY: windows::core::PCWSTR = w!("WallpaperLive.Glass");
 
 pub fn rgb(hex: u32) -> COLORREF {
@@ -387,6 +437,13 @@ pub fn clear() {
             }
         }
     });
+    FONTS.with(|f| {
+        for (_, font) in f.borrow_mut().drain() {
+            unsafe {
+                let _ = DeleteObject(font);
+            }
+        }
+    });
 }
 
 struct PaintRuntime {
@@ -484,6 +541,111 @@ impl PaintBuffer {
         }
         true
     }
+    unsafe fn apply_rounded_mask(&self, mask: &RoundedMask) -> bool {
+        let width = self.area.right - self.area.left;
+        let height = self.area.bottom - self.area.top;
+        if width <= 0 || height <= 0 {
+            return true;
+        }
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        if unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
+            || bits.is_null()
+            || stride < width
+            || !unsafe { GdiFlush() }.as_bool()
+        {
+            return false;
+        }
+        let Some(len) = (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<RGBQUAD>())
+        else {
+            return false;
+        };
+        // SAFETY: GetBufferedPaintBits owns stride * buffer height RGBQUADs until EndBufferedPaint.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
+        let w = width as f32;
+        let h = height as f32;
+        let hw = w * 0.5;
+        let hh = h * 0.5;
+        let radius = (mask.ellipse as f32 * 0.5).min(hw).min(hh);
+        let split_rgb = |c: u32| -> (f32, f32, f32) {
+            (
+                ((c >> 16) & 255) as f32,
+                ((c >> 8) & 255) as f32,
+                (c & 255) as f32,
+            )
+        };
+        let (br, bg, bb) = split_rgb(mask.border);
+        let (fr, fg, fb) = split_rgb(mask.focus);
+        let (hr, hg, hb) = split_rgb(mask.host_color);
+        let ha = f32::from(mask.host_alpha);
+        let host_pre_r = hr * ha / 255.0;
+        let host_pre_g = hg * ha / 255.0;
+        let host_pre_b = hb * ha / 255.0;
+        let safe_inset = mask.border_width
+            + if mask.focus != 0 {
+                mask.focus_inset + 2.0
+            } else {
+                1.0
+            };
+        let corner_band = (radius + safe_inset).ceil() as i32;
+        let edge_band = (safe_inset + 1.0).ceil() as i32;
+        let focus_center = -(mask.border_width + mask.focus_inset);
+        for y in 0..height {
+            let row_offset = y as usize * stride as usize;
+            let row = &mut pixels[row_offset..row_offset + width as usize];
+            let py = y as f32 + 0.5;
+            let y_inner = y >= edge_band && y < height - edge_band;
+            let y_deep = y >= corner_band && y < height - corner_band;
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let xi = x as i32;
+                if y_deep && xi >= edge_band && xi < width - edge_band
+                    || y_inner && xi >= corner_band && xi < width - corner_band
+                {
+                    pixel.rgbReserved = 255;
+                    continue;
+                }
+                let px = x as f32 + 0.5;
+                let qx = (px - hw).abs() - (hw - radius);
+                let qy = (py - hh).abs() - (hh - radius);
+                let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+                if d <= -safe_inset {
+                    pixel.rgbReserved = 255;
+                    continue;
+                }
+                let mut src_r = f32::from(pixel.rgbRed);
+                let mut src_g = f32::from(pixel.rgbGreen);
+                let mut src_b = f32::from(pixel.rgbBlue);
+                if mask.focus != 0 {
+                    let focus_cov = (0.5 - (d - focus_center).abs()).clamp(0.0, 1.0);
+                    if focus_cov > 0.0 {
+                        src_r += (fr - src_r) * focus_cov;
+                        src_g += (fg - src_g) * focus_cov;
+                        src_b += (fb - src_b) * focus_cov;
+                    }
+                }
+                let shape_cov = (0.5 - d).clamp(0.0, 1.0);
+                let inner_cov = (0.5 - (d + mask.border_width)).clamp(0.0, 1.0);
+                let fg_r = br + (src_r - br) * inner_cov;
+                let fg_g = bg + (src_g - bg) * inner_cov;
+                let fg_b = bb + (src_b - bb) * inner_cov;
+                let out_a = (ha * (1.0 - shape_cov) + 255.0 * shape_cov)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                let blend = |f: f32, hp: f32| -> u8 {
+                    (hp * (1.0 - shape_cov) + f * shape_cov)
+                        .round()
+                        .clamp(0.0, f32::from(out_a)) as u8
+                };
+                pixel.rgbRed = blend(fg_r, host_pre_r);
+                pixel.rgbGreen = blend(fg_g, host_pre_g);
+                pixel.rgbBlue = blend(fg_b, host_pre_b);
+                pixel.rgbReserved = out_a;
+            }
+        }
+        true
+    }
     unsafe fn finish(mut self) -> bool {
         let result = unsafe { EndBufferedPaint(self.handle, true) }.is_ok();
         self.handle = 0;
@@ -505,40 +667,27 @@ pub fn glass_enabled(window: HWND) -> bool {
 }
 
 pub unsafe fn fill(dc: HDC, r: RECT, color: u32) {
-    // SAFETY: brush belongs to this synchronous drawing call.
+    // SAFETY: cached brush belongs to this UI thread and outlives synchronous fill.
     unsafe {
-        let brush = CreateSolidBrush(rgb(color));
-        FillRect(dc, &r, brush);
-        let _ = DeleteObject(brush);
+        FillRect(dc, &r, brush(color));
     }
 }
 unsafe fn rounded(dc: HDC, r: RECT, color: u32, border: u32, radius: i32) {
-    // SAFETY: restore native objects before deleting the created brush and pen.
+    // SAFETY: restore native objects before deleting the created pen; brush is thread-cached.
     unsafe {
-        let brush = CreateSolidBrush(rgb(color));
         let pen = CreatePen(PS_SOLID, 1, rgb(border));
-        let b = SelectObject(dc, brush);
+        let b = SelectObject(dc, brush(color));
         let p = SelectObject(dc, pen);
         let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
         SelectObject(dc, b);
         SelectObject(dc, p);
-        let _ = DeleteObject(brush);
         let _ = DeleteObject(pen);
     }
 }
 unsafe fn raised_rounded(dc: HDC, r: RECT, color: u32, border: u32, highlight: u32, radius: i32) {
-    // SAFETY: restore native objects before deleting the created brush and pen.
+    // SAFETY: restore native objects before deleting created pens; brush is thread-cached.
     unsafe {
-        let brush = CreateSolidBrush(rgb(color));
-        let pen = CreatePen(PS_SOLID, 1, rgb(border));
-        let b = SelectObject(dc, brush);
-        let p = SelectObject(dc, pen);
-        let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
-        SelectObject(dc, b);
-        SelectObject(dc, p);
-        let _ = DeleteObject(brush);
-        let _ = DeleteObject(pen);
-
+        rounded(dc, r, color, border, radius);
         if highlight != 0 && r.right - r.left > radius * 2 && r.bottom - r.top > radius {
             let h_pen = CreatePen(PS_SOLID, 1, rgb(highlight));
             let old = SelectObject(dc, h_pen);
@@ -561,24 +710,9 @@ unsafe fn label(
     if text.is_empty() || r.right <= r.left || r.bottom <= r.top {
         return;
     }
-    // SAFETY: drawing only borrows temporary UTF-16/font until native function returns.
+    // SAFETY: drawing borrows temporary UTF-16 buffer and thread-cached font until return.
     unsafe {
-        let font = CreateFontW(
-            -size,
-            0,
-            0,
-            0,
-            if bold { 600 } else { 400 },
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY.0 as u32,
-            0,
-            w!("Segoe UI"),
-        );
+        let font = cached_font(size, bold);
         let old = SelectObject(dc, font);
         SetTextColor(dc, rgb(color));
         SetBkMode(dc, TRANSPARENT);
@@ -611,7 +745,6 @@ unsafe fn label(
             }
         }
         SelectObject(dc, old);
-        let _ = DeleteObject(font);
     }
 }
 unsafe fn image(dc: HDC, bitmap: HBITMAP, r: RECT) {
@@ -681,37 +814,64 @@ fn window_text(hwnd: HWND) -> String {
     }
 }
 
+struct RoundedMask {
+    ellipse: i32,
+    border: u32,
+    border_width: f32,
+    focus: u32,
+    focus_inset: f32,
+    host_color: u32,
+    host_alpha: u8,
+}
+
 pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
     // SAFETY: the owner-draw DC stays borrowed until this synchronous dispatch returns.
     unsafe {
+        let parent = if !item.hwndItem.0.is_null() {
+            GetParent(item.hwndItem).unwrap_or_default()
+        } else {
+            HWND::default()
+        };
         if let Some(buffer) = PaintBuffer::new(item.hDC, item.rcItem) {
             let buffered = DRAWITEMSTRUCT {
                 hDC: buffer.dc,
                 ..*item
             };
-            draw_item_into(&buffered);
-            if buffer.opaque() && buffer.finish() {
+            let mask = draw_item_into(&buffered, glass_enabled(parent), true);
+            let ok = match mask {
+                Some(mask) => buffer.apply_rounded_mask(&mask),
+                None => buffer.opaque(),
+            };
+            if ok && buffer.finish() {
                 return;
             }
         }
-        if !item.hwndItem.0.is_null()
-            && let Ok(parent) = GetParent(item.hwndItem)
-        {
+        if !parent.0.is_null() {
             disable_backdrop(parent);
         }
-        draw_item_into(item);
+        let _ = draw_item_into(item, false, false);
     }
 }
 
-unsafe fn draw_item_into(item: &DRAWITEMSTRUCT) {
+unsafe fn draw_item_into(
+    item: &DRAWITEMSTRUCT,
+    glass_active: bool,
+    buffered: bool,
+) -> Option<RoundedMask> {
     let id = item.CtlID as usize;
     let dpi = unsafe { GetDpiForWindow(item.hwndItem) }.max(96) as i32;
     let s = |n: i32| n * dpi / 96;
     let r = item.rcItem;
     let dc = item.hDC;
-    // SAFETY: initialize the whole child rectangle before rounded GDI painting.
+    let (host_color, glass_host) = control_surface(id);
+    let host_alpha = if glass_host && glass_active {
+        PANEL_ALPHA
+    } else {
+        255
+    };
+    let ellipse = control_corner_ellipse(id, dpi);
+    // SAFETY: child rect pixels remain owned for the duration of synchronous owner-draw dispatch.
     unsafe {
-        fill(dc, r, CARD);
         if id == PAGE {
             fill(dc, r, CANVAS);
             label(
@@ -723,7 +883,35 @@ unsafe fn draw_item_into(item: &DRAWITEMSTRUCT) {
                 MUTED,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
-        } else if id == PREVIEW || (TILE_BASE..TILE_BASE + 9).contains(&id) {
+            return None;
+        }
+        let hide_focus = item.itemState.0 & ODS_NOFOCUSRECT_FLAG != 0
+            || (!item.hwndItem.0.is_null() && {
+                let parent = GetParent(item.hwndItem).unwrap_or_default();
+                !parent.0.is_null()
+                    && SendMessageW(parent, WM_QUERYUISTATE, WPARAM(0), LPARAM(0)).0
+                        & UISF_HIDEFOCUS_FLAG
+                        != 0
+            });
+        let focus_visible = item.itemState.0 & ODS_FOCUS.0 != 0
+            && item.itemState.0 & ODS_DISABLED.0 == 0
+            && !hide_focus;
+        let is_tab = matches!(id, TAB_LIBRARY | TAB_SETTINGS);
+        let active_tab = is_tab
+            && SKIN.with(|s| {
+                let tab = s.borrow().tab;
+                (tab != Tab::Settings && id == TAB_LIBRARY)
+                    || (tab == Tab::Settings && id == TAB_SETTINGS)
+            });
+        let focus_color = if !focus_visible {
+            0
+        } else if (is_tab && active_tab) || (id == 102 && item.itemState.0 & ODS_SELECTED.0 == 0) {
+            TEXT_ON_DARK
+        } else {
+            ACCENT_SOFT
+        };
+        if id == PREVIEW || (TILE_BASE..TILE_BASE + 9).contains(&id) {
+            let mut active_tile = false;
             SKIN.with(|skin| {
                 let skin = skin.borrow();
                 let path = if id == PREVIEW {
@@ -732,6 +920,7 @@ unsafe fn draw_item_into(item: &DRAWITEMSTRUCT) {
                     skin.tiles.get(&id)
                 };
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
+                active_tile = active;
                 let playing = path.is_some_and(|path| skin.playing.contains(path));
                 let card_color = if id == PREVIEW {
                     INK
@@ -748,7 +937,20 @@ unsafe fn draw_item_into(item: &DRAWITEMSTRUCT) {
                 } else {
                     HIGHLIGHT
                 };
-                raised_rounded(dc, r, card_color, card_border, card_highlight, s(10));
+                if buffered {
+                    fill(dc, r, card_color);
+                    if card_highlight != 0 && r.right - r.left > ellipse {
+                        let h_pen = CreatePen(PS_SOLID, 1, rgb(card_highlight));
+                        let old = SelectObject(dc, h_pen);
+                        let _ = MoveToEx(dc, r.left + ellipse / 2, r.top + 1, None);
+                        let _ = LineTo(dc, r.right - ellipse / 2, r.top + 1);
+                        SelectObject(dc, old);
+                        let _ = DeleteObject(h_pen);
+                    }
+                } else {
+                    fill(dc, r, host_color);
+                    raised_rounded(dc, r, card_color, card_border, card_highlight, ellipse);
+                }
                 let area = rect(
                     r.left + s(3),
                     r.top + s(3),
@@ -829,131 +1031,148 @@ unsafe fn draw_item_into(item: &DRAWITEMSTRUCT) {
                     rounded(
                         dc,
                         box_rect,
-                        if checked { ACCENT } else { PANEL },
-                        if checked { ACCENT } else { MUTED },
-                        s(4),
+                        if checked { ACCENT } else { INK },
+                        if checked { ACCENT_DARK } else { LINE },
+                        s(6),
                     );
                     if checked {
-                        let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(CANVAS));
+                        let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(INK));
                         let old = SelectObject(dc, pen);
-                        let _ = MoveToEx(dc, box_rect.left + s(3), box_rect.top + s(8), None);
-                        let _ = LineTo(dc, box_rect.left + s(6), box_rect.top + s(11));
-                        let _ = LineTo(dc, box_rect.left + s(13), box_rect.top + s(4));
+                        let _ = MoveToEx(dc, box_rect.left + s(4), box_rect.top + s(8), None);
+                        let _ = LineTo(dc, box_rect.left + s(7), box_rect.top + s(11));
+                        let _ = LineTo(dc, box_rect.left + s(12), box_rect.top + s(5));
                         SelectObject(dc, old);
                         let _ = DeleteObject(pen);
                     }
                 }
-                if active {
+                if !buffered && active {
                     let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(ACCENT));
                     let old_pen = SelectObject(dc, pen);
                     let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                    let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, s(10), s(10));
+                    let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, ellipse, ellipse);
                     SelectObject(dc, old_brush);
                     SelectObject(dc, old_pen);
                     let _ = DeleteObject(pen);
                 }
             });
-        } else {
-            let text = window_text(item.hwndItem);
-            let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
-            let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
-            let primary = id == 102;
-            let is_tab = matches!(id, TAB_LIBRARY | TAB_SETTINGS);
-
-            let active_tab = is_tab
-                && SKIN.with(|s| {
-                    let tab = s.borrow().tab;
-                    (tab != Tab::Settings && id == TAB_LIBRARY)
-                        || (tab == Tab::Settings && id == TAB_SETTINGS)
-                });
-
-            let radius = if is_tab { s(18) } else { s(8) };
-            let (color, border, highlight) = if disabled {
-                (CANVAS, PANEL, 0)
-            } else if is_tab {
-                if active_tab {
-                    (ACCENT, ACCENT_DARK, ACCENT_SOFT)
-                } else if pressed {
-                    (mix(INK, CREAM, 8, 100), LINE, 0)
-                } else {
-                    (INK, LINE, 0)
-                }
-            } else if primary {
-                if pressed {
-                    (ACCENT_DARK, ACCENT_DEEP, 0)
-                } else {
-                    (ACCENT, ACCENT_DARK, ACCENT_SOFT)
-                }
-            } else if pressed {
-                (CARD_LIT, HIGHLIGHT, 0)
-            } else {
-                (CARD, LINE, HIGHLIGHT)
-            };
-            raised_rounded(dc, r, color, border, highlight, radius);
-            let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
-            label(
-                dc,
-                &text,
-                rect(
-                    r.left + s(if selector { 12 } else { 8 }),
-                    r.top,
-                    r.right - s(if selector { 32 } else { 8 }),
-                    r.bottom,
-                ),
-                s(14),
-                primary || active_tab,
-                if disabled {
-                    DISABLED_TEXT
-                } else if primary && pressed {
-                    TEXT_ON_DARK
-                } else if primary || (is_tab && active_tab) {
-                    TEXT_ON_ACCENT
-                } else if is_tab {
-                    TEXT_ON_DARK
-                } else {
-                    TEXT
-                },
-                (if selector { DT_LEFT } else { DT_CENTER })
-                    | DT_VCENTER
-                    | DT_SINGLELINE
-                    | DT_END_ELLIPSIS
-                    | DT_NOPREFIX,
-            );
-            if selector {
-                let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(MUTED));
-                let old = SelectObject(dc, pen);
-                let x = r.right - s(18);
-                let y = (r.top + r.bottom) / 2;
-                let _ = MoveToEx(dc, x - s(4), y - s(2), None);
-                let _ = LineTo(dc, x, y + s(2));
-                let _ = LineTo(dc, x + s(4), y - s(2));
-                SelectObject(dc, old);
+            let card_border = if active_tile { ACCENT } else { LINE };
+            if !buffered && focus_color != 0 {
+                let focus_r = ellipse.saturating_sub(s(4)).max(s(4));
+                let focus = rect(r.left + s(3), r.top + s(3), r.right - s(3), r.bottom - s(3));
+                let pen = CreatePen(PS_SOLID, 1, rgb(focus_color));
+                let old_pen = SelectObject(dc, pen);
+                let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                let _ = RoundRect(
+                    dc,
+                    focus.left,
+                    focus.top,
+                    focus.right,
+                    focus.bottom,
+                    focus_r,
+                    focus_r,
+                );
+                SelectObject(dc, old_brush);
+                SelectObject(dc, old_pen);
                 let _ = DeleteObject(pen);
             }
+            return Some(RoundedMask {
+                ellipse,
+                border: card_border,
+                border_width: if active_tile { s(2).max(1) as f32 } else { 1.0 },
+                focus: focus_color,
+                focus_inset: s(3).max(2) as f32,
+                host_color,
+                host_alpha,
+            });
         }
-        if item.itemState.0 & ODS_FOCUS.0 != 0 && item.itemState.0 & ODS_DISABLED.0 == 0 {
-            let focus_r = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
-                s(14)
+
+        let text = window_text(item.hwndItem);
+        let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
+        let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
+        let primary = id == 102;
+        let (color, border, highlight) = if disabled {
+            (
+                if glass_host { PANEL } else { DISABLED_FILL },
+                DISABLED_BORDER,
+                0,
+            )
+        } else if is_tab {
+            if active_tab {
+                (ACCENT, ACCENT_DARK, ACCENT_SOFT)
+            } else if pressed {
+                (mix(INK, CREAM, 10, 100), LINE, 0)
             } else {
-                s(6)
-            };
-            let focus = rect(r.left + s(3), r.top + s(3), r.right - s(3), r.bottom - s(3));
-            let focus_color = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
-                if SKIN.with(|s| {
-                    let tab = s.borrow().tab;
-                    (id == TAB_LIBRARY && tab != Tab::Settings)
-                        || (id == TAB_SETTINGS && tab == Tab::Settings)
-                }) {
-                    INK
-                } else {
-                    TEXT_ON_DARK
-                }
-            } else if id == 102 && item.itemState.0 & ODS_SELECTED.0 == 0 {
-                INK
+                (INK, LINE, 0)
+            }
+        } else if primary {
+            if pressed {
+                (ACCENT_DARK, ACCENT_DEEP, 0)
+            } else {
+                (ACCENT, ACCENT_DARK, ACCENT_SOFT)
+            }
+        } else if pressed {
+            (CARD_LIT, HIGHLIGHT, 0)
+        } else {
+            (CARD, LINE, HIGHLIGHT)
+        };
+        if buffered {
+            fill(dc, r, color);
+            if highlight != 0 && r.right - r.left > ellipse {
+                let h_pen = CreatePen(PS_SOLID, 1, rgb(highlight));
+                let old = SelectObject(dc, h_pen);
+                let _ = MoveToEx(dc, r.left + ellipse / 2, r.top + 1, None);
+                let _ = LineTo(dc, r.right - ellipse / 2, r.top + 1);
+                SelectObject(dc, old);
+                let _ = DeleteObject(h_pen);
+            }
+        } else {
+            fill(dc, r, host_color);
+            raised_rounded(dc, r, color, border, highlight, ellipse);
+        }
+        let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
+        label(
+            dc,
+            &text,
+            rect(
+                r.left + s(if selector { 12 } else { 8 }),
+                r.top,
+                r.right - s(if selector { 32 } else { 8 }),
+                r.bottom,
+            ),
+            s(14),
+            primary || active_tab,
+            if disabled {
+                DISABLED_TEXT
+            } else if primary && pressed {
+                TEXT_ON_DARK
+            } else if primary || (is_tab && active_tab) {
+                TEXT_ON_ACCENT
+            } else if is_tab {
+                TEXT_ON_DARK
             } else {
                 TEXT
-            };
-            let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(focus_color));
+            },
+            (if selector { DT_LEFT } else { DT_CENTER })
+                | DT_VCENTER
+                | DT_SINGLELINE
+                | DT_END_ELLIPSIS
+                | DT_NOPREFIX,
+        );
+        if selector {
+            let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(MUTED));
+            let old = SelectObject(dc, pen);
+            let x = r.right - s(18);
+            let y = (r.top + r.bottom) / 2;
+            let _ = MoveToEx(dc, x - s(4), y - s(2), None);
+            let _ = LineTo(dc, x, y + s(2));
+            let _ = LineTo(dc, x + s(4), y - s(2));
+            SelectObject(dc, old);
+            let _ = DeleteObject(pen);
+        }
+        if !buffered && focus_color != 0 {
+            let focus_r = ellipse.saturating_sub(s(4)).max(s(4));
+            let focus = rect(r.left + s(3), r.top + s(3), r.right - s(3), r.bottom - s(3));
+            let pen = CreatePen(PS_SOLID, 1, rgb(focus_color));
             let old_pen = SelectObject(dc, pen);
             let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
             let _ = RoundRect(
@@ -969,6 +1188,15 @@ unsafe fn draw_item_into(item: &DRAWITEMSTRUCT) {
             SelectObject(dc, old_pen);
             let _ = DeleteObject(pen);
         }
+        Some(RoundedMask {
+            ellipse,
+            border,
+            border_width: 1.0,
+            focus: focus_color,
+            focus_inset: s(3).max(2) as f32,
+            host_color,
+            host_alpha,
+        })
     }
 }
 
@@ -1133,7 +1361,6 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
                     ),
                     LINE,
                 );
-                fill(dc, pixels(layout.pager), PANEL);
             }
             Tab::Settings => {
                 raised_rounded(
@@ -1378,8 +1605,15 @@ pub fn prepare_control(window: HWND) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
         }
         let button = class_name == "Button";
+        if button {
+            let class_style = GetClassLongPtrW(window, GCL_STYLE) as usize;
+            let stripped = class_style & !(CS_PARENTDC.0 as usize);
+            if stripped != class_style {
+                SetClassLongPtrW(window, GCL_STYLE, stripped as isize);
+            }
+        }
         let owner_draw = button && style & 0xf == BS_OWNERDRAW as u32;
-        if !owner_draw && !SetWindowSubclass(window, Some(control_proc), 1, 0).as_bool() {
+        if !SetWindowSubclass(window, Some(control_proc), 1, usize::from(owner_draw)).as_bool() {
             return Err("Could not initialize opaque native control painting".into());
         }
     }
@@ -1401,14 +1635,8 @@ pub fn round_control(window: HWND) -> Result<(), String> {
             return Ok(());
         }
         let id = GetDlgCtrlID(window) as usize;
-        let radius = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
-            18
-        } else if id == PREVIEW || (TILE_BASE..TILE_BASE + 9).contains(&id) {
-            10
-        } else {
-            8
-        };
-        let radius = radius * GetDpiForWindow(window).max(96) as i32 / 96;
+        let dpi = GetDpiForWindow(window).max(96) as i32;
+        let radius = control_corner_ellipse(id, dpi);
         let region = CreateRoundRectRgn(0, 0, area.right + 1, area.bottom + 1, radius, radius);
         if region.0.is_null() {
             return Err("Could not create the control's rounded region".into());
@@ -1422,10 +1650,12 @@ pub fn round_control(window: HWND) -> Result<(), String> {
 }
 
 fn control_color(id: usize) -> u32 {
-    match id {
-        113 => FOOTER,
-        PAGE => PANEL,
-        _ => CARD,
+    if id == 113 {
+        FOOTER
+    } else if id == SEARCH {
+        CARD
+    } else {
+        control_surface(id).0
     }
 }
 
@@ -1440,99 +1670,175 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
         let checkbox = matches!(id, 107 | 108 | 121);
         let color = control_color(id);
         if let Some(buffer) = PaintBuffer::new(dc, area) {
-            if (static_text || checkbox) && glass_enabled(parent) {
-                let theme = OpenThemeData(parent, w!("WINDOW"));
-                if theme.0 != 0 {
-                    fill(buffer.dc, area, if id == PAGE { PANEL } else { CARD });
-                    let alpha_ok =
-                        buffer.tint_background(area, if id == PAGE { 255 } else { PANEL_ALPHA });
-                    let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
-                    let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
-                    let dpi = GetDpiForWindow(window).max(96) as i32;
-                    let mut text_area = area;
-                    if checkbox {
-                        let size = 14 * dpi / 96;
-                        let top = (area.top + area.bottom - size) / 2;
-                        let mut glyph = rect(area.left, top, area.left + size, top + size);
-                        let state = SendMessageW(window, BM_GETSTATE, WPARAM(0), LPARAM(0)).0;
-                        let flags = DFCS_BUTTONCHECK
-                            | if state & 3 == 1 {
-                                DFCS_CHECKED
-                            } else {
-                                DFCS_STATE(0)
-                            }
-                            | if state & 4 != 0 {
-                                DFCS_PUSHED
-                            } else {
-                                DFCS_STATE(0)
-                            };
-                        let _ = DrawFrameControl(buffer.dc, &mut glyph, DFC_BUTTON, flags);
-                        let _ = GdiFlush();
-                        let _ = BufferedPaintSetAlpha(buffer.handle, Some(&glyph), 255);
-                        text_area.left += 18 * dpi / 96;
-                    }
-                    label(
-                        buffer.dc,
-                        &window_text(window),
-                        text_area,
-                        (if id == PAGE { 13 } else { 14 }) * dpi / 96,
-                        false,
-                        if id == 112 || checkbox { TEXT } else { MUTED },
-                        if id == PAGE {
-                            DT_CENTER | DT_VCENTER | DT_SINGLELINE
-                        } else if checkbox {
-                            DT_SINGLELINE | DT_VCENTER
-                        } else if id == 112 {
-                            DT_SINGLELINE | DT_END_ELLIPSIS
+            if static_text || checkbox {
+                let glass = glass_enabled(parent);
+                let (surface_color, surface_translucent) = control_surface(id);
+                let theme = if glass {
+                    OpenThemeData(parent, w!("WINDOW"))
+                } else {
+                    HTHEME(0)
+                };
+                fill(buffer.dc, area, surface_color);
+                let alpha_ok = if theme.0 != 0 {
+                    buffer.tint_background(
+                        area,
+                        if surface_translucent {
+                            PANEL_ALPHA
                         } else {
-                            DT_WORDBREAK
+                            255
                         },
-                    );
-                    if checkbox
-                        && SendMessageW(window, BM_GETSTATE, WPARAM(0), LPARAM(0)).0 & 8 != 0
-                    {
-                        let _ = DrawFocusRect(
-                            buffer.dc,
-                            &rect(
-                                text_area.left,
-                                area.top + 3,
-                                area.right - 3,
-                                area.bottom - 3,
-                            ),
-                        );
+                    )
+                } else {
+                    true
+                };
+                let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
+                let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+                let dpi = GetDpiForWindow(window).max(96) as i32;
+                let s = |n: i32| n * dpi / 96;
+                let mut text_area = area;
+                if checkbox {
+                    let size = s(15).max(12);
+                    let top = (area.top + area.bottom - size) / 2;
+                    let glyph = rect(area.left, top, area.left + size, top + size);
+                    let state = SendMessageW(window, BM_GETSTATE, WPARAM(0), LPARAM(0)).0;
+                    let checked = state & 3 == 1;
+                    let pressed = state & 4 != 0;
+                    let disabled = GetWindowLongW(window, GWL_STYLE) as u32 & WS_DISABLED.0 != 0;
+                    let box_fill = if checked {
+                        if pressed { ACCENT_DARK } else { ACCENT }
+                    } else if pressed {
+                        CARD_LIT
+                    } else {
+                        INK
+                    };
+                    let box_border = if checked {
+                        if pressed { ACCENT_DEEP } else { ACCENT_DARK }
+                    } else if disabled {
+                        DISABLED_BORDER
+                    } else {
+                        HIGHLIGHT
+                    };
+                    rounded(buffer.dc, glyph, box_fill, box_border, s(5).max(3));
+                    if checked {
+                        let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(INK));
+                        let old_pen = SelectObject(buffer.dc, pen);
+                        let x0 = glyph.left + size * 24 / 100;
+                        let y0 = glyph.top + size * 52 / 100;
+                        let x1 = glyph.left + size * 43 / 100;
+                        let y1 = glyph.top + size * 71 / 100;
+                        let x2 = glyph.left + size * 77 / 100;
+                        let y2 = glyph.top + size * 31 / 100;
+                        let _ = MoveToEx(buffer.dc, x0, y0, None);
+                        let _ = LineTo(buffer.dc, x1, y1);
+                        let _ = LineTo(buffer.dc, x2, y2);
+                        SelectObject(buffer.dc, old_pen);
+                        let _ = DeleteObject(pen);
                     }
-                    TEXT_THEME.with(|slot| slot.set(old_theme));
-                    GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+                    let _ = GdiFlush();
+                    let _ = BufferedPaintSetAlpha(buffer.handle, Some(&glyph), 255);
+                    text_area.left += size + s(9);
+                }
+                label(
+                    buffer.dc,
+                    &window_text(window),
+                    text_area,
+                    s(if id == PAGE { 13 } else { 14 }),
+                    false,
+                    if id == 112 || checkbox { TEXT } else { MUTED },
+                    if id == PAGE {
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE
+                    } else if checkbox {
+                        DT_SINGLELINE | DT_VCENTER
+                    } else if id == 112 {
+                        DT_SINGLELINE | DT_END_ELLIPSIS
+                    } else {
+                        DT_WORDBREAK
+                    },
+                );
+                if checkbox {
+                    let state = SendMessageW(window, BM_GETSTATE, WPARAM(0), LPARAM(0)).0;
+                    let hide_focus = !parent.0.is_null()
+                        && SendMessageW(parent, WM_QUERYUISTATE, WPARAM(0), LPARAM(0)).0
+                            & UISF_HIDEFOCUS_FLAG
+                            != 0;
+                    if state & 8 != 0 && !hide_focus {
+                        let focus_r = rect(
+                            (text_area.left - s(4)).max(area.left),
+                            area.top + s(2),
+                            area.right - s(2),
+                            area.bottom - s(2),
+                        );
+                        for edge in [
+                            rect(focus_r.left, focus_r.top, focus_r.right, focus_r.top + 1),
+                            rect(
+                                focus_r.left,
+                                focus_r.bottom - 1,
+                                focus_r.right,
+                                focus_r.bottom,
+                            ),
+                            rect(focus_r.left, focus_r.top, focus_r.left + 1, focus_r.bottom),
+                            rect(
+                                focus_r.right - 1,
+                                focus_r.top,
+                                focus_r.right,
+                                focus_r.bottom,
+                            ),
+                        ] {
+                            fill(buffer.dc, edge, ACCENT_SOFT);
+                            let _ = GdiFlush();
+                            let _ = BufferedPaintSetAlpha(buffer.handle, Some(&edge), 255);
+                        }
+                    }
+                }
+                TEXT_THEME.with(|slot| slot.set(old_theme));
+                GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+                if theme.0 != 0 {
                     let _ = CloseThemeData(theme);
                     if alpha_ok && buffer.finish() {
                         return;
                     }
                     disable_backdrop(parent);
-                    fill(dc, area, color);
-                    DefSubclassProc(
-                        window,
-                        WM_PRINTCLIENT,
-                        WPARAM(dc.0 as usize),
-                        LPARAM(PRF_CLIENT as isize),
-                    );
+                } else if buffer.opaque() && buffer.finish() {
                     return;
                 }
-            }
-            fill(buffer.dc, area, color);
-            DefSubclassProc(
-                window,
-                WM_PRINTCLIENT,
-                WPARAM(buffer.dc.0 as usize),
-                LPARAM(PRF_CLIENT as isize),
-            );
-            if buffer.opaque() && buffer.finish() {
-                return;
+            } else {
+                fill(buffer.dc, area, color);
+                DefSubclassProc(
+                    window,
+                    WM_PRINTCLIENT,
+                    WPARAM(buffer.dc.0 as usize),
+                    LPARAM(PRF_CLIENT as isize),
+                );
+                if buffer.opaque() && buffer.finish() {
+                    return;
+                }
             }
         }
         if !parent.0.is_null() {
             disable_backdrop(parent);
         }
         fill(dc, area, color);
+        if static_text || checkbox {
+            let dpi = GetDpiForWindow(window).max(96) as i32;
+            label(
+                dc,
+                &window_text(window),
+                area,
+                if id == PAGE { 13 } else { 14 } * dpi / 96,
+                false,
+                if id == 112 || checkbox { TEXT } else { MUTED },
+                if id == PAGE {
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE
+                } else if checkbox {
+                    DT_SINGLELINE | DT_VCENTER
+                } else if id == 112 {
+                    DT_SINGLELINE | DT_END_ELLIPSIS
+                } else {
+                    DT_WORDBREAK
+                },
+            );
+            return;
+        }
         DefSubclassProc(
             window,
             WM_PRINTCLIENT,
@@ -1548,11 +1854,15 @@ unsafe extern "system" fn control_proc(
     wparam: WPARAM,
     lparam: LPARAM,
     id: usize,
-    _: usize,
+    data: usize,
 ) -> LRESULT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_DOWN, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    };
     unsafe {
+        let owner_draw = data != 0;
         match message {
-            WM_PAINT => {
+            WM_PAINT if !owner_draw => {
                 let mut ps = PAINTSTRUCT::default();
                 let dc = BeginPaint(window, &mut ps);
                 let mut area = RECT::default();
@@ -1562,7 +1872,7 @@ unsafe extern "system" fn control_proc(
                 let _ = EndPaint(window, &ps);
                 LRESULT(0)
             }
-            WM_PRINTCLIENT if wparam.0 != 0 => {
+            WM_PRINTCLIENT if !owner_draw && wparam.0 != 0 => {
                 let mut area = RECT::default();
                 if GetClientRect(window, &mut area).is_ok() {
                     paint_control_into(window, HDC(wparam.0 as *mut _), area);
@@ -1570,6 +1880,42 @@ unsafe extern "system" fn control_proc(
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                if let Ok(parent) = GetParent(window)
+                    && !parent.0.is_null()
+                {
+                    let _ = SendMessageW(
+                        parent,
+                        WM_CHANGEUISTATE,
+                        WPARAM(UIS_SET as usize | ((UISF_HIDEFOCUS as usize) << 16)),
+                        LPARAM(0),
+                    );
+                }
+                DefSubclassProc(window, message, wparam, lparam)
+            }
+            WM_KEYDOWN => {
+                let key = wparam.0 as u16;
+                if matches!(
+                    key,
+                    x if x == VK_TAB.0
+                        || x == VK_LEFT.0
+                        || x == VK_RIGHT.0
+                        || x == VK_UP.0
+                        || x == VK_DOWN.0
+                        || x == VK_SPACE.0
+                        || x == VK_RETURN.0
+                ) && let Ok(parent) = GetParent(window)
+                    && !parent.0.is_null()
+                {
+                    let _ = SendMessageW(
+                        parent,
+                        WM_CHANGEUISTATE,
+                        WPARAM(UIS_CLEAR as usize | ((UISF_HIDEFOCUS as usize) << 16)),
+                        LPARAM(0),
+                    );
+                }
+                DefSubclassProc(window, message, wparam, lparam)
+            }
             WM_NCDESTROY => {
                 let _ = RemoveWindowSubclass(window, Some(control_proc), id);
                 DefSubclassProc(window, message, wparam, lparam)
@@ -1612,12 +1958,39 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
         Some(LRESULT(brush(color).0 as isize))
     }
 }
-thread_local! {static BRUSHES:RefCell<HashMap<u32,HBRUSH>>=RefCell::new(HashMap::new());}
+thread_local! {
+    static BRUSHES: RefCell<HashMap<u32, HBRUSH>> = RefCell::new(HashMap::new());
+    static FONTS: RefCell<HashMap<(i32, bool), HFONT>> = RefCell::new(HashMap::new());
+}
 pub fn brush(color: u32) -> HBRUSH {
     BRUSHES.with(|b| {
         *b.borrow_mut()
             .entry(color)
             .or_insert_with(|| unsafe { CreateSolidBrush(rgb(color)) })
+    })
+}
+fn cached_font(size: i32, bold: bool) -> HFONT {
+    FONTS.with(|f| {
+        *f.borrow_mut()
+            .entry((size, bold))
+            .or_insert_with(|| unsafe {
+                CreateFontW(
+                    -size,
+                    0,
+                    0,
+                    0,
+                    if bold { 600 } else { 400 },
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET.0 as u32,
+                    OUT_DEFAULT_PRECIS.0 as u32,
+                    CLIP_DEFAULT_PRECIS.0 as u32,
+                    CLEARTYPE_QUALITY.0 as u32,
+                    0,
+                    w!("Segoe UI"),
+                )
+            })
     })
 }
 
@@ -1704,13 +2077,96 @@ mod tests {
             let _ = DeleteDC(dc);
             assert_eq!(
                 corner & 0x00ff_ffff,
-                CARD,
-                "rounded corners must not retain native white erase"
+                INK,
+                "canvas tile corners must match Ink backdrop without residual boxes"
             );
             assert_eq!(
                 center,
                 0xff00_0000 | CARD,
                 "foreground controls must reach DWM with alpha 255"
+            );
+        }
+    }
+
+    #[test]
+    fn host_surface_and_focus_states_match_controls() {
+        assert_eq!(control_color(PAGE), INK);
+        assert_eq!(control_color(SEARCH), CARD);
+        assert_eq!(control_color(113), FOOTER);
+        assert_eq!(control_surface(TAB_LIBRARY), (INK, false));
+        assert_eq!(control_surface(PREVIOUS), (INK, false));
+        assert_eq!(control_surface(PRODUCT_WEBSITE), (CARD, true));
+
+        // SAFETY: test-owned memory DC and DIB never attach to any desktop window.
+        unsafe {
+            let draw_pixels = |id: usize, state: u32| -> Vec<u32> {
+                let dc = CreateCompatibleDC(None);
+                let mut bits = std::ptr::null_mut();
+                let bitmap = CreateDIBSection(
+                    dc,
+                    &BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: 120,
+                            biHeight: -36,
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    DIB_RGB_COLORS,
+                    &mut bits,
+                    None,
+                    0,
+                )
+                .expect("control test DIB");
+                let old = SelectObject(dc, bitmap);
+                std::slice::from_raw_parts_mut(bits as *mut u32, 120 * 36).fill(0xffff_ffff);
+                let mut item = DRAWITEMSTRUCT {
+                    CtlID: id as u32,
+                    hDC: dc,
+                    rcItem: rect(0, 0, 120, 36),
+                    ..Default::default()
+                };
+                item.itemState.0 = state;
+                draw_item(&item);
+                let _ = GdiFlush();
+                let result = std::slice::from_raw_parts(bits as *const u32, 120 * 36).to_vec();
+                SelectObject(dc, old);
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(dc);
+                result
+            };
+
+            let tab_pixels = draw_pixels(TAB_LIBRARY, 0);
+            assert_eq!(tab_pixels[0] & 0x00ff_ffff, INK);
+
+            let panel_pixels = draw_pixels(PRODUCT_WEBSITE, 0);
+            assert_eq!(panel_pixels[0] & 0x00ff_ffff, CARD);
+
+            let disabled_prev = draw_pixels(PREVIOUS, ODS_DISABLED.0);
+            assert_eq!(disabled_prev[0] & 0x00ff_ffff, INK);
+            assert_eq!(disabled_prev[18 * 120 + 60] & 0x00ff_ffff, DISABLED_FILL);
+
+            let focused_key = draw_pixels(NEXT, ODS_FOCUS.0);
+            let focused_mouse = draw_pixels(NEXT, ODS_FOCUS.0 | ODS_NOFOCUSRECT_FLAG);
+            let key_focus_count = focused_key
+                .iter()
+                .filter(|px| **px & 0x00ff_ffff == ACCENT_SOFT)
+                .count();
+            let mouse_focus_count = focused_mouse
+                .iter()
+                .filter(|px| **px & 0x00ff_ffff == ACCENT_SOFT)
+                .count();
+            assert!(
+                key_focus_count > 20,
+                "keyboard focus ring must remain visible"
+            );
+            assert_eq!(
+                mouse_focus_count, 0,
+                "ODS_NOFOCUSRECT must suppress focus outline on click"
             );
         }
     }

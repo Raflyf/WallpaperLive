@@ -27,8 +27,13 @@ try {
     }
 }
 finally { $stream.Dispose() }
+$cargo = Get-Content -LiteralPath (Join-Path $root 'Cargo.toml') -Raw
+if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+    throw 'Could not determine version from Cargo.toml.'
+}
+$version = $Matches[1]
 $Destination = [IO.Path]::GetFullPath($Destination)
-$package = Join-Path $Destination 'WallpaperLive-0.1.0-windows-x64'
+$package = Join-Path $Destination "WallpaperLive-$version-windows-x64"
 $zip = $package + '.zip'
 if ((Test-Path -LiteralPath $package) -or (Test-Path -LiteralPath $zip)) {
     throw "Package output already exists; choose a new -Destination. Nothing overwritten: $package"

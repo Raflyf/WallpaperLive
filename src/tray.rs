@@ -44,8 +44,17 @@ impl Palette {
             }
         }
     }
+    fn app_surface() -> Self {
+        Self {
+            // Match WallpaperLive's dark surface (#232221 / #F3EEE3 / #353331) using COLORREF BGR.
+            background: COLORREF(0x212223),
+            text: COLORREF(0xe3eef3),
+            selected: COLORREF(0x313335),
+            disabled: COLORREF(0x888f93),
+        }
+    }
 }
-fn system_palette() -> Option<Palette> {
+fn system_palette(force_app_dark: bool) -> Option<Palette> {
     let mut contrast = HIGHCONTRASTW {
         cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
         ..Default::default()
@@ -62,6 +71,9 @@ fn system_palette() -> Option<Palette> {
             || contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
         {
             return None;
+        }
+        if force_app_dark {
+            return Some(Palette::app_surface());
         }
         let mut light = 1u32;
         let mut bytes = std::mem::size_of_val(&light) as u32;
@@ -88,6 +100,7 @@ struct Entry {
     width: u32,
     height: u32,
     padding: i32,
+    checked: bool,
 }
 struct Menu {
     handle: HMENU,
@@ -115,6 +128,7 @@ impl Menu {
     fn new(
         owner: HWND,
         items: &[(usize, &str)],
+        selected_id: Option<usize>,
         colors: Option<Palette>,
         dpi: u32,
     ) -> Result<Self, String> {
@@ -155,53 +169,65 @@ impl Menu {
                     },
                 )
                 .map_err(|e| e.to_string())?;
-                for (id, label) in items {
-                    let mut text: Vec<_> = label.encode_utf16().chain(Some(0)).collect();
-                    let dc = GetDC(owner);
-                    if dc.0.is_null() {
-                        return Err("Could not measure tray menu text".into());
-                    }
-                    let old = SelectObject(dc, menu.font);
-                    let mut size = SIZE::default();
-                    let measured =
-                        GetTextExtentPoint32W(dc, &text[..text.len() - 1], &mut size).as_bool();
-                    SelectObject(dc, old);
-                    ReleaseDC(owner, dc);
-                    if !measured {
-                        return Err("Could not measure tray menu text".into());
-                    }
-                    let scale = |n| n * dpi as i32 / 96;
-                    let entry = Box::new(Entry {
-                        accessible: MSAAMENUINFO {
-                            dwMSAASignature: MSAA_MENU_SIG as u32,
-                            cchWText: (text.len() - 1) as u32,
-                            pszWText: PWSTR(text.as_mut_ptr()),
-                        },
-                        text,
-                        font: menu.font,
-                        colors,
-                        width: (size.cx + scale(32)) as u32,
-                        height: (size.cy.max(scale(16)) + scale(12)) as u32,
-                        padding: scale(16),
-                    });
-                    let info = MENUITEMINFOW {
-                        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-                        fMask: MIIM_ID | MIIM_FTYPE | MIIM_DATA | MIIM_STRING,
-                        fType: MFT_OWNERDRAW,
-                        wID: *id as u32,
-                        dwItemData: (&*entry as *const Entry) as usize,
-                        dwTypeData: entry.accessible.pszWText,
-                        cch: entry.accessible.cchWText,
-                        ..Default::default()
-                    };
-                    InsertMenuItemW(menu.handle, *id as u32, false, &info)
-                        .map_err(|e| e.to_string())?;
-                    menu.entries.push(entry);
+                let check_gutter = selected_id.is_some();
+                let dc = GetDC(owner);
+                if dc.0.is_null() {
+                    return Err("Could not measure tray menu text".into());
                 }
+                let old = SelectObject(dc, menu.font);
+                let scale = |n| n * dpi as i32 / 96;
+                let pad_left = scale(if check_gutter { 26 } else { 16 });
+                let pad_right = scale(16);
+                let measure_result = (|| -> Result<(), String> {
+                    for (id, label) in items {
+                        let mut text: Vec<_> = label.encode_utf16().chain(Some(0)).collect();
+                        let mut size = SIZE::default();
+                        if !GetTextExtentPoint32W(dc, &text[..text.len() - 1], &mut size).as_bool()
+                        {
+                            return Err("Could not measure tray menu text".into());
+                        }
+                        let entry = Box::new(Entry {
+                            accessible: MSAAMENUINFO {
+                                dwMSAASignature: MSAA_MENU_SIG as u32,
+                                cchWText: (text.len() - 1) as u32,
+                                pszWText: PWSTR(text.as_mut_ptr()),
+                            },
+                            text,
+                            font: menu.font,
+                            colors,
+                            width: (size.cx + pad_left + pad_right) as u32,
+                            height: (size.cy.max(scale(16)) + scale(12)) as u32,
+                            padding: pad_left,
+                            checked: selected_id == Some(*id),
+                        });
+                        let info = MENUITEMINFOW {
+                            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                            fMask: MIIM_ID | MIIM_FTYPE | MIIM_DATA | MIIM_STRING,
+                            fType: MFT_OWNERDRAW,
+                            wID: *id as u32,
+                            dwItemData: (&*entry as *const Entry) as usize,
+                            dwTypeData: entry.accessible.pszWText,
+                            cch: entry.accessible.cchWText,
+                            ..Default::default()
+                        };
+                        InsertMenuItemW(menu.handle, *id as u32, false, &info)
+                            .map_err(|e| e.to_string())?;
+                        menu.entries.push(entry);
+                    }
+                    Ok(())
+                })();
+                SelectObject(dc, old);
+                ReleaseDC(owner, dc);
+                measure_result?;
             } else {
                 for (id, label) in items {
                     let text: Vec<_> = label.encode_utf16().chain(Some(0)).collect();
-                    AppendMenuW(menu.handle, MF_STRING, *id, PCWSTR(text.as_ptr()))
+                    let flags = if selected_id == Some(*id) {
+                        MF_STRING | MF_CHECKED
+                    } else {
+                        MF_STRING
+                    };
+                    AppendMenuW(menu.handle, flags, *id, PCWSTR(text.as_ptr()))
                         .map_err(|e| e.to_string())?;
                 }
             }
@@ -214,6 +240,47 @@ fn anchor(payload: WPARAM) -> POINT {
     POINT {
         x: payload.0 as u16 as i16 as i32,
         y: (payload.0 >> 16) as u16 as i16 as i32,
+    }
+}
+fn track_menu(
+    owner: HWND,
+    point: POINT,
+    items: &[(usize, &str)],
+    selected_id: Option<usize>,
+    force_app_dark: bool,
+) -> Result<usize, String> {
+    let mut dpi = unsafe { GetDpiForWindow(owner) }.max(96);
+    let mut dpi_y = dpi;
+    let _ = unsafe {
+        GetDpiForMonitor(
+            MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST),
+            MDT_EFFECTIVE_DPI,
+            &mut dpi,
+            &mut dpi_y,
+        )
+    };
+    let menu = Menu::new(
+        owner,
+        items,
+        selected_id,
+        system_palette(force_app_dark),
+        dpi.max(96),
+    )?;
+    // SAFETY: native menu retains keyboard navigation; entry data lives throughout modal tracking.
+    unsafe {
+        let _ = SetForegroundWindow(owner);
+        let id = TrackPopupMenu(
+            menu.handle,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+            point.x,
+            point.y,
+            0,
+            owner,
+            None,
+        )
+        .0 as usize;
+        let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
+        Ok(id)
     }
 }
 pub fn popup(owner: HWND, items_anchor: WPARAM, items: &[(usize, &str)]) -> Result<usize, String> {
@@ -235,33 +302,15 @@ pub fn popup(owner: HWND, items_anchor: WPARAM, items: &[(usize, &str)]) -> Resu
             y: (rect.top + rect.bottom) / 2,
         };
     }
-    let mut dpi = unsafe { GetDpiForWindow(owner) }.max(96);
-    let mut dpi_y = dpi;
-    let _ = unsafe {
-        GetDpiForMonitor(
-            MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST),
-            MDT_EFFECTIVE_DPI,
-            &mut dpi,
-            &mut dpi_y,
-        )
-    };
-    let menu = Menu::new(owner, items, system_palette(), dpi.max(96))?;
-    // SAFETY: native menu retains keyboard navigation; entry data lives throughout modal tracking.
-    unsafe {
-        let _ = SetForegroundWindow(owner);
-        let id = TrackPopupMenu(
-            menu.handle,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-            point.x,
-            point.y,
-            0,
-            owner,
-            None,
-        )
-        .0 as usize;
-        let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
-        Ok(id)
-    }
+    track_menu(owner, point, items, None, false)
+}
+pub fn popup_at(
+    owner: HWND,
+    point: POINT,
+    items: &[(usize, &str)],
+    selected_id: Option<usize>,
+) -> Result<usize, String> {
+    track_menu(owner, point, items, selected_id, true)
 }
 pub unsafe fn measure(item: &mut MEASUREITEMSTRUCT) -> bool {
     if item.CtlType != ODT_MENU || item.itemData == 0 {
@@ -303,7 +352,20 @@ pub unsafe fn draw(item: &DRAWITEMSTRUCT) -> bool {
         );
         let mut rect = item.rcItem;
         rect.left += entry.padding;
-        rect.right -= entry.padding;
+        rect.right -= entry.padding.min(16);
+        if entry.checked {
+            let cy = (item.rcItem.top + item.rcItem.bottom) / 2;
+            let cx = item.rcItem.left + entry.padding / 2;
+            let stroke = (entry.padding / 13).max(2);
+            let u = (entry.padding / 6).max(3);
+            let pen = CreatePen(PS_SOLID, stroke, COLORREF(0x1e54d9));
+            let old_pen = SelectObject(item.hDC, pen);
+            let _ = MoveToEx(item.hDC, cx - u, cy, None);
+            let _ = LineTo(item.hDC, cx - u / 4, cy + u * 3 / 4);
+            let _ = LineTo(item.hDC, cx + u * 5 / 4, cy - u * 3 / 4);
+            SelectObject(item.hDC, old_pen);
+            let _ = DeleteObject(pen);
+        }
         let mut text = entry.text[..entry.text.len() - 1].to_vec();
         DrawTextW(
             item.hDC,
@@ -311,7 +373,7 @@ pub unsafe fn draw(item: &DRAWITEMSTRUCT) -> bool {
             &mut rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
-        if item.itemState.0 & ODS_FOCUS.0 != 0 {
+        if item.itemState.0 & ODS_FOCUS.0 != 0 && item.itemState.0 & 0x0200 == 0 {
             let _ = DrawFocusRect(item.hDC, &item.rcItem);
         }
         let _ = RestoreDC(item.hDC, saved);
@@ -351,13 +413,17 @@ mod tests {
             (126, "Check for updates"),
             (110, "Exit"),
         ];
+        let app_colors = Palette::app_surface();
+        assert!(contrast(app_colors.text, app_colors.background) >= 4.5);
+        assert!(contrast(app_colors.text, app_colors.selected) >= 4.5);
+        assert!(contrast(app_colors.disabled, app_colors.background) >= 4.5);
         for dpi in [96, 192] {
             for dark in [false, true] {
                 let colors = Palette::new(dark);
                 assert!(contrast(colors.text, colors.background) >= 4.5);
                 assert!(contrast(colors.text, colors.selected) >= 4.5);
                 assert!(contrast(colors.disabled, colors.background) >= 4.5);
-                let menu = Menu::new(HWND::default(), &labels, Some(colors), dpi)?;
+                let menu = Menu::new(HWND::default(), &labels, Some(109), Some(colors), dpi)?;
                 // SAFETY: memory DC/bitmap are owned by this test; no visible windows or registry writes.
                 unsafe {
                     let width = menu.entries.iter().map(|e| e.width).max().unwrap() as i32;
