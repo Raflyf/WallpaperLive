@@ -4600,16 +4600,19 @@ mod tests {
                                 glass_pixels[i..i + 4].try_into().expect("BGRA pixel"),
                             )
                         };
-                        let bg_channel = (17u16 * u16::from(visuals::PANEL_ALPHA) / 255) as u32;
+                        let bg_channel = (17u32 * u32::from(visuals::PANEL_ALPHA) + 127) / 255;
                         let expected_acrylic = (u32::from(visuals::PANEL_ALPHA) << 24)
                             | (bg_channel << 16)
                             | (bg_channel << 8)
                             | bg_channel;
-                        let card_b = (visuals::CARD & 255) * u32::from(visuals::CARD_ALPHA) / 255;
+                        let card_b =
+                            ((visuals::CARD & 255) * u32::from(visuals::CARD_ALPHA) + 127) / 255;
                         let card_g =
-                            ((visuals::CARD >> 8) & 255) * u32::from(visuals::CARD_ALPHA) / 255;
+                            (((visuals::CARD >> 8) & 255) * u32::from(visuals::CARD_ALPHA) + 127)
+                                / 255;
                         let card_r =
-                            ((visuals::CARD >> 16) & 255) * u32::from(visuals::CARD_ALPHA) / 255;
+                            (((visuals::CARD >> 16) & 255) * u32::from(visuals::CARD_ALPHA) + 127)
+                                / 255;
                         let expected_card = (u32::from(visuals::CARD_ALPHA) << 24)
                             | (card_r << 16)
                             | (card_g << 8)

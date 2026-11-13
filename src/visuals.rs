@@ -248,6 +248,11 @@ const fn mix_channel(a: u32, b: u32, shift: u32, num: u32, den: u32) -> u32 {
     ((x + (y - x) * num as i32 / den as i32) as u32) << shift
 }
 
+/// Round-to-nearest premultiplication matching float SDF `.round()`.
+const fn premul_channel(channel: u8, alpha: u8) -> u8 {
+    ((channel as u16 * alpha as u16 + 127) / 255) as u8
+}
+
 /// Linear blend `num/den` of the way from `a` towards `b`.
 const fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
     mix_channel(a, b, 16, num, den)
@@ -539,9 +544,9 @@ impl PaintBuffer {
                     (y - self.area.top) as usize * stride as usize + (x - self.area.left) as usize;
                 let pixel = &mut pixels[i];
                 if pixel.rgbReserved == 0 {
-                    pixel.rgbBlue = (u16::from(pixel.rgbBlue) * u16::from(alpha) / 255) as u8;
-                    pixel.rgbGreen = (u16::from(pixel.rgbGreen) * u16::from(alpha) / 255) as u8;
-                    pixel.rgbRed = (u16::from(pixel.rgbRed) * u16::from(alpha) / 255) as u8;
+                    pixel.rgbBlue = premul_channel(pixel.rgbBlue, alpha);
+                    pixel.rgbGreen = premul_channel(pixel.rgbGreen, alpha);
+                    pixel.rgbRed = premul_channel(pixel.rgbRed, alpha);
                     pixel.rgbReserved = alpha;
                 }
             }
@@ -623,10 +628,9 @@ impl PaintBuffer {
                 return;
             }
             if mask.fill_alpha < 255 {
-                let fa16 = u16::from(mask.fill_alpha);
-                pixel.rgbBlue = (u16::from(pixel.rgbBlue) * fa16 / 255) as u8;
-                pixel.rgbGreen = (u16::from(pixel.rgbGreen) * fa16 / 255) as u8;
-                pixel.rgbRed = (u16::from(pixel.rgbRed) * fa16 / 255) as u8;
+                pixel.rgbBlue = premul_channel(pixel.rgbBlue, mask.fill_alpha);
+                pixel.rgbGreen = premul_channel(pixel.rgbGreen, mask.fill_alpha);
+                pixel.rgbRed = premul_channel(pixel.rgbRed, mask.fill_alpha);
             }
             pixel.rgbReserved = mask.fill_alpha;
         };
@@ -2474,10 +2478,10 @@ mod tests {
                 let i = (y * 80 + x) * 4;
                 pixels[i..i + 4].try_into().expect("BGRA pixel")
             };
-            let bg = u8::try_from(17u16 * u16::from(PANEL_ALPHA) / 255).unwrap();
-            let card_b = u8::try_from((CARD & 255) * u32::from(CARD_ALPHA) / 255).unwrap();
-            let card_g = u8::try_from(((CARD >> 8) & 255) * u32::from(CARD_ALPHA) / 255).unwrap();
-            let card_r = u8::try_from(((CARD >> 16) & 255) * u32::from(CARD_ALPHA) / 255).unwrap();
+            let bg = premul_channel(17, PANEL_ALPHA);
+            let card_b = premul_channel((CARD & 255) as u8, CARD_ALPHA);
+            let card_g = premul_channel(((CARD >> 8) & 255) as u8, CARD_ALPHA);
+            let card_r = premul_channel(((CARD >> 16) & 255) as u8, CARD_ALPHA);
             assert_eq!(px(4, 4), [bg, bg, bg, PANEL_ALPHA]);
             assert_eq!(
                 px(10, 10),
