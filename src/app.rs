@@ -109,9 +109,8 @@ fn dormant_grace(reasons: &PauseReasons) -> Option<Duration> {
         || reasons.display_off
     {
         Some(Duration::from_secs(3))
-    } else if reasons.battery || reasons.fullscreen || reasons.maximized {
-        Some(Duration::from_secs(8))
     } else {
+        // Keep maximized, fullscreen, and battery pauses warm on their last frame for instant desktop return.
         None
     }
 }
@@ -252,6 +251,7 @@ struct DisplayState {
     dormant: Option<Dormant>,
     resume_position: f64,
     paused_since: Option<Instant>,
+    pause_trimmed: bool,
 }
 impl DisplayState {
     fn new(monitor: String) -> Self {
@@ -279,6 +279,7 @@ impl DisplayState {
             dormant: None,
             resume_position: 0.0,
             paused_since: None,
+            pause_trimmed: false,
         }
     }
     fn active(&self) -> bool {
@@ -355,6 +356,7 @@ struct App {
     dormant: Option<Dormant>,
     resume_position: f64,
     paused_since: Option<Instant>,
+    pause_trimmed: bool,
     wts_tick: u8,
     status_cache: std::cell::RefCell<(String, &'static str, &'static str, Option<bool>)>,
     page: usize,
@@ -392,7 +394,8 @@ impl App {
             playback_info,
             dormant,
             resume_position,
-            paused_since
+            paused_since,
+            pause_trimmed
         );
     }
     fn with_display<T>(
@@ -1993,6 +1996,7 @@ impl App {
         self.video_ready = None;
         self.loading_since = None;
         self.paused_since = None;
+        self.pause_trimmed = false;
         self.actual_pause = false;
         self.requested_pause = false;
         // SAFETY: teardown cancels only the timer owned by this controller.
@@ -2033,6 +2037,7 @@ impl App {
         self.cancel_thumbnails();
         self.dormant = None;
         self.paused_since = None;
+        self.pause_trimmed = false;
         self.update_reasons();
         let prepared = crate::cache::Prepared {
             path: path.clone(),
@@ -2357,23 +2362,31 @@ impl App {
             }
             self.launch_preparation()?;
             self.request_thumbnails();
-            if let Some(grace) = dormant_grace(&self.reasons)
-                && self.loaded
-                && self.requested_pause
-                && self.dormant.is_none()
-            {
+            if self.loaded && self.requested_pause && self.dormant.is_none() {
                 let since = *self.paused_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= grace
-                    && let Some(playback) = &self.playback
-                {
-                    let position = playback_position(playback).unwrap_or(0.0);
-                    let path = playback.path.clone();
-                    self.release_playback();
-                    self.dormant = Some(Dormant { path, position });
-                    if !self.multi_dispatch {
-                        self.arm_monitor()?;
+                if let Some(grace) = dormant_grace(&self.reasons) {
+                    if since.elapsed() >= grace
+                        && let Some(playback) = &self.playback
+                    {
+                        let position = playback_position(playback).unwrap_or(0.0);
+                        let path = playback.path.clone();
+                        self.release_playback();
+                        self.dormant = Some(Dormant { path, position });
+                        if !self.multi_dispatch {
+                            self.arm_monitor()?;
+                        }
+                        // SAFETY: pseudo-handle for current process; best-effort working-set trim when idle.
+                        unsafe {
+                            let _ = SetProcessWorkingSetSize(
+                                GetCurrentProcess(),
+                                usize::MAX,
+                                usize::MAX,
+                            );
+                        }
                     }
-                    // SAFETY: pseudo-handle for current process; best-effort working-set trim when idle.
+                } else if !self.pause_trimmed && since.elapsed() >= Duration::from_secs(1) {
+                    self.pause_trimmed = true;
+                    // SAFETY: trim resident working set after pause settles while keeping playback/frame ready.
                     unsafe {
                         let _ =
                             SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
@@ -2381,11 +2394,13 @@ impl App {
                 }
             } else {
                 self.paused_since = None;
+                self.pause_trimmed = false;
             }
             self.update_status();
             return Ok(());
         }
         self.paused_since = None;
+        self.pause_trimmed = false;
         if (self.playback.is_none() || self.loaded)
             && !self.requested_pause
             && self
@@ -3564,6 +3579,7 @@ pub fn run() -> Result<(), String> {
             dormant: None,
             resume_position: 0.0,
             paused_since: None,
+            pause_trimmed: false,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             page: 0,
@@ -4053,6 +4069,7 @@ mod tests {
             dormant: None,
             resume_position: 0.0,
             paused_since: None,
+            pause_trimmed: false,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             page: 0,
@@ -4588,7 +4605,15 @@ mod tests {
                             | (bg_channel << 16)
                             | (bg_channel << 8)
                             | bg_channel;
-                        let expected_card = 0xff00_0000 | visuals::CARD;
+                        let card_b = (visuals::CARD & 255) * u32::from(visuals::CARD_ALPHA) / 255;
+                        let card_g =
+                            ((visuals::CARD >> 8) & 255) * u32::from(visuals::CARD_ALPHA) / 255;
+                        let card_r =
+                            ((visuals::CARD >> 16) & 255) * u32::from(visuals::CARD_ALPHA) / 255;
+                        let expected_card = (u32::from(visuals::CARD_ALPHA) << 24)
+                            | (card_r << 16)
+                            | (card_g << 8)
+                            | card_b;
                         let layout = visuals::Layout::new(logical_width, logical_height);
                         assert_eq!(
                             canvas_pixel(8, 8),
@@ -4612,7 +4637,7 @@ mod tests {
                                     (layout.sidebar.top + 8) * dpi / 96,
                                 ),
                                 expected_card,
-                                "library sidebar must stay opaque Card"
+                                "library sidebar must use frosted Card acrylic"
                             ),
                             visuals::Tab::Settings => {
                                 assert_eq!(
@@ -4621,7 +4646,7 @@ mod tests {
                                         (layout.settings_preferences_panel.top + 6) * dpi / 96,
                                     ),
                                     expected_card,
-                                    "settings card must stay opaque Card"
+                                    "settings card must use frosted Card acrylic"
                                 );
                                 assert_eq!(
                                     canvas_pixel(
@@ -4639,7 +4664,7 @@ mod tests {
                                         (layout.sources_panel.top + 6) * dpi / 96,
                                     ),
                                     expected_card,
-                                    "sources card must stay opaque Card"
+                                    "sources card must use frosted Card acrylic"
                                 );
                                 assert_eq!(
                                     canvas_pixel(
@@ -4689,7 +4714,7 @@ mod tests {
                                     let i = ((y * width + x) * 4) as usize;
                                     let pixel = &control_pixels[i..i + 4];
                                     assert!(
-                                        pixel[3] >= 196
+                                        pixel[3] >= 148
                                             && pixel[..3]
                                                 .iter()
                                                 .all(|channel| *channel <= pixel[3]),
@@ -4723,13 +4748,10 @@ mod tests {
                                 let x = 150 * dpi / 96;
                                 let y = 172 * dpi / 96;
                                 let i = ((y * width + x) * 4) as usize;
-                                let rgb = u32::from(pixels[i + 2]) << 16
-                                    | u32::from(pixels[i + 1]) << 8
-                                    | u32::from(pixels[i]);
-                                assert_eq!(
-                                    rgb,
-                                    visuals::CARD,
-                                    "native typing must not wash out the search background"
+                                let (b, g, r) = (pixels[i], pixels[i + 1], pixels[i + 2]);
+                                assert!(
+                                    r <= 0x48 && g <= 0x48 && b <= 0x48,
+                                    "native typing must not wash out the search background: ({r}, {g}, {b})"
                                 );
                             }
                             fs::write(
@@ -5389,6 +5411,7 @@ mod tests {
             dormant: None,
             resume_position: 0.0,
             paused_since: None,
+            pause_trimmed: false,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             page: 0,
@@ -5521,7 +5544,13 @@ mod tests {
         assert_eq!(dormant_grace(&reasons), None);
 
         reasons.battery = true;
-        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(8)));
+        assert_eq!(dormant_grace(&reasons), None);
+
+        reasons.fullscreen = true;
+        assert_eq!(dormant_grace(&reasons), None);
+
+        reasons.maximized = true;
+        assert_eq!(dormant_grace(&reasons), None);
 
         reasons.locked = true;
         assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(3)));

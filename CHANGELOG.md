@@ -20,18 +20,19 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Changed
 
-- Use frosted Ink Black (`#111111` at premultiplied alpha `196`) across the window background without a fake gradient, while keeping elevated content cards (selected-wallpaper sidebar, rounded Settings panels, and Sources panel) opaque Card (`#232221`). Cream (`#F3EEE3`) is text; Burnt Orange (`#D9541E`) marks primary actions and active states.
-- Match label and unselected status text surfaces to their acrylic or opaque host so no rectangular patches appear behind text.
+- Use more translucent frosted Ink Black (`#111111` at premultiplied alpha `160`) across the window background without a fake gradient, with frosted Card panels (`#232221`, alpha `180`, borders `224`) and frosted secondary controls/tiles (alpha `192`/`212`), while keeping primary Burnt Orange (`#D9541E`, alpha `242`) actions, active badges, and video thumbnails sharp. Cream (`#F3EEE3`) is text.
+- Match label, checkbox, and unselected status surfaces to their acrylic or card host alpha so no rectangular patches appear behind text or rounded overlays, and mask backgrounds before drawing composited labels and vector glyphs.
 
 ### Fixed
 
 - Preserve DWM acrylic across minimize/restore (`paint_into`, `draw_item`, and `paint_control_into` ignore `IsIconic`/empty rects instead of calling `disable_backdrop`, `WM_SIZE` ignores `SIZE_MINIMIZED` so cached page thumbnails stay warm, and restore/show refreshes `enable_backdrop`).
-- Supply premultiplied alpha for the acrylic background and rounded card SDF masking (`apply_rounded_rect_mask`), keeping cards, media, and owner-drawn controls opaque without opaque corner artifacts; no global window opacity or bitmap tint.
+- Keep live wallpapers paused in place (retaining the last rendered video frame while trimming resident working-set memory) when maximizing windows, entering fullscreen apps, or running on battery so returning to the desktop resumes immediately without reload flicker; release decoders to `Dormant` only for off-screen session states (`locked`, `remote`, `disconnected`, `suspended`, `display_off`).
+- Supply premultiplied alpha for layered acrylic panels, frosted buttons/tiles, and rounded card SDF masking (`apply_rounded_rect_mask`), keeping media and focal controls crisp without opaque corner artifacts; no global window opacity or bitmap tint.
 - Replace residual corner fills on rounded buttons, tabs, tiles, and pager controls using host-aware SDF corner masking and `CS_PARENTDC` removal without altering button hit-testing.
 - Remove the floating pager background card, suppress click-triggered focus rings via `ODS_NOFOCUSRECT`/`UISF_HIDEFOCUS`, draw dark custom checkboxes in Settings, and route dropdown/tile context menus through dark owner-drawn popups.
 - Update the Settings Product website link to `https://livelydesk.vercel.app`.
-- Reduce idle CPU/RAM/GPU overhead on low-spec hardware: release paused playback decoders after grace periods (`Dormant` auto-resume), throttle WTS queries, cache status/font/brush GDI objects, run thumbnail ffmpeg/ffprobe extraction at below-normal priority, and configure lightweight libmpv output buffers.
-- Keep search typing, selection, and caret painting in an opaque native child surface so direct edit repaints do not turn white over acrylic.
+- Reduce CPU/RAM/GPU overhead on low-spec hardware: trim working set when idle/paused without unloading visible desktop surfaces, throttle WTS queries, cache status/font/brush GDI objects, run thumbnail ffmpeg/ffprobe extraction at below-normal priority, and configure lightweight libmpv output buffers.
+- Keep search typing, selection, and caret painting in a translucent layered child surface (`LWA_ALPHA 216`) so direct edit repaints stay dark and readable over acrylic.
 - Repaint the whole workspace in opaque dark colors if backdrop or buffered painting is unavailable. Hidden tabs remain hidden; choosing a display still does not apply a wallpaper.
 
 ### Verification and limits

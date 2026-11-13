@@ -258,7 +258,7 @@ const fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
 pub const TEXT: u32 = CREAM;
 pub const TEXT_ON_DARK: u32 = CREAM;
 pub const TEXT_ON_ACCENT: u32 = INK;
-pub const MUTED: u32 = mix(CREAM, INK, 16, 100);
+pub const MUTED: u32 = mix(CREAM, INK, 10, 100);
 pub const MUTED_ON_DARK: u32 = MUTED;
 pub const ACCENT: u32 = ORANGE;
 pub const BODY: u32 = INK;
@@ -276,7 +276,13 @@ pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 16, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
-pub const PANEL_ALPHA: u8 = 196;
+pub const PANEL_ALPHA: u8 = 160;
+pub const CARD_ALPHA: u8 = 180;
+const CONTROL_ALPHA: u8 = 192;
+const ACTIVE_TILE_ALPHA: u8 = 212;
+const ACTIVE_ALPHA: u8 = 242;
+pub const BORDER_ALPHA: u8 = 224;
+const SEARCH_ALPHA: u8 = 216;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -291,7 +297,7 @@ fn control_corner_ellipse(id: usize, dpi: i32) -> i32 {
     base * dpi.max(96) / 96
 }
 
-fn control_surface(id: usize) -> (u32, bool) {
+fn control_surface(id: usize) -> (u32, u8) {
     if matches!(
         id,
         PREVIEW
@@ -319,9 +325,9 @@ fn control_surface(id: usize) -> (u32, bool) {
             | SOURCES_NOTE
     ) || (SITE_BASE..SITE_BASE + 4).contains(&id)
     {
-        (CARD, false)
+        (CARD, CARD_ALPHA)
     } else {
-        (CANVAS, true)
+        (CANVAS, PANEL_ALPHA)
     }
 }
 const GLASS_PROPERTY: windows::core::PCWSTR = w!("WallpaperLive.Glass");
@@ -542,9 +548,6 @@ impl PaintBuffer {
         }
         true
     }
-    unsafe fn apply_rounded_mask(&self, mask: &RoundedMask) -> bool {
-        unsafe { self.apply_rounded_rect_mask(self.area, mask) }
-    }
     unsafe fn apply_rounded_rect_mask(&self, bounds: RECT, mask: &RoundedMask) -> bool {
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
@@ -595,6 +598,13 @@ impl PaintBuffer {
         let (br, bg, bb) = split_rgb(mask.border);
         let (fr, fg, fb) = split_rgb(mask.focus);
         let (hr, hg, hb) = split_rgb(mask.host_color);
+        let fa = f32::from(mask.fill_alpha);
+        let fill_scale = fa / 255.0;
+        let ba = f32::from(mask.border_alpha);
+        let border_scale = ba / 255.0;
+        let border_pre_r = br * border_scale;
+        let border_pre_g = bg * border_scale;
+        let border_pre_b = bb * border_scale;
         let ha = f32::from(mask.host_alpha);
         let host_pre_r = hr * ha / 255.0;
         let host_pre_g = hg * ha / 255.0;
@@ -608,6 +618,18 @@ impl PaintBuffer {
         let corner_band = (radius + safe_inset).ceil() as i32;
         let edge_band = (safe_inset + 1.0).ceil() as i32;
         let focus_center = -(mask.border_width + mask.focus_inset - 0.5);
+        let tint_interior = |pixel: &mut RGBQUAD| {
+            if pixel.rgbReserved != 0 {
+                return;
+            }
+            if mask.fill_alpha < 255 {
+                let fa16 = u16::from(mask.fill_alpha);
+                pixel.rgbBlue = (u16::from(pixel.rgbBlue) * fa16 / 255) as u8;
+                pixel.rgbGreen = (u16::from(pixel.rgbGreen) * fa16 / 255) as u8;
+                pixel.rgbRed = (u16::from(pixel.rgbRed) * fa16 / 255) as u8;
+            }
+            pixel.rgbReserved = mask.fill_alpha;
+        };
         for y in rect_top..rect_bottom {
             let row_offset = (y - self.area.top) as usize * stride as usize;
             let col_start = (rect_left - self.area.left) as usize;
@@ -622,7 +644,7 @@ impl PaintBuffer {
                 if y_deep && xi >= edge_band && xi < bounds_w - edge_band
                     || y_inner && xi >= corner_band && xi < bounds_w - corner_band
                 {
-                    pixel.rgbReserved = 255;
+                    tint_interior(pixel);
                     continue;
                 }
                 let px = xi as f32 + 0.5;
@@ -630,36 +652,47 @@ impl PaintBuffer {
                 let qy = (py - hh).abs() - (hh - radius);
                 let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
                 if d <= -safe_inset {
-                    pixel.rgbReserved = 255;
+                    tint_interior(pixel);
                     continue;
-                }
-                let mut src_r = f32::from(pixel.rgbRed);
-                let mut src_g = f32::from(pixel.rgbGreen);
-                let mut src_b = f32::from(pixel.rgbBlue);
-                if mask.focus != 0 {
-                    let focus_cov = (1.0 - (d - focus_center).abs()).clamp(0.0, 1.0);
-                    if focus_cov > 0.0 {
-                        src_r += (fr - src_r) * focus_cov;
-                        src_g += (fg - src_g) * focus_cov;
-                        src_b += (fb - src_b) * focus_cov;
-                    }
                 }
                 let shape_cov = (0.5 - d).clamp(0.0, 1.0);
                 let inner_cov = (0.5 - (d + mask.border_width)).clamp(0.0, 1.0);
-                let fg_r = br + (src_r - br) * inner_cov;
-                let fg_g = bg + (src_g - bg) * inner_cov;
-                let fg_b = bb + (src_b - bb) * inner_cov;
-                let out_a = (ha * (1.0 - shape_cov) + 255.0 * shape_cov)
+                let border_cov = (shape_cov - inner_cov).max(0.0);
+                let out_cov = 1.0 - shape_cov;
+                let src_r = f32::from(pixel.rgbRed);
+                let src_g = f32::from(pixel.rgbGreen);
+                let src_b = f32::from(pixel.rgbBlue);
+                let (mut fill_pre_r, mut fill_pre_g, mut fill_pre_b, mut fill_a) =
+                    if pixel.rgbReserved == 255 {
+                        (src_r, src_g, src_b, 255.0)
+                    } else {
+                        (
+                            src_r * fill_scale,
+                            src_g * fill_scale,
+                            src_b * fill_scale,
+                            fa,
+                        )
+                    };
+                if mask.focus != 0 {
+                    let focus_cov = (1.0 - (d - focus_center).abs()).clamp(0.0, 1.0);
+                    if focus_cov > 0.0 {
+                        fill_pre_r = fill_pre_r * (1.0 - focus_cov) + fr * focus_cov;
+                        fill_pre_g = fill_pre_g * (1.0 - focus_cov) + fg * focus_cov;
+                        fill_pre_b = fill_pre_b * (1.0 - focus_cov) + fb * focus_cov;
+                        fill_a = fill_a * (1.0 - focus_cov) + 255.0 * focus_cov;
+                    }
+                }
+                let out_a = (fill_a * inner_cov + ba * border_cov + ha * out_cov)
                     .round()
                     .clamp(0.0, 255.0) as u8;
-                let blend = |f: f32, hp: f32| -> u8 {
-                    (hp * (1.0 - shape_cov) + f * shape_cov)
+                let blend = |f_pre: f32, b_pre: f32, h_pre: f32| -> u8 {
+                    (f_pre * inner_cov + b_pre * border_cov + h_pre * out_cov)
                         .round()
                         .clamp(0.0, f32::from(out_a)) as u8
                 };
-                pixel.rgbRed = blend(fg_r, host_pre_r);
-                pixel.rgbGreen = blend(fg_g, host_pre_g);
-                pixel.rgbBlue = blend(fg_b, host_pre_b);
+                pixel.rgbRed = blend(fill_pre_r, border_pre_r, host_pre_r);
+                pixel.rgbGreen = blend(fill_pre_g, border_pre_g, host_pre_g);
+                pixel.rgbBlue = blend(fill_pre_b, border_pre_b, host_pre_b);
                 pixel.rgbReserved = out_a;
             }
         }
@@ -837,6 +870,8 @@ struct RoundedMask {
     ellipse: i32,
     border: u32,
     border_width: f32,
+    border_alpha: u8,
+    fill_alpha: u8,
     focus: u32,
     focus_inset: f32,
     host_color: u32,
@@ -858,15 +893,24 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
             return;
         }
         if let Some(buffer) = PaintBuffer::new(item.hDC, item.rcItem) {
+            let glass = glass_enabled(parent);
+            let theme = if glass {
+                OpenThemeData(parent, w!("WINDOW"))
+            } else {
+                HTHEME(0)
+            };
+            let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
+            let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
             let buffered = DRAWITEMSTRUCT {
                 hDC: buffer.dc,
                 ..*item
             };
-            let mask = draw_item_into(&buffered, glass_enabled(parent), true);
-            let ok = match mask {
-                Some(mask) => buffer.apply_rounded_mask(&mask),
-                None => buffer.opaque(),
-            };
+            let ok = draw_item_into(&buffered, glass, Some(&buffer));
+            TEXT_THEME.with(|slot| slot.set(old_theme));
+            GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+            if theme.0 != 0 {
+                let _ = CloseThemeData(theme);
+            }
             if ok && buffer.finish() {
                 return;
             }
@@ -874,31 +918,34 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
         if !parent.0.is_null() {
             disable_backdrop(parent);
         }
-        let _ = draw_item_into(item, false, false);
+        let _ = draw_item_into(item, false, None);
     }
 }
 
 unsafe fn draw_item_into(
     item: &DRAWITEMSTRUCT,
     glass_active: bool,
-    buffered: bool,
-) -> Option<RoundedMask> {
+    buffer: Option<&PaintBuffer>,
+) -> bool {
     let id = item.CtlID as usize;
     let dpi = unsafe { GetDpiForWindow(item.hwndItem) }.max(96) as i32;
     let s = |n: i32| n * dpi / 96;
     let r = item.rcItem;
     let dc = item.hDC;
-    let (host_color, glass_host) = control_surface(id);
-    let host_alpha = if glass_host && glass_active {
-        PANEL_ALPHA
-    } else {
-        255
-    };
+    let buffered = buffer.is_some();
+    let (host_color, glass_host_alpha) = control_surface(id);
+    let is_card_host = host_color == CARD;
+    let host_alpha = if glass_active { glass_host_alpha } else { 255 };
     let ellipse = control_corner_ellipse(id, dpi);
     // SAFETY: child rect pixels remain owned for the duration of synchronous owner-draw dispatch.
     unsafe {
         if id == PAGE {
             fill(dc, r, host_color);
+            if let Some(buffer) = buffer
+                && !buffer.tint_background(r, host_alpha)
+            {
+                return false;
+            }
             label(
                 dc,
                 &window_text(item.hwndItem),
@@ -908,7 +955,7 @@ unsafe fn draw_item_into(
                 MUTED,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
-            return None;
+            return true;
         }
         let hide_focus = item.itemState.0 & ODS_NOFOCUSRECT_FLAG != 0
             || (!item.hwndItem.0.is_null() && {
@@ -937,6 +984,23 @@ unsafe fn draw_item_into(
         };
         if id == PREVIEW || (TILE_BASE..TILE_BASE + 9).contains(&id) {
             let mut active_tile = false;
+            let mut playing = false;
+            let mut missing_label = None;
+            let mut title_text = None;
+            let mut checked = None;
+            let mut card_border = LINE;
+            let mut fill_alpha = 255u8;
+            let mut border_alpha = 255u8;
+            let area = rect(
+                r.left + s(3),
+                r.top + s(3),
+                r.right - s(3),
+                if id == PREVIEW {
+                    r.bottom - s(3)
+                } else {
+                    r.bottom - s(28)
+                },
+            );
             SKIN.with(|skin| {
                 let skin = skin.borrow();
                 let path = if id == PREVIEW {
@@ -946,7 +1010,7 @@ unsafe fn draw_item_into(
                 };
                 let active = id != PREVIEW && path.is_some() && path == skin.selected.as_ref();
                 active_tile = active;
-                let playing = path.is_some_and(|path| skin.playing.contains(path));
+                playing = path.is_some_and(|path| skin.playing.contains(path));
                 let card_color = if id == PREVIEW {
                     INK
                 } else if active {
@@ -954,7 +1018,25 @@ unsafe fn draw_item_into(
                 } else {
                     CARD
                 };
-                let card_border = if active { ACCENT } else { LINE };
+                card_border = if active { ACCENT } else { LINE };
+                fill_alpha = if !glass_active {
+                    255
+                } else if id == PREVIEW {
+                    if path.is_some() {
+                        CARD_ALPHA
+                    } else {
+                        PANEL_ALPHA
+                    }
+                } else if active {
+                    ACTIVE_TILE_ALPHA
+                } else {
+                    CONTROL_ALPHA
+                };
+                border_alpha = if !glass_active || active {
+                    255
+                } else {
+                    BORDER_ALPHA
+                };
                 let card_highlight = if id == PREVIEW {
                     0
                 } else if active {
@@ -976,111 +1058,126 @@ unsafe fn draw_item_into(
                     fill(dc, r, host_color);
                     raised_rounded(dc, r, card_color, card_border, card_highlight, ellipse);
                 }
-                let area = rect(
-                    r.left + s(3),
-                    r.top + s(3),
-                    r.right - s(3),
-                    if id == PREVIEW {
-                        r.bottom - s(3)
-                    } else {
-                        r.bottom - s(28)
-                    },
-                );
                 if let Some(path) = path {
                     if let Some(bitmap) = skin.thumbnails.get(path) {
                         image(dc, bitmap.0, area);
+                        if let Some(buffer) = buffer {
+                            let _ = GdiFlush();
+                            let _ = BufferedPaintSetAlpha(buffer.handle, Some(&area), 255);
+                        }
                     } else {
-                        label(
-                            dc,
-                            &extension(path),
-                            area,
-                            s(24),
-                            true,
-                            if id == PREVIEW { MUTED_ON_DARK } else { MUTED },
-                            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                        );
+                        missing_label = Some(extension(path));
                     }
                     if id != PREVIEW {
-                        let title_rect = rect(
-                            r.left + s(8),
-                            r.bottom - s(24),
-                            r.right - s(8),
-                            r.bottom - s(4),
-                        );
-                        label(
-                            dc,
-                            &filename(path),
-                            title_rect,
-                            s(13),
-                            true,
-                            TEXT,
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                        );
-                        if playing {
-                            let badge_w = s(46);
-                            let badge_h = s(18);
-                            let badge_rect = rect(
-                                area.right - badge_w - s(5),
-                                area.bottom - badge_h - s(5),
-                                area.right - s(5),
-                                area.bottom - s(5),
-                            );
-                            raised_rounded(dc, badge_rect, ACCENT_DEEP, ACCENT, ACCENT_SOFT, s(4));
-                            label(
-                                dc,
-                                "Active",
-                                badge_rect,
-                                s(10),
-                                true,
-                                TEXT_ON_DARK,
-                                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                            );
-                        }
+                        title_text = Some(filename(path));
+                        checked = Some(skin.marked.contains(path));
                     }
                 } else {
+                    missing_label = Some("Select a wallpaper".to_owned());
+                }
+            });
+            if let Some(buffer) = buffer {
+                let mask = RoundedMask {
+                    ellipse,
+                    border: card_border,
+                    border_width: if active_tile { s(2).max(1) as f32 } else { 1.0 },
+                    border_alpha,
+                    fill_alpha,
+                    focus: focus_color,
+                    focus_inset: s(3).max(2) as f32,
+                    host_color,
+                    host_alpha,
+                };
+                if !buffer.apply_rounded_rect_mask(r, &mask) {
+                    return false;
+                }
+            }
+            if let Some(ref missing) = missing_label {
+                label(
+                    dc,
+                    missing,
+                    area,
+                    s(if title_text.is_some() || missing != "Select a wallpaper" {
+                        24
+                    } else {
+                        15
+                    }),
+                    missing != "Select a wallpaper",
+                    if id == PREVIEW { MUTED_ON_DARK } else { MUTED },
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+            if let Some(ref title) = title_text {
+                let title_rect = rect(
+                    r.left + s(8),
+                    r.bottom - s(24),
+                    r.right - s(8),
+                    r.bottom - s(4),
+                );
+                label(
+                    dc,
+                    title,
+                    title_rect,
+                    s(13),
+                    true,
+                    TEXT,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+                if playing {
+                    let badge_w = s(46);
+                    let badge_h = s(18);
+                    let badge_rect = rect(
+                        area.right - badge_w - s(5),
+                        area.bottom - badge_h - s(5),
+                        area.right - s(5),
+                        area.bottom - s(5),
+                    );
+                    raised_rounded(dc, badge_rect, ACCENT_DEEP, ACCENT, ACCENT_SOFT, s(4));
+                    if let Some(buffer) = buffer {
+                        let _ = buffer.tint_background(badge_rect, 255);
+                    }
                     label(
                         dc,
-                        "Select a wallpaper",
-                        area,
-                        s(15),
-                        false,
-                        if id == PREVIEW { MUTED_ON_DARK } else { MUTED },
+                        "Active",
+                        badge_rect,
+                        s(10),
+                        true,
+                        TEXT_ON_DARK,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                     );
                 }
-                if id != PREVIEW
-                    && let Some(path) = path
-                {
-                    let checked = skin.marked.contains(path);
-                    let box_rect = rect(r.left + s(8), r.top + s(8), r.left + s(24), r.top + s(24));
-                    rounded(
-                        dc,
-                        box_rect,
-                        if checked { ACCENT } else { INK },
-                        if checked { ACCENT_DARK } else { LINE },
-                        s(6),
-                    );
-                    if checked {
-                        let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(INK));
-                        let old = SelectObject(dc, pen);
-                        let _ = MoveToEx(dc, box_rect.left + s(4), box_rect.top + s(8), None);
-                        let _ = LineTo(dc, box_rect.left + s(7), box_rect.top + s(11));
-                        let _ = LineTo(dc, box_rect.left + s(12), box_rect.top + s(5));
-                        SelectObject(dc, old);
-                        let _ = DeleteObject(pen);
-                    }
-                }
-                if !buffered && active {
-                    let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(ACCENT));
-                    let old_pen = SelectObject(dc, pen);
-                    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                    let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, ellipse, ellipse);
-                    SelectObject(dc, old_brush);
-                    SelectObject(dc, old_pen);
+            }
+            if let Some(checked) = checked {
+                let box_rect = rect(r.left + s(8), r.top + s(8), r.left + s(24), r.top + s(24));
+                rounded(
+                    dc,
+                    box_rect,
+                    if checked { ACCENT } else { INK },
+                    if checked { ACCENT_DARK } else { LINE },
+                    s(6),
+                );
+                if checked {
+                    let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(INK));
+                    let old = SelectObject(dc, pen);
+                    let _ = MoveToEx(dc, box_rect.left + s(4), box_rect.top + s(8), None);
+                    let _ = LineTo(dc, box_rect.left + s(7), box_rect.top + s(11));
+                    let _ = LineTo(dc, box_rect.left + s(12), box_rect.top + s(5));
+                    SelectObject(dc, old);
                     let _ = DeleteObject(pen);
                 }
-            });
-            let card_border = if active_tile { ACCENT } else { LINE };
+                if let Some(buffer) = buffer {
+                    let _ = buffer.tint_background(box_rect, 255);
+                }
+            }
+            if !buffered && active_tile {
+                let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(ACCENT));
+                let old_pen = SelectObject(dc, pen);
+                let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, ellipse, ellipse);
+                SelectObject(dc, old_brush);
+                SelectObject(dc, old_pen);
+                let _ = DeleteObject(pen);
+            }
             if !buffered && focus_color != 0 {
                 let focus_r = ellipse.saturating_sub(s(4)).max(s(4));
                 let focus = rect(r.left + s(3), r.top + s(3), r.right - s(3), r.bottom - s(3));
@@ -1100,15 +1197,7 @@ unsafe fn draw_item_into(
                 SelectObject(dc, old_pen);
                 let _ = DeleteObject(pen);
             }
-            return Some(RoundedMask {
-                ellipse,
-                border: card_border,
-                border_width: if active_tile { s(2).max(1) as f32 } else { 1.0 },
-                focus: focus_color,
-                focus_inset: s(3).max(2) as f32,
-                host_color,
-                host_alpha,
-            });
+            return true;
         }
 
         let text = window_text(item.hwndItem);
@@ -1117,7 +1206,7 @@ unsafe fn draw_item_into(
         let primary = id == 102;
         let (color, border, highlight) = if disabled {
             (
-                if glass_host { PANEL } else { DISABLED_FILL },
+                if is_card_host { DISABLED_FILL } else { PANEL },
                 DISABLED_BORDER,
                 0,
             )
@@ -1140,6 +1229,32 @@ unsafe fn draw_item_into(
         } else {
             (CARD, LINE, HIGHLIGHT)
         };
+        let fill_alpha = if !glass_active {
+            255
+        } else if disabled {
+            if is_card_host { PANEL_ALPHA } else { 148 }
+        } else if is_tab {
+            if active_tab {
+                ACTIVE_ALPHA
+            } else if pressed {
+                CONTROL_ALPHA
+            } else {
+                PANEL_ALPHA
+            }
+        } else if primary {
+            ACTIVE_ALPHA
+        } else if pressed {
+            216
+        } else {
+            CONTROL_ALPHA
+        };
+        let border_alpha = if !glass_active || (is_tab && active_tab) || (primary && !disabled) {
+            255
+        } else if disabled {
+            196
+        } else {
+            BORDER_ALPHA
+        };
         if buffered {
             fill(dc, r, color);
             if highlight != 0 && r.right - r.left > ellipse {
@@ -1153,6 +1268,22 @@ unsafe fn draw_item_into(
         } else {
             fill(dc, r, host_color);
             raised_rounded(dc, r, color, border, highlight, ellipse);
+        }
+        if let Some(buffer) = buffer {
+            let mask = RoundedMask {
+                ellipse,
+                border,
+                border_width: 1.0,
+                border_alpha,
+                fill_alpha,
+                focus: focus_color,
+                focus_inset: s(3).max(2) as f32,
+                host_color,
+                host_alpha,
+            };
+            if !buffer.apply_rounded_rect_mask(r, &mask) {
+                return false;
+            }
         }
         let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
         label(
@@ -1193,6 +1324,10 @@ unsafe fn draw_item_into(
             let _ = LineTo(dc, x + s(4), y - s(2));
             SelectObject(dc, old);
             let _ = DeleteObject(pen);
+            if let Some(buffer) = buffer {
+                let chevron = rect(x - s(6), y - s(4), x + s(6), y + s(4));
+                let _ = buffer.tint_background(chevron, 255);
+            }
         }
         if !buffered && focus_color != 0 {
             let focus_r = ellipse.saturating_sub(s(4)).max(s(4));
@@ -1213,15 +1348,7 @@ unsafe fn draw_item_into(
             SelectObject(dc, old_pen);
             let _ = DeleteObject(pen);
         }
-        Some(RoundedMask {
-            ellipse,
-            border,
-            border_width: 1.0,
-            focus: focus_color,
-            focus_inset: s(3).max(2) as f32,
-            host_color,
-            host_alpha,
-        })
+        true
     }
 }
 
@@ -1432,17 +1559,42 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
             LINE,
         );
         if let Some(buffer) = glass {
+            let header_divider = rect(
+                0,
+                scale(layout.header.bottom - 1),
+                scale(layout.client.right),
+                scale(layout.header.bottom),
+            );
+            let footer_divider = rect(
+                0,
+                scale(layout.footer.top),
+                scale(layout.client.right),
+                scale(layout.footer.top + 1),
+            );
+            let div_ok = buffer.tint_background(header_divider, BORDER_ALPHA)
+                && buffer.tint_background(footer_divider, BORDER_ALPHA);
             let card_mask = RoundedMask {
                 ellipse: scale(12),
                 border: LINE,
                 border_width: 1.0,
+                border_alpha: BORDER_ALPHA,
+                fill_alpha: CARD_ALPHA,
                 focus: 0,
                 focus_inset: 0.0,
                 host_color: INK,
                 host_alpha: PANEL_ALPHA,
             };
             let panel_ok = match tab {
-                Tab::Library => buffer.tint_background(pixels(layout.sidebar), 255),
+                Tab::Library => {
+                    let side_divider = rect(
+                        scale(layout.sidebar.left),
+                        scale(layout.header.bottom),
+                        scale(layout.sidebar.left + 1),
+                        scale(layout.footer.top),
+                    );
+                    buffer.tint_background(side_divider, BORDER_ALPHA)
+                        && buffer.tint_background(pixels(layout.sidebar), CARD_ALPHA)
+                }
                 Tab::Settings => {
                     buffer.apply_rounded_rect_mask(
                         pixels(layout.settings_preferences_panel),
@@ -1456,8 +1608,8 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
                     buffer.apply_rounded_rect_mask(pixels(layout.sources_panel), &card_mask)
                 }
             };
-            // Content panels stay opaque; outer header, canvas and footer transmit the acrylic backdrop.
-            if !panel_ok || !buffer.tint_background(client, PANEL_ALPHA) {
+            // Window canvas, elevated cards, and dividers all transmit the acrylic backdrop at layered alpha levels.
+            if !div_ok || !panel_ok || !buffer.tint_background(client, PANEL_ALPHA) {
                 return false;
             }
         }
@@ -1642,10 +1794,10 @@ pub fn prepare_control(window: HWND) -> Result<(), String> {
         let count = GetClassNameW(window, &mut class).max(0) as usize;
         let class_name = String::from_utf16_lossy(&class[..count]);
         if class_name == "Edit" && GetDlgCtrlID(window) as usize == SEARCH {
-            // Native editing, selection and caret repaint outside WM_PAINT; composite this child opaque.
+            // Native editing, selection and caret repaint outside WM_PAINT; composite this child with frosted alpha.
             let extended = GetWindowLongPtrW(window, GWL_EXSTYLE);
             SetWindowLongPtrW(window, GWL_EXSTYLE, extended | WS_EX_LAYERED.0 as isize);
-            SetLayeredWindowAttributes(window, COLORREF(0), 255, LWA_ALPHA)
+            SetLayeredWindowAttributes(window, COLORREF(0), SEARCH_ALPHA, LWA_ALPHA)
                 .map_err(|error| error.to_string())?;
         }
         let button = class_name == "Button";
@@ -1734,7 +1886,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
         if let Some(buffer) = PaintBuffer::new(dc, area) {
             if static_text || checkbox || (status_edit && !status_selected) {
                 let glass = glass_enabled(parent);
-                let (surface_color, surface_translucent) = control_surface(id);
+                let (surface_color, surface_alpha) = control_surface(id);
                 let theme = if glass {
                     OpenThemeData(parent, w!("WINDOW"))
                 } else {
@@ -1742,14 +1894,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                 };
                 fill(buffer.dc, area, surface_color);
                 let alpha_ok = if theme.0 != 0 {
-                    buffer.tint_background(
-                        area,
-                        if surface_translucent {
-                            PANEL_ALPHA
-                        } else {
-                            255
-                        },
-                    )
+                    buffer.tint_background(area, surface_alpha)
                 } else {
                     true
                 };
@@ -1796,8 +1941,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                         SelectObject(buffer.dc, old_pen);
                         let _ = DeleteObject(pen);
                     }
-                    let _ = GdiFlush();
-                    let _ = BufferedPaintSetAlpha(buffer.handle, Some(&glyph), 255);
+                    let _ = buffer.tint_background(glyph, 255);
                     text_area.left += size + s(9);
                 }
                 label(
@@ -2113,6 +2257,7 @@ mod tests {
         for (foreground, background) in [
             (TEXT, INK),
             (TEXT, CARD),
+            (TEXT, 0x6a6a6a),
             (MUTED, CARD),
             (INK, ORANGE),
             (TEXT, ACCENT_DARK),
@@ -2186,12 +2331,12 @@ mod tests {
         assert_eq!(control_color(PAGE), INK);
         assert_eq!(control_color(SEARCH), CARD);
         assert_eq!(control_color(113), FOOTER);
-        assert_eq!(control_surface(TAB_LIBRARY), (INK, true));
-        assert_eq!(control_surface(PREVIOUS), (INK, true));
-        assert_eq!(control_surface(PAGE), (INK, true));
-        assert_eq!(control_surface(113), (FOOTER, true));
-        assert_eq!(control_surface(PRODUCT_WEBSITE), (CARD, false));
-        assert_eq!(control_surface(VERSION), (CARD, false));
+        assert_eq!(control_surface(TAB_LIBRARY), (INK, PANEL_ALPHA));
+        assert_eq!(control_surface(PREVIOUS), (INK, PANEL_ALPHA));
+        assert_eq!(control_surface(PAGE), (INK, PANEL_ALPHA));
+        assert_eq!(control_surface(113), (FOOTER, PANEL_ALPHA));
+        assert_eq!(control_surface(PRODUCT_WEBSITE), (CARD, CARD_ALPHA));
+        assert_eq!(control_surface(VERSION), (CARD, CARD_ALPHA));
 
         // SAFETY: test-owned memory DC and DIB never attach to any desktop window.
         unsafe {
@@ -2313,6 +2458,8 @@ mod tests {
                     ellipse: 12,
                     border: LINE,
                     border_width: 1.0,
+                    border_alpha: BORDER_ALPHA,
+                    fill_alpha: CARD_ALPHA,
                     focus: 0,
                     focus_inset: 0.0,
                     host_color: INK,
@@ -2328,18 +2475,43 @@ mod tests {
                 pixels[i..i + 4].try_into().expect("BGRA pixel")
             };
             let bg = u8::try_from(17u16 * u16::from(PANEL_ALPHA) / 255).unwrap();
+            let card_b = u8::try_from((CARD & 255) * u32::from(CARD_ALPHA) / 255).unwrap();
+            let card_g = u8::try_from(((CARD >> 8) & 255) * u32::from(CARD_ALPHA) / 255).unwrap();
+            let card_r = u8::try_from(((CARD >> 16) & 255) * u32::from(CARD_ALPHA) / 255).unwrap();
             assert_eq!(px(4, 4), [bg, bg, bg, PANEL_ALPHA]);
             assert_eq!(
                 px(10, 10),
                 [bg, bg, bg, PANEL_ALPHA],
                 "rounded panel corner outside arc must match acrylic canvas"
             );
-            let center = px(40, 40);
-            assert_eq!(center[3], 255, "panel interior must remain opaque");
             assert_eq!(
-                u32::from(center[2]) << 16 | u32::from(center[1]) << 8 | u32::from(center[0]),
-                CARD
+                px(10, 40)[3],
+                BORDER_ALPHA,
+                "panel border must use frosted border alpha"
             );
+            let center = px(40, 40);
+            assert_eq!(
+                center,
+                [card_b, card_g, card_r, CARD_ALPHA],
+                "panel interior must use frosted Card acrylic alpha"
+            );
+
+            // Overlay rounded glyph over frosted Card must promote only painted interior pixels.
+            std::slice::from_raw_parts_mut(bits as *mut u32, 80 * 80).fill(0);
+            let overlay = PaintBuffer::new(dc, full).expect("overlay buffer");
+            fill(overlay.dc, full, CARD);
+            assert!(overlay.tint_background(full, CARD_ALPHA));
+            let glyph = rect(30, 30, 50, 50);
+            rounded(overlay.dc, glyph, ACCENT, ACCENT_DARK, 8);
+            assert!(overlay.tint_background(glyph, 255));
+            assert!(overlay.finish());
+            let _ = GdiFlush();
+            assert_eq!(
+                px(30, 30),
+                [card_b, card_g, card_r, CARD_ALPHA],
+                "rounded overlay corner must preserve translucent card alpha"
+            );
+            assert_eq!(px(40, 40)[3], 255, "overlay interior must be opaque");
             SelectObject(dc, old);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);
