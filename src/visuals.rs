@@ -101,6 +101,13 @@ pub fn is_body_control(id: usize) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptionButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
 pub struct Layout {
     pub client: Rect,
     pub header: Rect,
@@ -127,6 +134,8 @@ pub struct Layout {
     pub sidebar_divider: Option<Rect>,
     pub settings_dividers: [Option<Rect>; 2],
     pub sources_divider: Option<Rect>,
+    pub caption_divider: Rect,
+    pub caption_buttons: [(CaptionButton, Rect); 3],
     pub tile_rects: [Rect; 9],
     controls: [(usize, Rect); 42],
 }
@@ -210,10 +219,16 @@ impl Layout {
             sidebar_divider,
             settings_dividers,
             sources_divider,
+            caption_divider: r(width - 146, 22, 1, 28),
+            caption_buttons: [
+                (CaptionButton::Minimize, r(width - 134, 18, 36, 36)),
+                (CaptionButton::Maximize, r(width - 94, 18, 36, 36)),
+                (CaptionButton::Close, r(width - 54, 18, 36, 36)),
+            ],
             tile_rects,
             controls: [
-                (101, r(width - 272, 18, 118, 36)),
-                (ADD_FOLDER, r(width - 146, 18, 122, 36)),
+                (101, r(width - 406, 18, 118, 36)),
+                (ADD_FOLDER, r(width - 280, 18, 122, 36)),
                 (TAB_LIBRARY, r(176, 18, 96, 36)),
                 (TAB_SETTINGS, r(280, 18, 96, 36)),
                 (SEARCH, r(24, 164, split - 336, 32)),
@@ -312,29 +327,29 @@ pub const FOOTER: u32 = INK;
 pub const PANEL: u32 = mix(INK, CREAM, 8, 100);
 pub const CARD: u32 = mix(INK, CREAM, 14, 100);
 pub const CARD_LIT: u32 = mix(INK, CREAM, 23, 100);
-pub const LINE: u32 = mix(INK, CREAM, 34, 100);
-pub const HIGHLIGHT: u32 = mix(INK, CREAM, 50, 100);
-pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 34, 100);
-const DISABLED_FILL: u32 = mix(INK, CREAM, 8, 100);
-const DISABLED_BORDER: u32 = mix(INK, CREAM, 22, 100);
+pub const LINE: u32 = mix(INK, CREAM, 42, 100);
+pub const HIGHLIGHT: u32 = mix(INK, CREAM, 60, 100);
+pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 26, 100);
+const DISABLED_FILL: u32 = mix(INK, CREAM, 10, 100);
+const DISABLED_BORDER: u32 = mix(INK, CREAM, 26, 100);
 pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 26, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
 pub const ACCENT_HOVER: u32 = mix(ORANGE, CREAM, 12, 100);
-pub const GLASS_RIM: u32 = mix(INK, CREAM, 64, 100);
+pub const GLASS_RIM: u32 = mix(INK, CREAM, 74, 100);
 pub const PANEL_ALPHA: u8 = 0;
-pub const CARD_ALPHA: u8 = 92;
-const CONTROL_ALPHA: u8 = 128;
-const HOVER_ALPHA: u8 = 172;
-const ACTIVE_TILE_ALPHA: u8 = 188;
+pub const CARD_ALPHA: u8 = 96;
+const CONTROL_ALPHA: u8 = 138;
+const HOVER_ALPHA: u8 = 184;
+const ACTIVE_TILE_ALPHA: u8 = 196;
 const ACTIVE_ALPHA: u8 = 244;
-pub const BORDER_ALPHA: u8 = 196;
-const DIVIDER_ALPHA: u8 = 128;
-const SEARCH_ALPHA: u8 = 204;
-pub const DROPDOWN_ALPHA: u8 = 148;
-// Deep Ink Acrylic tint applied via SetWindowCompositionAttribute (kept blurred even when unfocused).
-const ACRYLIC_TINT_COLOR: u32 = 0x3e11_1111;
+pub const BORDER_ALPHA: u8 = 220;
+const DIVIDER_ALPHA: u8 = 176;
+const SEARCH_ALPHA: u8 = 208;
+pub const DROPDOWN_ALPHA: u8 = 156;
+// Lighter smoked Ink Acrylic tint so wallpaper colors & blur shine clearly both focused and unfocused.
+const ACRYLIC_TINT_COLOR: u32 = 0x2211_1111;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -425,7 +440,7 @@ impl Drop for Bitmap {
         }
     }
 }
-const MAX_CACHED_THUMBNAILS: usize = 72;
+pub const MAX_CACHED_THUMBNAILS: usize = 162;
 
 struct ThumbEntry {
     bitmap: Bitmap,
@@ -540,11 +555,10 @@ pub fn thumbnail(path: PathBuf, image: HBITMAP) {
     });
 }
 pub const ANIM_TIMER_ID: usize = 3;
-const ANIM_INTERVAL_MS: u32 = 10;
 const TAB_ANIM_MS: u32 = 210;
 const TOGGLE_ANIM_MS: u32 = 150;
-pub const PAGE_ANIM_MS: u32 = 220;
-pub const TAB_TRANSITION_MS: u32 = 230;
+pub const PAGE_ANIM_MS: u32 = 250;
+pub const TAB_TRANSITION_MS: u32 = 260;
 
 struct ToggleAnim {
     from: f32,
@@ -577,6 +591,8 @@ struct TransitionAnim {
 #[derive(Default)]
 struct AnimState {
     hot: isize,
+    caption_hot: Option<CaptionButton>,
+    caption_down: Option<CaptionButton>,
     toggles: HashMap<usize, ToggleAnim>,
     tab_slide: Option<TabSlideAnim>,
     transition: Option<TransitionAnim>,
@@ -606,6 +622,26 @@ fn is_hot(window: HWND) -> bool {
     !window.0.is_null() && ANIM.with(|a| a.borrow().hot == window.0 as isize)
 }
 
+fn anim_interval_ms() -> u32 {
+    use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
+    let mut info = DWM_TIMING_INFO {
+        cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+        ..Default::default()
+    };
+    // Match the DWM composition refresh rate so transitions advance once per vsync instead of beating at 10ms vs 16.6ms.
+    // SAFETY: sized DWM_TIMING_INFO out-parameter with null window queries the primary display cadence.
+    if unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) }.is_ok()
+        && info.rateRefresh.uiNumerator > 0
+        && info.rateRefresh.uiDenominator > 0
+    {
+        let ms = (info.rateRefresh.uiDenominator as f64 * 1000.0
+            / info.rateRefresh.uiNumerator as f64)
+            .floor() as u32;
+        return ms.clamp(6, 16);
+    }
+    16
+}
+
 fn arm_anim_timer(window: HWND) {
     if !window.0.is_null() {
         ANIM.with(|a| {
@@ -618,10 +654,96 @@ fn arm_anim_timer(window: HWND) {
                 }
             }
         });
+        let interval = anim_interval_ms();
         unsafe {
-            let _ = SetTimer(window, ANIM_TIMER_ID, ANIM_INTERVAL_MS, None);
+            let _ = SetTimer(window, ANIM_TIMER_ID, interval, None);
         }
     }
+}
+
+pub fn caption_cluster_rect(window: HWND) -> Option<RECT> {
+    if window.0.is_null() {
+        return None;
+    }
+    let mut client = RECT::default();
+    // SAFETY: read-only geometry query on live window.
+    if unsafe { GetClientRect(window, &mut client) }.is_err() || client.right <= 0 {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
+    let layout = Layout::new(client.right * 96 / dpi, client.bottom.max(1) * 96 / dpi);
+    let first = layout.caption_buttons[0].1;
+    let last = layout.caption_buttons[2].1;
+    Some(rect(
+        first.left * dpi / 96 - 2,
+        first.top * dpi / 96 - 2,
+        last.right * dpi / 96 + 2,
+        last.bottom * dpi / 96 + 2,
+    ))
+}
+
+pub fn caption_button_hit(window: HWND, x: i32, y: i32) -> Option<CaptionButton> {
+    if window.0.is_null() {
+        return None;
+    }
+    let mut client = RECT::default();
+    // SAFETY: read-only geometry query on live window.
+    if unsafe { GetClientRect(window, &mut client) }.is_err()
+        || client.right <= 0
+        || client.bottom <= 0
+    {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
+    let layout = Layout::new(client.right * 96 / dpi, client.bottom * 96 / dpi);
+    layout.caption_buttons.iter().find_map(|(btn, r)| {
+        let left = r.left * dpi / 96;
+        let top = r.top * dpi / 96;
+        let right = r.right * dpi / 96;
+        let bottom = r.bottom * dpi / 96;
+        (x >= left && x < right && y >= top && y < bottom).then_some(*btn)
+    })
+}
+
+pub fn set_caption_hover(window: HWND, hot: Option<CaptionButton>) -> bool {
+    let changed = ANIM.with(|a| {
+        let mut state = a.borrow_mut();
+        if state.caption_hot == hot {
+            false
+        } else {
+            state.caption_hot = hot;
+            true
+        }
+    });
+    if changed && let Some(area) = caption_cluster_rect(window) {
+        // SAFETY: invalidates only the caption button cluster for immediate redraw.
+        unsafe {
+            let _ = RedrawWindow(window, Some(&area), None, RDW_INVALIDATE | RDW_UPDATENOW);
+        }
+    }
+    changed
+}
+
+pub fn set_caption_down(window: HWND, down: Option<CaptionButton>) {
+    let changed = ANIM.with(|a| {
+        let mut state = a.borrow_mut();
+        if state.caption_down == down {
+            false
+        } else {
+            state.caption_down = down;
+            true
+        }
+    });
+    if changed && let Some(area) = caption_cluster_rect(window) {
+        // SAFETY: invalidates only the caption button cluster for immediate press feedback.
+        unsafe {
+            let _ = RedrawWindow(window, Some(&area), None, RDW_INVALIDATE | RDW_UPDATENOW);
+        }
+    }
+}
+
+pub fn caption_down() -> Option<CaptionButton> {
+    ANIM.with(|a| a.borrow().caption_down)
 }
 
 fn disarm_timer_if_idle(window: HWND) {
@@ -966,7 +1088,12 @@ fn end_transition(window: HWND, anim: TransitionAnim) {
             let _ = SetFocus(target);
         }
         if !window.0.is_null() && IsWindow(window).as_bool() {
-            let _ = InvalidateRect(window, Some(&anim.clip), false);
+            let _ = RedrawWindow(
+                window,
+                Some(&anim.clip),
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
         }
     }
     drop(anim.old_layer);
@@ -1673,7 +1800,7 @@ impl PaintBuffer {
         let raw = (elapsed / trans.duration_ms as f32).clamp(0.0, 1.0);
         let ease = ease_out_cubic(raw);
         let clip_w = (trans.clip.right - trans.clip.left).max(1) as f32;
-        let slide = 36.0 * (clip_w / 640.0).clamp(0.85, 1.35);
+        let slide = 44.0 * (clip_w / 640.0).clamp(0.85, 1.35);
         // Subpixel 256th-px shifts eliminate discrete integer pixel snapping / edge jitter.
         let dx_old_fp = (trans.direction as f32 * slide * ease * 256.0).round() as i32;
         let dx_new_fp = (-trans.direction as f32 * slide * (1.0 - ease) * 256.0).round() as i32;
@@ -1731,6 +1858,154 @@ impl PaintBuffer {
                 pixel.rgbGreen = fg.min(fa) as u8;
                 pixel.rgbBlue = fb.min(fa) as u8;
                 pixel.rgbReserved = out_a;
+            }
+        }
+        true
+    }
+    unsafe fn draw_caption_glyph(
+        &self,
+        area: RECT,
+        btn: CaptionButton,
+        maximized: bool,
+        dpi: i32,
+        color: u32,
+    ) -> bool {
+        let width = self.area.right - self.area.left;
+        let height = self.area.bottom - self.area.top;
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        if width <= 0
+            || height <= 0
+            || unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
+            || bits.is_null()
+            || stride < width
+            || !unsafe { GdiFlush() }.as_bool()
+        {
+            return false;
+        }
+        let Some(len) = (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<RGBQUAD>())
+        else {
+            return false;
+        };
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
+        let scale_f = dpi as f32 / 96.0;
+        let cx = (area.left + area.right) as f32 * 0.5;
+        let cy = (area.top + area.bottom) as f32 * 0.5;
+        let half_len = 5.0 * scale_f;
+        let half_w = (0.65 * scale_f).max(0.55);
+        let r = ((color >> 16) & 255) as f32;
+        let g = ((color >> 8) & 255) as f32;
+        let b = (color & 255) as f32;
+        let segment_dist = |px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32| -> f32 {
+            let abx = bx - ax;
+            let aby = by - ay;
+            let denom = abx * abx + aby * aby;
+            let t = if denom > 0.0 {
+                (((px - ax) * abx + (py - ay) * aby) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let dx = px - (ax + abx * t);
+            let dy = py - (ay + aby * t);
+            (dx * dx + dy * dy).sqrt()
+        };
+        let box_outline_dist = |px: f32, py: f32, left: f32, top: f32, right: f32, bottom: f32| {
+            let d1 = segment_dist(px, py, left, top, right, top);
+            let d2 = segment_dist(px, py, right, top, right, bottom);
+            let d3 = segment_dist(px, py, right, bottom, left, bottom);
+            let d4 = segment_dist(px, py, left, bottom, left, top);
+            d1.min(d2).min(d3).min(d4)
+        };
+        let y0 = area.top.max(self.area.top);
+        let y1 = area.bottom.min(self.area.bottom);
+        let x0 = area.left.max(self.area.left);
+        let x1 = area.right.min(self.area.right);
+        for y in y0..y1 {
+            let row = (y - self.area.top) as usize * stride as usize;
+            let py = y as f32 + 0.5;
+            for x in x0..x1 {
+                let px = x as f32 + 0.5;
+                let dist = match btn {
+                    CaptionButton::Minimize => {
+                        segment_dist(px, py, cx - half_len, cy, cx + half_len, cy)
+                    }
+                    CaptionButton::Maximize if !maximized => box_outline_dist(
+                        px,
+                        py,
+                        cx - half_len,
+                        cy - half_len,
+                        cx + half_len,
+                        cy + half_len,
+                    ),
+                    CaptionButton::Maximize => {
+                        let s = 3.8 * scale_f;
+                        let shift = 2.0 * scale_f;
+                        let front = box_outline_dist(
+                            px,
+                            py,
+                            cx - s - shift * 0.5,
+                            cy - s + shift * 0.5,
+                            cx + s - shift * 0.5,
+                            cy + s + shift * 0.5,
+                        );
+                        let back_top = segment_dist(
+                            px,
+                            py,
+                            cx - s + shift * 0.5,
+                            cy - s - shift * 0.5,
+                            cx + s + shift * 0.5,
+                            cy - s - shift * 0.5,
+                        );
+                        let back_right = segment_dist(
+                            px,
+                            py,
+                            cx + s + shift * 0.5,
+                            cy - s - shift * 0.5,
+                            cx + s + shift * 0.5,
+                            cy + s - shift * 0.5,
+                        );
+                        front.min(back_top).min(back_right)
+                    }
+                    CaptionButton::Close => {
+                        let d1 = segment_dist(
+                            px,
+                            py,
+                            cx - half_len,
+                            cy - half_len,
+                            cx + half_len,
+                            cy + half_len,
+                        );
+                        let d2 = segment_dist(
+                            px,
+                            py,
+                            cx + half_len,
+                            cy - half_len,
+                            cx - half_len,
+                            cy + half_len,
+                        );
+                        d1.min(d2)
+                    }
+                };
+                let cov = (half_w + 0.5 - dist).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let sa = (cov * 255.0).round() as u32;
+                let inv = 255u32.saturating_sub(sa);
+                let pixel = &mut pixels[row + (x - self.area.left) as usize];
+                let out_a = (sa + (u32::from(pixel.rgbReserved) * inv + 127) / 255).min(255);
+                let sr = (r * cov).round() as u32;
+                let sg = (g * cov).round() as u32;
+                let sb = (b * cov).round() as u32;
+                pixel.rgbRed =
+                    ((sr + (u32::from(pixel.rgbRed) * inv + 127) / 255) as u8).min(out_a as u8);
+                pixel.rgbGreen =
+                    ((sg + (u32::from(pixel.rgbGreen) * inv + 127) / 255) as u8).min(out_a as u8);
+                pixel.rgbBlue =
+                    ((sb + (u32::from(pixel.rgbBlue) * inv + 127) / 255) as u8).min(out_a as u8);
+                pixel.rgbReserved = out_a as u8;
             }
         }
         true
@@ -2546,7 +2821,7 @@ pub fn enable_backdrop(window: HWND) -> bool {
     unsafe {
         let dark = 1i32;
         let round = DWMWCP_ROUND.0;
-        let none = DWMSBT_NONE.0;
+        let auto = DWMSBT_AUTO.0;
         let acrylic = DWMSBT_TRANSIENTWINDOW.0;
         let _ = DwmSetWindowAttribute(
             window,
@@ -2567,24 +2842,28 @@ pub fn enable_backdrop(window: HWND) -> bool {
             disable_backdrop(window);
             return false;
         }
-        // Clear DWMSBT_TRANSIENTWINDOW first so DWM never replaces Acrylic with solid grey when unfocused.
+        // Reset Win11 SystemBackdrop (DWMSBT_AUTO) and client frame margins to {0} so DWM does not
+        // replace Acrylic with solid active black or inactive #2B2B2B grey; enable per-pixel client
+        // alpha via DwmEnableBlurBehindWindow + SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND).
         let _ = DwmSetWindowAttribute(
             window,
             DWMWA_SYSTEMBACKDROP_TYPE,
-            (&none as *const i32).cast(),
-            std::mem::size_of_val(&none) as u32,
+            (&auto as *const i32).cast(),
+            std::mem::size_of_val(&auto) as u32,
         );
-        let frame_ok = DwmExtendFrameIntoClientArea(
-            window,
-            &MARGINS {
-                cxLeftWidth: -1,
-                cxRightWidth: -1,
-                cyTopHeight: -1,
-                cyBottomHeight: -1,
-            },
-        )
-        .is_ok();
-        let backdrop_ok = frame_ok
+        let _ = DwmExtendFrameIntoClientArea(window, &MARGINS::default());
+        let region = CreateRectRgn(0, 0, -1, -1);
+        let blur = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION | DWM_BB_TRANSITIONONMAXIMIZED,
+            fEnable: true.into(),
+            hRgnBlur: region,
+            fTransitionOnMaximized: true.into(),
+        };
+        let blur_ok = DwmEnableBlurBehindWindow(window, &blur).is_ok();
+        if !region.0.is_null() {
+            let _ = DeleteObject(region);
+        }
+        let backdrop_ok = blur_ok
             && (set_acrylic_composition(window, true)
                 || DwmSetWindowAttribute(
                     window,
@@ -2611,12 +2890,18 @@ pub fn enable_backdrop(window: HWND) -> bool {
     }
 }
 
-fn disable_backdrop(window: HWND) {
+pub fn disable_backdrop(window: HWND) {
     use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
     unsafe {
         let was_enabled = glass_enabled(window);
         let _ = RemovePropW(window, GLASS_PROPERTY);
         let _ = set_acrylic_composition(window, false);
+        let blur = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE,
+            fEnable: false.into(),
+            ..Default::default()
+        };
+        let _ = DwmEnableBlurBehindWindow(window, &blur);
         let none = DWMSBT_NONE.0;
         let _ = DwmSetWindowAttribute(
             window,
@@ -2716,6 +3001,12 @@ unsafe fn paint_scene(
             scale(layout.client.right),
             scale(layout.header.bottom),
         );
+        let caption_divider = rect(
+            scale(layout.caption_divider.left),
+            scale(layout.caption_divider.top),
+            scale(layout.caption_divider.left) + divider_px,
+            scale(layout.caption_divider.bottom),
+        );
         let footer_divider = rect(
             0,
             scale(layout.footer.top),
@@ -2740,11 +3031,41 @@ unsafe fn paint_scene(
         let prefs_divider = layout.settings_dividers[0].map(h_divider);
         let resources_divider = layout.settings_dividers[1].map(h_divider);
         let sources_divider = layout.sources_divider.map(h_divider);
+        let (caption_hot, caption_down) = ANIM.with(|a| {
+            let state = a.borrow();
+            (state.caption_hot, state.caption_down)
+        });
+        let caption_style = |btn: CaptionButton| -> Option<(u32, u32, u8)> {
+            let down = caption_down == Some(btn);
+            let hot = caption_hot == Some(btn);
+            if !down && !hot {
+                return None;
+            }
+            if btn == CaptionButton::Close {
+                Some(if down {
+                    (0xa82215, 0xd14b3c, 240)
+                } else {
+                    (0xc42b1c, 0xe05848, 224)
+                })
+            } else {
+                Some(if down {
+                    (CARD, HIGHLIGHT, ACTIVE_TILE_ALPHA)
+                } else {
+                    (CARD_LIT, GLASS_RIM, HOVER_ALPHA)
+                })
+            }
+        };
 
         fill(dc, pixels(layout.client), BODY);
         fill(dc, pixels(layout.header), BODY);
         fill(dc, top_divider, divider_color);
         fill(dc, header_divider, divider_color);
+        fill(dc, caption_divider, divider_color);
+        for &(btn, area) in &layout.caption_buttons {
+            if let Some((bg, border, _)) = caption_style(btn) {
+                raised_rounded(dc, pixels(area), bg, border, border, scale(8));
+            }
+        }
         if !covers_body {
             match tab {
                 Tab::Library => {
@@ -2797,9 +3118,31 @@ unsafe fn paint_scene(
         fill(dc, footer_divider, divider_color);
         if let Some(buffer) = buffer {
             if glass_active {
-                let div_ok = buffer.tint_background(top_divider, DIVIDER_ALPHA)
+                let mut div_ok = buffer.tint_background(top_divider, DIVIDER_ALPHA)
                     && buffer.tint_background(header_divider, DIVIDER_ALPHA)
+                    && buffer.tint_background(caption_divider, DIVIDER_ALPHA)
                     && buffer.tint_background(footer_divider, DIVIDER_ALPHA);
+                for &(btn, area) in &layout.caption_buttons {
+                    if let Some((_, border, alpha)) = caption_style(btn) {
+                        div_ok &= buffer.apply_rounded_rect_mask(
+                            pixels(area),
+                            &RoundedMask {
+                                ellipse: scale(8),
+                                border,
+                                border_width: 1.0,
+                                border_alpha: BORDER_ALPHA,
+                                fill_alpha: alpha,
+                                focus: 0,
+                                focus_inset: 0.0,
+                                host_color: INK,
+                                host_alpha: PANEL_ALPHA,
+                                top_rim: GLASS_RIM,
+                                bottom_rim: INK,
+                                sheen_strength: 0.0,
+                            },
+                        );
+                    }
+                }
                 let card_mask = RoundedMask {
                     ellipse: scale(12),
                     border: LINE,
@@ -2877,6 +3220,48 @@ unsafe fn paint_scene(
             TEXT_ON_DARK,
             DT_SINGLELINE,
         );
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsZoomed};
+            let maximized = !window.0.is_null() && IsZoomed(window).as_bool();
+            let focused = !window.0.is_null() && GetForegroundWindow() == window;
+            for &(btn, area) in &layout.caption_buttons {
+                let area_px = pixels(area);
+                let active = caption_hot == Some(btn) || caption_down == Some(btn);
+                let glyph_color = if active || focused {
+                    TEXT_ON_DARK
+                } else {
+                    MUTED
+                };
+                if let Some(buffer) = buffer {
+                    let _ = buffer.draw_caption_glyph(area_px, btn, maximized, dpi, glyph_color);
+                } else {
+                    let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(glyph_color));
+                    let old_pen = SelectObject(dc, pen);
+                    let cx = (area_px.left + area_px.right) / 2;
+                    let cy = (area_px.top + area_px.bottom) / 2;
+                    let r = scale(5);
+                    match btn {
+                        CaptionButton::Minimize => {
+                            let _ = MoveToEx(dc, cx - r, cy, None);
+                            let _ = LineTo(dc, cx + r, cy);
+                        }
+                        CaptionButton::Maximize => {
+                            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                            let _ = Rectangle(dc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+                            SelectObject(dc, old_brush);
+                        }
+                        CaptionButton::Close => {
+                            let _ = MoveToEx(dc, cx - r, cy - r, None);
+                            let _ = LineTo(dc, cx + r + 1, cy + r + 1);
+                            let _ = MoveToEx(dc, cx + r, cy - r, None);
+                            let _ = LineTo(dc, cx - r - 1, cy + r + 1);
+                        }
+                    }
+                    SelectObject(dc, old_pen);
+                    let _ = DeleteObject(pen);
+                }
+            }
+        }
         if !covers_body {
             match tab {
                 Tab::Library => {
@@ -4339,5 +4724,111 @@ mod tests {
     fn animations_forced_for_windows_and_transparency_query_is_safe() {
         assert!(!animations_enabled(HWND::default()));
         let _ = transparency_enabled();
+    }
+
+    #[test]
+    fn custom_caption_controls_keep_drag_gap_and_non_overlapping_bounds() {
+        for (width, height) in [(MIN_CLIENT_WIDTH, MIN_CLIENT_HEIGHT), (1080, 740)] {
+            let layout = Layout::new(width, height);
+            assert!(layout.header.covers(layout.caption_divider));
+            let add_folder = layout.control(ADD_FOLDER).unwrap();
+            let add_wallpaper = layout.control(101).unwrap();
+            let settings_tab = layout.control(TAB_SETTINGS).unwrap();
+            assert!(add_wallpaper.left - settings_tab.right >= 100);
+            assert!(layout.caption_divider.left > add_folder.right);
+            assert!(layout.caption_divider.right <= layout.caption_buttons[0].1.left);
+
+            for i in 0..layout.caption_buttons.len() {
+                let (_, area) = layout.caption_buttons[i];
+                assert!(layout.header.covers(area));
+                assert!(!overlap(area, layout.caption_divider));
+                assert!(!overlap(area, add_folder));
+                assert!(!overlap(area, add_wallpaper));
+                assert!(!overlap(area, settings_tab));
+                if i + 1 < layout.caption_buttons.len() {
+                    let (_, next) = layout.caption_buttons[i + 1];
+                    assert!(area.right <= next.left);
+                    assert!(!overlap(area, next));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anim_interval_ms_stays_within_vsync_clamp_bounds() {
+        let interval = anim_interval_ms();
+        assert!(
+            (6..=16).contains(&interval),
+            "expected vsync animation interval in 6..=16 ms, got {interval}"
+        );
+    }
+
+    #[test]
+    fn caption_glyph_rendering_preserves_premultiplied_alpha() {
+        // SAFETY: test-owned memory DIB section never touches any desktop window.
+        unsafe {
+            let w = 36i32;
+            let h = 28i32;
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(
+                dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .expect("caption glyph DIB");
+            let prev = SelectObject(dc, bitmap);
+            let full = rect(0, 0, w, h);
+
+            for (btn, maximized) in [
+                (CaptionButton::Minimize, false),
+                (CaptionButton::Maximize, false),
+                (CaptionButton::Maximize, true),
+                (CaptionButton::Close, false),
+            ] {
+                std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize).fill(0);
+                let buffer = PaintBuffer::new(dc, full).expect("caption paint buffer");
+                fill(buffer.dc, full, CARD);
+                assert!(buffer.tint_background(full, CARD_ALPHA));
+                assert!(buffer.draw_caption_glyph(full, btn, maximized, 96, TEXT_ON_DARK));
+                assert!(buffer.finish());
+                let _ = GdiFlush();
+                let pixels = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+                let at = |x: usize, y: usize| -> [u8; 4] {
+                    let idx = (y * w as usize + x) * 4;
+                    pixels[idx..idx + 4].try_into().unwrap()
+                };
+                assert_eq!(at(0, 0)[3], CARD_ALPHA);
+                if matches!(btn, CaptionButton::Close | CaptionButton::Minimize) {
+                    assert!(at(w as usize / 2, h as usize / 2)[3] > 200);
+                }
+                assert!(
+                    pixels
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]),
+                    "non-premultiplied caption glyph pixel detected for {btn:?}"
+                );
+            }
+
+            SelectObject(dc, prev);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+        }
     }
 }

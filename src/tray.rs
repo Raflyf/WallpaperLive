@@ -368,17 +368,18 @@ mod dropdown {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        ReleaseCapture, SetCapture, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_RETURN, VK_SPACE,
-        VK_TAB, VK_UP,
+        GetCapture, ReleaseCapture, SetCapture, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_RETURN,
+        VK_SPACE, VK_TAB, VK_UP,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-        GetClientRect, GetMessageW, GetWindowLongPtrW, IDC_ARROW, KillTimer, LoadCursorW, MSG,
-        RegisterClassW, RemovePropW, SW_SHOWNOACTIVATE, SetTimer, SetWindowLongPtrW, ShowWindow,
-        TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE,
-        WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-        WM_MOUSEWHEEL, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
-        WM_TIMER, WNDCLASS_STYLES, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE,
+        GetClientRect, GetMessageW, GetWindowLongPtrW, IDC_ARROW, KillTimer, LoadCursorW,
+        MA_NOACTIVATE, MSG, RegisterClassW, RemovePropW, SW_SHOWNOACTIVATE, SetTimer,
+        SetWindowLongPtrW, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE,
+        WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER,
+        WNDCLASS_STYLES, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
     use windows::core::{PCWSTR, w};
@@ -503,6 +504,9 @@ mod dropdown {
         }
 
         fn finish(&mut self, chosen: Option<usize>) {
+            if !self.open {
+                return;
+            }
             self.chosen_index = chosen;
             self.open = false;
         }
@@ -656,11 +660,15 @@ mod dropdown {
                     }
                     LRESULT(0)
                 }
+                WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
                 WM_LBUTTONDOWN => {
                     let x = (lparam.0 & 0xffff) as i16 as i32;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
                     if let Some(idx) = state.row_at(width, x, y) {
                         state.pressed_inside = true;
+                        if GetCapture() != hwnd {
+                            let _ = SetCapture(hwnd);
+                        }
                         if state.hover_index != Some(idx) {
                             state.hover_index = Some(idx);
                             let _ = InvalidateRect(hwnd, None, false);
@@ -686,7 +694,7 @@ mod dropdown {
                     LRESULT(0)
                 }
                 WM_CAPTURECHANGED => {
-                    if HWND(lparam.0 as *mut std::ffi::c_void) != hwnd {
+                    if state.open && HWND(lparam.0 as *mut std::ffi::c_void) != hwnd {
                         state.finish(None);
                     }
                     LRESULT(0)
@@ -902,6 +910,19 @@ mod dropdown {
                     }
                     continue;
                 }
+                if msg.hwnd != popup
+                    && matches!(
+                        msg.message,
+                        WM_LBUTTONDOWN
+                            | WM_RBUTTONDOWN
+                            | WM_MBUTTONDOWN
+                            | WM_NCLBUTTONDOWN
+                            | WM_NCRBUTTONDOWN
+                    )
+                {
+                    state.finish(None);
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 let _ = DispatchMessageW(&msg);
                 if msg.hwnd == owner && matches!(msg.message, WM_CLOSE | WM_DESTROY) {
@@ -909,7 +930,10 @@ mod dropdown {
                 }
             }
 
-            let _ = ReleaseCapture();
+            let _ = SetWindowLongPtrW(popup, GWLP_USERDATA, 0);
+            if GetCapture() == popup {
+                let _ = ReleaseCapture();
+            }
             let _ = DestroyWindow(popup);
             Ok(state
                 .chosen_index
@@ -952,6 +976,109 @@ mod dropdown {
             assert!(g_above.rect.bottom <= bottom_anchor.top);
             assert!(g_above.rect.right <= work.right);
             assert!(g_above.rect.top >= work.top);
+        }
+
+        #[test]
+        fn dropdown_click_selection_survives_capture_release_and_never_activates()
+        -> Result<(), String> {
+            use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+            let labels = ["All folders", r"D:\wallpapers\live"];
+            let mut state = State {
+                items: &labels,
+                checked_index: Some(1),
+                hover_index: Some(1),
+                pressed_inside: false,
+                scroll_top: 0,
+                item_h: 34,
+                pad_y: 6,
+                visible_rows: 2,
+                dpi: 96,
+                glass: false,
+                animate: false,
+                opened_at: Instant::now(),
+                reveal_t: 1.0,
+                chosen_index: None,
+                open: true,
+            };
+            state.finish(Some(1));
+            state.finish(None);
+            assert_eq!(state.chosen_index, Some(1));
+            assert!(!state.open);
+
+            state.chosen_index = None;
+            state.open = true;
+
+            // SAFETY: offscreen no-activate popups created and destroyed within this test only.
+            unsafe {
+                let instance: HINSTANCE = GetModuleHandleW(None).map_err(|e| e.to_string())?.into();
+                let class_name = ensure_class(instance);
+                let owner = CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    class_name,
+                    w!(""),
+                    WS_POPUP,
+                    -32000,
+                    -32000,
+                    220,
+                    120,
+                    HWND::default(),
+                    None,
+                    instance,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+                let popup = CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                    class_name,
+                    w!(""),
+                    WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                    -32000,
+                    -32000,
+                    220,
+                    80,
+                    owner,
+                    None,
+                    instance,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+                let _ = SetWindowLongPtrW(
+                    popup,
+                    GWLP_USERDATA,
+                    (&mut state as *mut State<'_>) as isize,
+                );
+                let _ = ShowWindow(popup, SW_SHOWNOACTIVATE);
+                let _ = SetCapture(popup);
+
+                let ma = SendMessageW(
+                    popup,
+                    WM_MOUSEACTIVATE,
+                    WPARAM(owner.0 as usize),
+                    LPARAM(0x0201_0001),
+                );
+                assert_eq!(ma.0, MA_NOACTIVATE as isize);
+
+                let click_lp = LPARAM((((state.pad_y + state.item_h / 2) << 16) | 40) as isize);
+                let _ = SendMessageW(popup, WM_LBUTTONDOWN, WPARAM(1), click_lp);
+                assert!(state.pressed_inside);
+                assert!(state.open);
+
+                let _ = SendMessageW(popup, WM_LBUTTONUP, WPARAM(0), click_lp);
+                assert_eq!(state.chosen_index, Some(0));
+                assert!(!state.open);
+
+                let _ = SendMessageW(popup, WM_CAPTURECHANGED, WPARAM(0), LPARAM(0));
+                if GetCapture() == popup {
+                    let _ = ReleaseCapture();
+                }
+                assert_eq!(state.chosen_index, Some(0));
+
+                let _ = SetWindowLongPtrW(popup, GWLP_USERDATA, 0);
+                let _ = DestroyWindow(popup);
+                let _ = DestroyWindow(owner);
+            }
+            Ok(())
         }
     }
 }

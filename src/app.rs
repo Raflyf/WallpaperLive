@@ -26,7 +26,8 @@ use windows::{
             },
             HiDpi::*,
             Input::KeyboardAndMouse::{
-                EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, SetFocus, VK_CONTROL,
+                EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture,
+                SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL,
                 VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SPACE,
             },
             Shell::*,
@@ -1527,6 +1528,29 @@ impl App {
         self.request_thumbnails();
         self.apply_layout(repaint)
     }
+    fn set_redraw(&self, enabled: bool) {
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        let flag = WPARAM(usize::from(enabled));
+        // SAFETY: suppresses synchronous child invalidations while updating control state before slide capture.
+        unsafe {
+            let _ = SendMessageW(self.hwnd, WM_SETREDRAW, flag, LPARAM(0));
+            for &(_, child) in &self.controls {
+                if !child.0.is_null() {
+                    let _ = SendMessageW(child, WM_SETREDRAW, flag, LPARAM(0));
+                }
+            }
+            if enabled {
+                let _ = ValidateRect(self.hwnd, None);
+                for &(_, child) in &self.controls {
+                    if !child.0.is_null() {
+                        let _ = ValidateRect(child, None);
+                    }
+                }
+            }
+        }
+    }
     fn step_page(&mut self, delta: isize) -> Result<(), String> {
         let pages = self.library_view().len().div_ceil(9).max(1);
         let next_page = (self.page as isize + delta).clamp(0, (pages - 1) as isize) as usize;
@@ -1540,7 +1564,10 @@ impl App {
         if old_layer.is_none() {
             return self.refresh_library();
         }
-        self.refresh_library_with_repaint(false)?;
+        self.set_redraw(false);
+        let refresh = self.refresh_library_with_repaint(false);
+        self.set_redraw(true);
+        refresh?;
         let hidden = self.visible_controls_for(false);
         if let (Some(c), Some(old)) = (clip, old_layer)
             && let Some(new) = visuals::capture_region(self.hwnd, c, &self.controls)
@@ -1557,10 +1584,11 @@ impl App {
                 None,
                 false,
             );
-            // SAFETY: invalidate pager buttons while grid slides over body region.
+            // SAFETY: synchronously commit pager label/button state cleanly at frame 0 of the slide.
             unsafe {
                 for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
-                    let _ = InvalidateRect(self.control(id), None, false);
+                    let _ =
+                        RedrawWindow(self.control(id), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                 }
             }
             return Ok(());
@@ -1761,6 +1789,9 @@ impl App {
         Ok(())
     }
     fn thumbnail_paths(&self) -> Vec<PathBuf> {
+        self.ordered_thumbnail_paths(unsafe { IsWindowVisible(self.hwnd) }.as_bool())
+    }
+    fn ordered_thumbnail_paths(&self, visible: bool) -> Vec<PathBuf> {
         if self.tab != visuals::Tab::Library
             || self.reasons.reason().is_some()
             || self.preparation.is_some()
@@ -1774,20 +1805,35 @@ impl App {
                     .iter()
                     .all(|display| display.pause_reason.is_some()))
             || self.dormant.is_some()
-            || !unsafe { IsWindowVisible(self.hwnd) }.as_bool()
+            || !visible
         {
             return Vec::new();
         }
-        let mut paths: Vec<_> = self
-            .library_view()
-            .into_iter()
-            .skip(self.page * 9)
-            .take(9)
-            .collect();
-        if let Some(path) = &self.selected
-            && !paths.contains(path)
-        {
-            paths.push(path.clone());
+        let view = self.library_view();
+        let mut paths = Vec::new();
+        let mut push_unique = |path: PathBuf| {
+            if paths.len() < visuals::MAX_CACHED_THUMBNAILS && !paths.contains(&path) {
+                paths.push(path);
+            }
+        };
+        for path in view.iter().skip(self.page * 9).take(9) {
+            push_unique(path.clone());
+        }
+        if let Some(path) = &self.selected {
+            push_unique(path.clone());
+        }
+        let pages = view.len().div_ceil(9).max(1);
+        for offset in 1..pages {
+            if let Some(next_page) = self.page.checked_add(offset).filter(|p| *p < pages) {
+                for path in view.iter().skip(next_page * 9).take(9) {
+                    push_unique(path.clone());
+                }
+            }
+            if let Some(prev_page) = self.page.checked_sub(offset) {
+                for path in view.iter().skip(prev_page * 9).take(9) {
+                    push_unique(path.clone());
+                }
+            }
         }
         paths
     }
@@ -1811,25 +1857,47 @@ impl App {
             };
             let _ = worker.join();
             self.thumbnail_pending = None;
+            let mut loaded = Vec::new();
             for (path, result) in self.thumbnail_rx.try_iter() {
                 if !cancelled.load(std::sync::atomic::Ordering::Relaxed)
                     && self.library.contains(&path)
                 {
                     match result.and_then(|bytes| crate::thumbnail::bitmap(&bytes)) {
-                        Ok(bitmap) => visuals::thumbnail(path, bitmap),
+                        Ok(bitmap) => {
+                            visuals::thumbnail(path.clone(), bitmap);
+                            loaded.push(path);
+                        }
                         Err(_) => {
                             self.thumbnail_failed.insert(path);
                         }
                     }
                 }
             }
-            if !visuals::has_transition() {
-                // SAFETY: only thumbnail tiles and preview pane depend on newly decoded frames.
+            if !loaded.is_empty() && !visuals::has_transition() && self.tab == visuals::Tab::Library
+            {
+                let page_paths: Vec<_> = self
+                    .library_view()
+                    .into_iter()
+                    .skip(self.page * 9)
+                    .take(9)
+                    .collect();
+                // SAFETY: invalidate only visible tile/preview controls matching newly cached thumbnails.
                 unsafe {
-                    for id in (visuals::TILE_BASE..visuals::TILE_BASE + 9)
-                        .chain(std::iter::once(visuals::PREVIEW))
+                    for (slot, tile_path) in page_paths.iter().enumerate() {
+                        if loaded.contains(tile_path) {
+                            let _ = InvalidateRect(
+                                self.control(visuals::TILE_BASE + slot),
+                                None,
+                                false,
+                            );
+                        }
+                    }
+                    if self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|selected| loaded.contains(selected))
                     {
-                        let _ = InvalidateRect(self.control(id), None, false);
+                        let _ = InvalidateRect(self.control(visuals::PREVIEW), None, false);
                     }
                 }
             }
@@ -3378,15 +3446,21 @@ impl App {
         }
         self.tab = tab;
         visuals::set_tab(tab);
-        if tab == visuals::Tab::Library {
-            self.refresh_library_with_repaint(repaint_now)?;
+        if !repaint_now {
+            self.set_redraw(false);
+        }
+        let update_result = if tab == visuals::Tab::Library {
+            self.refresh_library_with_repaint(repaint_now)
         } else {
-            self.cancel_thumbnails();
             if tab == visuals::Tab::Settings {
                 self.refresh_diagnostics();
             }
-            self.apply_layout(repaint_now)?;
+            self.apply_layout(repaint_now)
+        };
+        if !repaint_now {
+            self.set_redraw(true);
         }
+        update_result?;
         let focus = match tab {
             visuals::Tab::Sources => visuals::SOURCES_BACK,
             visuals::Tab::Settings => visuals::TAB_SETTINGS,
@@ -3790,6 +3864,15 @@ pub fn run() -> Result<(), String> {
             LPARAM(app.small_icon.0.0 as isize),
         );
         let _ = visuals::enable_backdrop(hwnd);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         app.create_controls()?;
         if let Err(e) = app.tray(true) {
             app.set_error(e);
@@ -3983,7 +4066,150 @@ unsafe extern "system" fn window_proc(
         let post = |message: u32, wparam: WPARAM, lparam: LPARAM| {
             let _ = PostMessageW(window, message, wparam, lparam);
         };
+        const WM_MOUSELEAVE: u32 = 0x02A3;
         match message {
+            WM_NCCALCSIZE if wparam.0 != 0 && lparam.0 != 0 => {
+                let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+                let saved_top = params.rgrc[0].top;
+                let _ = DefWindowProcW(window, message, wparam, lparam);
+                params.rgrc[0].top = saved_top;
+                if IsZoomed(window).as_bool() {
+                    let dpi = GetDpiForWindow(window).max(96);
+                    let frame = GetSystemMetricsForDpi(SM_CYFRAME, dpi)
+                        + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    params.rgrc[0].top += frame;
+                }
+                LRESULT(0)
+            }
+            WM_NCACTIVATE => {
+                if IsIconic(window).as_bool() {
+                    DefWindowProcW(window, message, wparam, lparam)
+                } else {
+                    LRESULT(1)
+                }
+            }
+            WM_ACTIVATE => {
+                if let Some(area) = visuals::caption_cluster_rect(window) {
+                    let _ = InvalidateRect(window, Some(&area), false);
+                }
+                DefWindowProcW(window, message, wparam, lparam)
+            }
+            WM_NCHITTEST => {
+                let def = DefWindowProcW(window, message, wparam, lparam);
+                if matches!(
+                    def.0 as u32,
+                    HTLEFT
+                        | HTRIGHT
+                        | HTTOP
+                        | HTTOPLEFT
+                        | HTTOPRIGHT
+                        | HTBOTTOM
+                        | HTBOTTOMLEFT
+                        | HTBOTTOMRIGHT
+                ) {
+                    return def;
+                }
+                let mut pt = POINT {
+                    x: (lparam.0 & 0xffff) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+                };
+                if !ScreenToClient(window, &mut pt).as_bool() {
+                    return def;
+                }
+                let mut client = RECT::default();
+                let _ = GetClientRect(window, &mut client);
+                let dpi = GetDpiForWindow(window).max(96) as i32;
+                if !IsZoomed(window).as_bool() {
+                    let edge = (6 * dpi / 96).max(4);
+                    let corner = 12 * dpi / 96;
+                    if pt.y >= 0 && pt.y < edge {
+                        return LRESULT(if pt.x < corner {
+                            HTTOPLEFT
+                        } else if pt.x >= client.right - corner {
+                            HTTOPRIGHT
+                        } else {
+                            HTTOP
+                        } as isize);
+                    }
+                }
+                if visuals::caption_button_hit(window, pt.x, pt.y).is_some() {
+                    return LRESULT(HTCLIENT as isize);
+                }
+                let header_px = visuals::HEADER_HEIGHT * dpi / 96;
+                if pt.y >= 0 && pt.y < header_px {
+                    return LRESULT(HTCAPTION as isize);
+                }
+                def
+            }
+            WM_NCMOUSEMOVE => {
+                if wparam.0 as u32 != HTCLIENT {
+                    visuals::set_caption_hover(window, None);
+                }
+                DefWindowProcW(window, message, wparam, lparam)
+            }
+            WM_MOUSEMOVE => {
+                let x = (lparam.0 & 0xffff) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                let hot = visuals::caption_button_hit(window, x, y);
+                if visuals::set_caption_hover(window, hot) && hot.is_some() {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: window,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut track);
+                }
+                DefWindowProcW(window, message, wparam, lparam)
+            }
+            WM_MOUSELEAVE => {
+                visuals::set_caption_hover(window, None);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                let x = (lparam.0 & 0xffff) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                if let Some(btn) = visuals::caption_button_hit(window, x, y) {
+                    let _ = SetCapture(window);
+                    visuals::set_caption_down(window, Some(btn));
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(window, message, wparam, lparam)
+                }
+            }
+            WM_LBUTTONUP => {
+                if let Some(pressed) = visuals::caption_down() {
+                    visuals::set_caption_down(window, None);
+                    let _ = ReleaseCapture();
+                    let x = (lparam.0 & 0xffff) as i16 as i32;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                    if visuals::caption_button_hit(window, x, y) == Some(pressed) {
+                        match pressed {
+                            visuals::CaptionButton::Minimize => {
+                                post(WM_SYSCOMMAND, WPARAM(SC_MINIMIZE as usize), LPARAM(0));
+                            }
+                            visuals::CaptionButton::Maximize => {
+                                let cmd = if IsZoomed(window).as_bool() {
+                                    SC_RESTORE
+                                } else {
+                                    SC_MAXIMIZE
+                                };
+                                post(WM_SYSCOMMAND, WPARAM(cmd as usize), LPARAM(0));
+                            }
+                            visuals::CaptionButton::Close => {
+                                post(WM_CLOSE, WPARAM(0), LPARAM(0));
+                            }
+                        }
+                    }
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(window, message, wparam, lparam)
+                }
+            }
+            WM_CAPTURECHANGED => {
+                visuals::set_caption_down(window, None);
+                DefWindowProcW(window, message, wparam, lparam)
+            }
             WM_PAINT => {
                 visuals::paint(window);
                 LRESULT(0)
@@ -4089,6 +4315,8 @@ unsafe extern "system" fn window_proc(
                         WS_EX_CONTROLPARENT,
                         dpi as u32,
                     );
+                    // WM_NCCALCSIZE removes the native top OS caption while keeping resize frames.
+                    rect.top = 0;
                     info.ptMinTrackSize = POINT {
                         x: rect.right - rect.left,
                         y: rect.bottom - rect.top,
@@ -4317,6 +4545,12 @@ mod tests {
         }
         Ok(bitmap)
     }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ProofFocus {
+        FocusedGlass,
+        UnfocusedGlass,
+        FocusedOpaque,
+    }
 
     struct DesktopProof {
         backdrop: HWND,
@@ -4369,11 +4603,14 @@ mod tests {
             &self,
             window: HWND,
             mode: isize,
+            focus: ProofFocus,
             dc: HDC,
             width: i32,
             height: i32,
         ) -> Result<(), String> {
             use windows::Win32::Graphics::Dwm::DwmFlush;
+            let focused = focus != ProofFocus::UnfocusedGlass;
+            let require_glass = focus != ProofFocus::FocusedOpaque;
             unsafe {
                 let mut origin = POINT::default();
                 MapWindowPoints(window, None, std::slice::from_mut(&mut origin));
@@ -4389,9 +4626,34 @@ mod tests {
                 .map_err(native_error)?;
                 SetWindowLongPtrW(self.backdrop, GWLP_USERDATA, mode);
                 let _ = ShowWindow(window, SW_SHOWNORMAL);
-                let _ = SetForegroundWindow(window);
-                if GetForegroundWindow() != window {
-                    return Err("Desktop proof could not activate its own window".into());
+                if focused {
+                    let _ = SetForegroundWindow(window);
+                    if GetForegroundWindow() != window {
+                        return Err("Desktop proof could not activate its own window".into());
+                    }
+                } else {
+                    let _ = SetForegroundWindow(self.backdrop);
+                    if GetForegroundWindow() == window {
+                        return Err("Desktop proof could not unfocus its own window".into());
+                    }
+                    let _ = SetWindowPos(
+                        self.backdrop,
+                        window,
+                        origin.x,
+                        origin.y,
+                        width,
+                        height,
+                        SWP_NOACTIVATE,
+                    );
+                    let _ = SetWindowPos(
+                        window,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
                 }
                 for _ in 0..6 {
                     let _ = RedrawWindow(self.backdrop, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
@@ -4404,41 +4666,43 @@ mod tests {
                     DwmFlush().map_err(native_error)?;
                 }
                 // Exercise native direct repaint after the buffered paint, without a forced redraw.
-                let focus = GetFocus();
-                let id = GetDlgCtrlID(focus) as usize;
-                if id == visuals::SEARCH {
-                    SendMessageW(
-                        focus,
-                        windows::Win32::UI::Controls::EM_SETSEL,
-                        WPARAM(1),
-                        LPARAM(1),
-                    );
-                    SendMessageW(focus, WM_CHAR, WPARAM('x' as usize), LPARAM(1));
-                    SendMessageW(focus, WM_CHAR, WPARAM(8), LPARAM(1));
-                    SendMessageW(
-                        focus,
-                        windows::Win32::UI::Controls::EM_SETSEL,
-                        WPARAM(0),
-                        LPARAM(1),
-                    );
-                    assert_eq!(window_text(focus), "z");
-                } else if id == BATTERY {
-                    let checked = SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0));
-                    SendMessageW(focus, WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
-                    SendMessageW(focus, WM_KEYUP, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
-                    assert_ne!(
-                        SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0)),
-                        checked
-                    );
-                    SendMessageW(focus, WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
-                    SendMessageW(focus, WM_KEYUP, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
-                    assert_eq!(
-                        SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0)),
-                        checked
-                    );
+                if focused {
+                    let focus = GetFocus();
+                    let id = GetDlgCtrlID(focus) as usize;
+                    if id == visuals::SEARCH {
+                        SendMessageW(
+                            focus,
+                            windows::Win32::UI::Controls::EM_SETSEL,
+                            WPARAM(1),
+                            LPARAM(1),
+                        );
+                        SendMessageW(focus, WM_CHAR, WPARAM('x' as usize), LPARAM(1));
+                        SendMessageW(focus, WM_CHAR, WPARAM(8), LPARAM(1));
+                        SendMessageW(
+                            focus,
+                            windows::Win32::UI::Controls::EM_SETSEL,
+                            WPARAM(0),
+                            LPARAM(1),
+                        );
+                        assert_eq!(window_text(focus), "z");
+                    } else if id == BATTERY {
+                        let checked = SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0));
+                        SendMessageW(focus, WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
+                        SendMessageW(focus, WM_KEYUP, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
+                        assert_ne!(
+                            SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0)),
+                            checked
+                        );
+                        SendMessageW(focus, WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
+                        SendMessageW(focus, WM_KEYUP, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
+                        assert_eq!(
+                            SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0)),
+                            checked
+                        );
+                    }
                 }
                 DwmFlush().map_err(native_error)?;
-                if !visuals::glass_enabled(window) {
+                if require_glass && !visuals::glass_enabled(window) {
                     return Err("Desktop proof fell back to opaque rendering".into());
                 }
                 let screen = GetDC(None);
@@ -4900,29 +5164,47 @@ mod tests {
                         }
                     }
                     if let Some(desktop) = &desktop {
-                        for (mode, label) in [(0, "black"), (1, "white"), (2, "edge")] {
-                            desktop.capture(app.hwnd, mode, dc, width, height)?;
+                        let sample_rgb = |pixels: &[u8], lx: i32, ly: i32| -> [u8; 3] {
+                            let i = (((ly * dpi / 96) * width + lx * dpi / 96) * 4) as usize;
+                            [pixels[i], pixels[i + 1], pixels[i + 2]]
+                        };
+                        let mut black_footer = None;
+                        let mut white_footer = None;
+                        let mut unfocused_black_footer = None;
+                        let mut unfocused_white_footer = None;
+                        for (mode, focus, label) in [
+                            (0, ProofFocus::FocusedGlass, "black"),
+                            (1, ProofFocus::FocusedGlass, "white"),
+                            (2, ProofFocus::FocusedGlass, "edge"),
+                            (0, ProofFocus::UnfocusedGlass, "unfocused-black"),
+                            (1, ProofFocus::UnfocusedGlass, "unfocused-white"),
+                        ] {
+                            let focused = focus == ProofFocus::FocusedGlass;
+                            desktop.capture(app.hwnd, mode, focus, dc, width, height)?;
                             let pixels = std::slice::from_raw_parts(
                                 bits as *const u8,
                                 (width * height * 4) as usize,
                             );
-                            let status_i = ((((logical_height - 40) * dpi / 96) * width
-                                + 32 * dpi / 96)
-                                * 4) as usize;
-                            let footer_i = ((((logical_height - 40) * dpi / 96) * width
-                                + 12 * dpi / 96)
-                                * 4) as usize;
+                            let status_rgb = sample_rgb(pixels, 32, logical_height - 40);
+                            let footer_rgb = sample_rgb(pixels, 12, logical_height - 40);
+                            let header_rgb = sample_rgb(pixels, 12, 8);
                             for c in 0..3 {
                                 assert!(
-                                    pixels[status_i + c].abs_diff(pixels[footer_i + c]) <= 1,
+                                    status_rgb[c].abs_diff(footer_rgb[c]) <= 1,
                                     "empty status must match acrylic Ink footer"
                                 );
                             }
-                            if tab == visuals::Tab::Library {
-                                let x = 150 * dpi / 96;
-                                let y = 172 * dpi / 96;
-                                let i = ((y * width + x) * 4) as usize;
-                                let (b, g, r) = (pixels[i], pixels[i + 1], pixels[i + 2]);
+                            if focused && mode == 0 {
+                                black_footer = Some((footer_rgb, header_rgb));
+                            } else if focused && mode == 1 {
+                                white_footer = Some((footer_rgb, header_rgb));
+                            } else if !focused && mode == 0 {
+                                unfocused_black_footer = Some((footer_rgb, header_rgb));
+                            } else if !focused && mode == 1 {
+                                unfocused_white_footer = Some((footer_rgb, header_rgb));
+                            }
+                            if focused && tab == visuals::Tab::Library {
+                                let [b, g, r] = sample_rgb(pixels, 150, 172);
                                 assert!(
                                     r <= 0x48 && g <= 0x48 && b <= 0x48,
                                     "native typing must not wash out the search background: ({r}, {g}, {b})"
@@ -4934,6 +5216,58 @@ mod tests {
                                 proof_bmp(pixels, width, height),
                             )
                             .map_err(|e| e.to_string())?;
+                        }
+                        if let (Some((bf, bh)), Some((wf, wh))) = (black_footer, white_footer) {
+                            let footer_delta = (0..3)
+                                .map(|c| wf[c].saturating_sub(bf[c]))
+                                .max()
+                                .unwrap_or(0);
+                            let header_delta = (0..3)
+                                .map(|c| wh[c].saturating_sub(bh[c]))
+                                .max()
+                                .unwrap_or(0);
+                            assert!(
+                                footer_delta >= 12 && header_delta >= 12,
+                                "focused acrylic must transmit behind-window luminance (footer black={bf:?} white={wf:?}, header black={bh:?} white={wh:?})"
+                            );
+                        }
+                        if let (Some((bf, bh)), Some((wf, wh))) =
+                            (unfocused_black_footer, unfocused_white_footer)
+                        {
+                            let footer_delta = (0..3)
+                                .map(|c| wf[c].saturating_sub(bf[c]))
+                                .max()
+                                .unwrap_or(0);
+                            let header_delta = (0..3)
+                                .map(|c| wh[c].saturating_sub(bh[c]))
+                                .max()
+                                .unwrap_or(0);
+                            assert!(
+                                footer_delta >= 12 && header_delta >= 12,
+                                "unfocused acrylic must keep transmitting behind-window luminance instead of turning #2B2B2B grey (footer black={bf:?} white={wf:?}, header black={bh:?} white={wh:?})"
+                            );
+                        }
+                        if tab == visuals::Tab::Library && logical_width == 920 {
+                            visuals::disable_backdrop(app.hwnd);
+                            desktop.capture(
+                                app.hwnd,
+                                1,
+                                ProofFocus::FocusedOpaque,
+                                dc,
+                                width,
+                                height,
+                            )?;
+                            let pixels = std::slice::from_raw_parts(
+                                bits as *const u8,
+                                (width * height * 4) as usize,
+                            );
+                            let header_off = sample_rgb(pixels, 12, 8);
+                            let footer_off = sample_rgb(pixels, 12, logical_height - 40);
+                            assert!(
+                                header_off.iter().all(|c| c.abs_diff(0x11) <= 2)
+                                    && footer_off.iter().all(|c| c.abs_diff(0x11) <= 2),
+                                "disabled transparency fallback must stay solid #111111, got header={header_off:?} footer={footer_off:?}"
+                            );
                         }
                         if tab == visuals::Tab::Library {
                             app.text(visuals::SEARCH, "");
@@ -4955,18 +5289,7 @@ mod tests {
                         );
                         let _ = ShowWindow(app.hwnd, SW_HIDE);
                     }
-                    let none = windows::Win32::Graphics::Dwm::DWMSBT_NONE.0;
-                    let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
-                        app.hwnd,
-                        windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,
-                        (&none as *const i32).cast(),
-                        std::mem::size_of_val(&none) as u32,
-                    );
-                    let _ = windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea(
-                        app.hwnd,
-                        &windows::Win32::UI::Controls::MARGINS::default(),
-                    );
-                    let _ = RemovePropW(app.hwnd, w!("WallpaperLive.Glass"));
+                    visuals::disable_backdrop(app.hwnd);
                     SelectObject(dc, previous);
                     let _ = DeleteObject(bitmap);
                     let _ = DeleteDC(dc);
@@ -5738,5 +6061,178 @@ mod tests {
         assert!(is_shell_class(&progman));
         assert!(is_shell_class(&tray));
         assert!(!is_shell_class(&app_win));
+    }
+
+    #[test]
+    fn ordered_thumbnail_paths_prioritizes_current_selected_and_adjacent_pages() {
+        let mut app = fixture();
+        app.tab = visuals::Tab::Library;
+        app.sort = crate::library::Sort::Newest;
+        app.library = (0..30)
+            .map(|i| PathBuf::from(format!(r"C:\wallpapers\clip-{i:02}.mp4")))
+            .collect();
+        app.page = 1;
+        app.selected = Some(app.library[28].clone());
+
+        assert!(app.ordered_thumbnail_paths(false).is_empty());
+
+        let ordered = app.ordered_thumbnail_paths(true);
+        assert_eq!(ordered.len(), 30);
+        // First 9 items match current page 1 (`9..18`).
+        assert_eq!(&ordered[0..9], &app.library[9..18]);
+        // Selected item outside page 1 is queued immediately after the visible page.
+        assert_eq!(ordered[9], app.library[28]);
+        // Next and previous adjacent pages (`page + 1` = `18..27`, `page - 1` = `0..9`) follow.
+        assert_eq!(&ordered[10..19], &app.library[18..27]);
+        assert_eq!(&ordered[19..28], &app.library[0..9]);
+        // Remaining page 3 items (`27`, `29`) complete without duplicating `selected` (`28`).
+        assert_eq!(ordered[28], app.library[27]);
+        assert_eq!(ordered[29], app.library[29]);
+
+        // Cap respects `visuals::MAX_CACHED_THUMBNAILS` when library exceeds cache capacity.
+        app.library = (0..visuals::MAX_CACHED_THUMBNAILS + 25)
+            .map(|i| PathBuf::from(format!(r"C:\wallpapers\extra-{i:03}.mp4")))
+            .collect();
+        app.page = 0;
+        app.selected = None;
+        let capped = app.ordered_thumbnail_paths(true);
+        assert_eq!(capped.len(), visuals::MAX_CACHED_THUMBNAILS);
+
+        app.tab = visuals::Tab::Settings;
+        assert!(app.ordered_thumbnail_paths(true).is_empty());
+    }
+
+    #[test]
+    fn custom_frame_window_proc_preserves_top_and_routes_caption_hittest() {
+        // SAFETY: isolated test window class registered and destroyed solely within this test.
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("module handle");
+            let class_name = w!("WallpaperLive.CustomFrameTest");
+            let atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            });
+            assert!(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+            let hwnd = CreateWindowExW(
+                WS_EX_CONTROLPARENT | WS_EX_NOACTIVATE,
+                class_name,
+                w!("WallpaperLive Frame Test"),
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                100,
+                100,
+                1040,
+                720,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("custom frame test window");
+
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+
+            // WM_NCCALCSIZE preserves rgrc[0].top while keeping native side/bottom resize insets.
+            let initial = RECT {
+                left: 100,
+                top: 100,
+                right: 1140,
+                bottom: 820,
+            };
+            let mut params = NCCALCSIZE_PARAMS {
+                rgrc: [initial, RECT::default(), RECT::default()],
+                lppos: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                SendMessageW(
+                    hwnd,
+                    WM_NCCALCSIZE,
+                    WPARAM(1),
+                    LPARAM((&mut params as *mut NCCALCSIZE_PARAMS) as isize),
+                ),
+                LRESULT(0)
+            );
+            assert_eq!(params.rgrc[0].top, initial.top);
+            assert!(params.rgrc[0].bottom < initial.bottom);
+            assert!(params.rgrc[0].left > initial.left);
+            assert!(params.rgrc[0].right < initial.right);
+
+            // WM_NCACTIVATE keeps the custom dark frame stable across inactive/active transitions.
+            assert_eq!(
+                SendMessageW(hwnd, WM_NCACTIVATE, WPARAM(0), LPARAM(0)),
+                LRESULT(1)
+            );
+            assert_eq!(
+                SendMessageW(hwnd, WM_NCACTIVATE, WPARAM(1), LPARAM(0)),
+                LRESULT(1)
+            );
+
+            // WM_GETMINMAXINFO excludes OS titlebar height from ptMinTrackSize.y.
+            let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            let mut full_frame = RECT {
+                left: 0,
+                top: 0,
+                right: visuals::MIN_CLIENT_WIDTH * dpi / 96,
+                bottom: visuals::MIN_CLIENT_HEIGHT * dpi / 96,
+            };
+            let _ = AdjustWindowRectExForDpi(
+                &mut full_frame,
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                false,
+                WS_EX_CONTROLPARENT,
+                dpi as u32,
+            );
+            let mut minmax = MINMAXINFO::default();
+            assert_eq!(
+                SendMessageW(
+                    hwnd,
+                    WM_GETMINMAXINFO,
+                    WPARAM(0),
+                    LPARAM((&mut minmax as *mut MINMAXINFO) as isize),
+                ),
+                LRESULT(0)
+            );
+            assert!(minmax.ptMinTrackSize.y >= visuals::MIN_CLIENT_HEIGHT * dpi / 96);
+            assert!(minmax.ptMinTrackSize.y < full_frame.bottom - full_frame.top);
+
+            // WM_NCHITTEST routes top border -> HTTOP, caption button center -> HTCLIENT, drag strip -> HTCAPTION.
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let send_hittest = |x: i32, y: i32| -> LRESULT {
+                let mut pt = POINT { x, y };
+                assert!(ClientToScreen(hwnd, &mut pt).as_bool());
+                let packed =
+                    ((pt.x as i16 as u16) as usize) | (((pt.y as i16 as u16) as usize) << 16);
+                SendMessageW(hwnd, WM_NCHITTEST, WPARAM(0), LPARAM(packed as isize))
+            };
+            assert_eq!(send_hittest(client.right / 2, 1), LRESULT(HTTOP as isize));
+
+            let layout =
+                visuals::Layout::new(client.right * 96 / dpi, client.bottom.max(1) * 96 / dpi);
+            let (_, close_rect) = layout.caption_buttons[2];
+            let close_x = ((close_rect.left + close_rect.right) / 2) * dpi / 96;
+            let close_y = ((close_rect.top + close_rect.bottom) / 2) * dpi / 96;
+            assert_eq!(send_hittest(close_x, close_y), LRESULT(HTCLIENT as isize));
+
+            let header_mid_y = (visuals::HEADER_HEIGHT * dpi / 96) / 2;
+            assert_eq!(
+                send_hittest(client.right / 2, header_mid_y),
+                LRESULT(HTCAPTION as isize)
+            );
+
+            let _ = DestroyWindow(hwnd);
+            if atom != 0 {
+                let _ = UnregisterClassW(class_name, instance);
+            }
+        }
     }
 }
