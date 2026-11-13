@@ -15,20 +15,24 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- Native acrylic across the window background (header, canvas, and footer) on Windows 11 build 22621 or newer.
+- Native dark Ink Acrylic backdrop across the window background (header, canvas, and footer) via `SetWindowCompositionAttribute` (`WCA_ACCENT_POLICY`, dark tint `0x3e11_1111`), keeping glass blur translucent even when unfocused, with a `DWMSBT_TRANSIENTWINDOW` fallback where `SetWindowCompositionAttribute` is unavailable.
+- Architectural `1px` dividers (`DIVIDER_ALPHA 128`) along the top edge, header/footer seams, sidebar column/actions split, Settings group action headers, and Sources bottom guidance bar.
 - Rounded Library/Settings tabs, right-aligned 3D pill toggle switches in Settings, and a Saweria support link alongside Buy me a coffee.
 - Custom rounded Acrylic popup dropdowns (`WallpaperLive.Dropdown`, matching/exceeding selector width on toolbar/sidebar pickers and used on library tile context menus, falling back to system menus in High Contrast).
-- Short ease-out UI transitions for Library page slides (`190ms`), Library/Settings/Sources tab cross-slides (`200ms`), pill toggle travel (`150ms`), hover lift, and dropdown reveal (`120ms`), driven by an on-demand 16ms timer that disarms immediately when idle and drops temporary layer buffers on settle.
+- Short ease-out UI transitions for Library page slides (`220ms`), Library/Settings/Sources tab cross-slides (`230ms`, pill `210ms`), pill toggle travel (`150ms`), and dropdown reveal, driven by an on-demand `10ms` timer scoped with `winmm` `timeBeginPeriod(1)`/`timeEndPeriod(1)` that runs whenever the window is visible and non-minimized (ignoring OS Reduce Motion) and drops temporary layer buffers on settle.
 
 ### Changed
 
-- Lower panel/canvas over-tinting on Windows 11 Acrylic (`PANEL_ALPHA 0` across header/canvas/footer with `DIVIDER_ALPHA 72`, frosted Card groups `CARD_ALPHA 56`, controls `84`, hover `112`, active tiles `118`, focal Orange `232`, glass rims/borders `152`, layered Search `180`, and dropdowns `116`) so native `DWMSBT_TRANSIENTWINDOW` blur shows seamlessly underneath the titlebar without a top-edge seam.
+- Tune dark Ink Acrylic translucency and contrast balance (`PANEL_ALPHA 0` across header/canvas/footer, frosted Card groups `CARD #302f2d` at `CARD_ALPHA 92`, controls `128`, hover `172`, active tiles `188`, focal Orange `244`, glass rims/borders `196`, layered Search `204`, dropdowns `148`, sharper `LINE`/`HIGHLIGHT`/`GLASS_RIM` mixes and brighter `MUTED`/`DISABLED_TEXT` typography) so glass blur stays noticeably transparent while text, buttons, cards, and active states stand out clearly.
+- Composite page and tab slides with integer fixed-point horizontal subpixel sampling (`w_old + w_new = 256`), synchronous `RedrawWindow` ticks, and `SWP_NOREDRAW` child updates during transition capture setup to eliminate discrete-pixel slide jitter and flash frames.
+- Retain up to `72` decoded thumbnails (`MAX_CACHED_THUMBNAILS = 72`) in an LRU cache across Library page and tab switches, preserving selected and visible items instead of reloading thumbnails on Next/Previous (still clearing the cache when minimized to tray).
+- Respect Windows `EnableTransparency` (`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`) and `SPI_GETHIGHCONTRAST`, updating live on `WM_SETTINGCHANGE`, `WM_THEMECHANGED`, `WM_DWMCOLORIZATIONCOLORCHANGED`, and `WM_DWMCOMPOSITIONCHANGED` so turning OS transparency effects off cleanly restores WallpaperLive's `#111111` Ink Black dark theme instead of DWM solid grey.
 - Add 3D glass depth (top specular catchlights, bottom rim shadows, pressed bevel inversion, hover tracking via `TME_LEAVE`, and raised 3D spherical toggle knobs) while keeping video thumbnails, active badges, and Cream typography sharp.
 - Match label, toggle switch, and unselected status surfaces to their acrylic or card host alpha so no rectangular patches appear behind text or rounded overlays, and mask backgrounds before drawing composited labels and vector glyphs.
 
 ### Fixed
 
-- Preserve DWM acrylic across minimize/restore (`paint_into`, `draw_item`, and `paint_control_into` ignore `IsIconic`/empty rects instead of calling `disable_backdrop`, `WM_SIZE` ignores `SIZE_MINIMIZED` so cached page thumbnails stay warm, and restore/show refreshes `enable_backdrop`).
+- Preserve DWM/composition acrylic across unfocus and minimize/restore (`paint_into`, `draw_item`, and `paint_control_into` ignore `IsIconic`/empty rects instead of calling `disable_backdrop`, `DWMWA_SYSTEMBACKDROP_TYPE` resets to `DWMSBT_NONE` so DWM never substitutes solid grey on deactivation, `WM_SIZE` ignores `SIZE_MINIMIZED` so cached page thumbnails stay warm, and restore/show refreshes `enable_backdrop`).
 - Keep live wallpapers paused in place (retaining the last rendered video frame while trimming resident working-set memory) when maximizing windows, entering fullscreen apps, or running on battery so returning to the desktop resumes immediately without reload flicker; release decoders to `Dormant` only for off-screen session states (`locked`, `remote`, `disconnected`, `suspended`, `display_off`).
 - Supply premultiplied alpha for layered acrylic panels, frosted buttons/tiles, and rounded card SDF masking (`apply_rounded_rect_mask`), keeping media and focal controls crisp without opaque corner artifacts; no global window opacity or bitmap tint.
 - Replace residual corner fills on rounded buttons, tabs, tiles, and pager controls using host-aware SDF corner masking and `CS_PARENTDC` removal without altering button hit-testing.
@@ -41,7 +45,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
 ### Verification and limits
 
 - The opt-in desktop fixture checks acrylic background/status alignment, opaque card/search pixels, minimize/restore backdrop persistence, and captures Library, Settings, and Sources over controlled black, white, and hard-edge backgrounds at two sizes. Background test patterns are not part of the UI.
-- Hardware-dependent acrylic is not promised on Windows 10 or when Windows disables transparency; on Windows 11, DWM `DWMSBT_TRANSIENTWINDOW` intentionally drops blur to a solid fallback surface when the window is inactive/unfocused (OS composition behavior that also saves GPU work in background state; popups use `WS_EX_NOACTIVATE` so opening a dropdown keeps the owner window blurred).
+- Focus-persistent Acrylic relies on `SetWindowCompositionAttribute` (plus `DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_NONE`); when Windows disables Transparency effects (`EnableTransparency == 0`) or enables High Contrast, WallpaperLive disables composition backdrop and renders its `#111111` Ink Black + `#302f2d` Card dark theme instead of DWM's default grey fallback.
 - Build testing uses GitHub Actions artifacts only; no v0.2.0 tag or GitHub Release is created by this UI fix.
 
 ---

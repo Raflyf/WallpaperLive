@@ -7,9 +7,14 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::*,
+        System::{
+            LibraryLoader::{GetModuleHandleW, GetProcAddress},
+            Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
+        },
         UI::{
+            Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
             Controls::{
                 BP_PAINTPARAMS, BPBF_TOPDOWNDIB, BPPF_ERASE, BeginBufferedPaint, BufferedPaintInit,
                 BufferedPaintSetAlpha, BufferedPaintUnInit, CloseThemeData, DRAWITEMSTRUCT,
@@ -23,8 +28,14 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::w,
+    core::{s, w},
 };
+
+#[link(name = "winmm")]
+unsafe extern "system" {
+    fn timeBeginPeriod(uPeriod: u32) -> u32;
+    fn timeEndPeriod(uPeriod: u32) -> u32;
+}
 
 pub const TILE_BASE: usize = 400;
 pub const PREVIEW: usize = 115;
@@ -113,6 +124,9 @@ pub struct Layout {
     pub sources_panel: Rect,
     pub sources_title: Rect,
     pub sources_subtitle: Rect,
+    pub sidebar_divider: Option<Rect>,
+    pub settings_dividers: [Option<Rect>; 2],
+    pub sources_divider: Option<Rect>,
     pub tile_rects: [Rect; 9],
     controls: [(usize, Rect); 42],
 }
@@ -150,6 +164,7 @@ impl Layout {
         let display = r(side_x, display_label.bottom + 4, side_width, 32);
         let fit_label = r(side_x, display.bottom + 4, side_width, 16);
         let fit = r(side_x, fit_label.bottom + 4, side_width, 32);
+        let fps_bottom = fit.bottom + 46;
         let content_width = (width - 48).min(1040);
         let content_x = (width - content_width) / 2;
         let column_width = (content_width - 32) / 2;
@@ -157,6 +172,19 @@ impl Layout {
         let settings_note = r(content_x, 212, column_width, 40);
         let source_width = (width - 48).min(840);
         let source_x = (width - source_width) / 2;
+        let settings_preferences_panel =
+            r(content_x - 12, 172, column_width + 24, footer.top - 188);
+        let settings_resources_panel =
+            r(resources_x - 12, 172, column_width + 24, footer.top - 188);
+        let sources_panel = r(source_x - 12, 168, source_width + 24, footer.top - 188);
+        let sidebar_divider = (audio_y - fps_bottom >= 8)
+            .then(|| r(side_x, (fps_bottom + audio_y) / 2, side_width, 1));
+        let settings_dividers = [
+            (settings_preferences_panel.bottom > 442).then(|| r(content_x, 438, column_width, 1)),
+            (settings_resources_panel.bottom > 442).then(|| r(resources_x, 438, column_width, 1)),
+        ];
+        let sources_divider =
+            (sources_panel.bottom > 408).then(|| r(source_x, 404, source_width, 1));
         Self {
             client: r(0, 0, width, height),
             header: r(0, 0, width, HEADER_HEIGHT),
@@ -174,11 +202,14 @@ impl Layout {
             settings_subtitle: r(content_x, 136, content_width, 20),
             preferences_title: r(content_x, 184, column_width, 24),
             resources_title: r(resources_x, 184, column_width, 24),
-            settings_preferences_panel: r(content_x - 12, 172, column_width + 24, footer.top - 188),
-            settings_resources_panel: r(resources_x - 12, 172, column_width + 24, footer.top - 188),
-            sources_panel: r(source_x - 12, 168, source_width + 24, footer.top - 188),
+            settings_preferences_panel,
+            settings_resources_panel,
+            sources_panel,
             sources_title: r(source_x, 96, source_width - 196, 32),
             sources_subtitle: r(source_x, 136, source_width, 24),
+            sidebar_divider,
+            settings_dividers,
+            sources_divider,
             tile_rects,
             controls: [
                 (101, r(width - 272, 18, 118, 36)),
@@ -272,36 +303,38 @@ const fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
 pub const TEXT: u32 = CREAM;
 pub const TEXT_ON_DARK: u32 = CREAM;
 pub const TEXT_ON_ACCENT: u32 = INK;
-pub const MUTED: u32 = mix(CREAM, INK, 10, 100);
+pub const MUTED: u32 = mix(CREAM, INK, 6, 100);
 pub const MUTED_ON_DARK: u32 = MUTED;
 pub const ACCENT: u32 = ORANGE;
 pub const BODY: u32 = INK;
 pub const CANVAS: u32 = INK;
 pub const FOOTER: u32 = INK;
-pub const PANEL: u32 = mix(INK, CREAM, 6, 100);
-pub const CARD: u32 = mix(INK, CREAM, 8, 100);
-pub const CARD_LIT: u32 = mix(INK, CREAM, 14, 100);
-pub const LINE: u32 = mix(INK, CREAM, 24, 100);
-pub const HIGHLIGHT: u32 = mix(INK, CREAM, 38, 100);
-pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 48, 100);
-const DISABLED_FILL: u32 = mix(INK, CREAM, 4, 100);
-const DISABLED_BORDER: u32 = mix(INK, CREAM, 12, 100);
-pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 16, 100);
+pub const PANEL: u32 = mix(INK, CREAM, 8, 100);
+pub const CARD: u32 = mix(INK, CREAM, 14, 100);
+pub const CARD_LIT: u32 = mix(INK, CREAM, 23, 100);
+pub const LINE: u32 = mix(INK, CREAM, 34, 100);
+pub const HIGHLIGHT: u32 = mix(INK, CREAM, 50, 100);
+pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 34, 100);
+const DISABLED_FILL: u32 = mix(INK, CREAM, 8, 100);
+const DISABLED_BORDER: u32 = mix(INK, CREAM, 22, 100);
+pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 26, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
 pub const ACCENT_HOVER: u32 = mix(ORANGE, CREAM, 12, 100);
-pub const GLASS_RIM: u32 = mix(INK, CREAM, 46, 100);
+pub const GLASS_RIM: u32 = mix(INK, CREAM, 64, 100);
 pub const PANEL_ALPHA: u8 = 0;
-pub const CARD_ALPHA: u8 = 56;
-const CONTROL_ALPHA: u8 = 84;
-const HOVER_ALPHA: u8 = 112;
-const ACTIVE_TILE_ALPHA: u8 = 118;
-const ACTIVE_ALPHA: u8 = 232;
-pub const BORDER_ALPHA: u8 = 152;
-const DIVIDER_ALPHA: u8 = 72;
-const SEARCH_ALPHA: u8 = 180;
-pub const DROPDOWN_ALPHA: u8 = 116;
+pub const CARD_ALPHA: u8 = 92;
+const CONTROL_ALPHA: u8 = 128;
+const HOVER_ALPHA: u8 = 172;
+const ACTIVE_TILE_ALPHA: u8 = 188;
+const ACTIVE_ALPHA: u8 = 244;
+pub const BORDER_ALPHA: u8 = 196;
+const DIVIDER_ALPHA: u8 = 128;
+const SEARCH_ALPHA: u8 = 204;
+pub const DROPDOWN_ALPHA: u8 = 148;
+// Deep Ink Acrylic tint applied via SetWindowCompositionAttribute (kept blurred even when unfocused).
+const ACRYLIC_TINT_COLOR: u32 = 0x3e11_1111;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -392,16 +425,24 @@ impl Drop for Bitmap {
         }
     }
 }
+const MAX_CACHED_THUMBNAILS: usize = 72;
+
+struct ThumbEntry {
+    bitmap: Bitmap,
+    stamp: u64,
+}
+
 struct Skin {
     selected: Option<PathBuf>,
     marked: Vec<PathBuf>,
     playing: Vec<PathBuf>,
     library_empty: bool,
     tiles: HashMap<usize, PathBuf>,
-    thumbnails: HashMap<PathBuf, Bitmap>,
+    thumbnails: HashMap<PathBuf, ThumbEntry>,
+    thumb_seq: u64,
     tab: Tab,
 }
-thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:Vec::new(),library_empty:true,tiles:HashMap::new(),thumbnails:HashMap::new(),tab:Tab::Library});}
+thread_local! {static SKIN:RefCell<Skin>=RefCell::new(Skin{selected:None,marked:Vec::new(),playing:Vec::new(),library_empty:true,tiles:HashMap::new(),thumbnails:HashMap::new(),thumb_seq:0,tab:Tab::Library});}
 pub fn library_empty(value: bool) {
     SKIN.with(|s| s.borrow_mut().library_empty = value);
 }
@@ -415,15 +456,33 @@ pub fn playing_all(paths: &[PathBuf]) {
     SKIN.with(|s| s.borrow_mut().playing = paths.to_vec());
 }
 pub fn selected(path: Option<PathBuf>) {
-    SKIN.with(|s| s.borrow_mut().selected = path);
+    SKIN.with(|s| {
+        let skin = &mut *s.borrow_mut();
+        if let Some(ref p) = path {
+            let next = skin.thumb_seq.wrapping_add(1);
+            if let Some(entry) = skin.thumbnails.get_mut(p) {
+                skin.thumb_seq = next;
+                entry.stamp = next;
+            }
+        }
+        skin.selected = path;
+    });
 }
 pub fn tiles(paths: &[PathBuf]) {
     SKIN.with(|s| {
-        s.borrow_mut().tiles = paths
+        let skin = &mut *s.borrow_mut();
+        skin.tiles = paths
             .iter()
             .enumerate()
             .map(|(i, p)| (TILE_BASE + i, p.clone()))
-            .collect()
+            .collect();
+        for p in paths {
+            let next = skin.thumb_seq.wrapping_add(1);
+            if let Some(entry) = skin.thumbnails.get_mut(p) {
+                skin.thumb_seq = next;
+                entry.stamp = next;
+            }
+        }
     });
 }
 pub fn has_thumbnail(path: &Path) -> bool {
@@ -448,29 +507,44 @@ pub fn thumbnail(path: PathBuf, image: HBITMAP) {
     }
     SKIN.with(|s| {
         let mut skin = s.borrow_mut();
-        if skin.thumbnails.len() >= 12 && !skin.thumbnails.contains_key(&path) {
+        if skin.thumbnails.len() >= MAX_CACHED_THUMBNAILS && !skin.thumbnails.contains_key(&path) {
             let victim = skin
                 .thumbnails
-                .keys()
-                .find(|p| {
+                .iter()
+                .filter(|(p, _)| {
                     Some(*p) != skin.selected.as_ref()
                         && !skin.tiles.values().any(|tile| tile == *p)
                 })
-                .or_else(|| skin.thumbnails.keys().next())
+                .min_by_key(|(_, entry)| entry.stamp)
+                .map(|(p, _)| p)
+                .or_else(|| {
+                    skin.thumbnails
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.stamp)
+                        .map(|(p, _)| p)
+                })
                 .cloned();
             if let Some(victim) = victim {
                 skin.thumbnails.remove(&victim);
             }
         }
-        skin.thumbnails.insert(path, image);
+        skin.thumb_seq = skin.thumb_seq.wrapping_add(1);
+        let stamp = skin.thumb_seq;
+        skin.thumbnails.insert(
+            path,
+            ThumbEntry {
+                bitmap: image,
+                stamp,
+            },
+        );
     });
 }
 pub const ANIM_TIMER_ID: usize = 3;
-const ANIM_INTERVAL_MS: u32 = 16;
-const TAB_ANIM_MS: u32 = 200;
+const ANIM_INTERVAL_MS: u32 = 10;
+const TAB_ANIM_MS: u32 = 210;
 const TOGGLE_ANIM_MS: u32 = 150;
-pub const PAGE_ANIM_MS: u32 = 190;
-pub const TAB_TRANSITION_MS: u32 = 200;
+pub const PAGE_ANIM_MS: u32 = 220;
+pub const TAB_TRANSITION_MS: u32 = 230;
 
 struct ToggleAnim {
     from: f32,
@@ -506,6 +580,7 @@ struct AnimState {
     toggles: HashMap<usize, ToggleAnim>,
     tab_slide: Option<TabSlideAnim>,
     transition: Option<TransitionAnim>,
+    timer_period_active: bool,
 }
 impl AnimState {
     fn has_active(&self) -> bool {
@@ -519,24 +594,12 @@ thread_local! {
 }
 
 pub fn animations_enabled(window: HWND) -> bool {
-    if window.0.is_null() {
-        return false;
-    }
-    // SAFETY: read-only visibility and OS client-area animation preference check.
-    unsafe {
-        if !IsWindowVisible(window).as_bool() {
-            return false;
-        }
-        let mut enabled = 1i32;
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            Some((&mut enabled as *mut i32).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-        .is_ok()
-            && enabled != 0
-    }
+    !window.0.is_null()
+        && unsafe { IsWindowVisible(window).as_bool() && !IsIconic(window).as_bool() }
+}
+
+pub fn has_transition() -> bool {
+    ANIM.with(|a| a.borrow().transition.is_some())
 }
 
 fn is_hot(window: HWND) -> bool {
@@ -545,6 +608,16 @@ fn is_hot(window: HWND) -> bool {
 
 fn arm_anim_timer(window: HWND) {
     if !window.0.is_null() {
+        ANIM.with(|a| {
+            let mut state = a.borrow_mut();
+            if !state.timer_period_active {
+                unsafe {
+                    if timeBeginPeriod(1) == 0 {
+                        state.timer_period_active = true;
+                    }
+                }
+            }
+        });
         unsafe {
             let _ = SetTimer(window, ANIM_TIMER_ID, ANIM_INTERVAL_MS, None);
         }
@@ -552,13 +625,21 @@ fn arm_anim_timer(window: HWND) {
 }
 
 fn disarm_timer_if_idle(window: HWND) {
-    if window.0.is_null() {
-        return;
-    }
     let active = ANIM.with(|a| a.borrow().has_active());
     if !active {
-        unsafe {
-            let _ = KillTimer(window, ANIM_TIMER_ID);
+        ANIM.with(|a| {
+            let mut state = a.borrow_mut();
+            if state.timer_period_active {
+                unsafe {
+                    let _ = timeEndPeriod(1);
+                }
+                state.timer_period_active = false;
+            }
+        });
+        if !window.0.is_null() {
+            unsafe {
+                let _ = KillTimer(window, ANIM_TIMER_ID);
+            }
         }
     }
 }
@@ -712,12 +793,16 @@ pub unsafe fn paint_children_into(
                 let y0 = child_rect.top.max(0);
                 let x1 = child_rect.right.min(w);
                 let y1 = child_rect.bottom.min(h);
+                let a = if glass_enabled(parent) {
+                    SEARCH_ALPHA
+                } else {
+                    255
+                };
                 let slice = std::slice::from_raw_parts_mut(bits, (w * h) as usize);
                 for y in y0..y1 {
                     let row = y as usize * w as usize;
                     for x in x0..x1 {
                         let px = slice[row + x as usize];
-                        let a = SEARCH_ALPHA;
                         let r_ch = premul_channel(((px >> 16) & 255) as u8, a);
                         let g_ch = premul_channel(((px >> 8) & 255) as u8, a);
                         let b_ch = premul_channel((px & 255) as u8, a);
@@ -862,7 +947,7 @@ pub fn begin_transition(
     });
     arm_anim_timer(window);
     unsafe {
-        let _ = InvalidateRect(window, Some(&clip), false);
+        let _ = RedrawWindow(window, Some(&clip), None, RDW_INVALIDATE | RDW_UPDATENOW);
     }
 }
 
@@ -949,7 +1034,7 @@ pub fn tick_animations(window: HWND) -> bool {
                 if let Ok(h) = GetDlgItem(window, tab_id as i32)
                     && !h.0.is_null()
                 {
-                    let _ = InvalidateRect(h, None, false);
+                    let _ = RedrawWindow(h, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                 }
             }
         }
@@ -957,13 +1042,13 @@ pub fn tick_animations(window: HWND) -> bool {
             if let Ok(h) = GetDlgItem(window, id as i32)
                 && !h.0.is_null()
             {
-                let _ = InvalidateRect(h, None, false);
+                let _ = RedrawWindow(h, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
             }
         }
         if let Some(anim) = finished_transition {
             end_transition(window, anim);
         } else if let Some(clip) = transition_clip {
-            let _ = InvalidateRect(window, Some(&clip), false);
+            let _ = RedrawWindow(window, Some(&clip), None, RDW_INVALIDATE | RDW_UPDATENOW);
         }
     }
     disarm_timer_if_idle(window);
@@ -977,13 +1062,22 @@ pub fn clear() {
     SKIN.with(|s| {
         let mut skin = s.borrow_mut();
         skin.thumbnails.clear();
+        skin.thumb_seq = 0;
         skin.tiles.clear();
         skin.selected = None;
         skin.marked.clear();
         skin.playing.clear();
         skin.library_empty = true;
     });
-    ANIM.with(|a| *a.borrow_mut() = AnimState::default());
+    ANIM.with(|a| {
+        let mut state = a.borrow_mut();
+        if state.timer_period_active {
+            unsafe {
+                let _ = timeEndPeriod(1);
+            }
+        }
+        *state = AnimState::default();
+    });
     BRUSHES.with(|b| {
         for (_, brush) in b.borrow_mut().drain() {
             unsafe {
@@ -1549,7 +1643,12 @@ impl PaintBuffer {
         }
         true
     }
-    unsafe fn composite_transition(&self, trans: &TransitionAnim, now: Instant) -> bool {
+    unsafe fn composite_transition(
+        &self,
+        trans: &TransitionAnim,
+        now: Instant,
+        glass_active: bool,
+    ) -> bool {
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
         let mut bits = std::ptr::null_mut();
@@ -1574,23 +1673,36 @@ impl PaintBuffer {
         let raw = (elapsed / trans.duration_ms as f32).clamp(0.0, 1.0);
         let ease = ease_out_cubic(raw);
         let clip_w = (trans.clip.right - trans.clip.left).max(1) as f32;
-        let slide = (28.0 * (clip_w / 640.0).clamp(0.8, 1.35)).round();
-        let dx_old = (trans.direction as f32 * slide * ease).round() as i32;
-        let dx_new = (-trans.direction as f32 * slide * (1.0 - ease)).round() as i32;
-        let w_old = (1.0 - ease * 1.25).clamp(0.0, 1.0);
-        let w_new = ease;
-        let sample = |layer: &CapturedLayer, lx: i32, ly: i32| -> (f32, f32, f32, f32) {
-            if lx < 0 || ly < 0 || lx >= layer.width || ly >= layer.height {
-                return (0.0, 0.0, 0.0, 0.0);
-            }
-            let px = layer.pixels[(ly * layer.width + lx) as usize];
-            (
-                ((px >> 16) & 255) as f32,
-                ((px >> 8) & 255) as f32,
-                (px & 255) as f32,
-                ((px >> 24) & 255) as f32,
-            )
-        };
+        let slide = 36.0 * (clip_w / 640.0).clamp(0.85, 1.35);
+        // Subpixel 256th-px shifts eliminate discrete integer pixel snapping / edge jitter.
+        let dx_old_fp = (trans.direction as f32 * slide * ease * 256.0).round() as i32;
+        let dx_new_fp = (-trans.direction as f32 * slide * (1.0 - ease) * 256.0).round() as i32;
+        let w_new = (ease * 256.0).round().clamp(0.0, 256.0) as u32;
+        let w_old = 256u32 - w_new;
+        let sample_subpixel_x =
+            |layer: &CapturedLayer, lx_fp: i32, ly: i32| -> (u32, u32, u32, u32) {
+                if ly < 0 || ly >= layer.height {
+                    return (0, 0, 0, 0);
+                }
+                let x0 = lx_fp >> 8;
+                let fx = (lx_fp & 255) as u32;
+                let inv = 256u32 - fx;
+                let row = (ly * layer.width) as usize;
+                let p0 = if x0 >= 0 && x0 < layer.width {
+                    layer.pixels[row + x0 as usize]
+                } else {
+                    0
+                };
+                let p1 = if x0 + 1 >= 0 && x0 + 1 < layer.width {
+                    layer.pixels[row + (x0 + 1) as usize]
+                } else {
+                    0
+                };
+                let mix_ch = |shift: u32| -> u32 {
+                    (((p0 >> shift) & 255) * inv + ((p1 >> shift) & 255) * fx + 128) >> 8
+                };
+                (mix_ch(16), mix_ch(8), mix_ch(0), mix_ch(24))
+            };
         let y0 = trans.clip.top.max(self.area.top);
         let y1 = trans.clip.bottom.min(self.area.bottom);
         let x0 = trans.clip.left.max(self.area.left);
@@ -1599,20 +1711,25 @@ impl PaintBuffer {
             let row = (y - self.area.top) as usize * stride as usize;
             let ly = y - trans.clip.top;
             for x in x0..x1 {
-                let lx = x - trans.clip.left;
-                let (or, og, ob, oa) = sample(&trans.old_layer, lx - dx_old, ly);
-                let (nr, ng, nb, na) = sample(&trans.new_layer, lx - dx_new, ly);
-                let out_a = (oa * w_old + na * w_new).round().clamp(0.0, 255.0) as u8;
+                let lx_fp = (x - trans.clip.left) << 8;
+                let (or, og, ob, oa) = sample_subpixel_x(&trans.old_layer, lx_fp - dx_old_fp, ly);
+                let (nr, ng, nb, na) = sample_subpixel_x(&trans.new_layer, lx_fp - dx_new_fp, ly);
+                let mut fr = (or * w_old + nr * w_new + 128) >> 8;
+                let mut fg = (og * w_old + ng * w_new + 128) >> 8;
+                let mut fb = (ob * w_old + nb * w_new + 128) >> 8;
+                let mut fa = ((oa * w_old + na * w_new + 128) >> 8).min(255);
                 let pixel = &mut pixels[row + (x - self.area.left) as usize];
-                pixel.rgbRed = (or * w_old + nr * w_new)
-                    .round()
-                    .clamp(0.0, f32::from(out_a)) as u8;
-                pixel.rgbGreen = (og * w_old + ng * w_new)
-                    .round()
-                    .clamp(0.0, f32::from(out_a)) as u8;
-                pixel.rgbBlue = (ob * w_old + nb * w_new)
-                    .round()
-                    .clamp(0.0, f32::from(out_a)) as u8;
+                if !glass_active {
+                    let inv = 255u32.saturating_sub(fa);
+                    fr = (fr + ((u32::from(pixel.rgbRed) * inv + 127) / 255)).min(255);
+                    fg = (fg + ((u32::from(pixel.rgbGreen) * inv + 127) / 255)).min(255);
+                    fb = (fb + ((u32::from(pixel.rgbBlue) * inv + 127) / 255)).min(255);
+                    fa = 255;
+                }
+                let out_a = fa as u8;
+                pixel.rgbRed = fr.min(fa) as u8;
+                pixel.rgbGreen = fg.min(fa) as u8;
+                pixel.rgbBlue = fb.min(fa) as u8;
                 pixel.rgbReserved = out_a;
             }
         }
@@ -2001,8 +2118,8 @@ unsafe fn draw_item_into(
                     raised_rounded(dc, r, card_color, card_border, card_highlight, ellipse);
                 }
                 if let Some(path) = path {
-                    if let Some(bitmap) = skin.thumbnails.get(path) {
-                        image(dc, bitmap.0, area);
+                    if let Some(entry) = skin.thumbnails.get(path) {
+                        image(dc, entry.bitmap.0, area);
                         if let Some(buffer) = buffer {
                             let _ = GdiFlush();
                             let _ = BufferedPaintSetAlpha(buffer.handle, Some(&area), 255);
@@ -2204,20 +2321,20 @@ unsafe fn draw_item_into(
         let fill_alpha = if !glass_active {
             255
         } else if disabled {
-            if is_card_host { 42 } else { 48 }
+            if is_card_host { 72 } else { 80 }
         } else if is_tab {
             let base_a = if pressed {
-                156
+                176
             } else if hot {
                 HOVER_ALPHA
             } else {
-                56
+                CARD_ALPHA
             };
             lerp_u8(base_a, ACTIVE_ALPHA, tab_weight)
         } else if primary {
             ACTIVE_ALPHA
         } else if pressed {
-            168
+            188
         } else if hot {
             HOVER_ALPHA
         } else {
@@ -2226,11 +2343,11 @@ unsafe fn draw_item_into(
         let border_alpha = if !glass_active || (primary && !disabled) {
             255
         } else if is_tab {
-            lerp_u8(if hot { 196 } else { BORDER_ALPHA }, 255, tab_weight)
+            lerp_u8(if hot { 216 } else { BORDER_ALPHA }, 255, tab_weight)
         } else if disabled {
-            96
+            132
         } else if hot || pressed {
-            208
+            224
         } else {
             BORDER_ALPHA
         };
@@ -2331,12 +2448,105 @@ unsafe fn draw_item_into(
     }
 }
 
+#[repr(C)]
+struct WindowCompositionAttribData {
+    attrib: u32,
+    pv_data: *mut std::ffi::c_void,
+    cb_data: usize,
+}
+
+#[repr(C)]
+struct AccentPolicy {
+    accent_state: u32,
+    accent_flags: u32,
+    gradient_color: u32,
+    animation_id: u32,
+}
+
+pub fn transparency_enabled() -> bool {
+    // SAFETY: read-only OS high-contrast flag and HKCU transparency registry setting.
+    unsafe {
+        let mut hc = HIGHCONTRASTW {
+            cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            ..Default::default()
+        };
+        if SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            Some((&mut hc as *mut HIGHCONTRASTW).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && hc.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
+        {
+            return false;
+        }
+        let mut enabled = 1u32;
+        let mut bytes = std::mem::size_of::<u32>() as u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("EnableTransparency"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut enabled as *mut u32).cast()),
+            Some(&mut bytes),
+        );
+        !(status.is_ok() && bytes == std::mem::size_of::<u32>() as u32 && enabled == 0)
+    }
+}
+
+unsafe fn set_acrylic_composition(window: HWND, enable: bool) -> bool {
+    type SetWindowCompositionAttributeFn =
+        unsafe extern "system" fn(HWND, *mut WindowCompositionAttribData) -> BOOL;
+    // SAFETY: user32.dll is permanently resident in GUI processes and stack buffers outlive the call.
+    unsafe {
+        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else {
+            return false;
+        };
+        let Some(proc_addr) = GetProcAddress(user32, s!("SetWindowCompositionAttribute")) else {
+            return false;
+        };
+        let func: SetWindowCompositionAttributeFn = std::mem::transmute(proc_addr);
+        let mut policy = AccentPolicy {
+            accent_state: if enable { 4 } else { 0 },
+            accent_flags: if enable { 0 } else { 2 },
+            gradient_color: if enable { ACRYLIC_TINT_COLOR } else { 0 },
+            animation_id: 0,
+        };
+        let mut data = WindowCompositionAttribData {
+            attrib: 0x13,
+            pv_data: (&mut policy as *mut AccentPolicy).cast(),
+            cb_data: std::mem::size_of::<AccentPolicy>(),
+        };
+        func(window, &mut data).as_bool()
+    }
+}
+
+unsafe fn sync_search_alpha(parent: HWND, search: HWND) {
+    if search.0.is_null() {
+        return;
+    }
+    let alpha = if !parent.0.is_null() && glass_enabled(parent) {
+        SEARCH_ALPHA
+    } else {
+        255
+    };
+    unsafe {
+        let _ = SetLayeredWindowAttributes(search, COLORREF(0), alpha, LWA_ALPHA);
+    }
+}
+
 pub fn enable_backdrop(window: HWND) -> bool {
     use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
-    // SAFETY: all attributes and the property belong to this top-level HWND.
+    if window.0.is_null() {
+        return false;
+    }
+    // SAFETY: all attributes, composition flags, and properties belong to this window HWND.
     unsafe {
         let dark = 1i32;
         let round = DWMWCP_ROUND.0;
+        let none = DWMSBT_NONE.0;
         let acrylic = DWMSBT_TRANSIENTWINDOW.0;
         let _ = DwmSetWindowAttribute(
             window,
@@ -2350,25 +2560,40 @@ pub fn enable_backdrop(window: HWND) -> bool {
             (&round as *const i32).cast(),
             std::mem::size_of_val(&round) as u32,
         );
-        let enabled = PAINT_RUNTIME.with(|runtime| runtime.initialized)
-            && DwmIsCompositionEnabled().is_ok_and(|value| value.as_bool())
-            && DwmSetWindowAttribute(
-                window,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                (&acrylic as *const i32).cast(),
-                std::mem::size_of_val(&acrylic) as u32,
-            )
-            .is_ok()
-            && DwmExtendFrameIntoClientArea(
-                window,
-                &MARGINS {
-                    cxLeftWidth: -1,
-                    cxRightWidth: -1,
-                    cyTopHeight: -1,
-                    cyBottomHeight: -1,
-                },
-            )
-            .is_ok()
+        let can_glass = PAINT_RUNTIME.with(|runtime| runtime.initialized)
+            && transparency_enabled()
+            && DwmIsCompositionEnabled().is_ok_and(|value| value.as_bool());
+        if !can_glass {
+            disable_backdrop(window);
+            return false;
+        }
+        // Clear DWMSBT_TRANSIENTWINDOW first so DWM never replaces Acrylic with solid grey when unfocused.
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&none as *const i32).cast(),
+            std::mem::size_of_val(&none) as u32,
+        );
+        let frame_ok = DwmExtendFrameIntoClientArea(
+            window,
+            &MARGINS {
+                cxLeftWidth: -1,
+                cxRightWidth: -1,
+                cyTopHeight: -1,
+                cyBottomHeight: -1,
+            },
+        )
+        .is_ok();
+        let backdrop_ok = frame_ok
+            && (set_acrylic_composition(window, true)
+                || DwmSetWindowAttribute(
+                    window,
+                    DWMWA_SYSTEMBACKDROP_TYPE,
+                    (&acrylic as *const i32).cast(),
+                    std::mem::size_of_val(&acrylic) as u32,
+                )
+                .is_ok());
+        let enabled = backdrop_ok
             && SetPropW(
                 window,
                 GLASS_PROPERTY,
@@ -2377,8 +2602,12 @@ pub fn enable_backdrop(window: HWND) -> bool {
             .is_ok();
         if !enabled {
             disable_backdrop(window);
+            return false;
         }
-        enabled
+        if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
+            sync_search_alpha(window, search);
+        }
+        true
     }
 }
 
@@ -2387,6 +2616,7 @@ fn disable_backdrop(window: HWND) {
     unsafe {
         let was_enabled = glass_enabled(window);
         let _ = RemovePropW(window, GLASS_PROPERTY);
+        let _ = set_acrylic_composition(window, false);
         let none = DWMSBT_NONE.0;
         let _ = DwmSetWindowAttribute(
             window,
@@ -2395,6 +2625,9 @@ fn disable_backdrop(window: HWND) {
             std::mem::size_of_val(&none) as u32,
         );
         let _ = DwmExtendFrameIntoClientArea(window, &MARGINS::default());
+        if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
+            sync_search_alpha(window, search);
+        }
         if was_enabled {
             let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
         }
@@ -2431,15 +2664,7 @@ pub unsafe fn paint_into(window: HWND, target: HDC) {
             };
             let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
             let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
-            let rendered = paint_scene(
-                window,
-                buffer.dc,
-                if glass && theme.0 != 0 {
-                    Some(&buffer)
-                } else {
-                    None
-                },
-            );
+            let rendered = paint_scene(window, buffer.dc, Some(&buffer), glass && theme.0 != 0);
             TEXT_THEME.with(|slot| slot.set(old_theme));
             GLASS_BUFFER.with(|slot| slot.set(old_buffer));
             if theme.0 != 0 {
@@ -2454,11 +2679,16 @@ pub unsafe fn paint_into(window: HWND, target: HDC) {
             }
         }
         disable_backdrop(window);
-        paint_scene(window, target, None);
+        paint_scene(window, target, None, false);
     }
 }
 
-unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> bool {
+unsafe fn paint_scene(
+    window: HWND,
+    dc: HDC,
+    buffer: Option<&PaintBuffer>,
+    glass_active: bool,
+) -> bool {
     // SAFETY: caller supplies a valid drawing HDC; this function owns no paint session.
     unsafe {
         let mut client = RECT::default();
@@ -2477,32 +2707,52 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
                 .as_ref()
                 .map_or((false, false), |t| (true, t.covers_body))
         });
+        let divider_px = scale(1).max(1);
+        let divider_color = if glass_active { GLASS_RIM } else { LINE };
+        let top_divider = rect(0, 0, scale(layout.client.right), divider_px);
+        let header_divider = rect(
+            0,
+            scale(layout.header.bottom) - divider_px,
+            scale(layout.client.right),
+            scale(layout.header.bottom),
+        );
+        let footer_divider = rect(
+            0,
+            scale(layout.footer.top),
+            scale(layout.client.right),
+            scale(layout.footer.top) + divider_px,
+        );
+        let side_divider = rect(
+            scale(layout.sidebar.left),
+            scale(layout.header.bottom),
+            scale(layout.sidebar.left) + divider_px,
+            scale(layout.footer.top),
+        );
+        let h_divider = |r: Rect| {
+            rect(
+                scale(r.left),
+                scale(r.top),
+                scale(r.right),
+                scale(r.top) + divider_px,
+            )
+        };
+        let side_inner_divider = layout.sidebar_divider.map(h_divider);
+        let prefs_divider = layout.settings_dividers[0].map(h_divider);
+        let resources_divider = layout.settings_dividers[1].map(h_divider);
+        let sources_divider = layout.sources_divider.map(h_divider);
+
         fill(dc, pixels(layout.client), BODY);
         fill(dc, pixels(layout.header), BODY);
-        fill(
-            dc,
-            rect(
-                0,
-                scale(layout.header.bottom - 1),
-                scale(layout.client.right),
-                scale(layout.header.bottom),
-            ),
-            LINE,
-        );
+        fill(dc, top_divider, divider_color);
+        fill(dc, header_divider, divider_color);
         if !covers_body {
             match tab {
                 Tab::Library => {
                     fill(dc, pixels(layout.sidebar), CARD);
-                    fill(
-                        dc,
-                        rect(
-                            scale(layout.sidebar.left),
-                            scale(layout.header.bottom),
-                            scale(layout.sidebar.left + 1),
-                            scale(layout.footer.top),
-                        ),
-                        LINE,
-                    );
+                    fill(dc, side_divider, divider_color);
+                    if let Some(div) = side_inner_divider {
+                        fill(dc, div, divider_color);
+                    }
                 }
                 Tab::Settings => {
                     raised_rounded(
@@ -2521,6 +2771,12 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
                         HIGHLIGHT,
                         scale(12),
                     );
+                    if let Some(div) = prefs_divider {
+                        fill(dc, div, divider_color);
+                    }
+                    if let Some(div) = resources_divider {
+                        fill(dc, div, divider_color);
+                    }
                 }
                 Tab::Sources => {
                     raised_rounded(
@@ -2531,87 +2787,81 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
                         HIGHLIGHT,
                         scale(12),
                     );
+                    if let Some(div) = sources_divider {
+                        fill(dc, div, divider_color);
+                    }
                 }
             }
         }
         fill(dc, pixels(layout.footer), FOOTER);
-        fill(
-            dc,
-            rect(
-                0,
-                scale(layout.footer.top),
-                scale(layout.client.right),
-                scale(layout.footer.top + 1),
-            ),
-            LINE,
-        );
-        if let Some(buffer) = glass {
-            let header_divider = rect(
-                0,
-                scale(layout.header.bottom - 1),
-                scale(layout.client.right),
-                scale(layout.header.bottom),
-            );
-            let footer_divider = rect(
-                0,
-                scale(layout.footer.top),
-                scale(layout.client.right),
-                scale(layout.footer.top + 1),
-            );
-            let div_ok = buffer.tint_background(header_divider, DIVIDER_ALPHA)
-                && buffer.tint_background(footer_divider, DIVIDER_ALPHA);
-            let card_mask = RoundedMask {
-                ellipse: scale(12),
-                border: LINE,
-                border_width: 1.0,
-                border_alpha: BORDER_ALPHA,
-                fill_alpha: CARD_ALPHA,
-                focus: 0,
-                focus_inset: 0.0,
-                host_color: INK,
-                host_alpha: PANEL_ALPHA,
-                top_rim: GLASS_RIM,
-                bottom_rim: INK,
-                sheen_strength: 0.0,
-            };
-            let panel_ok = if covers_body {
-                true
-            } else {
-                match tab {
-                    Tab::Library => {
-                        let side_divider = rect(
-                            scale(layout.sidebar.left),
-                            scale(layout.header.bottom),
-                            scale(layout.sidebar.left + 1),
-                            scale(layout.footer.top),
-                        );
-                        buffer.tint_background(side_divider, DIVIDER_ALPHA)
-                            && buffer.tint_background(pixels(layout.sidebar), CARD_ALPHA)
+        fill(dc, footer_divider, divider_color);
+        if let Some(buffer) = buffer {
+            if glass_active {
+                let div_ok = buffer.tint_background(top_divider, DIVIDER_ALPHA)
+                    && buffer.tint_background(header_divider, DIVIDER_ALPHA)
+                    && buffer.tint_background(footer_divider, DIVIDER_ALPHA);
+                let card_mask = RoundedMask {
+                    ellipse: scale(12),
+                    border: LINE,
+                    border_width: 1.0,
+                    border_alpha: BORDER_ALPHA,
+                    fill_alpha: CARD_ALPHA,
+                    focus: 0,
+                    focus_inset: 0.0,
+                    host_color: INK,
+                    host_alpha: PANEL_ALPHA,
+                    top_rim: GLASS_RIM,
+                    bottom_rim: INK,
+                    sheen_strength: 0.0,
+                };
+                let panel_ok = if covers_body {
+                    true
+                } else {
+                    match tab {
+                        Tab::Library => {
+                            let inner_ok = side_inner_divider
+                                .is_none_or(|d| buffer.tint_background(d, DIVIDER_ALPHA));
+                            inner_ok
+                                && buffer.tint_background(side_divider, DIVIDER_ALPHA)
+                                && buffer.tint_background(pixels(layout.sidebar), CARD_ALPHA)
+                        }
+                        Tab::Settings => {
+                            let p_div_ok = prefs_divider
+                                .is_none_or(|d| buffer.tint_background(d, DIVIDER_ALPHA));
+                            let r_div_ok = resources_divider
+                                .is_none_or(|d| buffer.tint_background(d, DIVIDER_ALPHA));
+                            p_div_ok
+                                && r_div_ok
+                                && buffer.apply_rounded_rect_mask(
+                                    pixels(layout.settings_preferences_panel),
+                                    &card_mask,
+                                )
+                                && buffer.apply_rounded_rect_mask(
+                                    pixels(layout.settings_resources_panel),
+                                    &card_mask,
+                                )
+                        }
+                        Tab::Sources => {
+                            let s_div_ok = sources_divider
+                                .is_none_or(|d| buffer.tint_background(d, DIVIDER_ALPHA));
+                            s_div_ok
+                                && buffer.apply_rounded_rect_mask(
+                                    pixels(layout.sources_panel),
+                                    &card_mask,
+                                )
+                        }
                     }
-                    Tab::Settings => {
-                        buffer.apply_rounded_rect_mask(
-                            pixels(layout.settings_preferences_panel),
-                            &card_mask,
-                        ) && buffer.apply_rounded_rect_mask(
-                            pixels(layout.settings_resources_panel),
-                            &card_mask,
-                        )
-                    }
-                    Tab::Sources => {
-                        buffer.apply_rounded_rect_mask(pixels(layout.sources_panel), &card_mask)
-                    }
+                };
+                // Window canvas, elevated cards, and dividers all transmit the acrylic backdrop at layered alpha levels.
+                if !div_ok || !panel_ok || !buffer.tint_background(client, PANEL_ALPHA) {
+                    return false;
                 }
-            };
-            // Window canvas, elevated cards, and dividers all transmit the acrylic backdrop at layered alpha levels.
-            if !div_ok || !panel_ok || !buffer.tint_background(client, PANEL_ALPHA) {
-                return false;
             }
             if has_transition {
                 let comp_ok = ANIM.with(|a| {
-                    a.borrow()
-                        .transition
-                        .as_ref()
-                        .is_none_or(|t| buffer.composite_transition(t, Instant::now()))
+                    a.borrow().transition.as_ref().is_none_or(|t| {
+                        buffer.composite_transition(t, Instant::now(), glass_active)
+                    })
                 });
                 if !comp_ok {
                     return false;
@@ -2804,8 +3054,8 @@ pub fn prepare_control(window: HWND) -> Result<(), String> {
             // Native editing, selection and caret repaint outside WM_PAINT; composite this child with frosted alpha.
             let extended = GetWindowLongPtrW(window, GWL_EXSTYLE);
             SetWindowLongPtrW(window, GWL_EXSTYLE, extended | WS_EX_LAYERED.0 as isize);
-            SetLayeredWindowAttributes(window, COLORREF(0), SEARCH_ALPHA, LWA_ALPHA)
-                .map_err(|error| error.to_string())?;
+            let parent = GetParent(window).unwrap_or_default();
+            sync_search_alpha(parent, window);
         }
         let button = class_name == "Button";
         if button {
@@ -4009,5 +4259,85 @@ mod tests {
             let _ = DeleteObject(mbmp);
             let _ = DeleteDC(mdc);
         }
+    }
+
+    #[test]
+    fn thumbnail_cache_persists_across_pages_and_evicts_lru_preserving_active() {
+        clear();
+        let make_bitmap = || unsafe { CreateBitmap(1, 1, 1, 32, None) };
+        let path = |idx: usize| PathBuf::from(format!(r"C:\wallpapers\clip-{idx:03}.mp4"));
+        let paths: Vec<_> = (0..MAX_CACHED_THUMBNAILS + 2).map(path).collect();
+        for p in &paths[..MAX_CACHED_THUMBNAILS] {
+            let bmp = make_bitmap();
+            assert!(!bmp.0.is_null());
+            thumbnail(p.clone(), bmp);
+        }
+        selected(Some(paths[0].clone()));
+        tiles(&[paths[1].clone(), paths[2].clone(), paths[10].clone()]);
+
+        let extra = make_bitmap();
+        assert!(!extra.0.is_null());
+        thumbnail(paths[MAX_CACHED_THUMBNAILS].clone(), extra);
+
+        assert!(has_thumbnail(&paths[0]));
+        assert!(has_thumbnail(&paths[1]));
+        assert!(has_thumbnail(&paths[2]));
+        assert!(has_thumbnail(&paths[MAX_CACHED_THUMBNAILS]));
+        assert!(!has_thumbnail(&paths[3]));
+
+        // Paging to another set and retaining the library must preserve off-page cached items.
+        tiles(&[paths[10].clone()]);
+        retain_thumbnails(&paths);
+        assert!(has_thumbnail(&paths[1]));
+        assert!(has_thumbnail(&paths[10]));
+
+        // Hiding to tray clears all cached thumbnails.
+        retain_thumbnails(&[]);
+        assert!(!has_thumbnail(&paths[0]));
+        assert!(!has_thumbnail(&paths[MAX_CACHED_THUMBNAILS]));
+        clear();
+    }
+
+    #[test]
+    fn layout_dividers_fit_inside_hosts_without_overlapping_controls() {
+        for (width, height) in [(1080, 740), (920, 640)] {
+            let layout = Layout::new(width, height);
+            let inside = |inner: Rect, outer: Rect| {
+                inner.left >= outer.left
+                    && inner.right <= outer.right
+                    && inner.top >= outer.top
+                    && inner.bottom <= outer.bottom
+            };
+            let sidebar_div = layout.sidebar_divider.expect("sidebar divider");
+            assert!(inside(sidebar_div, layout.sidebar));
+            for (id, area) in &layout.controls {
+                if visible_on(Tab::Library, *id) {
+                    assert!(!overlap(sidebar_div, *area));
+                }
+            }
+            let pref_div = layout.settings_dividers[0].expect("settings prefs divider");
+            let res_div = layout.settings_dividers[1].expect("settings resources divider");
+            assert!(inside(pref_div, layout.settings_preferences_panel));
+            assert!(inside(res_div, layout.settings_resources_panel));
+            for (id, area) in &layout.controls {
+                if visible_on(Tab::Settings, *id) {
+                    assert!(!overlap(pref_div, *area));
+                    assert!(!overlap(res_div, *area));
+                }
+            }
+            let src_div = layout.sources_divider.expect("sources divider");
+            assert!(inside(src_div, layout.sources_panel));
+            for (id, area) in &layout.controls {
+                if visible_on(Tab::Sources, *id) {
+                    assert!(!overlap(src_div, *area));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn animations_forced_for_windows_and_transparency_query_is_safe() {
+        assert!(!animations_enabled(HWND::default()));
+        let _ = transparency_enabled();
     }
 }

@@ -1322,7 +1322,12 @@ impl App {
                 return Err("Could not create the Windows font".into());
             }
             for (_, control) in &self.controls {
-                SendMessageW(*control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+                SendMessageW(
+                    *control,
+                    WM_SETFONT,
+                    WPARAM(font.0 as usize),
+                    LPARAM(isize::from(repaint)),
+                );
             }
             if !self.font.0.is_null() {
                 let _ = DeleteObject(self.font);
@@ -1339,6 +1344,11 @@ impl App {
             let width = r.right * 96 / dpi;
             let height = r.bottom * 96 / dpi;
             let layout = visuals::Layout::new(width, height);
+            let noredraw = if repaint {
+                SET_WINDOW_POS_FLAGS(0)
+            } else {
+                SWP_NOREDRAW
+            };
             for (id, control) in &self.controls {
                 if let Some(area) = layout.control(*id) {
                     SetWindowPos(
@@ -1348,7 +1358,7 @@ impl App {
                         scale(area.top),
                         scale(area.right - area.left),
                         scale(area.bottom - area.top),
-                        SWP_NOZORDER | SWP_NOACTIVATE,
+                        SWP_NOZORDER | SWP_NOACTIVATE | noredraw,
                     )
                     .map_err(native_error)?;
                     visuals::round_control(*control)?;
@@ -1364,7 +1374,27 @@ impl App {
                     true
                 };
                 let visible = visuals::visible_on(self.tab, *id) && populated;
-                let _ = ShowWindow(*control, if visible { SW_SHOWNA } else { SW_HIDE });
+                let was_visible = GetWindowLongW(*control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+                if was_visible != visible {
+                    let _ = SetWindowPos(
+                        *control,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE
+                            | SWP_NOSIZE
+                            | SWP_NOZORDER
+                            | SWP_NOACTIVATE
+                            | noredraw
+                            | if visible {
+                                SWP_SHOWWINDOW
+                            } else {
+                                SWP_HIDEWINDOW
+                            },
+                    );
+                }
             }
             let _ = EnableWindow(self.control(visuals::SELECT_ALL), !view.is_empty());
             let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
@@ -1460,6 +1490,7 @@ impl App {
                 .unwrap_or_else(|| "All folders".into()),
         );
         visuals::tiles(&paths);
+        visuals::retain_thumbnails(&self.library);
         visuals::library_empty(self.library.is_empty());
         self.text(visuals::SORT, self.sort.label());
         visuals::selected(self.selected.clone());
@@ -1764,14 +1795,12 @@ impl App {
         if let Some((cancelled, _)) = &self.thumbnail_thread {
             cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        visuals::retain_thumbnails(&[]);
     }
     fn request_thumbnails(&mut self) {
         if self.multi_dispatch || unsafe { IsIconic(self.hwnd) }.as_bool() {
             return;
         }
         let paths = self.thumbnail_paths();
-        visuals::retain_thumbnails(&paths);
         if self
             .thumbnail_thread
             .as_ref()
@@ -1783,7 +1812,9 @@ impl App {
             let _ = worker.join();
             self.thumbnail_pending = None;
             for (path, result) in self.thumbnail_rx.try_iter() {
-                if !cancelled.load(std::sync::atomic::Ordering::Relaxed) && paths.contains(&path) {
+                if !cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    && self.library.contains(&path)
+                {
                     match result.and_then(|bytes| crate::thumbnail::bitmap(&bytes)) {
                         Ok(bitmap) => visuals::thumbnail(path, bitmap),
                         Err(_) => {
@@ -1792,14 +1823,24 @@ impl App {
                     }
                 }
             }
-            for (_, control) in &self.controls {
+            if !visuals::has_transition() {
+                // SAFETY: only thumbnail tiles and preview pane depend on newly decoded frames.
                 unsafe {
-                    let _ = InvalidateRect(*control, None, false);
+                    for id in (visuals::TILE_BASE..visuals::TILE_BASE + 9)
+                        .chain(std::iter::once(visuals::PREVIEW))
+                    {
+                        let _ = InvalidateRect(self.control(id), None, false);
+                    }
                 }
             }
         }
         if self.thumbnail_thread.is_some() {
-            if paths.is_empty() {
+            if paths.is_empty()
+                || self
+                    .thumbnail_pending
+                    .as_ref()
+                    .is_some_and(|pending| !paths.contains(pending))
+            {
                 self.cancel_thumbnails();
             }
             return;
@@ -3998,9 +4039,20 @@ unsafe extern "system" fn window_proc(
                 post(LAYOUT, WPARAM(0), LPARAM(0));
                 LRESULT(0)
             }
-            WM_DWMCOMPOSITIONCHANGED => {
-                let _ = visuals::enable_backdrop(window);
-                let _ = InvalidateRect(window, None, true);
+            WM_DWMCOMPOSITIONCHANGED
+            | WM_DWMCOLORIZATIONCOLORCHANGED
+            | WM_THEMECHANGED
+            | WM_SETTINGCHANGE => {
+                let was_glass = visuals::glass_enabled(window);
+                let is_glass = visuals::enable_backdrop(window);
+                if message != WM_SETTINGCHANGE || is_glass != was_glass {
+                    let _ = RedrawWindow(
+                        window,
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                    );
+                }
                 LRESULT(0)
             }
             WM_DPICHANGED => {
