@@ -1,16 +1,22 @@
 use crate::core::Rect;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     path::{Path, PathBuf},
 };
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HWND, LRESULT, RECT},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::*,
         UI::{
-            Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
+            Controls::{
+                BP_PAINTPARAMS, BPBF_TOPDOWNDIB, BPPF_ERASE, BeginBufferedPaint, BufferedPaintInit,
+                BufferedPaintSetAlpha, BufferedPaintUnInit, CloseThemeData, DRAWITEMSTRUCT,
+                DTT_COMPOSITED, DTT_TEXTCOLOR, DTTOPTS, DrawThemeTextEx, EndBufferedPaint,
+                GetBufferedPaintBits, HTHEME, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, OpenThemeData,
+            },
             HiDpi::GetDpiForWindow,
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
     },
@@ -247,27 +253,27 @@ const fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
         | mix_channel(a, b, 0, num, den)
 }
 
-pub const TEXT: u32 = INK;
+pub const TEXT: u32 = CREAM;
 pub const TEXT_ON_DARK: u32 = CREAM;
 pub const TEXT_ON_ACCENT: u32 = INK;
-pub const MUTED: u32 = mix(INK, CREAM, 32, 100);
-pub const MUTED_ON_DARK: u32 = mix(CREAM, INK, 24, 100);
+pub const MUTED: u32 = mix(CREAM, INK, 16, 100);
+pub const MUTED_ON_DARK: u32 = MUTED;
 pub const ACCENT: u32 = ORANGE;
-// Semantic roles. Body and cards stay opaque; only the header uses GLASS_KEY.
-pub const GLASS_KEY: u32 = 0;
-pub const BODY: u32 = CREAM;
-pub const CANVAS: u32 = mix(CREAM, INK, 4, 100);
+pub const BODY: u32 = INK;
+pub const CANVAS: u32 = INK;
 pub const FOOTER: u32 = INK;
-pub const PANEL: u32 = mix(CREAM, INK, 7, 100);
-pub const CARD: u32 = CREAM;
-pub const CARD_LIT: u32 = mix(CREAM, INK, 3, 100);
-pub const LINE: u32 = mix(CREAM, INK, 20, 100);
-pub const HIGHLIGHT: u32 = CREAM;
-pub const DISABLED_TEXT: u32 = mix(INK, CREAM, 60, 100);
-pub const ACTIVE_SURFACE: u32 = mix(CREAM, ORANGE, 22, 100);
+pub const PANEL: u32 = mix(INK, CREAM, 6, 100);
+pub const CARD: u32 = mix(INK, CREAM, 8, 100);
+pub const CARD_LIT: u32 = mix(INK, CREAM, 14, 100);
+pub const LINE: u32 = mix(INK, CREAM, 24, 100);
+pub const HIGHLIGHT: u32 = mix(INK, CREAM, 38, 100);
+pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 48, 100);
+pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 16, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
+const PANEL_ALPHA: u8 = 196;
+const GLASS_PROPERTY: windows::core::PCWSTR = w!("WallpaperLive.Glass");
 
 pub fn rgb(hex: u32) -> COLORREF {
     COLORREF(((hex >> 16) & 255) | (hex & 0xff00) | ((hex & 255) << 16))
@@ -383,6 +389,121 @@ pub fn clear() {
     });
 }
 
+struct PaintRuntime {
+    initialized: bool,
+}
+impl PaintRuntime {
+    fn new() -> Self {
+        Self {
+            initialized: unsafe { BufferedPaintInit() }.is_ok(),
+        }
+    }
+}
+impl Drop for PaintRuntime {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe {
+                let _ = BufferedPaintUnInit();
+            }
+        }
+    }
+}
+thread_local! {
+    static PAINT_RUNTIME: PaintRuntime = PaintRuntime::new();
+    static GLASS_BUFFER: Cell<isize> = const { Cell::new(0) };
+    static TEXT_THEME: Cell<HTHEME> = const { Cell::new(HTHEME(0)) };
+}
+struct PaintBuffer {
+    handle: isize,
+    dc: HDC,
+    area: RECT,
+}
+impl PaintBuffer {
+    unsafe fn new(target: HDC, area: RECT) -> Option<Self> {
+        if target.0.is_null()
+            || area.right <= area.left
+            || area.bottom <= area.top
+            || !PAINT_RUNTIME.with(|runtime| runtime.initialized)
+        {
+            return None;
+        }
+        let params = BP_PAINTPARAMS {
+            cbSize: std::mem::size_of::<BP_PAINTPARAMS>() as u32,
+            dwFlags: BPPF_ERASE,
+            ..Default::default()
+        };
+        let mut dc = HDC::default();
+        let handle =
+            unsafe { BeginBufferedPaint(target, &area, BPBF_TOPDOWNDIB, Some(&params), &mut dc) };
+        if handle == 0 {
+            return None;
+        }
+        if dc.0.is_null() {
+            unsafe {
+                let _ = EndBufferedPaint(handle, false);
+            }
+            return None;
+        }
+        Some(Self { handle, dc, area })
+    }
+    unsafe fn opaque(&self) -> bool {
+        unsafe { GdiFlush().as_bool() && BufferedPaintSetAlpha(self.handle, None, 255).is_ok() }
+    }
+    unsafe fn tint_background(&self, area: RECT, alpha: u8) -> bool {
+        let width = self.area.right - self.area.left;
+        let height = self.area.bottom - self.area.top;
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        if unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
+            || bits.is_null()
+            || stride < width
+            || !unsafe { GdiFlush() }.as_bool()
+        {
+            return false;
+        }
+        let Some(len) = (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<RGBQUAD>())
+        else {
+            return false;
+        };
+        // SAFETY: GetBufferedPaintBits owns stride * buffer height RGBQUADs until EndBufferedPaint.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
+        for y in area.top.max(self.area.top)..area.bottom.min(self.area.bottom) {
+            for x in area.left.max(self.area.left)..area.right.min(self.area.right) {
+                let i =
+                    (y - self.area.top) as usize * stride as usize + (x - self.area.left) as usize;
+                let pixel = &mut pixels[i];
+                if pixel.rgbReserved == 0 {
+                    pixel.rgbBlue = (u16::from(pixel.rgbBlue) * u16::from(alpha) / 255) as u8;
+                    pixel.rgbGreen = (u16::from(pixel.rgbGreen) * u16::from(alpha) / 255) as u8;
+                    pixel.rgbRed = (u16::from(pixel.rgbRed) * u16::from(alpha) / 255) as u8;
+                    pixel.rgbReserved = alpha;
+                }
+            }
+        }
+        true
+    }
+    unsafe fn finish(mut self) -> bool {
+        let result = unsafe { EndBufferedPaint(self.handle, true) }.is_ok();
+        self.handle = 0;
+        result
+    }
+}
+impl Drop for PaintBuffer {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            unsafe {
+                let _ = EndBufferedPaint(self.handle, false);
+            }
+        }
+    }
+}
+
+pub fn glass_enabled(window: HWND) -> bool {
+    !window.0.is_null() && unsafe { GetPropW(window, GLASS_PROPERTY).0 == window.0 }
+}
+
 pub unsafe fn fill(dc: HDC, r: RECT, color: u32) {
     // SAFETY: brush belongs to this synchronous drawing call.
     unsafe {
@@ -437,6 +558,9 @@ unsafe fn label(
     color: u32,
     flags: DRAW_TEXT_FORMAT,
 ) {
+    if text.is_empty() || r.right <= r.left || r.bottom <= r.top {
+        return;
+    }
     // SAFETY: drawing only borrows temporary UTF-16/font until native function returns.
     unsafe {
         let font = CreateFontW(
@@ -460,7 +584,32 @@ unsafe fn label(
         SetBkMode(dc, TRANSPARENT);
         let mut text: Vec<u16> = text.encode_utf16().collect();
         let mut r = r;
-        DrawTextW(dc, &mut text, &mut r, flags | DT_NOPREFIX);
+        let theme = TEXT_THEME.with(Cell::get);
+        let painted = theme.0 != 0
+            && DrawThemeTextEx(
+                theme,
+                dc,
+                0,
+                0,
+                &text,
+                flags | DT_NOPREFIX,
+                &mut r,
+                Some(&DTTOPTS {
+                    dwSize: std::mem::size_of::<DTTOPTS>() as u32,
+                    dwFlags: DTT_COMPOSITED | DTT_TEXTCOLOR,
+                    crText: rgb(color),
+                    ..Default::default()
+                }),
+            )
+            .is_ok();
+        if !painted {
+            DrawTextW(dc, &mut text, &mut r, flags | DT_NOPREFIX);
+            let buffer = GLASS_BUFFER.with(Cell::get);
+            if buffer != 0 {
+                let _ = GdiFlush();
+                let _ = BufferedPaintSetAlpha(buffer, Some(&r), 255);
+            }
+        }
         SelectObject(dc, old);
         let _ = DeleteObject(font);
     }
@@ -533,13 +682,36 @@ fn window_text(hwnd: HWND) -> String {
 }
 
 pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
+    // SAFETY: the owner-draw DC stays borrowed until this synchronous dispatch returns.
+    unsafe {
+        if let Some(buffer) = PaintBuffer::new(item.hDC, item.rcItem) {
+            let buffered = DRAWITEMSTRUCT {
+                hDC: buffer.dc,
+                ..*item
+            };
+            draw_item_into(&buffered);
+            if buffer.opaque() && buffer.finish() {
+                return;
+            }
+        }
+        if !item.hwndItem.0.is_null()
+            && let Ok(parent) = GetParent(item.hwndItem)
+        {
+            disable_backdrop(parent);
+        }
+        draw_item_into(item);
+    }
+}
+
+unsafe fn draw_item_into(item: &DRAWITEMSTRUCT) {
     let id = item.CtlID as usize;
     let dpi = unsafe { GetDpiForWindow(item.hwndItem) }.max(96) as i32;
     let s = |n: i32| n * dpi / 96;
     let r = item.rcItem;
     let dc = item.hDC;
-    // SAFETY: native DRAWITEMSTRUCT and HDC stay valid for this UI-thread dispatch only.
+    // SAFETY: initialize the whole child rectangle before rounded GDI painting.
     unsafe {
+        fill(dc, r, CARD);
         if id == PAGE {
             fill(dc, r, CANVAS);
             label(
@@ -776,8 +948,10 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
                 } else {
                     TEXT_ON_DARK
                 }
-            } else {
+            } else if id == 102 && item.itemState.0 & ODS_SELECTED.0 == 0 {
                 INK
+            } else {
+                TEXT
             };
             let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(focus_color));
             let old_pen = SelectObject(dc, pen);
@@ -800,41 +974,71 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
 
 pub fn enable_backdrop(window: HWND) -> bool {
     use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
-    // SAFETY: window is the app-owned top-level HWND; all payloads are POD values.
+    // SAFETY: all attributes and the property belong to this top-level HWND.
     unsafe {
         let dark = 1i32;
         let round = DWMWCP_ROUND.0;
         let acrylic = DWMSBT_TRANSIENTWINDOW.0;
-        let header_height = HEADER_HEIGHT * GetDpiForWindow(window).max(96) as i32 / 96;
-        let margins = MARGINS {
-            cxLeftWidth: 0,
-            cxRightWidth: 0,
-            cyTopHeight: header_height,
-            cyBottomHeight: 0,
-        };
-        let dark_ok = DwmSetWindowAttribute(
+        let _ = DwmSetWindowAttribute(
             window,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             (&dark as *const i32).cast(),
             std::mem::size_of_val(&dark) as u32,
-        )
-        .is_ok();
-        let round_ok = DwmSetWindowAttribute(
+        );
+        let _ = DwmSetWindowAttribute(
             window,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             (&round as *const i32).cast(),
             std::mem::size_of_val(&round) as u32,
-        )
-        .is_ok();
-        let acrylic_ok = DwmSetWindowAttribute(
+        );
+        let enabled = PAINT_RUNTIME.with(|runtime| runtime.initialized)
+            && DwmIsCompositionEnabled().is_ok_and(|value| value.as_bool())
+            && DwmSetWindowAttribute(
+                window,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                (&acrylic as *const i32).cast(),
+                std::mem::size_of_val(&acrylic) as u32,
+            )
+            .is_ok()
+            && DwmExtendFrameIntoClientArea(
+                window,
+                &MARGINS {
+                    cxLeftWidth: -1,
+                    cxRightWidth: -1,
+                    cyTopHeight: -1,
+                    cyBottomHeight: -1,
+                },
+            )
+            .is_ok()
+            && SetPropW(
+                window,
+                GLASS_PROPERTY,
+                windows::Win32::Foundation::HANDLE(window.0),
+            )
+            .is_ok();
+        if !enabled {
+            disable_backdrop(window);
+        }
+        enabled
+    }
+}
+
+fn disable_backdrop(window: HWND) {
+    use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
+    unsafe {
+        let was_enabled = glass_enabled(window);
+        let _ = RemovePropW(window, GLASS_PROPERTY);
+        let none = DWMSBT_NONE.0;
+        let _ = DwmSetWindowAttribute(
             window,
             DWMWA_SYSTEMBACKDROP_TYPE,
-            (&acrylic as *const i32).cast(),
-            std::mem::size_of_val(&acrylic) as u32,
-        )
-        .is_ok();
-        let frame_ok = DwmExtendFrameIntoClientArea(window, &margins).is_ok();
-        dark_ok && round_ok && acrylic_ok && frame_ok
+            (&none as *const i32).cast(),
+            std::mem::size_of_val(&none) as u32,
+        );
+        let _ = DwmExtendFrameIntoClientArea(window, &MARGINS::default());
+        if was_enabled {
+            let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
     }
 }
 
@@ -848,7 +1052,50 @@ pub unsafe fn paint(window: HWND) {
     }
 }
 
-pub unsafe fn paint_into(window: HWND, dc: HDC) {
+pub unsafe fn paint_into(window: HWND, target: HDC) {
+    // SAFETY: buffers, theme handle and target DC stay on this synchronous UI-thread call.
+    unsafe {
+        let mut client = RECT::default();
+        if GetClientRect(window, &mut client).is_err() {
+            return;
+        }
+        if let Some(buffer) = PaintBuffer::new(target, client) {
+            let glass = glass_enabled(window);
+            let theme = if glass {
+                OpenThemeData(window, w!("WINDOW"))
+            } else {
+                HTHEME::default()
+            };
+            let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
+            let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+            let rendered = paint_scene(
+                window,
+                buffer.dc,
+                if glass && theme.0 != 0 {
+                    Some(&buffer)
+                } else {
+                    None
+                },
+            );
+            TEXT_THEME.with(|slot| slot.set(old_theme));
+            GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+            if theme.0 != 0 {
+                let _ = CloseThemeData(theme);
+            }
+            let ready = rendered && ((glass && theme.0 != 0) || buffer.opaque());
+            if ready && buffer.finish() {
+                if glass && theme.0 == 0 {
+                    disable_backdrop(window);
+                }
+                return;
+            }
+        }
+        disable_backdrop(window);
+        paint_scene(window, target, None);
+    }
+}
+
+unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> bool {
     // SAFETY: caller supplies a valid drawing HDC; this function owns no paint session.
     unsafe {
         let mut client = RECT::default();
@@ -862,7 +1109,7 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
             (skin.tab, skin.tiles.is_empty(), skin.library_empty)
         });
         fill(dc, pixels(layout.client), BODY);
-        fill(dc, pixels(layout.header), GLASS_KEY);
+        fill(dc, pixels(layout.header), BODY);
         fill(
             dc,
             rect(
@@ -928,6 +1175,21 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
             ),
             LINE,
         );
+        if let Some(buffer) = glass {
+            let panel_ok = match tab {
+                Tab::Library => buffer.tint_background(pixels(layout.sidebar), PANEL_ALPHA),
+                Tab::Settings => {
+                    buffer.tint_background(pixels(layout.settings_preferences_panel), PANEL_ALPHA)
+                        && buffer
+                            .tint_background(pixels(layout.settings_resources_panel), PANEL_ALPHA)
+                }
+                Tab::Sources => buffer.tint_background(pixels(layout.sources_panel), PANEL_ALPHA),
+            };
+            // Only content panels transmit the backdrop; untouched canvas stays solid Ink.
+            if !panel_ok || !buffer.tint_background(client, 255) {
+                return false;
+            }
+        }
         label(
             dc,
             "WallpaperLive",
@@ -1097,6 +1359,223 @@ pub unsafe fn paint_into(window: HWND, dc: HDC) {
                 );
             }
         }
+        true
+    }
+}
+
+pub fn prepare_control(window: HWND) -> Result<(), String> {
+    // SAFETY: subclass executes on the control's UI thread and owns no Rust pointer.
+    unsafe {
+        let style = GetWindowLongW(window, GWL_STYLE) as u32;
+        let mut class = [0u16; 32];
+        let count = GetClassNameW(window, &mut class).max(0) as usize;
+        let class_name = String::from_utf16_lossy(&class[..count]);
+        if class_name == "Edit" && GetDlgCtrlID(window) as usize == SEARCH {
+            // Native editing, selection and caret repaint outside WM_PAINT; composite this child opaque.
+            let extended = GetWindowLongPtrW(window, GWL_EXSTYLE);
+            SetWindowLongPtrW(window, GWL_EXSTYLE, extended | WS_EX_LAYERED.0 as isize);
+            SetLayeredWindowAttributes(window, COLORREF(0), 255, LWA_ALPHA)
+                .map_err(|error| error.to_string())?;
+        }
+        let button = class_name == "Button";
+        let owner_draw = button && style & 0xf == BS_OWNERDRAW as u32;
+        if !owner_draw && !SetWindowSubclass(window, Some(control_proc), 1, 0).as_bool() {
+            return Err("Could not initialize opaque native control painting".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn round_control(window: HWND) -> Result<(), String> {
+    unsafe {
+        let mut class = [0u16; 32];
+        let count = GetClassNameW(window, &mut class).max(0) as usize;
+        if String::from_utf16_lossy(&class[..count]) != "Button"
+            || GetWindowLongW(window, GWL_STYLE) as u32 & 0xf != BS_OWNERDRAW as u32
+        {
+            return Ok(());
+        }
+        let mut area = RECT::default();
+        GetClientRect(window, &mut area).map_err(|e| e.to_string())?;
+        if area.right <= 0 || area.bottom <= 0 {
+            return Ok(());
+        }
+        let id = GetDlgCtrlID(window) as usize;
+        let radius = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
+            18
+        } else if id == PREVIEW || (TILE_BASE..TILE_BASE + 9).contains(&id) {
+            10
+        } else {
+            8
+        };
+        let radius = radius * GetDpiForWindow(window).max(96) as i32 / 96;
+        let region = CreateRoundRectRgn(0, 0, area.right + 1, area.bottom + 1, radius, radius);
+        if region.0.is_null() {
+            return Err("Could not create the control's rounded region".into());
+        }
+        if SetWindowRgn(window, region, false) == 0 {
+            let _ = DeleteObject(region);
+            return Err("Could not apply the control's rounded region".into());
+        }
+    }
+    Ok(())
+}
+
+fn control_color(id: usize) -> u32 {
+    match id {
+        113 => FOOTER,
+        PAGE => PANEL,
+        _ => CARD,
+    }
+}
+
+unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
+    // SAFETY: DefSubclassProc reaches the original native control, not this subclass again.
+    unsafe {
+        let id = GetDlgCtrlID(window) as usize;
+        let parent = GetParent(window).unwrap_or_default();
+        let mut class = [0u16; 32];
+        let count = GetClassNameW(window, &mut class).max(0) as usize;
+        let static_text = String::from_utf16_lossy(&class[..count]) == "Static";
+        let checkbox = matches!(id, 107 | 108 | 121);
+        let color = control_color(id);
+        if let Some(buffer) = PaintBuffer::new(dc, area) {
+            if (static_text || checkbox) && glass_enabled(parent) {
+                let theme = OpenThemeData(parent, w!("WINDOW"));
+                if theme.0 != 0 {
+                    fill(buffer.dc, area, if id == PAGE { PANEL } else { CARD });
+                    let alpha_ok =
+                        buffer.tint_background(area, if id == PAGE { 255 } else { PANEL_ALPHA });
+                    let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
+                    let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+                    let dpi = GetDpiForWindow(window).max(96) as i32;
+                    let mut text_area = area;
+                    if checkbox {
+                        let size = 14 * dpi / 96;
+                        let top = (area.top + area.bottom - size) / 2;
+                        let mut glyph = rect(area.left, top, area.left + size, top + size);
+                        let state = SendMessageW(window, BM_GETSTATE, WPARAM(0), LPARAM(0)).0;
+                        let flags = DFCS_BUTTONCHECK
+                            | if state & 3 == 1 {
+                                DFCS_CHECKED
+                            } else {
+                                DFCS_STATE(0)
+                            }
+                            | if state & 4 != 0 {
+                                DFCS_PUSHED
+                            } else {
+                                DFCS_STATE(0)
+                            };
+                        let _ = DrawFrameControl(buffer.dc, &mut glyph, DFC_BUTTON, flags);
+                        let _ = GdiFlush();
+                        let _ = BufferedPaintSetAlpha(buffer.handle, Some(&glyph), 255);
+                        text_area.left += 18 * dpi / 96;
+                    }
+                    label(
+                        buffer.dc,
+                        &window_text(window),
+                        text_area,
+                        (if id == PAGE { 13 } else { 14 }) * dpi / 96,
+                        false,
+                        if id == 112 || checkbox { TEXT } else { MUTED },
+                        if id == PAGE {
+                            DT_CENTER | DT_VCENTER | DT_SINGLELINE
+                        } else if checkbox {
+                            DT_SINGLELINE | DT_VCENTER
+                        } else if id == 112 {
+                            DT_SINGLELINE | DT_END_ELLIPSIS
+                        } else {
+                            DT_WORDBREAK
+                        },
+                    );
+                    if checkbox
+                        && SendMessageW(window, BM_GETSTATE, WPARAM(0), LPARAM(0)).0 & 8 != 0
+                    {
+                        let _ = DrawFocusRect(
+                            buffer.dc,
+                            &rect(
+                                text_area.left,
+                                area.top + 3,
+                                area.right - 3,
+                                area.bottom - 3,
+                            ),
+                        );
+                    }
+                    TEXT_THEME.with(|slot| slot.set(old_theme));
+                    GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+                    let _ = CloseThemeData(theme);
+                    if alpha_ok && buffer.finish() {
+                        return;
+                    }
+                    disable_backdrop(parent);
+                    fill(dc, area, color);
+                    DefSubclassProc(
+                        window,
+                        WM_PRINTCLIENT,
+                        WPARAM(dc.0 as usize),
+                        LPARAM(PRF_CLIENT as isize),
+                    );
+                    return;
+                }
+            }
+            fill(buffer.dc, area, color);
+            DefSubclassProc(
+                window,
+                WM_PRINTCLIENT,
+                WPARAM(buffer.dc.0 as usize),
+                LPARAM(PRF_CLIENT as isize),
+            );
+            if buffer.opaque() && buffer.finish() {
+                return;
+            }
+        }
+        if !parent.0.is_null() {
+            disable_backdrop(parent);
+        }
+        fill(dc, area, color);
+        DefSubclassProc(
+            window,
+            WM_PRINTCLIENT,
+            WPARAM(dc.0 as usize),
+            LPARAM(PRF_CLIENT as isize),
+        );
+    }
+}
+
+unsafe extern "system" fn control_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        match message {
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let dc = BeginPaint(window, &mut ps);
+                let mut area = RECT::default();
+                if GetClientRect(window, &mut area).is_ok() {
+                    paint_control_into(window, dc, area);
+                }
+                let _ = EndPaint(window, &ps);
+                LRESULT(0)
+            }
+            WM_PRINTCLIENT if wparam.0 != 0 => {
+                let mut area = RECT::default();
+                if GetClientRect(window, &mut area).is_ok() {
+                    paint_control_into(window, HDC(wparam.0 as *mut _), area);
+                }
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_NCDESTROY => {
+                let _ = RemoveWindowSubclass(window, Some(control_proc), id);
+                DefSubclassProc(window, message, wparam, lparam)
+            }
+            _ => DefSubclassProc(window, message, wparam, lparam),
+        }
     }
 }
 
@@ -1128,26 +1607,7 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
                 TEXT
             }),
         );
-        let color = if id == 113 {
-            FOOTER
-        } else if matches!(
-            id,
-            107 | 108
-                | 121
-                | VERSION
-                | MEMORY_INFO
-                | CACHE_INFO
-                | SOURCES_NOTE
-                | SETTINGS_NOTE
-                | SETTINGS_INFO
-                | PAGE
-        ) {
-            PANEL
-        } else if matches!(id, 105 | 106 | SEARCH) {
-            CARD
-        } else {
-            PANEL
-        };
+        let color = control_color(id);
         SetBkColor(dc, rgb(color));
         Some(LRESULT(brush(color).0 as isize))
     }
@@ -1170,9 +1630,89 @@ mod tests {
     #[test]
     fn identity_colors_anchor_semantic_roles() {
         assert_eq!((INK, CREAM, ORANGE), (0x111111, 0xf3eee3, 0xd9541e));
-        assert_eq!((BODY, CARD, HIGHLIGHT), (CREAM, CREAM, CREAM));
-        assert_eq!((TEXT, TEXT_ON_ACCENT, FOOTER), (INK, INK, INK));
-        assert_eq!((TEXT_ON_DARK, ACCENT), (CREAM, ORANGE));
+        assert_eq!((BODY, CANVAS, FOOTER), (INK, INK, INK));
+        assert_eq!((TEXT, TEXT_ON_DARK, TEXT_ON_ACCENT), (CREAM, CREAM, INK));
+        assert_eq!(ACCENT, ORANGE);
+        fn luminance(color: u32) -> f64 {
+            let channel = |shift: u32| {
+                let value = f64::from((color >> shift) & 255u32) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+        }
+        for (foreground, background) in [
+            (TEXT, INK),
+            (TEXT, CARD),
+            (MUTED, CARD),
+            (INK, ORANGE),
+            (TEXT, ACCENT_DARK),
+            (MUTED, 0x3c3c3b),
+        ] {
+            let a = luminance(foreground);
+            let b = luminance(background);
+            assert!(
+                (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5,
+                "text contrast below AA"
+            );
+        }
+    }
+
+    #[test]
+    fn rounded_controls_cover_native_erase_and_keep_opaque_alpha() {
+        // SAFETY: test-owned memory DC and bitmap never attach to the desktop.
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(
+                dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: 120,
+                        biHeight: -36,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .expect("control DIB");
+            let old = SelectObject(dc, bitmap);
+            std::slice::from_raw_parts_mut(bits as *mut u32, 120 * 36).fill(0xffff_ffff);
+            draw_item(&DRAWITEMSTRUCT {
+                CtlID: TILE_BASE as u32,
+                hDC: dc,
+                rcItem: rect(0, 0, 120, 36),
+                ..Default::default()
+            });
+            let _ = GdiFlush();
+            let pixels = std::slice::from_raw_parts(bits as *const u32, 120 * 36);
+            let corner = pixels[0];
+            let center = pixels[18 * 120 + 100];
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+            assert_eq!(
+                corner & 0x00ff_ffff,
+                CARD,
+                "rounded corners must not retain native white erase"
+            );
+            assert_eq!(
+                center,
+                0xff00_0000 | CARD,
+                "foreground controls must reach DWM with alpha 255"
+            );
+        }
     }
 
     #[test]

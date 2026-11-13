@@ -957,6 +957,9 @@ impl App {
                 .map_err(native_error)?;
                 self.controls.push((visuals::TILE_BASE + i, child));
             }
+            for (_, control) in &self.controls {
+                visuals::prepare_control(*control)?;
+            }
             self.text(
                 FIT,
                 if self.settings.fit == Fit::Contain {
@@ -1285,6 +1288,7 @@ impl App {
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     )
                     .map_err(native_error)?;
+                    visuals::round_control(*control)?;
                 }
             }
             let view = self.library_view();
@@ -4022,6 +4026,210 @@ mod tests {
         Ok(bitmap)
     }
 
+    struct DesktopProof {
+        backdrop: HWND,
+        previous: HWND,
+        instance: HINSTANCE,
+    }
+    impl DesktopProof {
+        unsafe fn new() -> Result<Self, String> {
+            // SAFETY: fixture owns this window and class; no desktop or app settings change.
+            unsafe {
+                let instance: HINSTANCE = GetModuleHandleW(None).map_err(native_error)?.into();
+                let class = w!("WallpaperLive.DesktopProofBackdrop");
+                if RegisterClassW(&WNDCLASSW {
+                    lpfnWndProc: Some(proof_backdrop_proc),
+                    hInstance: instance,
+                    lpszClassName: class,
+                    ..Default::default()
+                }) == 0
+                {
+                    return Err("Could not register desktop proof backdrop".into());
+                }
+                let backdrop = match CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    class,
+                    w!("UI proof backdrop"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    None,
+                    None,
+                    instance,
+                    None,
+                ) {
+                    Ok(window) => window,
+                    Err(error) => {
+                        let _ = UnregisterClassW(class, instance);
+                        return Err(native_error(error));
+                    }
+                };
+                Ok(Self {
+                    backdrop,
+                    previous: GetForegroundWindow(),
+                    instance,
+                })
+            }
+        }
+        unsafe fn capture(
+            &self,
+            window: HWND,
+            mode: isize,
+            dc: HDC,
+            width: i32,
+            height: i32,
+        ) -> Result<(), String> {
+            use windows::Win32::Graphics::Dwm::DwmFlush;
+            unsafe {
+                let mut origin = POINT::default();
+                MapWindowPoints(window, None, std::slice::from_mut(&mut origin));
+                SetWindowPos(
+                    self.backdrop,
+                    window,
+                    origin.x,
+                    origin.y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+                .map_err(native_error)?;
+                SetWindowLongPtrW(self.backdrop, GWLP_USERDATA, mode);
+                let _ = ShowWindow(window, SW_SHOWNORMAL);
+                let _ = SetForegroundWindow(window);
+                if GetForegroundWindow() != window {
+                    return Err("Desktop proof could not activate its own window".into());
+                }
+                for _ in 0..6 {
+                    let _ = RedrawWindow(self.backdrop, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                    let _ = RedrawWindow(
+                        window,
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                    );
+                    DwmFlush().map_err(native_error)?;
+                }
+                // Exercise native direct repaint after the buffered paint, without a forced redraw.
+                let focus = GetFocus();
+                let id = GetDlgCtrlID(focus) as usize;
+                if id == visuals::SEARCH {
+                    SendMessageW(
+                        focus,
+                        windows::Win32::UI::Controls::EM_SETSEL,
+                        WPARAM(1),
+                        LPARAM(1),
+                    );
+                    SendMessageW(focus, WM_CHAR, WPARAM('x' as usize), LPARAM(1));
+                    SendMessageW(focus, WM_CHAR, WPARAM(8), LPARAM(1));
+                    SendMessageW(
+                        focus,
+                        windows::Win32::UI::Controls::EM_SETSEL,
+                        WPARAM(0),
+                        LPARAM(1),
+                    );
+                    assert_eq!(window_text(focus), "z");
+                } else if id == BATTERY {
+                    let checked = SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0));
+                    SendMessageW(focus, WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
+                    SendMessageW(focus, WM_KEYUP, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
+                    assert_ne!(
+                        SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0)),
+                        checked
+                    );
+                    SendMessageW(focus, WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
+                    SendMessageW(focus, WM_KEYUP, WPARAM(VK_SPACE.0 as usize), LPARAM(1));
+                    assert_eq!(
+                        SendMessageW(focus, BM_GETCHECK, WPARAM(0), LPARAM(0)),
+                        checked
+                    );
+                }
+                DwmFlush().map_err(native_error)?;
+                if !visuals::glass_enabled(window) {
+                    return Err("Desktop proof fell back to opaque rendering".into());
+                }
+                let screen = GetDC(None);
+                if screen.0.is_null() {
+                    return Err("Desktop capture DC unavailable".into());
+                }
+                let copied = BitBlt(
+                    dc,
+                    0,
+                    0,
+                    width,
+                    height,
+                    screen,
+                    origin.x,
+                    origin.y,
+                    SRCCOPY | CAPTUREBLT,
+                );
+                let _ = ReleaseDC(None, screen);
+                copied.map_err(native_error)?;
+                if !GdiFlush().as_bool() {
+                    return Err("Desktop capture GDI flush failed".into());
+                }
+                Ok(())
+            }
+        }
+    }
+    impl Drop for DesktopProof {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.backdrop);
+                let _ = UnregisterClassW(w!("WallpaperLive.DesktopProofBackdrop"), self.instance);
+                if IsWindow(self.previous).as_bool() {
+                    let _ = SetForegroundWindow(self.previous);
+                }
+            }
+        }
+    }
+    unsafe extern "system" fn proof_backdrop_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe {
+            if message != WM_PAINT {
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(window, &mut ps);
+            let mut area = RECT::default();
+            let _ = GetClientRect(window, &mut area);
+            let mode = GetWindowLongPtrW(window, GWLP_USERDATA);
+            visuals::fill(dc, area, if mode == 1 { 0xffffff } else { 0 });
+            if mode == 2 {
+                visuals::fill(
+                    dc,
+                    RECT {
+                        top: area.bottom / 2,
+                        ..area
+                    },
+                    0xffffff,
+                );
+            }
+            let _ = EndPaint(window, &ps);
+            LRESULT(0)
+        }
+    }
+    fn proof_bmp(pixels: &[u8], width: i32, height: i32) -> Vec<u8> {
+        let mut bmp = Vec::with_capacity(54 + pixels.len());
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(54 + pixels.len() as u32).to_le_bytes());
+        bmp.extend_from_slice(&[0; 4]);
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&width.to_le_bytes());
+        bmp.extend_from_slice(&(-height).to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&32u16.to_le_bytes());
+        bmp.extend_from_slice(&[0; 24]);
+        bmp.extend_from_slice(pixels);
+        bmp
+    }
+
     #[test]
     fn native_tabs_keep_library_state_and_capture_layouts() -> Result<(), String> {
         // SAFETY: hidden test-owned window only; no app run(), tray, media decoder or desktop attachment.
@@ -4120,6 +4328,13 @@ mod tests {
             assert_eq!(SUPPORT_URL, "https://yapp.ink/raflyf");
             let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("scratch/ui-proof");
             fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+            let desktop_requested = std::env::var_os("WALLPAPERLIVE_UI_PROOF_DESKTOP")
+                .is_some_and(|value| value == "1");
+            let desktop = if desktop_requested {
+                Some(DesktopProof::new()?)
+            } else {
+                None
+            };
             for (logical_width, logical_height) in [(920, 640), (1080, 740)] {
                 let dpi = GetDpiForWindow(app.hwnd).max(96) as i32;
                 let width = logical_width * dpi / 96;
@@ -4184,11 +4399,11 @@ mod tests {
                     };
                     let header_height =
                         visuals::HEADER_HEIGHT * GetDpiForWindow(app.hwnd).max(96) as i32 / 96;
-                    assert_eq!(pixel(8, 8), visuals::GLASS_KEY, "header must stay acrylic");
+                    assert_eq!(pixel(8, 8), visuals::BODY, "header fallback must be Ink");
                     assert_eq!(
                         pixel(8, header_height + 8),
                         visuals::BODY,
-                        "body must stay opaque Cream"
+                        "body fallback must be Ink"
                     );
                     for (_, child) in &app.controls {
                         if GetWindowLongW(*child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
@@ -4203,6 +4418,12 @@ mod tests {
                         MapWindowPoints(None, app.hwnd, std::slice::from_mut(&mut point));
                         let state = SaveDC(dc);
                         let _ = SetViewportOrgEx(dc, point.x, point.y, None);
+                        let clip = CreateRectRgn(0, 0, 0, 0);
+                        if GetWindowRgn(*child, clip).0 != ERROR {
+                            let _ = OffsetRgn(clip, point.x, point.y);
+                            let _ = ExtSelectClipRgn(dc, clip, RGN_AND);
+                        }
+                        let _ = DeleteObject(clip);
                         SendMessageW(
                             *child,
                             WM_PRINT,
@@ -4216,23 +4437,188 @@ mod tests {
                         bits as *const u8,
                         (width * height * 4) as usize,
                     );
-                    let mut bmp = Vec::with_capacity(54 + pixels.len());
-                    bmp.extend_from_slice(b"BM");
-                    bmp.extend_from_slice(&(54 + pixels.len() as u32).to_le_bytes());
-                    bmp.extend_from_slice(&[0; 4]);
-                    bmp.extend_from_slice(&54u32.to_le_bytes());
-                    bmp.extend_from_slice(&40u32.to_le_bytes());
-                    bmp.extend_from_slice(&width.to_le_bytes());
-                    bmp.extend_from_slice(&(-height).to_le_bytes());
-                    bmp.extend_from_slice(&1u16.to_le_bytes());
-                    bmp.extend_from_slice(&32u16.to_le_bytes());
-                    bmp.extend_from_slice(&[0; 24]);
-                    bmp.extend_from_slice(pixels);
+                    let bmp = proof_bmp(pixels, width, height);
+                    fs::write(directory.join(format!("{name}-{logical_width}.bmp")), bmp)
+                        .map_err(|e| e.to_string())?;
+                    if desktop.is_some() {
+                        if tab == visuals::Tab::Library {
+                            let search = app.control(visuals::SEARCH);
+                            let _ = ShowWindow(app.hwnd, SW_SHOWNORMAL);
+                            SetFocus(search).map_err(native_error)?;
+                            SendMessageW(search, WM_CHAR, WPARAM('z' as usize), LPARAM(1));
+                            assert_eq!(window_text(search), "z");
+                            SendMessageW(
+                                search,
+                                windows::Win32::UI::Controls::EM_SETSEL,
+                                WPARAM(0),
+                                LPARAM(1),
+                            );
+                            let mut start = 0u32;
+                            let mut end = 0u32;
+                            SendMessageW(
+                                search,
+                                windows::Win32::UI::Controls::EM_GETSEL,
+                                WPARAM((&mut start as *mut u32) as usize),
+                                LPARAM((&mut end as *mut u32) as isize),
+                            );
+                            assert_eq!((start, end), (0, 1));
+                        } else if tab == visuals::Tab::Settings {
+                            let checkbox = app.control(BATTERY);
+                            let checked = SendMessageW(checkbox, BM_GETCHECK, WPARAM(0), LPARAM(0));
+                            let _ = ShowWindow(app.hwnd, SW_SHOWNORMAL);
+                            SetFocus(checkbox).map_err(native_error)?;
+                            SendMessageW(
+                                checkbox,
+                                WM_KEYDOWN,
+                                WPARAM(VK_SPACE.0 as usize),
+                                LPARAM(1),
+                            );
+                            SendMessageW(
+                                checkbox,
+                                WM_KEYUP,
+                                WPARAM(VK_SPACE.0 as usize),
+                                LPARAM(1),
+                            );
+                            assert_ne!(
+                                SendMessageW(checkbox, BM_GETCHECK, WPARAM(0), LPARAM(0)),
+                                checked
+                            );
+                            SendMessageW(
+                                checkbox,
+                                BM_SETCHECK,
+                                WPARAM(checked.0 as usize),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    // Exercise composited alpha even when CI has no interactive foreground.
+                    if visuals::enable_backdrop(app.hwnd) {
+                        visuals::paint_into(app.hwnd, dc);
+                        assert!(GdiFlush().as_bool());
+                        let glass_pixels = std::slice::from_raw_parts(
+                            bits as *const u8,
+                            (width * height * 4) as usize,
+                        );
+                        let canvas_pixel = |x: i32, y: i32| {
+                            let i = ((y * width + x) * 4) as usize;
+                            u32::from_le_bytes(
+                                glass_pixels[i..i + 4].try_into().expect("BGRA pixel"),
+                            )
+                        };
+                        assert_eq!(
+                            canvas_pixel(8, 8),
+                            0xff11_1111,
+                            "header must stay solid Ink"
+                        );
+                        assert_eq!(
+                            canvas_pixel(8, height / 2),
+                            0xff11_1111,
+                            "canvas must stay solid Ink, not become a backdrop gradient"
+                        );
+                        assert!(
+                            glass_pixels
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .all(|pixel| pixel[3] >= 196),
+                            "glass text must composite over, not replace, the tinted background"
+                        );
+                        assert!(
+                            glass_pixels
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .all(|pixel| pixel[..3].iter().all(|channel| *channel <= pixel[3])),
+                            "glass pixels must be premultiplied"
+                        );
+                        for (_, child) in &app.controls {
+                            if GetWindowLongW(*child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
+                                continue;
+                            }
+                            let mut area = RECT::default();
+                            GetClientRect(*child, &mut area).map_err(native_error)?;
+                            SendMessageW(
+                                *child,
+                                WM_PRINTCLIENT,
+                                WPARAM(dc.0 as usize),
+                                LPARAM(PRF_CLIENT as isize),
+                            );
+                            assert!(GdiFlush().as_bool());
+                            let control_pixels = std::slice::from_raw_parts(
+                                bits as *const u8,
+                                (width * height * 4) as usize,
+                            );
+                            for y in 0..area.bottom {
+                                for x in 0..area.right {
+                                    let i = ((y * width + x) * 4) as usize;
+                                    let pixel = &control_pixels[i..i + 4];
+                                    assert!(
+                                        pixel[3] >= 196
+                                            && pixel[..3]
+                                                .iter()
+                                                .all(|channel| *channel <= pixel[3]),
+                                        "control {} must preserve premultiplied alpha: {pixel:?} at ({x}, {y})",
+                                        GetDlgCtrlID(*child)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if let Some(desktop) = &desktop {
+                        for (mode, label) in [(0, "black"), (1, "white"), (2, "edge")] {
+                            desktop.capture(app.hwnd, mode, dc, width, height)?;
+                            let pixels = std::slice::from_raw_parts(
+                                bits as *const u8,
+                                (width * height * 4) as usize,
+                            );
+                            let status_i = ((((logical_height - 40) * dpi / 96) * width
+                                + 32 * dpi / 96)
+                                * 4) as usize;
+                            assert_eq!(
+                                &pixels[status_i..status_i + 3],
+                                &[17, 17, 17],
+                                "empty status must match solid Ink footer"
+                            );
+                            if tab == visuals::Tab::Library {
+                                let x = 150 * dpi / 96;
+                                let y = 172 * dpi / 96;
+                                let i = ((y * width + x) * 4) as usize;
+                                let rgb = u32::from(pixels[i + 2]) << 16
+                                    | u32::from(pixels[i + 1]) << 8
+                                    | u32::from(pixels[i]);
+                                assert_eq!(
+                                    rgb,
+                                    visuals::CARD,
+                                    "native typing must not wash out the search background"
+                                );
+                            }
+                            fs::write(
+                                directory
+                                    .join(format!("{name}-{logical_width}-desktop-{label}.bmp")),
+                                proof_bmp(pixels, width, height),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        if tab == visuals::Tab::Library {
+                            app.text(visuals::SEARCH, "");
+                        }
+                        let _ = ShowWindow(app.hwnd, SW_HIDE);
+                    }
+                    let none = windows::Win32::Graphics::Dwm::DWMSBT_NONE.0;
+                    let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                        app.hwnd,
+                        windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,
+                        (&none as *const i32).cast(),
+                        std::mem::size_of_val(&none) as u32,
+                    );
+                    let _ = windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea(
+                        app.hwnd,
+                        &windows::Win32::UI::Controls::MARGINS::default(),
+                    );
+                    let _ = RemovePropW(app.hwnd, w!("WallpaperLive.Glass"));
                     SelectObject(dc, previous);
                     let _ = DeleteObject(bitmap);
                     let _ = DeleteDC(dc);
-                    fs::write(directory.join(format!("{name}-{logical_width}.bmp")), bmp)
-                        .map_err(|e| e.to_string())?;
                 }
             }
             drop(app);

@@ -15,22 +15,26 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- Native acrylic styling in the header, paired with opaque Cream work surfaces and Ink Black media bezels.
-- Dual-tone etched glass border highlights and refined card rounding while strictly preserving the three core identity colors (Ink Black, Cream, Burnt Orange).
-- Pill-shaped capsule segmented tabs for seamless navigation between Library and Settings.
-- Integrated Saweria support button in Settings alongside Buy me a coffee.
+- Native acrylic on the selected-wallpaper panel, Settings panels, and Sources panel on Windows 11 build 22621 or newer.
+- Rounded Library/Settings tabs and a Saweria support link alongside Buy me a coffee.
 
 ### Changed
 
-- Enhanced thumbnail card viewport and active playback indicator badge for improved visual contrast and hierarchy.
+- Keep the canvas, header, and footer solid Ink Black (`#111111`), without a background gradient. Cream (`#F3EEE3`) is text; Burnt Orange (`#D9541E`) marks primary actions and active states.
+- Use one consistent translucent panel surface under labels and checkboxes instead of separate dark text rectangles. The visible panel tint follows the real background through Windows acrylic blur.
 
 ### Fixed
 
-- Native DWM acrylic is limited to the header; the workspace, cards, preview, controls, and footer remain opaque for reliable contrast.
-- Ink Black (`#111111`) defines headers, text, media bezels, and the footer; Cream (`#F3EEE3`) defines the workspace and cards; Burnt Orange (`#D9541E`) is reserved for primary actions and active states.
-- Thumbnail and preview bitmaps use an unmodified `SRCCOPY` path, preserving their original RGB values without opacity or tint.
-- Settings and Sources use dedicated opaque card panels, preventing content from inactive tabs showing through.
-- Footer status updates repaint against an opaque Ink Black background to prevent overlapping character ghosting.
+- Supply premultiplied alpha for acrylic panels and composite text after their tint. Keep media and owner-drawn controls opaque; no global window opacity or bitmap tint.
+- Clip rounded controls to their native regions so white corners do not surround the Library/Settings buttons.
+- Keep search typing, selection, and caret painting in an opaque native child surface so direct edit repaints do not turn white over acrylic.
+- Repaint the whole workspace in opaque dark colors if backdrop or buffered painting is unavailable. Hidden tabs remain hidden; choosing a display still does not apply a wallpaper.
+
+### Verification and limits
+
+- The opt-in desktop fixture checks solid canvas/status/search pixels and captures Library, Settings, and Sources over controlled black, white, and hard-edge backgrounds at two sizes. Background test patterns are not part of the UI.
+- Hardware-dependent acrylic is not promised on Windows 10 or when Windows disables transparency. The fallback is opaque dark.
+- Build testing uses GitHub Actions artifacts only; no v0.2.0 tag or GitHub Release is created by this UI fix.
 
 ---
 
