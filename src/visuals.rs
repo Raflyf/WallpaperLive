@@ -2244,7 +2244,14 @@ mod tests {
 
             let disabled_prev = draw_pixels(PREVIOUS, ODS_DISABLED.0);
             assert_eq!(disabled_prev[0] & 0x00ff_ffff, INK);
-            assert_eq!(disabled_prev[18 * 120 + 60] & 0x00ff_ffff, DISABLED_FILL);
+            assert_eq!(disabled_prev[18 * 120 + 60] & 0x00ff_ffff, PANEL);
+
+            let disabled_card_btn = draw_pixels(REMOVE, ODS_DISABLED.0);
+            assert_eq!(disabled_card_btn[0] & 0x00ff_ffff, CARD);
+            assert_eq!(
+                disabled_card_btn[18 * 120 + 60] & 0x00ff_ffff,
+                DISABLED_FILL
+            );
 
             let focused_key = draw_pixels(NEXT, ODS_FOCUS.0);
             let focused_mouse = draw_pixels(NEXT, ODS_FOCUS.0 | ODS_NOFOCUSRECT_FLAG);
