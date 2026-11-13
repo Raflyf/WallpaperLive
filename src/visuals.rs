@@ -3,10 +3,11 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     path::{Path, PathBuf},
+    time::Instant,
 };
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::*,
         UI::{
             Controls::{
@@ -17,6 +18,7 @@ use windows::{
                 ODS_SELECTED, OpenThemeData,
             },
             HiDpi::GetDpiForWindow,
+            Input::KeyboardAndMouse::{SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
@@ -79,6 +81,13 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         id if (TILE_BASE..TILE_BASE + 9).contains(&id) => tab == Tab::Library,
         _ => false,
     }
+}
+
+pub fn is_body_control(id: usize) -> bool {
+    !matches!(
+        id,
+        TAB_LIBRARY | TAB_SETTINGS | 101 | ADD_FOLDER | 110 | 113
+    )
 }
 
 pub struct Layout {
@@ -281,15 +290,42 @@ pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 16, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
-pub const PANEL_ALPHA: u8 = 160;
-pub const CARD_ALPHA: u8 = 180;
-const CONTROL_ALPHA: u8 = 192;
-const ACTIVE_TILE_ALPHA: u8 = 212;
-const ACTIVE_ALPHA: u8 = 242;
-pub const BORDER_ALPHA: u8 = 224;
-const SEARCH_ALPHA: u8 = 216;
+pub const ACCENT_HOVER: u32 = mix(ORANGE, CREAM, 12, 100);
+pub const GLASS_RIM: u32 = mix(INK, CREAM, 46, 100);
+pub const PANEL_ALPHA: u8 = 0;
+pub const CARD_ALPHA: u8 = 56;
+const CONTROL_ALPHA: u8 = 84;
+const HOVER_ALPHA: u8 = 112;
+const ACTIVE_TILE_ALPHA: u8 = 118;
+const ACTIVE_ALPHA: u8 = 232;
+pub const BORDER_ALPHA: u8 = 152;
+const DIVIDER_ALPHA: u8 = 72;
+const SEARCH_ALPHA: u8 = 180;
+pub const DROPDOWN_ALPHA: u8 = 116;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
+
+pub(crate) fn ease_out_cubic(t: f32) -> f32 {
+    let clamped = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - clamped).powi(3)
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    (f32::from(a) + (f32::from(b) - f32::from(a)) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix_c = |shift: u32| -> u32 {
+        let ca = ((a >> shift) & 255) as f32;
+        let cb = ((b >> shift) & 255) as f32;
+        ((ca + (cb - ca) * t).round().clamp(0.0, 255.0) as u32) << shift
+    };
+    mix_c(16) | mix_c(8) | mix_c(0)
+}
 
 fn control_corner_ellipse(id: usize, dpi: i32) -> i32 {
     let base = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
@@ -429,6 +465,511 @@ pub fn thumbnail(path: PathBuf, image: HBITMAP) {
         skin.thumbnails.insert(path, image);
     });
 }
+pub const ANIM_TIMER_ID: usize = 3;
+const ANIM_INTERVAL_MS: u32 = 16;
+const TAB_ANIM_MS: u32 = 200;
+const TOGGLE_ANIM_MS: u32 = 150;
+pub const PAGE_ANIM_MS: u32 = 190;
+pub const TAB_TRANSITION_MS: u32 = 200;
+
+struct ToggleAnim {
+    from: f32,
+    pos: f32,
+    target: bool,
+    start: Instant,
+    settled: bool,
+}
+struct TabSlideAnim {
+    from_settings: f32,
+    to_settings: f32,
+    start: Instant,
+}
+pub struct CapturedLayer {
+    pixels: Vec<u32>,
+    width: i32,
+    height: i32,
+}
+struct TransitionAnim {
+    clip: RECT,
+    direction: i32,
+    start: Instant,
+    duration_ms: u32,
+    old_layer: CapturedLayer,
+    new_layer: CapturedLayer,
+    hidden: Vec<HWND>,
+    restore_focus: Option<HWND>,
+    covers_body: bool,
+}
+#[derive(Default)]
+struct AnimState {
+    hot: isize,
+    toggles: HashMap<usize, ToggleAnim>,
+    tab_slide: Option<TabSlideAnim>,
+    transition: Option<TransitionAnim>,
+}
+impl AnimState {
+    fn has_active(&self) -> bool {
+        self.tab_slide.is_some()
+            || self.transition.is_some()
+            || self.toggles.values().any(|toggle| !toggle.settled)
+    }
+}
+thread_local! {
+    static ANIM: RefCell<AnimState> = RefCell::new(AnimState::default());
+}
+
+pub fn animations_enabled(window: HWND) -> bool {
+    if window.0.is_null() {
+        return false;
+    }
+    // SAFETY: read-only visibility and OS client-area animation preference check.
+    unsafe {
+        if !IsWindowVisible(window).as_bool() {
+            return false;
+        }
+        let mut enabled = 1i32;
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&mut enabled as *mut i32).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && enabled != 0
+    }
+}
+
+fn is_hot(window: HWND) -> bool {
+    !window.0.is_null() && ANIM.with(|a| a.borrow().hot == window.0 as isize)
+}
+
+fn arm_anim_timer(window: HWND) {
+    if !window.0.is_null() {
+        unsafe {
+            let _ = SetTimer(window, ANIM_TIMER_ID, ANIM_INTERVAL_MS, None);
+        }
+    }
+}
+
+fn disarm_timer_if_idle(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    let active = ANIM.with(|a| a.borrow().has_active());
+    if !active {
+        unsafe {
+            let _ = KillTimer(window, ANIM_TIMER_ID);
+        }
+    }
+}
+
+fn tab_settings_weight(tab: Tab) -> f32 {
+    ANIM.with(|a| {
+        let state = a.borrow();
+        if let Some(slide) = &state.tab_slide {
+            let raw = slide.start.elapsed().as_secs_f32() * 1000.0 / TAB_ANIM_MS as f32;
+            let t = ease_out_cubic(raw);
+            slide.from_settings + (slide.to_settings - slide.from_settings) * t
+        } else if tab == Tab::Settings {
+            1.0
+        } else {
+            0.0
+        }
+    })
+}
+
+fn toggle_progress(id: usize, checked: bool, parent: HWND) -> f32 {
+    let mut should_arm = false;
+    let pos = ANIM.with(|a| {
+        let mut state = a.borrow_mut();
+        let now = Instant::now();
+        let target_f = if checked { 1.0 } else { 0.0 };
+        match state.toggles.get_mut(&id) {
+            None => {
+                state.toggles.insert(
+                    id,
+                    ToggleAnim {
+                        from: target_f,
+                        pos: target_f,
+                        target: checked,
+                        start: now,
+                        settled: true,
+                    },
+                );
+                target_f
+            }
+            Some(entry) => {
+                let current_target = if entry.target { 1.0 } else { 0.0 };
+                let raw =
+                    now.duration_since(entry.start).as_secs_f32() * 1000.0 / TOGGLE_ANIM_MS as f32;
+                entry.pos = if entry.settled || raw >= 1.0 {
+                    entry.settled = true;
+                    current_target
+                } else {
+                    entry.from + (current_target - entry.from) * ease_out_cubic(raw)
+                };
+                if entry.target != checked {
+                    entry.from = entry.pos;
+                    entry.target = checked;
+                    entry.start = now;
+                    if animations_enabled(parent) {
+                        entry.settled = false;
+                        should_arm = true;
+                    } else {
+                        entry.pos = target_f;
+                        entry.from = target_f;
+                        entry.settled = true;
+                    }
+                }
+                entry.pos
+            }
+        }
+    });
+    if should_arm {
+        arm_anim_timer(parent);
+    }
+    pos
+}
+
+pub fn start_tab_pill_anim(window: HWND, from_tab: Tab, to_tab: Tab) {
+    let from_is_settings = from_tab == Tab::Settings;
+    let to_is_settings = to_tab == Tab::Settings;
+    if from_is_settings == to_is_settings || !animations_enabled(window) {
+        ANIM.with(|a| a.borrow_mut().tab_slide = None);
+        return;
+    }
+    let current = tab_settings_weight(from_tab);
+    ANIM.with(|a| {
+        a.borrow_mut().tab_slide = Some(TabSlideAnim {
+            from_settings: current,
+            to_settings: if to_is_settings { 1.0 } else { 0.0 },
+            start: Instant::now(),
+        });
+    });
+    arm_anim_timer(window);
+}
+
+pub unsafe fn paint_children_into(
+    parent: HWND,
+    dc: HDC,
+    controls: &[(usize, HWND)],
+    filter_clip: Option<RECT>,
+    dib_bits: Option<(*mut u32, i32, i32)>,
+) {
+    // SAFETY: parent and child HWNDs live on this synchronous UI thread; DIB pointer bounds validated.
+    unsafe {
+        for &(id, child) in controls {
+            if child.0.is_null() || GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
+                continue;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(child, &mut r).is_err() {
+                continue;
+            }
+            let mut pt = [
+                POINT {
+                    x: r.left,
+                    y: r.top,
+                },
+                POINT {
+                    x: r.right,
+                    y: r.bottom,
+                },
+            ];
+            MapWindowPoints(None, parent, &mut pt);
+            let child_rect = rect(pt[0].x, pt[0].y, pt[1].x, pt[1].y);
+            if let Some(clip) = filter_clip
+                && (child_rect.right <= clip.left
+                    || child_rect.left >= clip.right
+                    || child_rect.bottom <= clip.top
+                    || child_rect.top >= clip.bottom)
+            {
+                continue;
+            }
+            let state = SaveDC(dc);
+            let _ = SetViewportOrgEx(dc, child_rect.left, child_rect.top, None);
+            let clip_rgn = CreateRectRgn(0, 0, 0, 0);
+            if GetWindowRgn(child, clip_rgn).0 != ERROR {
+                let _ = OffsetRgn(clip_rgn, child_rect.left, child_rect.top);
+                let _ = ExtSelectClipRgn(dc, clip_rgn, RGN_AND);
+            }
+            let _ = DeleteObject(clip_rgn);
+            SendMessageW(
+                child,
+                WM_PRINT,
+                WPARAM(dc.0 as usize),
+                LPARAM((PRF_CLIENT | PRF_NONCLIENT | PRF_ERASEBKGND) as isize),
+            );
+            let _ = RestoreDC(dc, state);
+            if id == SEARCH
+                && let Some((bits, w, h)) = dib_bits
+                && !bits.is_null()
+                && w > 0
+                && h > 0
+            {
+                let _ = GdiFlush();
+                let x0 = child_rect.left.max(0);
+                let y0 = child_rect.top.max(0);
+                let x1 = child_rect.right.min(w);
+                let y1 = child_rect.bottom.min(h);
+                let slice = std::slice::from_raw_parts_mut(bits, (w * h) as usize);
+                for y in y0..y1 {
+                    let row = y as usize * w as usize;
+                    for x in x0..x1 {
+                        let px = slice[row + x as usize];
+                        let a = SEARCH_ALPHA;
+                        let r_ch = premul_channel(((px >> 16) & 255) as u8, a);
+                        let g_ch = premul_channel(((px >> 8) & 255) as u8, a);
+                        let b_ch = premul_channel((px & 255) as u8, a);
+                        slice[row + x as usize] = (u32::from(a) << 24)
+                            | (u32::from(r_ch) << 16)
+                            | (u32::from(g_ch) << 8)
+                            | u32::from(b_ch);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn capture_region(
+    window: HWND,
+    clip: RECT,
+    controls: &[(usize, HWND)],
+) -> Option<CapturedLayer> {
+    if window.0.is_null() {
+        return None;
+    }
+    // SAFETY: transient offscreen 32-bit DIB and DC are deleted before returning.
+    unsafe {
+        let mut client = RECT::default();
+        if GetClientRect(window, &mut client).is_err() {
+            return None;
+        }
+        let bounds = rect(
+            clip.left.max(0),
+            clip.top.max(0),
+            clip.right.min(client.right),
+            clip.bottom.min(client.bottom),
+        );
+        let cw = bounds.right - bounds.left;
+        let ch = bounds.bottom - bounds.top;
+        if client.right <= 0 || client.bottom <= 0 || cw <= 0 || ch <= 0 {
+            return None;
+        }
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(screen);
+        let _ = ReleaseDC(None, screen);
+        if dc.0.is_null() {
+            return None;
+        }
+        let mut bits = std::ptr::null_mut();
+        let Ok(bitmap) = CreateDIBSection(
+            dc,
+            &BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: client.right,
+                    biHeight: -client.bottom,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        ) else {
+            let _ = DeleteDC(dc);
+            return None;
+        };
+        let prev = SelectObject(dc, bitmap);
+        let total = (client.right * client.bottom) as usize;
+        std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
+        paint_into(window, dc);
+        paint_children_into(
+            window,
+            dc,
+            controls,
+            Some(bounds),
+            Some((bits as *mut u32, client.right, client.bottom)),
+        );
+        let _ = GdiFlush();
+        let src = std::slice::from_raw_parts(bits as *const u32, total);
+        let mut pixels = Vec::with_capacity((cw * ch) as usize);
+        for y in bounds.top..bounds.bottom {
+            let row = y as usize * client.right as usize;
+            pixels.extend_from_slice(&src[row + bounds.left as usize..row + bounds.right as usize]);
+        }
+        SelectObject(dc, prev);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(dc);
+        Some(CapturedLayer {
+            pixels,
+            width: cw,
+            height: ch,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn begin_transition(
+    window: HWND,
+    clip: RECT,
+    direction: i32,
+    duration_ms: u32,
+    old_layer: CapturedLayer,
+    new_layer: CapturedLayer,
+    hidden: Vec<HWND>,
+    restore_focus: Option<HWND>,
+    covers_body: bool,
+) {
+    cancel_transition(window);
+    if !animations_enabled(window) {
+        if let Some(target) = restore_focus
+            && !target.0.is_null()
+        {
+            unsafe {
+                if IsWindow(target).as_bool() && IsWindowVisible(target).as_bool() {
+                    let _ = SetFocus(target);
+                }
+            }
+        }
+        return;
+    }
+    unsafe {
+        for &child in &hidden {
+            if !child.0.is_null() {
+                let _ = ShowWindow(child, SW_HIDE);
+            }
+        }
+    }
+    ANIM.with(|a| {
+        a.borrow_mut().transition = Some(TransitionAnim {
+            clip,
+            direction,
+            start: Instant::now(),
+            duration_ms: duration_ms.max(1),
+            old_layer,
+            new_layer,
+            hidden,
+            restore_focus,
+            covers_body,
+        });
+    });
+    arm_anim_timer(window);
+    unsafe {
+        let _ = InvalidateRect(window, Some(&clip), false);
+    }
+}
+
+fn end_transition(window: HWND, anim: TransitionAnim) {
+    unsafe {
+        for child in anim.hidden {
+            if !child.0.is_null() && IsWindow(child).as_bool() {
+                let _ = ShowWindow(child, SW_SHOWNA);
+            }
+        }
+        if let Some(target) = anim.restore_focus
+            && !target.0.is_null()
+            && IsWindow(target).as_bool()
+            && IsWindowVisible(target).as_bool()
+        {
+            let _ = SetFocus(target);
+        }
+        if !window.0.is_null() && IsWindow(window).as_bool() {
+            let _ = InvalidateRect(window, Some(&anim.clip), false);
+        }
+    }
+    drop(anim.old_layer);
+    drop(anim.new_layer);
+}
+
+pub fn cancel_transition(window: HWND) {
+    let taken = ANIM.with(|a| a.borrow_mut().transition.take());
+    if let Some(anim) = taken {
+        end_transition(window, anim);
+        disarm_timer_if_idle(window);
+    }
+}
+
+pub fn tick_animations(window: HWND) -> bool {
+    if window.0.is_null() || unsafe { !IsWindow(window).as_bool() || IsIconic(window).as_bool() } {
+        cancel_transition(window);
+        ANIM.with(|a| {
+            let mut state = a.borrow_mut();
+            state.tab_slide = None;
+            state.toggles.clear();
+        });
+        disarm_timer_if_idle(window);
+        return false;
+    }
+    let now = Instant::now();
+    let mut invalidate_tabs = false;
+    let mut invalidate_toggles = Vec::new();
+    let mut finished_transition = None;
+    let mut transition_clip = None;
+    ANIM.with(|a| {
+        let mut state = a.borrow_mut();
+        if let Some(slide) = &state.tab_slide {
+            invalidate_tabs = true;
+            if now.duration_since(slide.start).as_secs_f32() * 1000.0 >= TAB_ANIM_MS as f32 {
+                state.tab_slide = None;
+            }
+        }
+        for (&id, entry) in &mut state.toggles {
+            if !entry.settled {
+                invalidate_toggles.push(id);
+                let target_f = if entry.target { 1.0 } else { 0.0 };
+                let raw =
+                    now.duration_since(entry.start).as_secs_f32() * 1000.0 / TOGGLE_ANIM_MS as f32;
+                if raw >= 1.0 {
+                    entry.pos = target_f;
+                    entry.from = target_f;
+                    entry.settled = true;
+                } else {
+                    entry.pos = entry.from + (target_f - entry.from) * ease_out_cubic(raw);
+                }
+            }
+        }
+        if let Some(trans) = &state.transition {
+            if now.duration_since(trans.start).as_secs_f32() * 1000.0 >= trans.duration_ms as f32 {
+                finished_transition = state.transition.take();
+            } else {
+                transition_clip = Some(trans.clip);
+            }
+        }
+    });
+    unsafe {
+        if invalidate_tabs {
+            for tab_id in [TAB_LIBRARY, TAB_SETTINGS] {
+                if let Ok(h) = GetDlgItem(window, tab_id as i32)
+                    && !h.0.is_null()
+                {
+                    let _ = InvalidateRect(h, None, false);
+                }
+            }
+        }
+        for id in invalidate_toggles {
+            if let Ok(h) = GetDlgItem(window, id as i32)
+                && !h.0.is_null()
+            {
+                let _ = InvalidateRect(h, None, false);
+            }
+        }
+        if let Some(anim) = finished_transition {
+            end_transition(window, anim);
+        } else if let Some(clip) = transition_clip {
+            let _ = InvalidateRect(window, Some(&clip), false);
+        }
+    }
+    disarm_timer_if_idle(window);
+    ANIM.with(|a| a.borrow().has_active())
+}
+
 pub fn set_tab(tab: Tab) {
     SKIN.with(|s| s.borrow_mut().tab = tab);
 }
@@ -442,6 +983,7 @@ pub fn clear() {
         skin.playing.clear();
         skin.library_empty = true;
     });
+    ANIM.with(|a| *a.borrow_mut() = AnimState::default());
     BRUSHES.with(|b| {
         for (_, brush) in b.borrow_mut().drain() {
             unsafe {
@@ -553,6 +1095,33 @@ impl PaintBuffer {
         }
         true
     }
+    unsafe fn clear_alpha(&self, area: RECT) -> bool {
+        let width = self.area.right - self.area.left;
+        let height = self.area.bottom - self.area.top;
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        if unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
+            || bits.is_null()
+            || stride < width
+            || !unsafe { GdiFlush() }.as_bool()
+        {
+            return false;
+        }
+        let Some(len) = (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<RGBQUAD>())
+        else {
+            return false;
+        };
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
+        for y in area.top.max(self.area.top)..area.bottom.min(self.area.bottom) {
+            let row = (y - self.area.top) as usize * stride as usize;
+            for x in area.left.max(self.area.left)..area.right.min(self.area.right) {
+                pixels[row + (x - self.area.left) as usize].rgbReserved = 0;
+            }
+        }
+        true
+    }
     unsafe fn apply_rounded_rect_mask(&self, bounds: RECT, mask: &RoundedMask) -> bool {
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
@@ -601,15 +1170,13 @@ impl PaintBuffer {
             )
         };
         let (br, bg, bb) = split_rgb(mask.border);
+        let (tr, tg, tb) = split_rgb(mask.top_rim);
+        let (dr, dg, db) = split_rgb(mask.bottom_rim);
         let (fr, fg, fb) = split_rgb(mask.focus);
         let (hr, hg, hb) = split_rgb(mask.host_color);
         let fa = f32::from(mask.fill_alpha);
         let fill_scale = fa / 255.0;
         let ba = f32::from(mask.border_alpha);
-        let border_scale = ba / 255.0;
-        let border_pre_r = br * border_scale;
-        let border_pre_g = bg * border_scale;
-        let border_pre_b = bb * border_scale;
         let ha = f32::from(mask.host_alpha);
         let host_pre_r = hr * ha / 255.0;
         let host_pre_g = hg * ha / 255.0;
@@ -623,16 +1190,9 @@ impl PaintBuffer {
         let corner_band = (radius + safe_inset).ceil() as i32;
         let edge_band = (safe_inset + 1.0).ceil() as i32;
         let focus_center = -(mask.border_width + mask.focus_inset - 0.5);
-        let tint_interior = |pixel: &mut RGBQUAD| {
-            if pixel.rgbReserved != 0 {
-                return;
-            }
-            if mask.fill_alpha < 255 {
-                pixel.rgbBlue = premul_channel(pixel.rgbBlue, mask.fill_alpha);
-                pixel.rgbGreen = premul_channel(pixel.rgbGreen, mask.fill_alpha);
-                pixel.rgbRed = premul_channel(pixel.rgbRed, mask.fill_alpha);
-            }
-            pixel.rgbReserved = mask.fill_alpha;
+        let light_band = (radius + 4.0).clamp(2.0, hh.max(2.0));
+        let apply_sheen = |c: f32, target: f32, weight: f32| -> f32 {
+            (c + (target - c) * weight).clamp(0.0, 255.0)
         };
         for y in rect_top..rect_bottom {
             let row_offset = (y - self.area.top) as usize * stride as usize;
@@ -641,6 +1201,53 @@ impl PaintBuffer {
             let row = &mut pixels[row_offset + col_start..row_offset + col_end];
             let yi = y - bounds.top;
             let py = yi as f32 + 0.5;
+            let top_edge = if mask.top_rim != 0 && py < light_band {
+                (1.0 - (py - 0.5) / light_band).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let bot_edge = if mask.bottom_rim != 0 && py > h - light_band {
+                (1.0 - ((h - 0.5) - py) / light_band).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let face_sheen = if mask.sheen_strength != 0.0 && h > 0.0 {
+                let v = (py / h).clamp(0.0, 1.0);
+                if v < 0.42 {
+                    mask.sheen_strength * (1.0 - v / 0.42)
+                } else if v > 0.62 {
+                    -mask.sheen_strength * 0.55 * ((v - 0.62) / 0.38)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let (sheen_target_r, sheen_target_g, sheen_target_b, sheen_w) = if face_sheen > 0.0 {
+                (250.0, 246.0, 238.0, face_sheen.clamp(0.0, 0.35))
+            } else {
+                (14.0, 14.0, 16.0, (-face_sheen).clamp(0.0, 0.35))
+            };
+            let top_w = top_edge * 0.58;
+            let bot_w = bot_edge * 0.48;
+            let mut row_br = br;
+            let mut row_bg = bg;
+            let mut row_bb = bb;
+            if top_w > 0.0 {
+                row_br += (tr - row_br) * top_w;
+                row_bg += (tg - row_bg) * top_w;
+                row_bb += (tb - row_bb) * top_w;
+            }
+            if bot_w > 0.0 {
+                row_br += (dr - row_br) * bot_w;
+                row_bg += (dg - row_bg) * bot_w;
+                row_bb += (db - row_bb) * bot_w;
+            }
+            let row_ba = (ba + (255.0 - ba) * 0.38 * top_edge).clamp(0.0, 255.0);
+            let border_scale = row_ba / 255.0;
+            let border_pre_r = row_br * border_scale;
+            let border_pre_g = row_bg * border_scale;
+            let border_pre_b = row_bb * border_scale;
             let y_inner = yi >= edge_band && yi < bounds_h - edge_band;
             let y_deep = yi >= corner_band && yi < bounds_h - corner_band;
             for (offset, pixel) in row.iter_mut().enumerate() {
@@ -648,7 +1255,31 @@ impl PaintBuffer {
                 if y_deep && xi >= edge_band && xi < bounds_w - edge_band
                     || y_inner && xi >= corner_band && xi < bounds_w - corner_band
                 {
-                    tint_interior(pixel);
+                    if pixel.rgbReserved == 0 {
+                        let (r, g, b) = if sheen_w > 0.0 {
+                            (
+                                apply_sheen(f32::from(pixel.rgbRed), sheen_target_r, sheen_w),
+                                apply_sheen(f32::from(pixel.rgbGreen), sheen_target_g, sheen_w),
+                                apply_sheen(f32::from(pixel.rgbBlue), sheen_target_b, sheen_w),
+                            )
+                        } else {
+                            (
+                                f32::from(pixel.rgbRed),
+                                f32::from(pixel.rgbGreen),
+                                f32::from(pixel.rgbBlue),
+                            )
+                        };
+                        if mask.fill_alpha < 255 {
+                            pixel.rgbRed = premul_channel(r.round() as u8, mask.fill_alpha);
+                            pixel.rgbGreen = premul_channel(g.round() as u8, mask.fill_alpha);
+                            pixel.rgbBlue = premul_channel(b.round() as u8, mask.fill_alpha);
+                        } else {
+                            pixel.rgbRed = r.round() as u8;
+                            pixel.rgbGreen = g.round() as u8;
+                            pixel.rgbBlue = b.round() as u8;
+                        }
+                        pixel.rgbReserved = mask.fill_alpha;
+                    }
                     continue;
                 }
                 let px = xi as f32 + 0.5;
@@ -656,16 +1287,50 @@ impl PaintBuffer {
                 let qy = (py - hh).abs() - (hh - radius);
                 let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
                 if d <= -safe_inset {
-                    tint_interior(pixel);
+                    if pixel.rgbReserved == 0 {
+                        let (r, g, b) = if sheen_w > 0.0 {
+                            (
+                                apply_sheen(f32::from(pixel.rgbRed), sheen_target_r, sheen_w),
+                                apply_sheen(f32::from(pixel.rgbGreen), sheen_target_g, sheen_w),
+                                apply_sheen(f32::from(pixel.rgbBlue), sheen_target_b, sheen_w),
+                            )
+                        } else {
+                            (
+                                f32::from(pixel.rgbRed),
+                                f32::from(pixel.rgbGreen),
+                                f32::from(pixel.rgbBlue),
+                            )
+                        };
+                        if mask.fill_alpha < 255 {
+                            pixel.rgbRed = premul_channel(r.round() as u8, mask.fill_alpha);
+                            pixel.rgbGreen = premul_channel(g.round() as u8, mask.fill_alpha);
+                            pixel.rgbBlue = premul_channel(b.round() as u8, mask.fill_alpha);
+                        } else {
+                            pixel.rgbRed = r.round() as u8;
+                            pixel.rgbGreen = g.round() as u8;
+                            pixel.rgbBlue = b.round() as u8;
+                        }
+                        pixel.rgbReserved = mask.fill_alpha;
+                    }
                     continue;
                 }
                 let shape_cov = (0.5 - d).clamp(0.0, 1.0);
                 let inner_cov = (0.5 - (d + mask.border_width)).clamp(0.0, 1.0);
                 let border_cov = (shape_cov - inner_cov).max(0.0);
                 let out_cov = 1.0 - shape_cov;
-                let src_r = f32::from(pixel.rgbRed);
-                let src_g = f32::from(pixel.rgbGreen);
-                let src_b = f32::from(pixel.rgbBlue);
+                let (src_r, src_g, src_b) = if pixel.rgbReserved == 0 && sheen_w > 0.0 {
+                    (
+                        apply_sheen(f32::from(pixel.rgbRed), sheen_target_r, sheen_w),
+                        apply_sheen(f32::from(pixel.rgbGreen), sheen_target_g, sheen_w),
+                        apply_sheen(f32::from(pixel.rgbBlue), sheen_target_b, sheen_w),
+                    )
+                } else {
+                    (
+                        f32::from(pixel.rgbRed),
+                        f32::from(pixel.rgbGreen),
+                        f32::from(pixel.rgbBlue),
+                    )
+                };
                 let (mut fill_pre_r, mut fill_pre_g, mut fill_pre_b, mut fill_a) =
                     if pixel.rgbReserved == 255 {
                         (src_r, src_g, src_b, 255.0)
@@ -686,7 +1351,7 @@ impl PaintBuffer {
                         fill_a = fill_a * (1.0 - focus_cov) + 255.0 * focus_cov;
                     }
                 }
-                let out_a = (fill_a * inner_cov + ba * border_cov + ha * out_cov)
+                let out_a = (fill_a * inner_cov + row_ba * border_cov + ha * out_cov)
                     .round()
                     .clamp(0.0, 255.0) as u8;
                 let blend = |f_pre: f32, b_pre: f32, h_pre: f32| -> u8 {
@@ -697,6 +1362,257 @@ impl PaintBuffer {
                 pixel.rgbRed = blend(fill_pre_r, border_pre_r, host_pre_r);
                 pixel.rgbGreen = blend(fill_pre_g, border_pre_g, host_pre_g);
                 pixel.rgbBlue = blend(fill_pre_b, border_pre_b, host_pre_b);
+                pixel.rgbReserved = out_a;
+            }
+        }
+        true
+    }
+    unsafe fn draw_toggle_switch(
+        &self,
+        track: RECT,
+        t: f32,
+        pressed: bool,
+        hot: bool,
+        disabled: bool,
+        glass: bool,
+    ) -> bool {
+        let width = self.area.right - self.area.left;
+        let height = self.area.bottom - self.area.top;
+        let tw = track.right - track.left;
+        let th = track.bottom - track.top;
+        if width <= 0 || height <= 0 || tw <= 4 || th <= 4 {
+            return true;
+        }
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        if unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
+            || bits.is_null()
+            || stride < width
+            || !unsafe { GdiFlush() }.as_bool()
+        {
+            return false;
+        }
+        let Some(len) = (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<RGBQUAD>())
+        else {
+            return false;
+        };
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
+        let w = tw as f32;
+        let h = th as f32;
+        let hw = w * 0.5;
+        let hh = h * 0.5;
+        let pill_r = hh;
+        let pad = (h * 0.14).max(2.0);
+        let knob_r = (hh - pad).max(3.0);
+        let knob_cx = pad + knob_r + t * (w - 2.0 * (pad + knob_r));
+        let knob_cy = hh;
+
+        let off_fill = if disabled {
+            DISABLED_FILL
+        } else if pressed {
+            CARD_LIT
+        } else if hot {
+            mix(INK, CREAM, 12, 100)
+        } else {
+            mix(INK, CREAM, 7, 100)
+        };
+        let on_fill = if disabled {
+            DISABLED_BORDER
+        } else if pressed {
+            ACCENT_DARK
+        } else if hot {
+            ACCENT_HOVER
+        } else {
+            ACCENT
+        };
+        let track_color = lerp_rgb(off_fill, on_fill, t);
+        let off_alpha = if !glass {
+            255
+        } else if hot || pressed {
+            168
+        } else {
+            132
+        };
+        let on_alpha = if glass { 244 } else { 255 };
+        let track_alpha = lerp_u8(off_alpha, on_alpha, t) as f32;
+        let off_border = if disabled { DISABLED_BORDER } else { HIGHLIGHT };
+        let on_border = if pressed { ACCENT_DEEP } else { ACCENT_SOFT };
+        let border_color = lerp_rgb(off_border, on_border, t);
+        let split = |c: u32| -> (f32, f32, f32) {
+            (
+                ((c >> 16) & 255) as f32,
+                ((c >> 8) & 255) as f32,
+                (c & 255) as f32,
+            )
+        };
+        let (tfr, tfg, tfb) = split(track_color);
+        let (tbr, tbg, tbb) = split(border_color);
+        let (kr_base, kg_base, kb_base) = split(if disabled { DISABLED_TEXT } else { CREAM });
+        let over_pre = |dst_r: f32,
+                        dst_g: f32,
+                        dst_b: f32,
+                        dst_a: f32,
+                        src_r: f32,
+                        src_g: f32,
+                        src_b: f32,
+                        src_a: f32|
+         -> (f32, f32, f32, f32) {
+            let sa = (src_a / 255.0).clamp(0.0, 1.0);
+            let inv = 1.0 - sa;
+            (
+                src_r * sa + dst_r * inv,
+                src_g * sa + dst_g * inv,
+                src_b * sa + dst_b * inv,
+                (src_a + dst_a * inv).clamp(0.0, 255.0),
+            )
+        };
+        let y0 = (track.top - 1).max(self.area.top);
+        let y1 = (track.bottom + 2).min(self.area.bottom);
+        let x0 = (track.left - 1).max(self.area.left);
+        let x1 = (track.right + 1).min(self.area.right);
+        for y in y0..y1 {
+            let row = (y - self.area.top) as usize * stride as usize;
+            let py = (y - track.top) as f32 + 0.5;
+            for x in x0..x1 {
+                let pixel = &mut pixels[row + (x - self.area.left) as usize];
+                let px = (x - track.left) as f32 + 0.5;
+                let qx = (px - hw).abs() - (hw - pill_r).max(0.0);
+                let qy = (py - hh).abs() - (hh - pill_r).max(0.0);
+                let d_track = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - pill_r;
+                let bg_r = f32::from(pixel.rgbRed);
+                let bg_g = f32::from(pixel.rgbGreen);
+                let bg_b = f32::from(pixel.rgbBlue);
+                let bg_a = f32::from(pixel.rgbReserved);
+
+                let track_cov = (0.5 - d_track).clamp(0.0, 1.0);
+                let inner_cov = (0.5 - (d_track + 1.0)).clamp(0.0, 1.0);
+                let border_cov = (track_cov - inner_cov).max(0.0);
+                // Concave inner recess when OFF, warm dome lift when ON.
+                let v = (py / h).clamp(0.0, 1.0);
+                let depth = ((0.5 - v) * 2.0) * (t * 0.14 - (1.0 - t) * 0.12);
+                let face_r = (tfr * (1.0 + depth)).clamp(0.0, 255.0);
+                let face_g = (tfg * (1.0 + depth)).clamp(0.0, 255.0);
+                let face_b = (tfb * (1.0 + depth)).clamp(0.0, 255.0);
+                let trk_a = track_alpha * inner_cov + 210.0 * border_cov;
+                let trk_r = if track_cov > 0.0 {
+                    (face_r * track_alpha * inner_cov + tbr * 210.0 * border_cov) / trk_a.max(1.0)
+                } else {
+                    0.0
+                };
+                let trk_g = if track_cov > 0.0 {
+                    (face_g * track_alpha * inner_cov + tbg * 210.0 * border_cov) / trk_a.max(1.0)
+                } else {
+                    0.0
+                };
+                let trk_b = if track_cov > 0.0 {
+                    (face_b * track_alpha * inner_cov + tbb * 210.0 * border_cov) / trk_a.max(1.0)
+                } else {
+                    0.0
+                };
+                let (mut cur_r, mut cur_g, mut cur_b, mut cur_a) = if track_cov > 0.0 {
+                    over_pre(bg_r, bg_g, bg_b, bg_a, trk_r, trk_g, trk_b, trk_a)
+                } else {
+                    (bg_r, bg_g, bg_b, bg_a)
+                };
+
+                // Soft 3D knob shadow over track.
+                let d_shadow = (px - knob_cx).hypot(py - (knob_cy + 1.2)) - (knob_r + 0.9);
+                let shadow_cov = (0.5 - d_shadow).clamp(0.0, 1.0);
+                if shadow_cov > 0.0 {
+                    let s_a = shadow_cov * 96.0;
+                    (cur_r, cur_g, cur_b, cur_a) =
+                        over_pre(cur_r, cur_g, cur_b, cur_a, 10.0, 10.0, 12.0, s_a);
+                }
+
+                // 3D spherical thumb with upper-left specular highlight and grounded rim.
+                let d_knob = (px - knob_cx).hypot(py - knob_cy) - knob_r;
+                let knob_cov = (0.5 - d_knob).clamp(0.0, 1.0);
+                if knob_cov > 0.0 {
+                    let nx = ((px - knob_cx) / knob_r).clamp(-1.0, 1.0);
+                    let ny = ((py - knob_cy) / knob_r).clamp(-1.0, 1.0);
+                    let spec = (-nx * 0.45 - ny * 0.85).clamp(0.0, 1.0) * 0.14;
+                    let rim = (d_knob / 1.0 + 0.5).clamp(0.0, 1.0) * 0.06;
+                    let kr = (kr_base + (255.0 - kr_base) * spec - kr_base * rim).clamp(0.0, 255.0);
+                    let kg = (kg_base + (255.0 - kg_base) * spec - kg_base * rim).clamp(0.0, 255.0);
+                    let kb = (kb_base + (255.0 - kb_base) * spec - kb_base * rim).clamp(0.0, 255.0);
+                    (cur_r, cur_g, cur_b, cur_a) =
+                        over_pre(cur_r, cur_g, cur_b, cur_a, kr, kg, kb, knob_cov * 255.0);
+                }
+                let out_a = cur_a.round().clamp(0.0, 255.0) as u8;
+                pixel.rgbRed = cur_r.round().clamp(0.0, f32::from(out_a)) as u8;
+                pixel.rgbGreen = cur_g.round().clamp(0.0, f32::from(out_a)) as u8;
+                pixel.rgbBlue = cur_b.round().clamp(0.0, f32::from(out_a)) as u8;
+                pixel.rgbReserved = out_a;
+            }
+        }
+        true
+    }
+    unsafe fn composite_transition(&self, trans: &TransitionAnim, now: Instant) -> bool {
+        let width = self.area.right - self.area.left;
+        let height = self.area.bottom - self.area.top;
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        if width <= 0
+            || height <= 0
+            || unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
+            || bits.is_null()
+            || stride < width
+            || !unsafe { GdiFlush() }.as_bool()
+        {
+            return false;
+        }
+        let Some(len) = (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<RGBQUAD>())
+        else {
+            return false;
+        };
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
+        let elapsed = now.duration_since(trans.start).as_secs_f32() * 1000.0;
+        let raw = (elapsed / trans.duration_ms as f32).clamp(0.0, 1.0);
+        let ease = ease_out_cubic(raw);
+        let clip_w = (trans.clip.right - trans.clip.left).max(1) as f32;
+        let slide = (28.0 * (clip_w / 640.0).clamp(0.8, 1.35)).round();
+        let dx_old = (trans.direction as f32 * slide * ease).round() as i32;
+        let dx_new = (-trans.direction as f32 * slide * (1.0 - ease)).round() as i32;
+        let w_old = (1.0 - ease * 1.25).clamp(0.0, 1.0);
+        let w_new = ease;
+        let sample = |layer: &CapturedLayer, lx: i32, ly: i32| -> (f32, f32, f32, f32) {
+            if lx < 0 || ly < 0 || lx >= layer.width || ly >= layer.height {
+                return (0.0, 0.0, 0.0, 0.0);
+            }
+            let px = layer.pixels[(ly * layer.width + lx) as usize];
+            (
+                ((px >> 16) & 255) as f32,
+                ((px >> 8) & 255) as f32,
+                (px & 255) as f32,
+                ((px >> 24) & 255) as f32,
+            )
+        };
+        let y0 = trans.clip.top.max(self.area.top);
+        let y1 = trans.clip.bottom.min(self.area.bottom);
+        let x0 = trans.clip.left.max(self.area.left);
+        let x1 = trans.clip.right.min(self.area.right);
+        for y in y0..y1 {
+            let row = (y - self.area.top) as usize * stride as usize;
+            let ly = y - trans.clip.top;
+            for x in x0..x1 {
+                let lx = x - trans.clip.left;
+                let (or, og, ob, oa) = sample(&trans.old_layer, lx - dx_old, ly);
+                let (nr, ng, nb, na) = sample(&trans.new_layer, lx - dx_new, ly);
+                let out_a = (oa * w_old + na * w_new).round().clamp(0.0, 255.0) as u8;
+                let pixel = &mut pixels[row + (x - self.area.left) as usize];
+                pixel.rgbRed = (or * w_old + nr * w_new)
+                    .round()
+                    .clamp(0.0, f32::from(out_a)) as u8;
+                pixel.rgbGreen = (og * w_old + ng * w_new)
+                    .round()
+                    .clamp(0.0, f32::from(out_a)) as u8;
+                pixel.rgbBlue = (ob * w_old + nb * w_new)
+                    .round()
+                    .clamp(0.0, f32::from(out_a)) as u8;
                 pixel.rgbReserved = out_a;
             }
         }
@@ -880,6 +1796,9 @@ struct RoundedMask {
     focus_inset: f32,
     host_color: u32,
     host_alpha: u8,
+    top_rim: u32,
+    bottom_rim: u32,
+    sheen_strength: f32,
 }
 
 pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
@@ -973,12 +1892,17 @@ unsafe fn draw_item_into(
             && item.itemState.0 & ODS_DISABLED.0 == 0
             && !hide_focus;
         let is_tab = matches!(id, TAB_LIBRARY | TAB_SETTINGS);
+        let current_tab = SKIN.with(|s| s.borrow().tab);
         let active_tab = is_tab
-            && SKIN.with(|s| {
-                let tab = s.borrow().tab;
-                (tab != Tab::Settings && id == TAB_LIBRARY)
-                    || (tab == Tab::Settings && id == TAB_SETTINGS)
-            });
+            && ((current_tab != Tab::Settings && id == TAB_LIBRARY)
+                || (current_tab == Tab::Settings && id == TAB_SETTINGS));
+        let tab_weight = if !is_tab {
+            0.0
+        } else {
+            let sw = tab_settings_weight(current_tab);
+            if id == TAB_SETTINGS { sw } else { 1.0 - sw }
+        };
+        let hot = is_hot(item.hwndItem);
         let focus_color = if !focus_visible {
             0
         } else if (is_tab && active_tab) || (id == 102 && item.itemState.0 & ODS_SELECTED.0 == 0) {
@@ -993,6 +1917,9 @@ unsafe fn draw_item_into(
             let mut title_text = None;
             let mut checked = None;
             let mut card_border = LINE;
+            let mut card_top_rim = 0u32;
+            let mut card_bottom_rim = INK;
+            let mut card_sheen = 0.0f32;
             let mut fill_alpha = 255u8;
             let mut border_alpha = 255u8;
             let area = rect(
@@ -1019,25 +1946,33 @@ unsafe fn draw_item_into(
                     INK
                 } else if active {
                     ACTIVE_SURFACE
+                } else if hot {
+                    CARD_LIT
                 } else {
                     CARD
                 };
-                card_border = if active { ACCENT } else { LINE };
+                card_border = if active {
+                    ACCENT
+                } else if hot && id != PREVIEW {
+                    HIGHLIGHT
+                } else {
+                    LINE
+                };
                 fill_alpha = if !glass_active {
                     255
                 } else if id == PREVIEW {
-                    if path.is_some() {
-                        CARD_ALPHA
-                    } else {
-                        PANEL_ALPHA
-                    }
+                    if path.is_some() { CARD_ALPHA } else { 44 }
                 } else if active {
                     ACTIVE_TILE_ALPHA
+                } else if hot {
+                    HOVER_ALPHA
                 } else {
                     CONTROL_ALPHA
                 };
                 border_alpha = if !glass_active || active {
                     255
+                } else if hot && id != PREVIEW {
+                    196
                 } else {
                     BORDER_ALPHA
                 };
@@ -1045,19 +1980,22 @@ unsafe fn draw_item_into(
                     0
                 } else if active {
                     ACCENT_SOFT
+                } else if hot {
+                    CREAM
                 } else {
-                    HIGHLIGHT
+                    GLASS_RIM
+                };
+                card_top_rim = card_highlight;
+                card_bottom_rim = if active { ACCENT_DEEP } else { INK };
+                card_sheen = if id == PREVIEW {
+                    0.0
+                } else if hot {
+                    0.08
+                } else {
+                    0.05
                 };
                 if buffered {
                     fill(dc, r, card_color);
-                    if card_highlight != 0 && r.right - r.left > ellipse {
-                        let h_pen = CreatePen(PS_SOLID, 1, rgb(card_highlight));
-                        let old = SelectObject(dc, h_pen);
-                        let _ = MoveToEx(dc, r.left + ellipse / 2, r.top + 1, None);
-                        let _ = LineTo(dc, r.right - ellipse / 2, r.top + 1);
-                        SelectObject(dc, old);
-                        let _ = DeleteObject(h_pen);
-                    }
                 } else {
                     fill(dc, r, host_color);
                     raised_rounded(dc, r, card_color, card_border, card_highlight, ellipse);
@@ -1091,6 +2029,9 @@ unsafe fn draw_item_into(
                     focus_inset: s(3).max(2) as f32,
                     host_color,
                     host_alpha,
+                    top_rim: card_top_rim,
+                    bottom_rim: card_bottom_rim,
+                    sheen_strength: card_sheen,
                 };
                 if !buffer.apply_rounded_rect_mask(r, &mask) {
                     return false;
@@ -1208,70 +2149,96 @@ unsafe fn draw_item_into(
         let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
         let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
         let primary = id == 102;
-        let (color, border, highlight) = if disabled {
+        let (color, border, top_rim, bottom_rim, sheen_strength) = if disabled {
             (
                 if is_card_host { DISABLED_FILL } else { PANEL },
                 DISABLED_BORDER,
                 0,
+                0,
+                0.0,
             )
         } else if is_tab {
-            if active_tab {
-                (ACCENT, ACCENT_DARK, ACCENT_SOFT)
-            } else if pressed {
-                (mix(INK, CREAM, 10, 100), LINE, 0)
+            let base_c = if pressed {
+                mix(INK, CREAM, 12, 100)
+            } else if hot {
+                CARD_LIT
             } else {
-                (INK, LINE, 0)
-            }
+                CARD
+            };
+            let active_c = if pressed { ACCENT_DARK } else { ACCENT };
+            let c = lerp_rgb(base_c, active_c, tab_weight);
+            let b = lerp_rgb(if hot { HIGHLIGHT } else { LINE }, ACCENT_DARK, tab_weight);
+            let top = lerp_rgb(
+                if pressed {
+                    INK
+                } else if hot {
+                    CREAM
+                } else {
+                    GLASS_RIM
+                },
+                if pressed { ACCENT_DEEP } else { ACCENT_SOFT },
+                tab_weight,
+            );
+            let bot = lerp_rgb(INK, ACCENT_DEEP, tab_weight);
+            let sheen = if pressed {
+                -0.07
+            } else {
+                0.05 + 0.06 * tab_weight + if hot { 0.03 } else { 0.0 }
+            };
+            (c, b, top, bot, sheen)
         } else if primary {
             if pressed {
-                (ACCENT_DARK, ACCENT_DEEP, 0)
+                (ACCENT_DARK, ACCENT_DEEP, ACCENT_DEEP, ACCENT_SOFT, -0.08)
+            } else if hot {
+                (ACCENT_HOVER, ACCENT, CREAM, ACCENT_DEEP, 0.13)
             } else {
-                (ACCENT, ACCENT_DARK, ACCENT_SOFT)
+                (ACCENT, ACCENT_DARK, ACCENT_SOFT, ACCENT_DEEP, 0.10)
             }
         } else if pressed {
-            (CARD_LIT, HIGHLIGHT, 0)
+            (CARD_LIT, HIGHLIGHT, INK, HIGHLIGHT, -0.07)
+        } else if hot {
+            (CARD_LIT, HIGHLIGHT, CREAM, INK, 0.08)
         } else {
-            (CARD, LINE, HIGHLIGHT)
+            (CARD, LINE, GLASS_RIM, INK, 0.05)
         };
         let fill_alpha = if !glass_active {
             255
         } else if disabled {
-            if is_card_host { PANEL_ALPHA } else { 148 }
+            if is_card_host { 42 } else { 48 }
         } else if is_tab {
-            if active_tab {
-                ACTIVE_ALPHA
-            } else if pressed {
-                CONTROL_ALPHA
+            let base_a = if pressed {
+                156
+            } else if hot {
+                HOVER_ALPHA
             } else {
-                PANEL_ALPHA
-            }
+                56
+            };
+            lerp_u8(base_a, ACTIVE_ALPHA, tab_weight)
         } else if primary {
             ACTIVE_ALPHA
         } else if pressed {
-            216
+            168
+        } else if hot {
+            HOVER_ALPHA
         } else {
             CONTROL_ALPHA
         };
-        let border_alpha = if !glass_active || (is_tab && active_tab) || (primary && !disabled) {
+        let border_alpha = if !glass_active || (primary && !disabled) {
             255
+        } else if is_tab {
+            lerp_u8(if hot { 196 } else { BORDER_ALPHA }, 255, tab_weight)
         } else if disabled {
-            196
+            96
+        } else if hot || pressed {
+            208
         } else {
             BORDER_ALPHA
         };
         if buffered {
             fill(dc, r, color);
-            if highlight != 0 && r.right - r.left > ellipse {
-                let h_pen = CreatePen(PS_SOLID, 1, rgb(highlight));
-                let old = SelectObject(dc, h_pen);
-                let _ = MoveToEx(dc, r.left + ellipse / 2, r.top + 1, None);
-                let _ = LineTo(dc, r.right - ellipse / 2, r.top + 1);
-                SelectObject(dc, old);
-                let _ = DeleteObject(h_pen);
-            }
         } else {
             fill(dc, r, host_color);
-            raised_rounded(dc, r, color, border, highlight, ellipse);
+            raised_rounded(dc, r, color, border, top_rim, ellipse);
         }
         if let Some(buffer) = buffer {
             let mask = RoundedMask {
@@ -1284,12 +2251,30 @@ unsafe fn draw_item_into(
                 focus_inset: s(3).max(2) as f32,
                 host_color,
                 host_alpha,
+                top_rim,
+                bottom_rim,
+                sheen_strength,
             };
             if !buffer.apply_rounded_rect_mask(r, &mask) {
                 return false;
             }
         }
         let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
+        let label_color = if disabled {
+            DISABLED_TEXT
+        } else if primary && pressed {
+            TEXT_ON_DARK
+        } else if primary {
+            TEXT_ON_ACCENT
+        } else if is_tab {
+            lerp_rgb(
+                TEXT_ON_DARK,
+                TEXT_ON_ACCENT,
+                if tab_weight >= 0.55 { tab_weight } else { 0.0 },
+            )
+        } else {
+            TEXT
+        };
         label(
             dc,
             &text,
@@ -1301,17 +2286,7 @@ unsafe fn draw_item_into(
             ),
             s(14),
             primary || active_tab,
-            if disabled {
-                DISABLED_TEXT
-            } else if primary && pressed {
-                TEXT_ON_DARK
-            } else if primary || (is_tab && active_tab) {
-                TEXT_ON_ACCENT
-            } else if is_tab {
-                TEXT_ON_DARK
-            } else {
-                TEXT
-            },
+            label_color,
             (if selector { DT_LEFT } else { DT_CENTER })
                 | DT_VCENTER
                 | DT_SINGLELINE
@@ -1496,6 +2471,12 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
             let skin = skin.borrow();
             (skin.tab, skin.tiles.is_empty(), skin.library_empty)
         });
+        let (has_transition, covers_body) = ANIM.with(|a| {
+            a.borrow()
+                .transition
+                .as_ref()
+                .map_or((false, false), |t| (true, t.covers_body))
+        });
         fill(dc, pixels(layout.client), BODY);
         fill(dc, pixels(layout.header), BODY);
         fill(
@@ -1508,47 +2489,49 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
             ),
             LINE,
         );
-        match tab {
-            Tab::Library => {
-                fill(dc, pixels(layout.sidebar), CARD);
-                fill(
-                    dc,
-                    rect(
-                        scale(layout.sidebar.left),
-                        scale(layout.header.bottom),
-                        scale(layout.sidebar.left + 1),
-                        scale(layout.footer.top),
-                    ),
-                    LINE,
-                );
-            }
-            Tab::Settings => {
-                raised_rounded(
-                    dc,
-                    pixels(layout.settings_preferences_panel),
-                    CARD,
-                    LINE,
-                    HIGHLIGHT,
-                    scale(12),
-                );
-                raised_rounded(
-                    dc,
-                    pixels(layout.settings_resources_panel),
-                    CARD,
-                    LINE,
-                    HIGHLIGHT,
-                    scale(12),
-                );
-            }
-            Tab::Sources => {
-                raised_rounded(
-                    dc,
-                    pixels(layout.sources_panel),
-                    CARD,
-                    LINE,
-                    HIGHLIGHT,
-                    scale(12),
-                );
+        if !covers_body {
+            match tab {
+                Tab::Library => {
+                    fill(dc, pixels(layout.sidebar), CARD);
+                    fill(
+                        dc,
+                        rect(
+                            scale(layout.sidebar.left),
+                            scale(layout.header.bottom),
+                            scale(layout.sidebar.left + 1),
+                            scale(layout.footer.top),
+                        ),
+                        LINE,
+                    );
+                }
+                Tab::Settings => {
+                    raised_rounded(
+                        dc,
+                        pixels(layout.settings_preferences_panel),
+                        CARD,
+                        LINE,
+                        HIGHLIGHT,
+                        scale(12),
+                    );
+                    raised_rounded(
+                        dc,
+                        pixels(layout.settings_resources_panel),
+                        CARD,
+                        LINE,
+                        HIGHLIGHT,
+                        scale(12),
+                    );
+                }
+                Tab::Sources => {
+                    raised_rounded(
+                        dc,
+                        pixels(layout.sources_panel),
+                        CARD,
+                        LINE,
+                        HIGHLIGHT,
+                        scale(12),
+                    );
+                }
             }
         }
         fill(dc, pixels(layout.footer), FOOTER);
@@ -1575,8 +2558,8 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
                 scale(layout.client.right),
                 scale(layout.footer.top + 1),
             );
-            let div_ok = buffer.tint_background(header_divider, BORDER_ALPHA)
-                && buffer.tint_background(footer_divider, BORDER_ALPHA);
+            let div_ok = buffer.tint_background(header_divider, DIVIDER_ALPHA)
+                && buffer.tint_background(footer_divider, DIVIDER_ALPHA);
             let card_mask = RoundedMask {
                 ellipse: scale(12),
                 border: LINE,
@@ -1587,34 +2570,52 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
                 focus_inset: 0.0,
                 host_color: INK,
                 host_alpha: PANEL_ALPHA,
+                top_rim: GLASS_RIM,
+                bottom_rim: INK,
+                sheen_strength: 0.0,
             };
-            let panel_ok = match tab {
-                Tab::Library => {
-                    let side_divider = rect(
-                        scale(layout.sidebar.left),
-                        scale(layout.header.bottom),
-                        scale(layout.sidebar.left + 1),
-                        scale(layout.footer.top),
-                    );
-                    buffer.tint_background(side_divider, BORDER_ALPHA)
-                        && buffer.tint_background(pixels(layout.sidebar), CARD_ALPHA)
-                }
-                Tab::Settings => {
-                    buffer.apply_rounded_rect_mask(
-                        pixels(layout.settings_preferences_panel),
-                        &card_mask,
-                    ) && buffer.apply_rounded_rect_mask(
-                        pixels(layout.settings_resources_panel),
-                        &card_mask,
-                    )
-                }
-                Tab::Sources => {
-                    buffer.apply_rounded_rect_mask(pixels(layout.sources_panel), &card_mask)
+            let panel_ok = if covers_body {
+                true
+            } else {
+                match tab {
+                    Tab::Library => {
+                        let side_divider = rect(
+                            scale(layout.sidebar.left),
+                            scale(layout.header.bottom),
+                            scale(layout.sidebar.left + 1),
+                            scale(layout.footer.top),
+                        );
+                        buffer.tint_background(side_divider, DIVIDER_ALPHA)
+                            && buffer.tint_background(pixels(layout.sidebar), CARD_ALPHA)
+                    }
+                    Tab::Settings => {
+                        buffer.apply_rounded_rect_mask(
+                            pixels(layout.settings_preferences_panel),
+                            &card_mask,
+                        ) && buffer.apply_rounded_rect_mask(
+                            pixels(layout.settings_resources_panel),
+                            &card_mask,
+                        )
+                    }
+                    Tab::Sources => {
+                        buffer.apply_rounded_rect_mask(pixels(layout.sources_panel), &card_mask)
+                    }
                 }
             };
             // Window canvas, elevated cards, and dividers all transmit the acrylic backdrop at layered alpha levels.
             if !div_ok || !panel_ok || !buffer.tint_background(client, PANEL_ALPHA) {
                 return false;
+            }
+            if has_transition {
+                let comp_ok = ANIM.with(|a| {
+                    a.borrow()
+                        .transition
+                        .as_ref()
+                        .is_none_or(|t| buffer.composite_transition(t, Instant::now()))
+                });
+                if !comp_ok {
+                    return false;
+                }
             }
         }
         label(
@@ -1626,164 +2627,166 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
             TEXT_ON_DARK,
             DT_SINGLELINE,
         );
-        match tab {
-            Tab::Library => {
-                label(
-                    dc,
-                    "Library",
-                    pixels(layout.library_title),
-                    scale(25),
-                    true,
-                    TEXT,
-                    DT_SINGLELINE,
-                );
-                label(
-                    dc,
-                    "Bring your own live wallpapers.",
-                    pixels(layout.library_note),
-                    scale(13),
-                    false,
-                    MUTED,
-                    DT_SINGLELINE | DT_END_ELLIPSIS,
-                );
-                if empty_view {
-                    let area = layout.library;
+        if !covers_body {
+            match tab {
+                Tab::Library => {
                     label(
                         dc,
-                        if empty_library {
-                            "No wallpapers yet"
-                        } else {
-                            "No matching wallpapers"
-                        },
-                        pixels(Rect {
-                            bottom: area.top + 40,
-                            ..area
-                        }),
-                        scale(23),
+                        "Library",
+                        pixels(layout.library_title),
+                        scale(25),
                         true,
                         TEXT,
-                        DT_SINGLELINE | DT_END_ELLIPSIS,
+                        DT_SINGLELINE,
                     );
                     label(
                         dc,
-                        if empty_library {
-                            "Add a media file or folder. Originals stay where they are."
-                        } else {
-                            "Clear the search or choose All folders to see your library."
-                        },
-                        pixels(Rect {
-                            top: area.top + 56,
-                            bottom: area.top + 120,
-                            ..area
-                        }),
-                        scale(15),
-                        false,
-                        MUTED,
-                        DT_WORDBREAK,
-                    );
-                    label(
-                        dc,
-                        if empty_library {
-                            "MP4  GIF  MKV  WebM  MOV  AVI"
-                        } else {
-                            "Your files remain in the library."
-                        },
-                        pixels(Rect {
-                            top: area.top + 132,
-                            bottom: area.top + 156,
-                            ..area
-                        }),
+                        "Bring your own live wallpapers.",
+                        pixels(layout.library_note),
                         scale(13),
                         false,
                         MUTED,
                         DT_SINGLELINE | DT_END_ELLIPSIS,
                     );
+                    if empty_view && !has_transition {
+                        let area = layout.library;
+                        label(
+                            dc,
+                            if empty_library {
+                                "No wallpapers yet"
+                            } else {
+                                "No matching wallpapers"
+                            },
+                            pixels(Rect {
+                                bottom: area.top + 40,
+                                ..area
+                            }),
+                            scale(23),
+                            true,
+                            TEXT,
+                            DT_SINGLELINE | DT_END_ELLIPSIS,
+                        );
+                        label(
+                            dc,
+                            if empty_library {
+                                "Add a media file or folder. Originals stay where they are."
+                            } else {
+                                "Clear the search or choose All folders to see your library."
+                            },
+                            pixels(Rect {
+                                top: area.top + 56,
+                                bottom: area.top + 120,
+                                ..area
+                            }),
+                            scale(15),
+                            false,
+                            MUTED,
+                            DT_WORDBREAK,
+                        );
+                        label(
+                            dc,
+                            if empty_library {
+                                "MP4  GIF  MKV  WebM  MOV  AVI"
+                            } else {
+                                "Your files remain in the library."
+                            },
+                            pixels(Rect {
+                                top: area.top + 132,
+                                bottom: area.top + 156,
+                                ..area
+                            }),
+                            scale(13),
+                            false,
+                            MUTED,
+                            DT_SINGLELINE | DT_END_ELLIPSIS,
+                        );
+                    }
+                    label(
+                        dc,
+                        "Selected wallpaper",
+                        pixels(layout.preview_title),
+                        scale(16),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE,
+                    );
+                    label(
+                        dc,
+                        "Display",
+                        pixels(layout.display_label),
+                        scale(13),
+                        true,
+                        MUTED,
+                        DT_SINGLELINE,
+                    );
+                    label(
+                        dc,
+                        "Placement",
+                        pixels(layout.fit_label),
+                        scale(13),
+                        true,
+                        MUTED,
+                        DT_SINGLELINE,
+                    );
                 }
-                label(
-                    dc,
-                    "Selected wallpaper",
-                    pixels(layout.preview_title),
-                    scale(16),
-                    true,
-                    TEXT,
-                    DT_SINGLELINE,
-                );
-                label(
-                    dc,
-                    "Display",
-                    pixels(layout.display_label),
-                    scale(13),
-                    true,
-                    MUTED,
-                    DT_SINGLELINE,
-                );
-                label(
-                    dc,
-                    "Placement",
-                    pixels(layout.fit_label),
-                    scale(13),
-                    true,
-                    MUTED,
-                    DT_SINGLELINE,
-                );
-            }
-            Tab::Settings => {
-                label(
-                    dc,
-                    "Settings",
-                    pixels(layout.settings_title),
-                    scale(25),
-                    true,
-                    TEXT,
-                    DT_SINGLELINE,
-                );
-                label(
-                    dc,
-                    "Playback preferences and application details",
-                    pixels(layout.settings_subtitle),
-                    scale(13),
-                    false,
-                    MUTED,
-                    DT_SINGLELINE,
-                );
-                label(
-                    dc,
-                    "Playback & startup",
-                    pixels(layout.preferences_title),
-                    scale(16),
-                    true,
-                    TEXT,
-                    DT_SINGLELINE,
-                );
-                label(
-                    dc,
-                    "Resources & support",
-                    pixels(layout.resources_title),
-                    scale(16),
-                    true,
-                    TEXT,
-                    DT_SINGLELINE,
-                );
-            }
-            Tab::Sources => {
-                label(
-                    dc,
-                    "Where to find wallpapers",
-                    pixels(layout.sources_title),
-                    scale(25),
-                    true,
-                    TEXT,
-                    DT_SINGLELINE,
-                );
-                label(
-                    dc,
-                    "Browse in your browser, then import local media.",
-                    pixels(layout.sources_subtitle),
-                    scale(14),
-                    false,
-                    MUTED,
-                    DT_SINGLELINE,
-                );
+                Tab::Settings => {
+                    label(
+                        dc,
+                        "Settings",
+                        pixels(layout.settings_title),
+                        scale(25),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE,
+                    );
+                    label(
+                        dc,
+                        "Playback preferences and application details",
+                        pixels(layout.settings_subtitle),
+                        scale(13),
+                        false,
+                        MUTED,
+                        DT_SINGLELINE,
+                    );
+                    label(
+                        dc,
+                        "Playback & startup",
+                        pixels(layout.preferences_title),
+                        scale(16),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE,
+                    );
+                    label(
+                        dc,
+                        "Resources & support",
+                        pixels(layout.resources_title),
+                        scale(16),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE,
+                    );
+                }
+                Tab::Sources => {
+                    label(
+                        dc,
+                        "Where to find wallpapers",
+                        pixels(layout.sources_title),
+                        scale(25),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE,
+                    );
+                    label(
+                        dc,
+                        "Browse in your browser, then import local media.",
+                        pixels(layout.sources_subtitle),
+                        scale(14),
+                        false,
+                        MUTED,
+                        DT_SINGLELINE,
+                    );
+                }
             }
         }
         true
@@ -1896,58 +2899,68 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                 } else {
                     HTHEME(0)
                 };
-                fill(buffer.dc, area, surface_color);
-                let alpha_ok = if theme.0 != 0 {
-                    buffer.tint_background(area, surface_alpha)
-                } else {
-                    true
-                };
-                let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
-                let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
                 let dpi = GetDpiForWindow(window).max(96) as i32;
                 let s = |n: i32| n * dpi / 96;
                 let mut text_area = area;
-                if checkbox {
-                    let size = s(15).max(12);
-                    let top = (area.top + area.bottom - size) / 2;
-                    let glyph = rect(area.left, top, area.left + size, top + size);
+                let mut toggle_track = RECT::default();
+                let mut toggle_state = (false, false, false, false, 0.0f32);
+                let alpha_ok = if checkbox {
                     let state = SendMessageW(window, BM_GETSTATE, WPARAM(0), LPARAM(0)).0;
                     let checked = state & 3 == 1;
                     let pressed = state & 4 != 0;
                     let disabled = GetWindowLongW(window, GWL_STYLE) as u32 & WS_DISABLED.0 != 0;
-                    let box_fill = if checked {
-                        if pressed { ACCENT_DARK } else { ACCENT }
-                    } else if pressed {
-                        CARD_LIT
+                    let hot = is_hot(window) && !disabled;
+                    let t = toggle_progress(id, checked, parent);
+                    toggle_state = (checked, pressed, disabled, hot, t);
+                    if hot || pressed {
+                        fill(buffer.dc, area, CARD_LIT);
+                        if theme.0 != 0 {
+                            let row_mask = RoundedMask {
+                                ellipse: s(8),
+                                border: HIGHLIGHT,
+                                border_width: 1.0,
+                                border_alpha: if pressed { 148 } else { 116 },
+                                fill_alpha: if pressed { 96 } else { 78 },
+                                focus: 0,
+                                focus_inset: 0.0,
+                                host_color: surface_color,
+                                host_alpha: surface_alpha,
+                                top_rim: CREAM,
+                                bottom_rim: 0,
+                                sheen_strength: 0.04,
+                            };
+                            buffer.apply_rounded_rect_mask(area, &row_mask)
+                        } else {
+                            true
+                        }
                     } else {
-                        INK
-                    };
-                    let box_border = if checked {
-                        if pressed { ACCENT_DEEP } else { ACCENT_DARK }
-                    } else if disabled {
-                        DISABLED_BORDER
-                    } else {
-                        HIGHLIGHT
-                    };
-                    rounded(buffer.dc, glyph, box_fill, box_border, s(5).max(3));
-                    if checked {
-                        let pen = CreatePen(PS_SOLID, s(2).max(1), rgb(INK));
-                        let old_pen = SelectObject(buffer.dc, pen);
-                        let x0 = glyph.left + size * 24 / 100;
-                        let y0 = glyph.top + size * 52 / 100;
-                        let x1 = glyph.left + size * 43 / 100;
-                        let y1 = glyph.top + size * 71 / 100;
-                        let x2 = glyph.left + size * 77 / 100;
-                        let y2 = glyph.top + size * 31 / 100;
-                        let _ = MoveToEx(buffer.dc, x0, y0, None);
-                        let _ = LineTo(buffer.dc, x1, y1);
-                        let _ = LineTo(buffer.dc, x2, y2);
-                        SelectObject(buffer.dc, old_pen);
-                        let _ = DeleteObject(pen);
+                        fill(buffer.dc, area, surface_color);
+                        if theme.0 != 0 {
+                            buffer.tint_background(area, surface_alpha)
+                        } else {
+                            true
+                        }
                     }
-                    let _ = buffer.tint_background(glyph, 255);
-                    text_area.left += size + s(9);
+                } else {
+                    fill(buffer.dc, area, surface_color);
+                    if theme.0 != 0 {
+                        buffer.tint_background(area, surface_alpha)
+                    } else {
+                        true
+                    }
+                };
+                let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
+                let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+                if checkbox {
+                    let track_h = (s(22).max(16) / 2) * 2;
+                    let track_w = s(40).max(28);
+                    let top = (area.top + area.bottom - track_h) / 2;
+                    let right = (area.right - s(4)).max(area.left + track_w + s(4));
+                    toggle_track = rect(right - track_w, top, right, top + track_h);
+                    text_area.left = (area.left + s(6)).min(toggle_track.left);
+                    text_area.right = (toggle_track.left - s(12)).max(text_area.left);
                 }
+                let (_, pressed, disabled, hot, toggle_t) = toggle_state;
                 label(
                     buffer.dc,
                     &window_text(window),
@@ -1956,6 +2969,8 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                     false,
                     if status_edit {
                         TEXT_ON_DARK
+                    } else if checkbox && disabled {
+                        DISABLED_TEXT
                     } else if id == 112 || checkbox {
                         TEXT
                     } else {
@@ -1964,7 +2979,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                     if id == PAGE {
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE
                     } else if checkbox {
-                        DT_SINGLELINE | DT_VCENTER
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
                     } else if id == 112 {
                         DT_SINGLELINE | DT_END_ELLIPSIS
                     } else if status_edit {
@@ -1974,6 +2989,14 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                     },
                 );
                 if checkbox {
+                    let _ = buffer.draw_toggle_switch(
+                        toggle_track,
+                        toggle_t,
+                        pressed,
+                        hot,
+                        disabled,
+                        theme.0 != 0,
+                    );
                     let state = SendMessageW(window, BM_GETSTATE, WPARAM(0), LPARAM(0)).0;
                     let hide_focus = !parent.0.is_null()
                         && SendMessageW(parent, WM_QUERYUISTATE, WPARAM(0), LPARAM(0)).0
@@ -1981,9 +3004,9 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                             != 0;
                     if state & 8 != 0 && !hide_focus {
                         let focus_r = rect(
-                            (text_area.left - s(4)).max(area.left),
+                            area.left + 1,
                             area.top + s(2),
-                            area.right - s(2),
+                            area.right - 1,
                             area.bottom - s(2),
                         );
                         for edge in [
@@ -2077,6 +3100,7 @@ unsafe extern "system" fn control_proc(
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_DOWN, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
     };
+    const WM_MOUSELEAVE: u32 = 0x02A3;
     unsafe {
         let owner_draw = data != 0;
         match message {
@@ -2125,10 +3149,53 @@ unsafe extern "system" fn control_proc(
                 }
                 res
             }
-            WM_MOUSEMOVE if wparam.0 & 1 != 0 && GetDlgCtrlID(window) as usize == 113 => {
+            WM_MOUSEMOVE => {
+                let ctrl_id = GetDlgCtrlID(window) as usize;
+                let interactive = owner_draw || matches!(ctrl_id, 107 | 108 | 121);
+                if interactive {
+                    let prev_hot = ANIM.with(|a| {
+                        let mut state = a.borrow_mut();
+                        let prev = state.hot;
+                        state.hot = window.0 as isize;
+                        prev
+                    });
+                    if prev_hot != window.0 as isize {
+                        let mut tme = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: window,
+                            dwHoverTime: 0,
+                        };
+                        let _ = TrackMouseEvent(&mut tme);
+                        if prev_hot != 0 {
+                            let old_hwnd = HWND(prev_hot as *mut _);
+                            if IsWindow(old_hwnd).as_bool() {
+                                let _ = InvalidateRect(old_hwnd, None, false);
+                            }
+                        }
+                        let _ = InvalidateRect(window, None, false);
+                    }
+                }
                 let res = DefSubclassProc(window, message, wparam, lparam);
-                let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                if wparam.0 & 1 != 0 && ctrl_id == 113 {
+                    let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                }
                 res
+            }
+            WM_MOUSELEAVE => {
+                let cleared = ANIM.with(|a| {
+                    let mut state = a.borrow_mut();
+                    if state.hot == window.0 as isize {
+                        state.hot = 0;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if cleared {
+                    let _ = InvalidateRect(window, None, false);
+                }
+                DefSubclassProc(window, message, wparam, lparam)
             }
             WM_KEYDOWN => {
                 let key = wparam.0 as u16;
@@ -2158,11 +3225,168 @@ unsafe extern "system" fn control_proc(
                 res
             }
             WM_NCDESTROY => {
+                ANIM.with(|a| {
+                    let mut state = a.borrow_mut();
+                    if state.hot == window.0 as isize {
+                        state.hot = 0;
+                    }
+                });
                 let _ = RemoveWindowSubclass(window, Some(control_proc), id);
                 DefSubclassProc(window, message, wparam, lparam)
             }
             _ => DefSubclassProc(window, message, wparam, lparam),
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn paint_dropdown_into(
+    target: HDC,
+    area: RECT,
+    items: &[&str],
+    checked_index: Option<usize>,
+    hover_index: Option<usize>,
+    item_h: i32,
+    scroll_top: usize,
+    reveal_t: f32,
+    dpi: i32,
+    glass: bool,
+) -> bool {
+    if area.right <= area.left || area.bottom <= area.top {
+        return false;
+    }
+    let s = |n: i32| n * dpi.max(96) / 96;
+    unsafe {
+        let Some(buffer) = PaintBuffer::new(target, area) else {
+            return false;
+        };
+        let theme = if glass {
+            OpenThemeData(HWND::default(), w!("WINDOW"))
+        } else {
+            HTHEME(0)
+        };
+        let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
+        let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+        let ok = (|| -> bool {
+            fill(buffer.dc, area, CARD);
+            let outer_mask = RoundedMask {
+                ellipse: s(12),
+                border: LINE,
+                border_width: 1.0,
+                border_alpha: if glass { BORDER_ALPHA } else { 255 },
+                fill_alpha: if glass { DROPDOWN_ALPHA } else { 255 },
+                focus: 0,
+                focus_inset: 0.0,
+                host_color: INK,
+                host_alpha: if glass { 0 } else { 255 },
+                top_rim: GLASS_RIM,
+                bottom_rim: INK,
+                sheen_strength: 0.03,
+            };
+            if !buffer.apply_rounded_rect_mask(area, &outer_mask) {
+                return false;
+            }
+            let pad_y = s(6);
+            let pad_x = s(6);
+            let gutter = if checked_index.is_some() {
+                s(26)
+            } else {
+                s(12)
+            };
+            let slide_y = ((1.0 - ease_out_cubic(reveal_t)) * (-s(6) as f32)).round() as i32;
+            let clip = CreateRectRgn(
+                area.left + 1,
+                area.top + pad_y,
+                area.right - 1,
+                (area.bottom - pad_y).max(area.top + pad_y + 1),
+            );
+            let saved = SaveDC(buffer.dc);
+            if !clip.0.is_null() {
+                let _ = ExtSelectClipRgn(buffer.dc, clip, RGN_AND);
+                let _ = DeleteObject(clip);
+            }
+            let host_alpha = if glass { DROPDOWN_ALPHA } else { 255 };
+            for (idx, text) in items.iter().enumerate().skip(scroll_top) {
+                let top = area.top + pad_y + (idx - scroll_top) as i32 * item_h + slide_y;
+                if top >= area.bottom - pad_y {
+                    break;
+                }
+                let row = rect(area.left + pad_x, top, area.right - pad_x, top + item_h);
+                if row.right <= row.left || row.bottom <= row.top {
+                    continue;
+                }
+                if Some(idx) == hover_index {
+                    fill(buffer.dc, row, CARD_LIT);
+                    let _ = buffer.clear_alpha(row);
+                    let hover_mask = RoundedMask {
+                        ellipse: s(8),
+                        border: HIGHLIGHT,
+                        border_width: 1.0,
+                        border_alpha: if glass { 192 } else { 255 },
+                        fill_alpha: if glass { 172 } else { 255 },
+                        focus: 0,
+                        focus_inset: 0.0,
+                        host_color: CARD,
+                        host_alpha,
+                        top_rim: CREAM,
+                        bottom_rim: INK,
+                        sheen_strength: 0.06,
+                    };
+                    let _ = buffer.apply_rounded_rect_mask(row, &hover_mask);
+                } else if Some(idx) == checked_index {
+                    fill(buffer.dc, row, ACTIVE_SURFACE);
+                    let _ = buffer.clear_alpha(row);
+                    let active_mask = RoundedMask {
+                        ellipse: s(8),
+                        border: ACCENT_DARK,
+                        border_width: 1.0,
+                        border_alpha: if glass { 116 } else { 200 },
+                        fill_alpha: if glass { 88 } else { 255 },
+                        focus: 0,
+                        focus_inset: 0.0,
+                        host_color: CARD,
+                        host_alpha,
+                        top_rim: ACCENT_SOFT,
+                        bottom_rim: INK,
+                        sheen_strength: 0.02,
+                    };
+                    let _ = buffer.apply_rounded_rect_mask(row, &active_mask);
+                }
+                if Some(idx) == checked_index {
+                    let cy = (row.top + row.bottom) / 2;
+                    let cx = row.left + gutter / 2;
+                    let u = (gutter / 6).max(3);
+                    let stroke = (gutter / 13).max(2);
+                    let pen = CreatePen(PS_SOLID, stroke, rgb(ACCENT));
+                    let old_pen = SelectObject(buffer.dc, pen);
+                    let _ = MoveToEx(buffer.dc, cx - u, cy, None);
+                    let _ = LineTo(buffer.dc, cx - u / 4, cy + u * 3 / 4);
+                    let _ = LineTo(buffer.dc, cx + u * 5 / 4, cy - u * 3 / 4);
+                    SelectObject(buffer.dc, old_pen);
+                    let _ = DeleteObject(pen);
+                    let check_box = rect(cx - u - 2, cy - u - 2, cx + u * 2, cy + u * 2);
+                    let _ = buffer.tint_background(check_box, 255);
+                }
+                let text_r = rect(row.left + gutter, row.top, row.right - s(10), row.bottom);
+                label(
+                    buffer.dc,
+                    text,
+                    text_r,
+                    s(14),
+                    Some(idx) == checked_index,
+                    TEXT,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            }
+            let _ = RestoreDC(buffer.dc, saved);
+            true
+        })();
+        TEXT_THEME.with(|slot| slot.set(old_theme));
+        GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+        if theme.0 != 0 {
+            let _ = CloseThemeData(theme);
+        }
+        ok && buffer.finish()
     }
 }
 
@@ -2468,6 +3692,9 @@ mod tests {
                     focus_inset: 0.0,
                     host_color: INK,
                     host_alpha: PANEL_ALPHA,
+                    top_rim: GLASS_RIM,
+                    bottom_rim: INK,
+                    sheen_strength: 0.0,
                 },
             ));
             assert!(buffer.tint_background(full, PANEL_ALPHA));
@@ -2672,6 +3899,115 @@ mod tests {
             assert_eq!(area(105).bottom - area(105).top, 32);
             assert_eq!(layout.control(TILE_BASE), Some(layout.tile_rects[0]));
             assert!(layout.control(TILE_BASE + 9).is_none());
+        }
+    }
+
+    #[test]
+    fn toggle_switch_3d_pill_and_glass_dropdown_preserve_premultiplied_alpha() {
+        // SAFETY: test-owned memory DIB sections never touch any desktop window.
+        unsafe {
+            let create_dib = |w: i32, h: i32| {
+                let dc = CreateCompatibleDC(None);
+                let mut bits = std::ptr::null_mut();
+                let bitmap = CreateDIBSection(
+                    dc,
+                    &BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: w,
+                            biHeight: -h,
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    DIB_RGB_COLORS,
+                    &mut bits,
+                    None,
+                    0,
+                )
+                .expect("test DIB");
+                let prev = SelectObject(dc, bitmap);
+                (dc, bitmap, prev, bits)
+            };
+
+            // Verify 3D pill toggle draws Cream spherical knob on left when OFF (t=0) and Orange track on right when ON (t=1).
+            let (dc, bitmap, prev, bits) = create_dib(60, 32);
+            std::slice::from_raw_parts_mut(bits as *mut u32, 60 * 32).fill(0);
+            let full = rect(0, 0, 60, 32);
+            let track = rect(10, 5, 50, 27);
+            let buf_off = PaintBuffer::new(dc, full).expect("toggle off buffer");
+            fill(buf_off.dc, full, CARD);
+            assert!(buf_off.tint_background(full, CARD_ALPHA));
+            assert!(buf_off.draw_toggle_switch(track, 0.0, false, false, false, true));
+            assert!(buf_off.finish());
+            let _ = GdiFlush();
+            let px_off = std::slice::from_raw_parts(bits as *const u8, 60 * 32 * 4);
+            let at = |buf: &[u8], w: usize, x: usize, y: usize| -> [u8; 4] {
+                let i = (y * w + x) * 4;
+                buf[i..i + 4].try_into().unwrap()
+            };
+            // Outside pill stays CARD frosted backdrop; left knob interior is opaque Cream-lit (alpha 255); right track stays frosted.
+            assert_eq!(at(px_off, 60, 2, 2)[3], CARD_ALPHA);
+            assert_eq!(at(px_off, 60, 21, 16)[3], 255);
+            assert!(at(px_off, 60, 21, 16)[2] > 200);
+            assert!(at(px_off, 60, 42, 16)[3] >= 120 && at(px_off, 60, 42, 16)[3] < 200);
+
+            std::slice::from_raw_parts_mut(bits as *mut u32, 60 * 32).fill(0);
+            let buf_on = PaintBuffer::new(dc, full).expect("toggle on buffer");
+            fill(buf_on.dc, full, CARD);
+            assert!(buf_on.tint_background(full, CARD_ALPHA));
+            assert!(buf_on.draw_toggle_switch(track, 1.0, false, false, false, true));
+            assert!(buf_on.finish());
+            let _ = GdiFlush();
+            let px_on = std::slice::from_raw_parts(bits as *const u8, 60 * 32 * 4);
+            assert_eq!(at(px_on, 60, 39, 16)[3], 255);
+            // Left track when ON uses warm ORANGE channel (red dominant).
+            let tr = at(px_on, 60, 18, 16);
+            assert!(tr[2] > tr[0] + 40 && tr[3] > 200);
+            assert!(
+                px_on
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| p[..3].iter().all(|c| *c <= p[3]))
+            );
+            SelectObject(dc, prev);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+
+            // Verify frosted glass dropdown keeps transparent corners, hover highlight pill, and premultiplied pixels.
+            let (mdc, mbmp, mprev, mbits) = create_dib(220, 80);
+            std::slice::from_raw_parts_mut(mbits as *mut u32, 220 * 80).fill(0);
+            let items = ["All folders", "Live wallpapers"];
+            assert!(paint_dropdown_into(
+                mdc,
+                rect(0, 0, 220, 80),
+                &items,
+                Some(0),
+                Some(1),
+                32,
+                0,
+                1.0,
+                96,
+                true,
+            ));
+            let _ = GdiFlush();
+            let mpx = std::slice::from_raw_parts(mbits as *const u8, 220 * 80 * 4);
+            assert_eq!(at(mpx, 220, 0, 0), [0, 0, 0, 0]);
+            assert_eq!(at(mpx, 220, 110, 3)[3], DROPDOWN_ALPHA);
+            assert_eq!(at(mpx, 220, 110, 50)[3], 172);
+            assert!(
+                mpx.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| p[..3].iter().all(|c| *c <= p[3]))
+            );
+            SelectObject(mdc, mprev);
+            let _ = DeleteObject(mbmp);
+            let _ = DeleteDC(mdc);
         }
     }
 }

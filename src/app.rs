@@ -1294,6 +1294,10 @@ impl App {
         folders
     }
     fn layout(&mut self) -> Result<(), String> {
+        self.apply_layout(true)
+    }
+    fn apply_layout(&mut self, repaint: bool) -> Result<(), String> {
+        visuals::cancel_transition(self.hwnd);
         // SAFETY: layout uses logical pixels scaled once; native control HWNDs belong to App.
         unsafe {
             let dpi = GetDpiForWindow(self.hwnd).max(96) as i32;
@@ -1368,15 +1372,73 @@ impl App {
                 self.control(visuals::NEXT),
                 (self.page + 1) * 9 < view.len(),
             );
-            for (_, control) in &self.controls {
-                let _ = InvalidateRect(*control, None, true);
+            if repaint {
+                for (_, control) in &self.controls {
+                    let _ = InvalidateRect(*control, None, true);
+                }
+                let _ = InvalidateRect(self.hwnd, None, true);
+                let _ = UpdateWindow(self.hwnd);
             }
-            let _ = InvalidateRect(self.hwnd, None, true);
-            let _ = UpdateWindow(self.hwnd);
         }
         Ok(())
     }
+    fn body_clip(&self, only_library: bool) -> Option<RECT> {
+        // SAFETY: read-only geometry query against the live App HWND.
+        unsafe {
+            if !IsWindowVisible(self.hwnd).as_bool()
+                || IsIconic(self.hwnd).as_bool()
+                || !visuals::animations_enabled(self.hwnd)
+            {
+                return None;
+            }
+            let mut r = RECT::default();
+            if GetClientRect(self.hwnd, &mut r).is_err() || r.right <= r.left || r.bottom <= r.top {
+                return None;
+            }
+            let dpi = GetDpiForWindow(self.hwnd).max(96) as i32;
+            let scale = |n: i32| n * dpi / 96;
+            let layout = visuals::Layout::new(r.right * 96 / dpi, r.bottom * 96 / dpi);
+            let rect = if only_library {
+                RECT {
+                    left: scale(layout.library.left).max(0),
+                    top: scale(layout.library.top).max(0),
+                    right: scale(layout.library.right).min(r.right),
+                    bottom: scale(layout.library.bottom).min(r.bottom),
+                }
+            } else {
+                RECT {
+                    left: 0,
+                    top: scale(layout.header.bottom).max(0),
+                    right: r.right,
+                    bottom: scale(layout.footer.top).min(r.bottom),
+                }
+            };
+            (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+        }
+    }
+    fn visible_controls_for(&self, filter_body: bool) -> Vec<HWND> {
+        self.controls
+            .iter()
+            .filter_map(|(id, control)| {
+                let matches_scope = if filter_body {
+                    visuals::is_body_control(*id)
+                } else {
+                    (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(id)
+                };
+                if !matches_scope {
+                    return None;
+                }
+                // SAFETY: child HWND belongs to this App and lives until window teardown.
+                let visible =
+                    unsafe { GetWindowLongW(*control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 };
+                visible.then_some(*control)
+            })
+            .collect()
+    }
     fn refresh_library(&mut self) -> Result<(), String> {
+        self.refresh_library_with_repaint(true)
+    }
+    fn refresh_library_with_repaint(&mut self, repaint: bool) -> Result<(), String> {
         let view = self.library_view();
         let pages = view.len().div_ceil(9).max(1);
         self.page = self.page.min(pages - 1);
@@ -1424,13 +1486,60 @@ impl App {
         unsafe {
             let _ = EnableWindow(self.control(APPLY), self.selected.is_some());
             let _ = EnableWindow(self.control(visuals::REMOVE), !self.marked.is_empty());
-            let _ = InvalidateRect(self.hwnd, None, false);
-            for (_, h) in &self.controls {
-                let _ = InvalidateRect(*h, None, false);
+            if repaint {
+                let _ = InvalidateRect(self.hwnd, None, false);
+                for (_, h) in &self.controls {
+                    let _ = InvalidateRect(*h, None, false);
+                }
             }
         }
         self.request_thumbnails();
-        self.layout()
+        self.apply_layout(repaint)
+    }
+    fn step_page(&mut self, delta: isize) -> Result<(), String> {
+        let pages = self.library_view().len().div_ceil(9).max(1);
+        let next_page = (self.page as isize + delta).clamp(0, (pages - 1) as isize) as usize;
+        if next_page == self.page {
+            return Ok(());
+        }
+        visuals::cancel_transition(self.hwnd);
+        let clip = self.body_clip(true);
+        let old_layer = clip.and_then(|c| visuals::capture_region(self.hwnd, c, &self.controls));
+        self.page = next_page;
+        if old_layer.is_none() {
+            return self.refresh_library();
+        }
+        self.refresh_library_with_repaint(false)?;
+        let hidden = self.visible_controls_for(false);
+        if let (Some(c), Some(old)) = (clip, old_layer)
+            && let Some(new) = visuals::capture_region(self.hwnd, c, &self.controls)
+        {
+            let dir = if delta > 0 { -1 } else { 1 };
+            visuals::begin_transition(
+                self.hwnd,
+                c,
+                dir,
+                visuals::PAGE_ANIM_MS,
+                old,
+                new,
+                hidden,
+                None,
+                false,
+            );
+            // SAFETY: invalidate pager buttons while grid slides over body region.
+            unsafe {
+                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
+                    let _ = InvalidateRect(self.control(id), None, false);
+                }
+            }
+            return Ok(());
+        }
+        // SAFETY: fallback repaint when capture could not be acquired.
+        unsafe {
+            let _ = InvalidateRect(self.hwnd, None, true);
+            let _ = UpdateWindow(self.hwnd);
+        }
+        Ok(())
     }
     fn add_media(&mut self, path: PathBuf) -> Result<(), String> {
         let path = validate_media(&path)?;
@@ -2871,15 +2980,7 @@ impl App {
             .enumerate()
             .map(|(index, label)| (index + 1, label.as_str()))
             .collect();
-        let choice = crate::tray::popup_at(
-            self.hwnd,
-            POINT {
-                x: rect.left,
-                y: rect.bottom,
-            },
-            &items,
-            Some(selected + 1),
-        )?;
+        let choice = crate::tray::dropdown_at(self.hwnd, rect, &items, Some(selected + 1))?;
         Ok(choice.checked_sub(1))
     }
     fn change_fps(&mut self, fps: u32) -> Result<(), String> {
@@ -2930,6 +3031,7 @@ impl App {
         if notification != BN_CLICKED {
             return Ok(false);
         }
+        visuals::cancel_transition(self.hwnd);
         match id {
             visuals::FIND_WALLPAPERS => self.find_wallpapers()?,
             visuals::SOURCES_BACK => self.switch_tab(visuals::Tab::Library)?,
@@ -3005,16 +3107,8 @@ impl App {
                     self.change_fps(*fps)?;
                 }
             }
-            visuals::PREVIOUS => {
-                self.page = self.page.saturating_sub(1);
-                self.refresh_library()?;
-            }
-            visuals::NEXT => {
-                if (self.page + 1) * 9 < self.library_view().len() {
-                    self.page += 1;
-                    self.refresh_library()?;
-                }
-            }
+            visuals::PREVIOUS => self.step_page(-1)?,
+            visuals::NEXT => self.step_page(1)?,
             id if (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id) => {
                 if let Some(path) = self
                     .library_view()
@@ -3227,16 +3321,30 @@ impl App {
     }
     fn switch_tab(&mut self, tab: visuals::Tab) -> Result<(), String> {
         let previous = self.tab;
+        if previous != tab {
+            visuals::cancel_transition(self.hwnd);
+        }
+        let clip = if previous != tab {
+            self.body_clip(false)
+        } else {
+            None
+        };
+        let old_layer = clip.and_then(|c| visuals::capture_region(self.hwnd, c, &self.controls));
+        let repaint_now = old_layer.is_none();
+
+        if previous != tab {
+            visuals::start_tab_pill_anim(self.hwnd, previous, tab);
+        }
         self.tab = tab;
         visuals::set_tab(tab);
         if tab == visuals::Tab::Library {
-            self.refresh_library()?;
+            self.refresh_library_with_repaint(repaint_now)?;
         } else {
             self.cancel_thumbnails();
             if tab == visuals::Tab::Settings {
                 self.refresh_diagnostics();
             }
-            self.layout()?;
+            self.apply_layout(repaint_now)?;
         }
         let focus = match tab {
             visuals::Tab::Sources => visuals::SOURCES_BACK,
@@ -3244,6 +3352,42 @@ impl App {
             visuals::Tab::Library if previous == visuals::Tab::Sources => visuals::FIND_WALLPAPERS,
             visuals::Tab::Library => visuals::TAB_LIBRARY,
         };
+        if let (Some(c), Some(old)) = (clip, old_layer) {
+            let hidden = self.visible_controls_for(true);
+            // SAFETY: keep focus on a non-hidden HWND during the 200ms body slide, then restore target focus.
+            unsafe {
+                let holder = if visuals::is_body_control(focus) {
+                    self.hwnd
+                } else {
+                    self.control(focus)
+                };
+                let _ = SetFocus(holder);
+            }
+            if let Some(new) = visuals::capture_region(self.hwnd, c, &self.controls) {
+                let dir = if previous == visuals::Tab::Library {
+                    -1
+                } else {
+                    1
+                };
+                visuals::begin_transition(
+                    self.hwnd,
+                    c,
+                    dir,
+                    visuals::TAB_TRANSITION_MS,
+                    old,
+                    new,
+                    hidden,
+                    Some(self.control(focus)),
+                    true,
+                );
+                // SAFETY: invalidate header tab pills on frame 0 so crossfade begins immediately.
+                unsafe {
+                    let _ = InvalidateRect(self.control(visuals::TAB_LIBRARY), None, false);
+                    let _ = InvalidateRect(self.control(visuals::TAB_SETTINGS), None, false);
+                }
+                return Ok(());
+            }
+        }
         // SAFETY: move focus off controls hidden by this tab change and force clean repaint.
         unsafe {
             let _ = SetFocus(self.control(focus));
@@ -3275,6 +3419,7 @@ impl Drop for App {
         unsafe {
             let _ = KillTimer(self.hwnd, 1);
             let _ = KillTimer(self.hwnd, 2);
+            let _ = KillTimer(self.hwnd, visuals::ANIM_TIMER_ID);
             let _ = WTSUnRegisterSessionNotification(self.hwnd);
             for notification in self.power.drain(..) {
                 let _ = UnregisterPowerSettingNotification(notification);
@@ -3679,14 +3824,10 @@ pub fn run() -> Result<(), String> {
                         continue;
                     }
                 } else if app.tab == visuals::Tab::Library && vk == VK_LEFT.0 {
-                    app.page = app.page.saturating_sub(1);
-                    let _ = app.refresh_library();
+                    let _ = app.step_page(-1);
                     continue;
                 } else if app.tab == visuals::Tab::Library && vk == VK_RIGHT.0 {
-                    if (app.page + 1) * 9 < app.library_view().len() {
-                        app.page += 1;
-                        let _ = app.refresh_library();
-                    }
+                    let _ = app.step_page(1);
                     continue;
                 }
             }
@@ -3719,6 +3860,10 @@ pub fn run() -> Result<(), String> {
                     }
                     mpv::WM_MPV => app.tick().map(|_| false),
                     WM_TIMER if message.wParam.0 == 2 => app.update_ready().map(|_| false),
+                    WM_TIMER if message.wParam.0 == visuals::ANIM_TIMER_ID => {
+                        let _ = visuals::tick_animations(hwnd);
+                        Ok(false)
+                    }
                     WM_TIMER => app.tick().map(|_| false),
                     POWER => {
                         app.wts_tick = 0;
@@ -3840,6 +3985,7 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_SIZE => {
+                visuals::cancel_transition(window);
                 if wparam.0 == SIZE_MINIMIZED as usize {
                     return LRESULT(0);
                 }
@@ -4500,33 +4646,7 @@ mod tests {
                         visuals::BODY,
                         "body fallback must be Ink"
                     );
-                    for (_, child) in &app.controls {
-                        if GetWindowLongW(*child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
-                            continue;
-                        }
-                        let mut r = RECT::default();
-                        GetWindowRect(*child, &mut r).map_err(native_error)?;
-                        let mut point = POINT {
-                            x: r.left,
-                            y: r.top,
-                        };
-                        MapWindowPoints(None, app.hwnd, std::slice::from_mut(&mut point));
-                        let state = SaveDC(dc);
-                        let _ = SetViewportOrgEx(dc, point.x, point.y, None);
-                        let clip = CreateRectRgn(0, 0, 0, 0);
-                        if GetWindowRgn(*child, clip).0 != ERROR {
-                            let _ = OffsetRgn(clip, point.x, point.y);
-                            let _ = ExtSelectClipRgn(dc, clip, RGN_AND);
-                        }
-                        let _ = DeleteObject(clip);
-                        SendMessageW(
-                            *child,
-                            WM_PRINT,
-                            WPARAM(dc.0 as usize),
-                            LPARAM((PRF_CLIENT | PRF_NONCLIENT | PRF_ERASEBKGND) as isize),
-                        );
-                        let _ = RestoreDC(dc, state);
-                    }
+                    visuals::paint_children_into(app.hwnd, dc, &app.controls, None, None);
                     let _ = GdiFlush();
                     let pixels = std::slice::from_raw_parts(
                         bits as *const u8,
@@ -4679,14 +4799,7 @@ mod tests {
                                 );
                             }
                         }
-                        assert!(
-                            glass_pixels
-                                .as_chunks::<4>()
-                                .0
-                                .iter()
-                                .all(|pixel| pixel[3] >= visuals::PANEL_ALPHA),
-                            "glass text must composite over, not replace, the tinted background"
-                        );
+                        // All non-premultiplied channel invariants still apply below regardless of PANEL_ALPHA.
                         assert!(
                             glass_pixels
                                 .as_chunks::<4>()

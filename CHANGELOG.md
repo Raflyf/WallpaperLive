@@ -16,12 +16,15 @@ Release history for WallpaperLive. Each version describes its own changes; older
 ### Added
 
 - Native acrylic across the window background (header, canvas, and footer) on Windows 11 build 22621 or newer.
-- Rounded Library/Settings tabs and a Saweria support link alongside Buy me a coffee.
+- Rounded Library/Settings tabs, right-aligned 3D pill toggle switches in Settings, and a Saweria support link alongside Buy me a coffee.
+- Custom rounded Acrylic popup dropdowns (`WallpaperLive.Dropdown`, matching/exceeding selector width on toolbar/sidebar pickers and used on library tile context menus, falling back to system menus in High Contrast).
+- Short ease-out UI transitions for Library page slides (`190ms`), Library/Settings/Sources tab cross-slides (`200ms`), pill toggle travel (`150ms`), hover lift, and dropdown reveal (`120ms`), driven by an on-demand 16ms timer that disarms immediately when idle and drops temporary layer buffers on settle.
 
 ### Changed
 
-- Use more translucent frosted Ink Black (`#111111` at premultiplied alpha `160`) across the window background without a fake gradient, with frosted Card panels (`#232221`, alpha `180`, borders `224`) and frosted secondary controls/tiles (alpha `192`/`212`), while keeping primary Burnt Orange (`#D9541E`, alpha `242`) actions, active badges, and video thumbnails sharp. Cream (`#F3EEE3`) is text.
-- Match label, checkbox, and unselected status surfaces to their acrylic or card host alpha so no rectangular patches appear behind text or rounded overlays, and mask backgrounds before drawing composited labels and vector glyphs.
+- Lower panel/canvas over-tinting on Windows 11 Acrylic (`PANEL_ALPHA 0` across header/canvas/footer with `DIVIDER_ALPHA 72`, frosted Card groups `CARD_ALPHA 56`, controls `84`, hover `112`, active tiles `118`, focal Orange `232`, glass rims/borders `152`, layered Search `180`, and dropdowns `116`) so native `DWMSBT_TRANSIENTWINDOW` blur shows seamlessly underneath the titlebar without a top-edge seam.
+- Add 3D glass depth (top specular catchlights, bottom rim shadows, pressed bevel inversion, hover tracking via `TME_LEAVE`, and raised 3D spherical toggle knobs) while keeping video thumbnails, active badges, and Cream typography sharp.
+- Match label, toggle switch, and unselected status surfaces to their acrylic or card host alpha so no rectangular patches appear behind text or rounded overlays, and mask backgrounds before drawing composited labels and vector glyphs.
 
 ### Fixed
 
@@ -38,7 +41,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
 ### Verification and limits
 
 - The opt-in desktop fixture checks acrylic background/status alignment, opaque card/search pixels, minimize/restore backdrop persistence, and captures Library, Settings, and Sources over controlled black, white, and hard-edge backgrounds at two sizes. Background test patterns are not part of the UI.
-- Hardware-dependent acrylic is not promised on Windows 10 or when Windows disables transparency. The fallback is opaque dark.
+- Hardware-dependent acrylic is not promised on Windows 10 or when Windows disables transparency; on Windows 11, DWM `DWMSBT_TRANSIENTWINDOW` intentionally drops blur to a solid fallback surface when the window is inactive/unfocused (OS composition behavior that also saves GPU work in background state; popups use `WS_EX_NOACTIVATE` so opening a dropdown keeps the owner window blurred).
 - Build testing uses GitHub Actions artifacts only; no v0.2.0 tag or GitHub Release is created by this UI fix.
 
 ---
