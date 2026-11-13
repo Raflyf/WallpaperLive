@@ -1806,11 +1806,11 @@ impl App {
                 if !include(id) || child.0.is_null() {
                     continue;
                 }
-                let was_visible = GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
-                let visible = self.control_visible(id, &view);
                 if was_frozen {
                     let _ = SendMessageW(child, WM_SETREDRAW, WPARAM(1), LPARAM(0));
                 }
+                let was_visible = GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+                let visible = self.control_visible(id, &view);
                 if was_visible != visible {
                     let _ = SetWindowPos(
                         child,
@@ -6897,8 +6897,7 @@ mod tests {
     fn update_status_reports_wallpaper_specs_and_native_fps() {
         let mut app = fixture();
         app.settings.fps = 60;
-        let mon1 = app.monitors[0].name.clone();
-        let mut first = DisplayState::new(mon1);
+        let mut first = DisplayState::new("\\\\.\\DISPLAY1".into());
         first.recovery = Some((Instant::now(), 0, PathBuf::from(r"C:\Walls\a.mp4")));
         first.playback_info = Some(crate::cache::Prepared {
             path: PathBuf::from(r"C:\Walls\a.mp4"),
