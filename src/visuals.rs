@@ -591,7 +591,7 @@ impl PaintBuffer {
             };
         let corner_band = (radius + safe_inset).ceil() as i32;
         let edge_band = (safe_inset + 1.0).ceil() as i32;
-        let focus_center = -(mask.border_width + mask.focus_inset);
+        let focus_center = -(mask.border_width + mask.focus_inset - 0.5);
         for y in 0..height {
             let row_offset = y as usize * stride as usize;
             let row = &mut pixels[row_offset..row_offset + width as usize];
@@ -618,7 +618,7 @@ impl PaintBuffer {
                 let mut src_g = f32::from(pixel.rgbGreen);
                 let mut src_b = f32::from(pixel.rgbBlue);
                 if mask.focus != 0 {
-                    let focus_cov = (0.5 - (d - focus_center).abs()).clamp(0.0, 1.0);
+                    let focus_cov = (1.0 - (d - focus_center).abs()).clamp(0.0, 1.0);
                     if focus_cov > 0.0 {
                         src_r += (fr - src_r) * focus_cov;
                         src_g += (fg - src_g) * focus_cov;
