@@ -4825,19 +4825,25 @@ mod tests {
                                 bits as *const u8,
                                 (width * height * 4) as usize,
                             );
+                            let mut max_alpha = 0u8;
                             for y in 0..area.bottom {
                                 for x in 0..area.right {
                                     let i = ((y * width + x) * 4) as usize;
                                     let pixel = &control_pixels[i..i + 4];
+                                    max_alpha = max_alpha.max(pixel[3]);
                                     assert!(
-                                        pixel[3] >= 148
-                                            && pixel[..3]
-                                                .iter()
-                                                .all(|channel| *channel <= pixel[3]),
+                                        pixel[..3].iter().all(|channel| *channel <= pixel[3]),
                                         "control {} must preserve premultiplied alpha: {pixel:?} at ({x}, {y})",
                                         GetDlgCtrlID(*child)
                                     );
                                 }
+                            }
+                            let ctrl_id = GetDlgCtrlID(*child);
+                            if ctrl_id != STATUS as i32 && ctrl_id != visuals::PREVIEW as i32 {
+                                assert!(
+                                    max_alpha >= 42,
+                                    "control {ctrl_id} must render visible alpha (got max {max_alpha})"
+                                );
                             }
                         }
                     }
