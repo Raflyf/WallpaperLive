@@ -12,8 +12,9 @@ use windows::{
             Controls::{
                 BP_PAINTPARAMS, BPBF_TOPDOWNDIB, BPPF_ERASE, BeginBufferedPaint, BufferedPaintInit,
                 BufferedPaintSetAlpha, BufferedPaintUnInit, CloseThemeData, DRAWITEMSTRUCT,
-                DTT_COMPOSITED, DTT_TEXTCOLOR, DTTOPTS, DrawThemeTextEx, EndBufferedPaint,
-                GetBufferedPaintBits, HTHEME, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, OpenThemeData,
+                DTT_COMPOSITED, DTT_TEXTCOLOR, DTTOPTS, DrawThemeTextEx, EM_GETSEL,
+                EndBufferedPaint, GetBufferedPaintBits, HTHEME, ODS_DISABLED, ODS_FOCUS,
+                ODS_SELECTED, OpenThemeData,
             },
             HiDpi::GetDpiForWindow,
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
@@ -275,7 +276,7 @@ pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 16, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
-const PANEL_ALPHA: u8 = 196;
+pub const PANEL_ALPHA: u8 = 196;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -318,9 +319,9 @@ fn control_surface(id: usize) -> (u32, bool) {
             | SOURCES_NOTE
     ) || (SITE_BASE..SITE_BASE + 4).contains(&id)
     {
-        (CARD, true)
+        (CARD, false)
     } else {
-        (INK, false)
+        (CANVAS, true)
     }
 }
 const GLASS_PROPERTY: windows::core::PCWSTR = w!("WallpaperLive.Glass");
@@ -542,9 +543,24 @@ impl PaintBuffer {
         true
     }
     unsafe fn apply_rounded_mask(&self, mask: &RoundedMask) -> bool {
+        unsafe { self.apply_rounded_rect_mask(self.area, mask) }
+    }
+    unsafe fn apply_rounded_rect_mask(&self, bounds: RECT, mask: &RoundedMask) -> bool {
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
-        if width <= 0 || height <= 0 {
+        let bounds_w = bounds.right - bounds.left;
+        let bounds_h = bounds.bottom - bounds.top;
+        let rect_left = bounds.left.max(self.area.left);
+        let rect_top = bounds.top.max(self.area.top);
+        let rect_right = bounds.right.min(self.area.right);
+        let rect_bottom = bounds.bottom.min(self.area.bottom);
+        if width <= 0
+            || height <= 0
+            || bounds_w <= 0
+            || bounds_h <= 0
+            || rect_right <= rect_left
+            || rect_bottom <= rect_top
+        {
             return true;
         }
         let mut bits = std::ptr::null_mut();
@@ -564,8 +580,8 @@ impl PaintBuffer {
         };
         // SAFETY: GetBufferedPaintBits owns stride * buffer height RGBQUADs until EndBufferedPaint.
         let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
-        let w = width as f32;
-        let h = height as f32;
+        let w = bounds_w as f32;
+        let h = bounds_h as f32;
         let hw = w * 0.5;
         let hh = h * 0.5;
         let radius = (mask.ellipse as f32 * 0.5).min(hw).min(hh);
@@ -592,21 +608,24 @@ impl PaintBuffer {
         let corner_band = (radius + safe_inset).ceil() as i32;
         let edge_band = (safe_inset + 1.0).ceil() as i32;
         let focus_center = -(mask.border_width + mask.focus_inset - 0.5);
-        for y in 0..height {
-            let row_offset = y as usize * stride as usize;
-            let row = &mut pixels[row_offset..row_offset + width as usize];
-            let py = y as f32 + 0.5;
-            let y_inner = y >= edge_band && y < height - edge_band;
-            let y_deep = y >= corner_band && y < height - corner_band;
-            for (x, pixel) in row.iter_mut().enumerate() {
-                let xi = x as i32;
-                if y_deep && xi >= edge_band && xi < width - edge_band
-                    || y_inner && xi >= corner_band && xi < width - corner_band
+        for y in rect_top..rect_bottom {
+            let row_offset = (y - self.area.top) as usize * stride as usize;
+            let col_start = (rect_left - self.area.left) as usize;
+            let col_end = (rect_right - self.area.left) as usize;
+            let row = &mut pixels[row_offset + col_start..row_offset + col_end];
+            let yi = y - bounds.top;
+            let py = yi as f32 + 0.5;
+            let y_inner = yi >= edge_band && yi < bounds_h - edge_band;
+            let y_deep = yi >= corner_band && yi < bounds_h - corner_band;
+            for (offset, pixel) in row.iter_mut().enumerate() {
+                let xi = rect_left - bounds.left + offset as i32;
+                if y_deep && xi >= edge_band && xi < bounds_w - edge_band
+                    || y_inner && xi >= corner_band && xi < bounds_w - corner_band
                 {
                     pixel.rgbReserved = 255;
                     continue;
                 }
-                let px = x as f32 + 0.5;
+                let px = xi as f32 + 0.5;
                 let qx = (px - hw).abs() - (hw - radius);
                 let qy = (py - hh).abs() - (hh - radius);
                 let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
@@ -832,6 +851,12 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
         } else {
             HWND::default()
         };
+        if item.rcItem.right <= item.rcItem.left
+            || item.rcItem.bottom <= item.rcItem.top
+            || (!parent.0.is_null() && IsIconic(parent).as_bool())
+        {
+            return;
+        }
         if let Some(buffer) = PaintBuffer::new(item.hDC, item.rcItem) {
             let buffered = DRAWITEMSTRUCT {
                 hDC: buffer.dc,
@@ -873,7 +898,7 @@ unsafe fn draw_item_into(
     // SAFETY: child rect pixels remain owned for the duration of synchronous owner-draw dispatch.
     unsafe {
         if id == PAGE {
-            fill(dc, r, CANVAS);
+            fill(dc, r, host_color);
             label(
                 dc,
                 &window_text(item.hwndItem),
@@ -1284,7 +1309,11 @@ pub unsafe fn paint_into(window: HWND, target: HDC) {
     // SAFETY: buffers, theme handle and target DC stay on this synchronous UI-thread call.
     unsafe {
         let mut client = RECT::default();
-        if GetClientRect(window, &mut client).is_err() {
+        if GetClientRect(window, &mut client).is_err()
+            || IsIconic(window).as_bool()
+            || client.right <= client.left
+            || client.bottom <= client.top
+        {
             return;
         }
         if let Some(buffer) = PaintBuffer::new(target, client) {
@@ -1403,17 +1432,32 @@ unsafe fn paint_scene(window: HWND, dc: HDC, glass: Option<&PaintBuffer>) -> boo
             LINE,
         );
         if let Some(buffer) = glass {
-            let panel_ok = match tab {
-                Tab::Library => buffer.tint_background(pixels(layout.sidebar), PANEL_ALPHA),
-                Tab::Settings => {
-                    buffer.tint_background(pixels(layout.settings_preferences_panel), PANEL_ALPHA)
-                        && buffer
-                            .tint_background(pixels(layout.settings_resources_panel), PANEL_ALPHA)
-                }
-                Tab::Sources => buffer.tint_background(pixels(layout.sources_panel), PANEL_ALPHA),
+            let card_mask = RoundedMask {
+                ellipse: scale(12),
+                border: LINE,
+                border_width: 1.0,
+                focus: 0,
+                focus_inset: 0.0,
+                host_color: INK,
+                host_alpha: PANEL_ALPHA,
             };
-            // Only content panels transmit the backdrop; untouched canvas stays solid Ink.
-            if !panel_ok || !buffer.tint_background(client, 255) {
+            let panel_ok = match tab {
+                Tab::Library => buffer.tint_background(pixels(layout.sidebar), 255),
+                Tab::Settings => {
+                    buffer.apply_rounded_rect_mask(
+                        pixels(layout.settings_preferences_panel),
+                        &card_mask,
+                    ) && buffer.apply_rounded_rect_mask(
+                        pixels(layout.settings_resources_panel),
+                        &card_mask,
+                    )
+                }
+                Tab::Sources => {
+                    buffer.apply_rounded_rect_mask(pixels(layout.sources_panel), &card_mask)
+                }
+            };
+            // Content panels stay opaque; outer header, canvas and footer transmit the acrylic backdrop.
+            if !panel_ok || !buffer.tint_background(client, PANEL_ALPHA) {
                 return false;
             }
         }
@@ -1664,13 +1708,31 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
     unsafe {
         let id = GetDlgCtrlID(window) as usize;
         let parent = GetParent(window).unwrap_or_default();
+        if area.right <= area.left
+            || area.bottom <= area.top
+            || (!parent.0.is_null() && IsIconic(parent).as_bool())
+        {
+            return;
+        }
         let mut class = [0u16; 32];
         let count = GetClassNameW(window, &mut class).max(0) as usize;
         let static_text = String::from_utf16_lossy(&class[..count]) == "Static";
         let checkbox = matches!(id, 107 | 108 | 121);
+        let status_edit = id == 113;
+        let mut status_selected = false;
+        if status_edit {
+            let (mut sel_start, mut sel_end) = (0u32, 0u32);
+            SendMessageW(
+                window,
+                EM_GETSEL,
+                WPARAM((&mut sel_start as *mut u32) as usize),
+                LPARAM((&mut sel_end as *mut u32) as isize),
+            );
+            status_selected = sel_start != sel_end;
+        }
         let color = control_color(id);
         if let Some(buffer) = PaintBuffer::new(dc, area) {
-            if static_text || checkbox {
+            if static_text || checkbox || (status_edit && !status_selected) {
                 let glass = glass_enabled(parent);
                 let (surface_color, surface_translucent) = control_surface(id);
                 let theme = if glass {
@@ -1744,13 +1806,21 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                     text_area,
                     s(if id == PAGE { 13 } else { 14 }),
                     false,
-                    if id == 112 || checkbox { TEXT } else { MUTED },
+                    if status_edit {
+                        TEXT_ON_DARK
+                    } else if id == 112 || checkbox {
+                        TEXT
+                    } else {
+                        MUTED
+                    },
                     if id == PAGE {
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE
                     } else if checkbox {
                         DT_SINGLELINE | DT_VCENTER
                     } else if id == 112 {
                         DT_SINGLELINE | DT_END_ELLIPSIS
+                    } else if status_edit {
+                        DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX
                     } else {
                         DT_WORDBREAK
                     },
@@ -1891,7 +1961,26 @@ unsafe extern "system" fn control_proc(
                         LPARAM(0),
                     );
                 }
-                DefSubclassProc(window, message, wparam, lparam)
+                let res = DefSubclassProc(window, message, wparam, lparam);
+                if GetDlgCtrlID(window) as usize == 113 {
+                    let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                }
+                res
+            }
+            WM_LBUTTONUP | WM_SETFOCUS | WM_KILLFOCUS | WM_KEYUP => {
+                let res = DefSubclassProc(window, message, wparam, lparam);
+                if GetDlgCtrlID(window) as usize == 113 {
+                    if message == WM_SETFOCUS {
+                        let _ = HideCaret(window);
+                    }
+                    let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                }
+                res
+            }
+            WM_MOUSEMOVE if wparam.0 & 1 != 0 && GetDlgCtrlID(window) as usize == 113 => {
+                let res = DefSubclassProc(window, message, wparam, lparam);
+                let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                res
             }
             WM_KEYDOWN => {
                 let key = wparam.0 as u16;
@@ -1914,7 +2003,11 @@ unsafe extern "system" fn control_proc(
                         LPARAM(0),
                     );
                 }
-                DefSubclassProc(window, message, wparam, lparam)
+                let res = DefSubclassProc(window, message, wparam, lparam);
+                if GetDlgCtrlID(window) as usize == 113 {
+                    let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                }
+                res
             }
             WM_NCDESTROY => {
                 let _ = RemoveWindowSubclass(window, Some(control_proc), id);
@@ -2093,9 +2186,12 @@ mod tests {
         assert_eq!(control_color(PAGE), INK);
         assert_eq!(control_color(SEARCH), CARD);
         assert_eq!(control_color(113), FOOTER);
-        assert_eq!(control_surface(TAB_LIBRARY), (INK, false));
-        assert_eq!(control_surface(PREVIOUS), (INK, false));
-        assert_eq!(control_surface(PRODUCT_WEBSITE), (CARD, true));
+        assert_eq!(control_surface(TAB_LIBRARY), (INK, true));
+        assert_eq!(control_surface(PREVIOUS), (INK, true));
+        assert_eq!(control_surface(PAGE), (INK, true));
+        assert_eq!(control_surface(113), (FOOTER, true));
+        assert_eq!(control_surface(PRODUCT_WEBSITE), (CARD, false));
+        assert_eq!(control_surface(VERSION), (CARD, false));
 
         // SAFETY: test-owned memory DC and DIB never attach to any desktop window.
         unsafe {
@@ -2168,6 +2264,78 @@ mod tests {
                 mouse_focus_count, 0,
                 "ODS_NOFOCUSRECT must suppress focus outline on click"
             );
+        }
+    }
+
+    #[test]
+    fn rounded_panel_mask_keeps_card_opaque_and_corners_translucent() {
+        // SAFETY: test-owned memory DC and DIB never attach to any desktop window.
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(
+                dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: 80,
+                        biHeight: -80,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .expect("panel mask test DIB");
+            let old = SelectObject(dc, bitmap);
+            std::slice::from_raw_parts_mut(bits as *mut u32, 80 * 80).fill(0);
+            let full = rect(0, 0, 80, 80);
+            let panel = rect(10, 10, 70, 70);
+            let buffer = PaintBuffer::new(dc, full).expect("buffered paint");
+            fill(buffer.dc, full, BODY);
+            raised_rounded(buffer.dc, panel, CARD, LINE, HIGHLIGHT, 12);
+            assert!(buffer.apply_rounded_rect_mask(
+                panel,
+                &RoundedMask {
+                    ellipse: 12,
+                    border: LINE,
+                    border_width: 1.0,
+                    focus: 0,
+                    focus_inset: 0.0,
+                    host_color: INK,
+                    host_alpha: PANEL_ALPHA,
+                },
+            ));
+            assert!(buffer.tint_background(full, PANEL_ALPHA));
+            assert!(buffer.finish());
+            let _ = GdiFlush();
+            let pixels = std::slice::from_raw_parts(bits as *const u8, 80 * 80 * 4);
+            let px = |x: usize, y: usize| -> [u8; 4] {
+                let i = (y * 80 + x) * 4;
+                pixels[i..i + 4].try_into().expect("BGRA pixel")
+            };
+            let bg = u8::try_from(17u16 * u16::from(PANEL_ALPHA) / 255).unwrap();
+            assert_eq!(px(4, 4), [bg, bg, bg, PANEL_ALPHA]);
+            assert_eq!(
+                px(10, 10),
+                [bg, bg, bg, PANEL_ALPHA],
+                "rounded panel corner outside arc must match acrylic canvas"
+            );
+            let center = px(40, 40);
+            assert_eq!(center[3], 255, "panel interior must remain opaque");
+            assert_eq!(
+                u32::from(center[2]) << 16 | u32::from(center[1]) << 8 | u32::from(center[0]),
+                CARD
+            );
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
         }
     }
 

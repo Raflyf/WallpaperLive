@@ -1321,8 +1321,14 @@ impl App {
                 let _ = DeleteObject(self.font);
             }
             self.font = font;
+            if IsIconic(self.hwnd).as_bool() {
+                return Ok(());
+            }
             let mut r = RECT::default();
             GetClientRect(self.hwnd, &mut r).map_err(native_error)?;
+            if r.right <= r.left || r.bottom <= r.top {
+                return Ok(());
+            }
             let width = r.right * 96 / dpi;
             let height = r.bottom * 96 / dpi;
             let layout = visuals::Layout::new(width, height);
@@ -1626,7 +1632,6 @@ impl App {
                     .all(|display| display.pause_reason.is_some()))
             || self.dormant.is_some()
             || !unsafe { IsWindowVisible(self.hwnd) }.as_bool()
-            || unsafe { IsIconic(self.hwnd) }.as_bool()
         {
             return Vec::new();
         }
@@ -1650,7 +1655,7 @@ impl App {
         visuals::retain_thumbnails(&[]);
     }
     fn request_thumbnails(&mut self) {
-        if self.multi_dispatch {
+        if self.multi_dispatch || unsafe { IsIconic(self.hwnd) }.as_bool() {
             return;
         }
         let paths = self.thumbnail_paths();
@@ -1930,6 +1935,7 @@ impl App {
                     SW_SHOW
                 },
             );
+            let _ = visuals::enable_backdrop(self.hwnd);
             let _ = SetForegroundWindow(self.hwnd);
             SendMessageW(
                 self.hwnd,
@@ -1938,6 +1944,12 @@ impl App {
                 LPARAM(0),
             );
             let _ = SetFocus(self.control(PICK));
+            let _ = RedrawWindow(
+                self.hwnd,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
         }
         self.request_thumbnails();
     }
@@ -3812,6 +3824,15 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_SIZE => {
+                if wparam.0 == SIZE_MINIMIZED as usize {
+                    return LRESULT(0);
+                }
+                if matches!(wparam.0 as u32, SIZE_RESTORED | SIZE_MAXIMIZED)
+                    && visuals::glass_enabled(window)
+                {
+                    let _ = visuals::enable_backdrop(window);
+                    let _ = InvalidateRect(window, None, true);
+                }
                 post(LAYOUT, WPARAM(0), LPARAM(0));
                 LRESULT(0)
             }
@@ -4562,22 +4583,80 @@ mod tests {
                                 glass_pixels[i..i + 4].try_into().expect("BGRA pixel"),
                             )
                         };
+                        let bg_channel = (17u16 * u16::from(visuals::PANEL_ALPHA) / 255) as u32;
+                        let expected_acrylic = (u32::from(visuals::PANEL_ALPHA) << 24)
+                            | (bg_channel << 16)
+                            | (bg_channel << 8)
+                            | bg_channel;
+                        let expected_card = 0xff00_0000 | visuals::CARD;
+                        let layout = visuals::Layout::new(logical_width, logical_height);
                         assert_eq!(
                             canvas_pixel(8, 8),
-                            0xff11_1111,
-                            "header must stay solid Ink"
+                            expected_acrylic,
+                            "header must transmit acrylic Ink backdrop"
                         );
                         assert_eq!(
                             canvas_pixel(8, height / 2),
-                            0xff11_1111,
-                            "canvas must stay solid Ink, not become a backdrop gradient"
+                            expected_acrylic,
+                            "canvas must transmit acrylic Ink backdrop"
                         );
+                        assert_eq!(
+                            canvas_pixel(8, height - 40 * dpi / 96),
+                            expected_acrylic,
+                            "footer must transmit acrylic Ink backdrop"
+                        );
+                        match tab {
+                            visuals::Tab::Library => assert_eq!(
+                                canvas_pixel(
+                                    (layout.sidebar.left + 8) * dpi / 96,
+                                    (layout.sidebar.top + 8) * dpi / 96,
+                                ),
+                                expected_card,
+                                "library sidebar must stay opaque Card"
+                            ),
+                            visuals::Tab::Settings => {
+                                assert_eq!(
+                                    canvas_pixel(
+                                        (layout.settings_preferences_panel.left + 6) * dpi / 96,
+                                        (layout.settings_preferences_panel.top + 6) * dpi / 96,
+                                    ),
+                                    expected_card,
+                                    "settings card must stay opaque Card"
+                                );
+                                assert_eq!(
+                                    canvas_pixel(
+                                        layout.settings_preferences_panel.left * dpi / 96,
+                                        layout.settings_preferences_panel.top * dpi / 96,
+                                    ),
+                                    expected_acrylic,
+                                    "settings rounded card corners must match acrylic canvas"
+                                );
+                            }
+                            visuals::Tab::Sources => {
+                                assert_eq!(
+                                    canvas_pixel(
+                                        (layout.sources_panel.left + 6) * dpi / 96,
+                                        (layout.sources_panel.top + 6) * dpi / 96,
+                                    ),
+                                    expected_card,
+                                    "sources card must stay opaque Card"
+                                );
+                                assert_eq!(
+                                    canvas_pixel(
+                                        layout.sources_panel.left * dpi / 96,
+                                        layout.sources_panel.top * dpi / 96,
+                                    ),
+                                    expected_acrylic,
+                                    "sources rounded card corners must match acrylic canvas"
+                                );
+                            }
+                        }
                         assert!(
                             glass_pixels
                                 .as_chunks::<4>()
                                 .0
                                 .iter()
-                                .all(|pixel| pixel[3] >= 196),
+                                .all(|pixel| pixel[3] >= visuals::PANEL_ALPHA),
                             "glass text must composite over, not replace, the tinted background"
                         );
                         assert!(
@@ -4631,11 +4710,15 @@ mod tests {
                             let status_i = ((((logical_height - 40) * dpi / 96) * width
                                 + 32 * dpi / 96)
                                 * 4) as usize;
-                            assert_eq!(
-                                &pixels[status_i..status_i + 3],
-                                &[17, 17, 17],
-                                "empty status must match solid Ink footer"
-                            );
+                            let footer_i = ((((logical_height - 40) * dpi / 96) * width
+                                + 12 * dpi / 96)
+                                * 4) as usize;
+                            for c in 0..3 {
+                                assert!(
+                                    pixels[status_i + c].abs_diff(pixels[footer_i + c]) <= 1,
+                                    "empty status must match acrylic Ink footer"
+                                );
+                            }
                             if tab == visuals::Tab::Library {
                                 let x = 150 * dpi / 96;
                                 let y = 172 * dpi / 96;
@@ -4659,6 +4742,21 @@ mod tests {
                         if tab == visuals::Tab::Library {
                             app.text(visuals::SEARCH, "");
                         }
+                        let _ = ShowWindow(app.hwnd, SW_HIDE);
+                    }
+                    if visuals::glass_enabled(app.hwnd) {
+                        let _ = ShowWindow(app.hwnd, SW_SHOWNA);
+                        let _ = ShowWindow(app.hwnd, SW_MINIMIZE);
+                        visuals::paint_into(app.hwnd, dc);
+                        assert!(
+                            visuals::glass_enabled(app.hwnd),
+                            "minimizing must preserve acrylic backdrop"
+                        );
+                        let _ = ShowWindow(app.hwnd, SW_RESTORE);
+                        assert!(
+                            visuals::glass_enabled(app.hwnd),
+                            "restoring from minimize must preserve acrylic backdrop"
+                        );
                         let _ = ShowWindow(app.hwnd, SW_HIDE);
                     }
                     let none = windows::Win32::Graphics::Dwm::DWMSBT_NONE.0;

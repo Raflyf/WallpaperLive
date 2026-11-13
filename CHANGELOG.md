@@ -15,17 +15,18 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- Native acrylic on the selected-wallpaper panel, Settings panels, and Sources panel on Windows 11 build 22621 or newer.
+- Native acrylic across the window background (header, canvas, and footer) on Windows 11 build 22621 or newer.
 - Rounded Library/Settings tabs and a Saweria support link alongside Buy me a coffee.
 
 ### Changed
 
-- Keep the canvas, header, and footer solid Ink Black (`#111111`), without a background gradient. Cream (`#F3EEE3`) is text; Burnt Orange (`#D9541E`) marks primary actions and active states.
-- Use one consistent translucent panel surface under labels and checkboxes instead of separate dark text rectangles. The visible panel tint follows the real background through Windows acrylic blur.
+- Use frosted Ink Black (`#111111` at premultiplied alpha `196`) across the window background without a fake gradient, while keeping elevated content cards (selected-wallpaper sidebar, rounded Settings panels, and Sources panel) opaque Card (`#232221`). Cream (`#F3EEE3`) is text; Burnt Orange (`#D9541E`) marks primary actions and active states.
+- Match label and unselected status text surfaces to their acrylic or opaque host so no rectangular patches appear behind text.
 
 ### Fixed
 
-- Supply premultiplied alpha for acrylic panels and composite text after their tint. Keep media and owner-drawn controls opaque; no global window opacity or bitmap tint.
+- Preserve DWM acrylic across minimize/restore (`paint_into`, `draw_item`, and `paint_control_into` ignore `IsIconic`/empty rects instead of calling `disable_backdrop`, `WM_SIZE` ignores `SIZE_MINIMIZED` so cached page thumbnails stay warm, and restore/show refreshes `enable_backdrop`).
+- Supply premultiplied alpha for the acrylic background and rounded card SDF masking (`apply_rounded_rect_mask`), keeping cards, media, and owner-drawn controls opaque without opaque corner artifacts; no global window opacity or bitmap tint.
 - Replace residual corner fills on rounded buttons, tabs, tiles, and pager controls using host-aware SDF corner masking and `CS_PARENTDC` removal without altering button hit-testing.
 - Remove the floating pager background card, suppress click-triggered focus rings via `ODS_NOFOCUSRECT`/`UISF_HIDEFOCUS`, draw dark custom checkboxes in Settings, and route dropdown/tile context menus through dark owner-drawn popups.
 - Update the Settings Product website link to `https://livelydesk.vercel.app`.
@@ -35,7 +36,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Verification and limits
 
-- The opt-in desktop fixture checks solid canvas/status/search pixels and captures Library, Settings, and Sources over controlled black, white, and hard-edge backgrounds at two sizes. Background test patterns are not part of the UI.
+- The opt-in desktop fixture checks acrylic background/status alignment, opaque card/search pixels, minimize/restore backdrop persistence, and captures Library, Settings, and Sources over controlled black, white, and hard-edge backgrounds at two sizes. Background test patterns are not part of the UI.
 - Hardware-dependent acrylic is not promised on Windows 10 or when Windows disables transparency. The fallback is opaque dark.
 - Build testing uses GitHub Actions artifacts only; no v0.2.0 tag or GitHub Release is created by this UI fix.
 
