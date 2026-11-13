@@ -1297,7 +1297,24 @@ impl App {
     fn layout(&mut self) -> Result<(), String> {
         self.apply_layout(true)
     }
+    fn control_visible(&self, id: usize, view: &[PathBuf]) -> bool {
+        let populated = if (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id) {
+            view.get(self.page * 9 + id - visuals::TILE_BASE).is_some()
+        } else if matches!(id, visuals::PREVIOUS | visuals::NEXT | visuals::PAGE) {
+            !view.is_empty()
+        } else {
+            true
+        };
+        visuals::visible_on(self.tab, id) && populated
+    }
     fn apply_layout(&mut self, repaint: bool) -> Result<(), String> {
+        self.apply_layout_with_visibility(repaint, true)
+    }
+    fn apply_layout_with_visibility(
+        &mut self,
+        repaint: bool,
+        sync_visibility: bool,
+    ) -> Result<(), String> {
         visuals::cancel_transition(self.hwnd);
         // SAFETY: layout uses logical pixels scaled once; native control HWNDs belong to App.
         unsafe {
@@ -1366,43 +1383,39 @@ impl App {
                 }
             }
             let view = self.library_view();
-            for (id, control) in &self.controls {
-                let populated = if (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(id) {
-                    view.get(self.page * 9 + id - visuals::TILE_BASE).is_some()
-                } else if matches!(*id, visuals::PREVIOUS | visuals::NEXT | visuals::PAGE) {
-                    !view.is_empty()
-                } else {
-                    true
-                };
-                let visible = visuals::visible_on(self.tab, *id) && populated;
-                let was_visible = GetWindowLongW(*control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
-                if was_visible != visible {
-                    let _ = SetWindowPos(
-                        *control,
-                        None,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE
-                            | SWP_NOSIZE
-                            | SWP_NOZORDER
-                            | SWP_NOACTIVATE
-                            | noredraw
-                            | if visible {
-                                SWP_SHOWWINDOW
-                            } else {
-                                SWP_HIDEWINDOW
-                            },
-                    );
-                }
-            }
             let _ = EnableWindow(self.control(visuals::SELECT_ALL), !view.is_empty());
             let _ = EnableWindow(self.control(visuals::PREVIOUS), self.page > 0);
             let _ = EnableWindow(
                 self.control(visuals::NEXT),
                 (self.page + 1) * 9 < view.len(),
             );
+            if sync_visibility {
+                for (id, control) in &self.controls {
+                    let visible = self.control_visible(*id, &view);
+                    let was_visible =
+                        GetWindowLongW(*control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+                    if was_visible != visible {
+                        let _ = SetWindowPos(
+                            *control,
+                            None,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE
+                                | SWP_NOSIZE
+                                | SWP_NOZORDER
+                                | SWP_NOACTIVATE
+                                | noredraw
+                                | if visible {
+                                    SWP_SHOWWINDOW
+                                } else {
+                                    SWP_HIDEWINDOW
+                                },
+                        );
+                    }
+                }
+            }
             if repaint {
                 for (_, control) in &self.controls {
                     let _ = InvalidateRect(*control, None, true);
@@ -1470,6 +1483,13 @@ impl App {
         self.refresh_library_with_repaint(true)
     }
     fn refresh_library_with_repaint(&mut self, repaint: bool) -> Result<(), String> {
+        self.refresh_library_with_options(repaint, true)
+    }
+    fn refresh_library_with_options(
+        &mut self,
+        repaint: bool,
+        sync_visibility: bool,
+    ) -> Result<(), String> {
         let view = self.library_view();
         let pages = view.len().div_ceil(9).max(1);
         self.page = self.page.min(pages - 1);
@@ -1526,29 +1546,63 @@ impl App {
             }
         }
         self.request_thumbnails();
-        self.apply_layout(repaint)
+        self.apply_layout_with_visibility(repaint, sync_visibility)
     }
-    fn set_redraw(&self, enabled: bool) {
+    fn freeze_visible_controls(&self) -> Vec<bool> {
+        let mut frozen = Vec::with_capacity(self.controls.len());
+        // SAFETY: suppresses synchronous child paints during control updates without mutating self.hwnd visibility.
+        unsafe {
+            for &(_, child) in &self.controls {
+                let visible = !child.0.is_null()
+                    && GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+                if visible {
+                    let _ = SendMessageW(child, WM_SETREDRAW, WPARAM(0), LPARAM(0));
+                }
+                frozen.push(visible);
+            }
+        }
+        frozen
+    }
+    fn unfreeze_controls(&self, frozen: &[bool]) {
         if self.hwnd.0.is_null() {
             return;
         }
-        let flag = WPARAM(usize::from(enabled));
-        // SAFETY: suppresses synchronous child invalidations while updating control state before slide capture.
+        let view = self.library_view();
+        // SAFETY: restores WM_SETREDRAW only on originally-visible children and applies target visibility silently.
         unsafe {
-            let _ = SendMessageW(self.hwnd, WM_SETREDRAW, flag, LPARAM(0));
-            for &(_, child) in &self.controls {
-                if !child.0.is_null() {
-                    let _ = SendMessageW(child, WM_SETREDRAW, flag, LPARAM(0));
+            for (&(id, child), &was_visible) in self.controls.iter().zip(frozen.iter()) {
+                if child.0.is_null() {
+                    continue;
+                }
+                let visible = self.control_visible(id, &view);
+                if was_visible {
+                    let _ = SendMessageW(child, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+                }
+                if was_visible != visible {
+                    let _ = SetWindowPos(
+                        child,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE
+                            | SWP_NOSIZE
+                            | SWP_NOZORDER
+                            | SWP_NOACTIVATE
+                            | SWP_NOREDRAW
+                            | if visible {
+                                SWP_SHOWWINDOW
+                            } else {
+                                SWP_HIDEWINDOW
+                            },
+                    );
+                }
+                if was_visible || visible {
+                    let _ = ValidateRect(child, None);
                 }
             }
-            if enabled {
-                let _ = ValidateRect(self.hwnd, None);
-                for &(_, child) in &self.controls {
-                    if !child.0.is_null() {
-                        let _ = ValidateRect(child, None);
-                    }
-                }
-            }
+            let _ = ValidateRect(self.hwnd, None);
         }
     }
     fn step_page(&mut self, delta: isize) -> Result<(), String> {
@@ -1564,9 +1618,9 @@ impl App {
         if old_layer.is_none() {
             return self.refresh_library();
         }
-        self.set_redraw(false);
-        let refresh = self.refresh_library_with_repaint(false);
-        self.set_redraw(true);
+        let frozen = self.freeze_visible_controls();
+        let refresh = self.refresh_library_with_options(false, false);
+        self.unfreeze_controls(&frozen);
         refresh?;
         let hidden = self.visible_controls_for(false);
         if let (Some(c), Some(old)) = (clip, old_layer)
@@ -3446,19 +3500,21 @@ impl App {
         }
         self.tab = tab;
         visuals::set_tab(tab);
-        if !repaint_now {
-            self.set_redraw(false);
-        }
+        let frozen = if repaint_now {
+            None
+        } else {
+            Some(self.freeze_visible_controls())
+        };
         let update_result = if tab == visuals::Tab::Library {
-            self.refresh_library_with_repaint(repaint_now)
+            self.refresh_library_with_options(repaint_now, repaint_now)
         } else {
             if tab == visuals::Tab::Settings {
                 self.refresh_diagnostics();
             }
-            self.apply_layout(repaint_now)
+            self.apply_layout_with_visibility(repaint_now, repaint_now)
         };
-        if !repaint_now {
-            self.set_redraw(true);
+        if let Some(frozen) = frozen.as_deref() {
+            self.unfreeze_controls(frozen);
         }
         update_result?;
         let focus = match tab {
@@ -3495,10 +3551,27 @@ impl App {
                     Some(self.control(focus)),
                     true,
                 );
-                // SAFETY: invalidate header tab pills on frame 0 so crossfade begins immediately.
+                // SAFETY: invalidate header tab pills on frame 0 and refresh Add buttons when toggling Settings.
                 unsafe {
                     let _ = InvalidateRect(self.control(visuals::TAB_LIBRARY), None, false);
                     let _ = InvalidateRect(self.control(visuals::TAB_SETTINGS), None, false);
+                    if (previous == visuals::Tab::Settings) != (tab == visuals::Tab::Settings) {
+                        let mut client = RECT::default();
+                        if GetClientRect(self.hwnd, &mut client).is_ok() {
+                            let header_clip = RECT {
+                                left: 0,
+                                top: 0,
+                                right: client.right,
+                                bottom: c.top,
+                            };
+                            let _ = RedrawWindow(
+                                self.hwnd,
+                                Some(&header_clip),
+                                None,
+                                RDW_INVALIDATE | RDW_ALLCHILDREN,
+                            );
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -6242,6 +6315,146 @@ mod tests {
             if atom != 0 {
                 let _ = UnregisterClassW(class_name, instance);
             }
+        }
+    }
+
+    #[test]
+    fn visible_window_transitions_preserve_tab_and_page_control_visibility() -> Result<(), String> {
+        // SAFETY: isolated visible off-DOM test window verifying WM_SETREDRAW-free slide transitions on all tabs/pages.
+        unsafe {
+            let instance = GetModuleHandleW(None).map_err(native_error)?;
+            let class = w!("WallpaperLive.TabVisibilityTransitionTest");
+            let atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class,
+                ..Default::default()
+            });
+            assert_ne!(atom, 0);
+            let mut app = fixture();
+            app.hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
+                class,
+                w!("Visibility transition test"),
+                WS_POPUP | WS_CLIPCHILDREN,
+                0,
+                0,
+                1080,
+                740,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .map_err(native_error)?;
+            app.reasons.manual = true;
+            app.create_controls()?;
+            let folder = PathBuf::from(r"C:\Transition-test");
+            app.library = (0..12)
+                .map(|i| folder.join(format!("Wall {i:02}.mp4")))
+                .collect();
+            app.selected = Some(app.library[0].clone());
+            app.refresh_library()?;
+            let _ = ShowWindow(app.hwnd, SW_SHOWNA);
+
+            let assert_settled_visibility = |app: &App, label: &str| {
+                assert_ne!(
+                    GetWindowLongW(app.hwnd, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                    0,
+                    "{label}: main HWND lost WS_VISIBLE"
+                );
+                let view = app.library_view();
+                for &(id, child) in &app.controls {
+                    let actual = GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+                    let expected = app.control_visible(id, &view);
+                    assert_eq!(
+                        actual, expected,
+                        "{label}: control {id} on {:?} page {} had WS_VISIBLE={actual}, expected {expected}",
+                        app.tab, app.page
+                    );
+                }
+            };
+
+            assert_settled_visibility(&app, "initial Library p0");
+
+            // Page 0 (9 tiles) -> Page 1 (3 tiles) while window is visible so body slide capture runs.
+            app.action(visuals::NEXT, BN_CLICKED)?;
+            assert!(
+                visuals::has_transition(),
+                "expected active page slide transition on visible HWND"
+            );
+            assert_eq!(app.page, 1);
+            // Non-body controls must keep exact tab visibility even mid-slide.
+            let mid_view = app.library_view();
+            for &(id, child) in &app.controls {
+                if visuals::is_body_control(id)
+                    && !(visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id)
+                {
+                    let actual = GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+                    assert_eq!(
+                        actual,
+                        app.control_visible(id, &mid_view),
+                        "mid page-slide non-tile {id}"
+                    );
+                }
+            }
+            visuals::cancel_transition(app.hwnd);
+            assert_settled_visibility(&app, "Library p1 partial page");
+
+            // Library -> Sources
+            app.action(visuals::FIND_WALLPAPERS, BN_CLICKED)?;
+            assert_eq!(app.tab, visuals::Tab::Sources);
+            assert!(visuals::has_transition());
+            assert_ne!(
+                GetWindowLongW(app.control(PICK), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0,
+                "Add wallpaper stays visible on Sources"
+            );
+            assert_ne!(
+                GetWindowLongW(app.control(visuals::ADD_FOLDER), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0,
+                "Add folder stays visible on Sources"
+            );
+            visuals::cancel_transition(app.hwnd);
+            assert_settled_visibility(&app, "Sources");
+
+            // Sources -> Settings (must hide Add wallpaper, Add folder, Sources, and Library controls)
+            app.action(visuals::TAB_SETTINGS, BN_CLICKED)?;
+            assert_eq!(app.tab, visuals::Tab::Settings);
+            assert!(visuals::has_transition());
+            assert_eq!(
+                GetWindowLongW(app.control(PICK), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0,
+                "Add wallpaper must be hidden on Settings mid-slide"
+            );
+            assert_eq!(
+                GetWindowLongW(app.control(visuals::ADD_FOLDER), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0,
+                "Add folder must be hidden on Settings mid-slide"
+            );
+            visuals::cancel_transition(app.hwnd);
+            assert_settled_visibility(&app, "Settings");
+
+            // Rapid mid-transition interruptions: Settings -> Library -> Sources -> Settings
+            app.action(visuals::TAB_LIBRARY, BN_CLICKED)?;
+            app.action(visuals::FIND_WALLPAPERS, BN_CLICKED)?;
+            app.action(visuals::TAB_SETTINGS, BN_CLICKED)?;
+            visuals::cancel_transition(app.hwnd);
+            assert_settled_visibility(&app, "Settings after interrupted chain");
+
+            // Back to Library p0
+            app.action(visuals::TAB_LIBRARY, BN_CLICKED)?;
+            visuals::cancel_transition(app.hwnd);
+            app.action(visuals::PREVIOUS, BN_CLICKED)?;
+            visuals::cancel_transition(app.hwnd);
+            assert_eq!(app.page, 0);
+            assert_settled_visibility(&app, "Library p0 restored");
+
+            let _ = DestroyWindow(app.hwnd);
+            if atom != 0 {
+                let _ = UnregisterClassW(class, instance);
+            }
+            Ok(())
         }
     }
 }
