@@ -23,7 +23,9 @@ use windows::{
                 ODS_SELECTED, OpenThemeData,
             },
             HiDpi::GetDpiForWindow,
-            Input::KeyboardAndMouse::{SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
+            Input::KeyboardAndMouse::{
+                GetFocus, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            },
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
@@ -65,6 +67,7 @@ pub const SETTINGS_NOTE: usize = 145;
 pub const SETTINGS_INFO: usize = 146;
 pub const SUPPORT: usize = 147;
 pub const SAWERIA: usize = 148;
+pub const ACRYLIC: usize = 149;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 pub const HEADER_HEIGHT: i32 = 72;
@@ -83,8 +86,10 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         101 | ADD_FOLDER => tab != Tab::Settings,
         SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
         id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
-        107 | 108 | 121 | VERSION | MEMORY_INFO | CACHE_INFO | CLEAR_CACHE | PRODUCT_WEBSITE
-        | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT | SAWERIA => tab == Tab::Settings,
+        107 | 108 | 121 | ACRYLIC | VERSION | MEMORY_INFO | CACHE_INFO | CLEAR_CACHE
+        | PRODUCT_WEBSITE | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT | SAWERIA => {
+            tab == Tab::Settings
+        }
         PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
         | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
             tab == Tab::Library
@@ -137,7 +142,7 @@ pub struct Layout {
     pub caption_divider: Rect,
     pub caption_buttons: [(CaptionButton, Rect); 3],
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 42],
+    controls: [(usize, Rect); 43],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -247,9 +252,10 @@ impl Layout {
                 (102, r(side_x, apply_y, side_width, 40)),
                 (103, r(side_x, pause_y, 142, 36)),
                 (104, r(side_x + 154, pause_y, 142, 36)),
-                (107, r(content_x, 264, column_width, 40)),
-                (108, r(content_x, 368, column_width, 40)),
-                (121, r(content_x, 316, column_width, 40)),
+                (107, r(content_x, 260, column_width, 38)),
+                (121, r(content_x, 304, column_width, 38)),
+                (108, r(content_x, 348, column_width, 38)),
+                (ACRYLIC, r(content_x, 392, column_width, 38)),
                 (VERSION, r(resources_x, 212, column_width, 24)),
                 (MEMORY_INFO, r(resources_x, 248, column_width, 40)),
                 (CACHE_INFO, r(resources_x, 300, column_width, 24)),
@@ -402,6 +408,7 @@ fn control_surface(id: usize) -> (u32, u8) {
             | 107
             | 108
             | 121
+            | ACRYLIC
             | PRODUCT_WEBSITE
             | CLEAR_CACHE
             | SUPPORT
@@ -852,6 +859,31 @@ pub fn start_tab_pill_anim(window: HWND, from_tab: Tab, to_tab: Tab) {
     arm_anim_timer(window);
 }
 
+unsafe fn set_child_visible_no_redraw(child: HWND, visible: bool) {
+    if child.0.is_null() {
+        return;
+    }
+    let flag = if visible {
+        SWP_SHOWWINDOW
+    } else {
+        SWP_HIDEWINDOW
+    };
+    unsafe {
+        if !visible || IsWindow(child).as_bool() {
+            let _ = SetWindowPos(
+                child,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | flag,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 pub unsafe fn paint_children_into(
     parent: HWND,
     dc: HDC,
@@ -861,8 +893,30 @@ pub unsafe fn paint_children_into(
 ) {
     // SAFETY: parent and child HWNDs live on this synchronous UI thread; DIB pointer bounds validated.
     unsafe {
+        paint_children_with_visibility(parent, dc, controls, filter_clip, dib_bits, true);
+    }
+}
+
+unsafe fn paint_children_with_visibility(
+    parent: HWND,
+    dc: HDC,
+    controls: &[(usize, HWND)],
+    filter_clip: Option<RECT>,
+    dib_bits: Option<(*mut u32, i32, i32)>,
+    require_visible: bool,
+) {
+    // SAFETY: parent and child HWNDs live on this synchronous UI thread; DIB pointer bounds validated.
+    unsafe {
+        let dpi = if parent.0.is_null() {
+            96
+        } else {
+            GetDpiForWindow(parent).max(96) as i32
+        };
+        let s = |v: i32| v * dpi / 96;
         for &(id, child) in controls {
-            if child.0.is_null() || GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
+            if child.0.is_null()
+                || (require_visible && GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0)
+            {
                 continue;
             }
             let mut r = RECT::default();
@@ -889,6 +943,118 @@ pub unsafe fn paint_children_into(
             {
                 continue;
             }
+            if id == SEARCH {
+                let mut saved = Vec::new();
+                let bounds = dib_bits.and_then(|(bits, w, h)| {
+                    if bits.is_null() || w <= 0 || h <= 0 {
+                        return None;
+                    }
+                    let x0 = child_rect.left.max(0);
+                    let y0 = child_rect.top.max(0);
+                    let x1 = child_rect.right.min(w);
+                    let y1 = child_rect.bottom.min(h);
+                    (x1 > x0 && y1 > y0).then_some((bits, w, h, x0, y0, x1, y1))
+                });
+                if let Some((bits, w, h, x0, y0, x1, y1)) = bounds {
+                    let _ = GdiFlush();
+                    let slice = std::slice::from_raw_parts(bits, (w * h) as usize);
+                    saved.reserve(((x1 - x0) * (y1 - y0)) as usize);
+                    for y in y0..y1 {
+                        let row = y as usize * w as usize;
+                        for x in x0..x1 {
+                            saved.push(slice[row + x as usize]);
+                        }
+                    }
+                }
+                let state = SaveDC(dc);
+                fill(dc, child_rect, LINE);
+                let inner = rect(
+                    child_rect.left + 1,
+                    child_rect.top + 1,
+                    child_rect.right - 1,
+                    child_rect.bottom - 1,
+                );
+                fill(dc, inner, CARD);
+                let text = window_text(child);
+                let text_rect = rect(
+                    inner.left + s(10),
+                    inner.top,
+                    inner.right - s(10),
+                    inner.bottom,
+                );
+                if !text.is_empty() {
+                    label(
+                        dc,
+                        &text,
+                        text_rect,
+                        s(14),
+                        false,
+                        TEXT,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                } else if GetFocus() != child {
+                    label(
+                        dc,
+                        "Search by filename",
+                        text_rect,
+                        s(14),
+                        false,
+                        MUTED,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                }
+                let _ = RestoreDC(dc, state);
+                if let Some((bits, w, h, x0, y0, x1, y1)) = bounds {
+                    let _ = GdiFlush();
+                    let a = if glass_enabled(parent) {
+                        SEARCH_ALPHA
+                    } else {
+                        255
+                    };
+                    let inv = 255u8 - a;
+                    let slice = std::slice::from_raw_parts_mut(bits, (w * h) as usize);
+                    let mut idx = 0usize;
+                    for y in y0..y1 {
+                        let row = y as usize * w as usize;
+                        for x in x0..x1 {
+                            let bg = saved[idx];
+                            idx += 1;
+                            let src = slice[row + x as usize];
+                            if a == 255 {
+                                slice[row + x as usize] = (255u32 << 24) | (src & 0x00ff_ffff);
+                            } else {
+                                let bg_a = ((bg >> 24) & 255) as u8;
+                                let bg_r = ((bg >> 16) & 255) as u8;
+                                let bg_g = ((bg >> 8) & 255) as u8;
+                                let bg_b = (bg & 255) as u8;
+                                let src_r = ((src >> 16) & 255) as u8;
+                                let src_g = ((src >> 8) & 255) as u8;
+                                let src_b = (src & 255) as u8;
+                                let out_a = (u16::from(a)
+                                    + (u16::from(bg_a) * u16::from(inv) + 127) / 255)
+                                    .min(255) as u8;
+                                let out_r = (u16::from(premul_channel(src_r, a))
+                                    + (u16::from(bg_r) * u16::from(inv) + 127) / 255)
+                                    .min(u16::from(out_a))
+                                    as u8;
+                                let out_g = (u16::from(premul_channel(src_g, a))
+                                    + (u16::from(bg_g) * u16::from(inv) + 127) / 255)
+                                    .min(u16::from(out_a))
+                                    as u8;
+                                let out_b = (u16::from(premul_channel(src_b, a))
+                                    + (u16::from(bg_b) * u16::from(inv) + 127) / 255)
+                                    .min(u16::from(out_a))
+                                    as u8;
+                                slice[row + x as usize] = (u32::from(out_a) << 24)
+                                    | (u32::from(out_r) << 16)
+                                    | (u32::from(out_g) << 8)
+                                    | u32::from(out_b);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             let state = SaveDC(dc);
             let _ = SetViewportOrgEx(dc, child_rect.left, child_rect.top, None);
             let clip_rgn = CreateRectRgn(0, 0, 0, 0);
@@ -904,37 +1070,6 @@ pub unsafe fn paint_children_into(
                 LPARAM((PRF_CLIENT | PRF_NONCLIENT | PRF_ERASEBKGND) as isize),
             );
             let _ = RestoreDC(dc, state);
-            if id == SEARCH
-                && let Some((bits, w, h)) = dib_bits
-                && !bits.is_null()
-                && w > 0
-                && h > 0
-            {
-                let _ = GdiFlush();
-                let x0 = child_rect.left.max(0);
-                let y0 = child_rect.top.max(0);
-                let x1 = child_rect.right.min(w);
-                let y1 = child_rect.bottom.min(h);
-                let a = if glass_enabled(parent) {
-                    SEARCH_ALPHA
-                } else {
-                    255
-                };
-                let slice = std::slice::from_raw_parts_mut(bits, (w * h) as usize);
-                for y in y0..y1 {
-                    let row = y as usize * w as usize;
-                    for x in x0..x1 {
-                        let px = slice[row + x as usize];
-                        let r_ch = premul_channel(((px >> 16) & 255) as u8, a);
-                        let g_ch = premul_channel(((px >> 8) & 255) as u8, a);
-                        let b_ch = premul_channel((px & 255) as u8, a);
-                        slice[row + x as usize] = (u32::from(a) << 24)
-                            | (u32::from(r_ch) << 16)
-                            | (u32::from(g_ch) << 8)
-                            | u32::from(b_ch);
-                    }
-                }
-            }
         }
     }
 }
@@ -997,12 +1132,14 @@ pub fn capture_region(
         let total = (client.right * client.bottom) as usize;
         std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
         paint_into(window, dc);
-        paint_children_into(
+        let require_visible = CAPTURE_REQUIRE_VISIBLE.with(Cell::get);
+        paint_children_with_visibility(
             window,
             dc,
             controls,
             Some(bounds),
             Some((bits as *mut u32, client.right, client.bottom)),
+            require_visible,
         );
         let _ = GdiFlush();
         let src = std::slice::from_raw_parts(bits as *const u32, total);
@@ -1022,6 +1159,22 @@ pub fn capture_region(
     }
 }
 
+pub fn capture_region_controls(
+    window: HWND,
+    bounds: RECT,
+    controls: &[(usize, HWND)],
+) -> Option<CapturedLayer> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CAPTURE_REQUIRE_VISIBLE.with(|slot| slot.set(self.0));
+        }
+    }
+    let prev = CAPTURE_REQUIRE_VISIBLE.with(|slot| slot.replace(false));
+    let _guard = Restore(prev);
+    capture_region(window, bounds, controls)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn begin_transition(
     window: HWND,
@@ -1034,8 +1187,51 @@ pub fn begin_transition(
     restore_focus: Option<HWND>,
     covers_body: bool,
 ) {
+    begin_transition_with_hide(
+        window,
+        clip,
+        direction,
+        duration_ms,
+        old_layer,
+        new_layer,
+        &[],
+        hidden,
+        restore_focus,
+        covers_body,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn begin_transition_with_hide(
+    window: HWND,
+    clip: RECT,
+    direction: i32,
+    duration_ms: u32,
+    old_layer: CapturedLayer,
+    new_layer: CapturedLayer,
+    to_hide: &[HWND],
+    hidden: Vec<HWND>,
+    restore_focus: Option<HWND>,
+    covers_body: bool,
+) {
     cancel_transition(window);
     if !animations_enabled(window) {
+        unsafe {
+            for &child in to_hide {
+                set_child_visible_no_redraw(child, false);
+            }
+            for &child in &hidden {
+                set_child_visible_no_redraw(child, true);
+            }
+            if !window.0.is_null() && IsWindow(window).as_bool() {
+                let _ = RedrawWindow(
+                    window,
+                    Some(&clip),
+                    None,
+                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                );
+            }
+        }
         if let Some(target) = restore_focus
             && !target.0.is_null()
         {
@@ -1048,10 +1244,8 @@ pub fn begin_transition(
         return;
     }
     unsafe {
-        for &child in &hidden {
-            if !child.0.is_null() {
-                let _ = ShowWindow(child, SW_HIDE);
-            }
+        for &child in to_hide.iter().chain(hidden.iter()) {
+            set_child_visible_no_redraw(child, false);
         }
     }
     ANIM.with(|a| {
@@ -1076,9 +1270,7 @@ pub fn begin_transition(
 fn end_transition(window: HWND, anim: TransitionAnim) {
     unsafe {
         for child in anim.hidden {
-            if !child.0.is_null() && IsWindow(child).as_bool() {
-                let _ = ShowWindow(child, SW_SHOWNA);
-            }
+            set_child_visible_no_redraw(child, true);
         }
         if let Some(target) = anim.restore_focus
             && !target.0.is_null()
@@ -1244,6 +1436,16 @@ thread_local! {
     static PAINT_RUNTIME: PaintRuntime = PaintRuntime::new();
     static GLASS_BUFFER: Cell<isize> = const { Cell::new(0) };
     static TEXT_THEME: Cell<HTHEME> = const { Cell::new(HTHEME(0)) };
+    static USER_ACRYLIC: Cell<bool> = const { Cell::new(true) };
+    static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
+}
+
+pub fn set_user_acrylic(enabled: bool) {
+    USER_ACRYLIC.with(|slot| slot.set(enabled));
+}
+
+pub fn user_acrylic_enabled() -> bool {
+    USER_ACRYLIC.with(Cell::get)
 }
 struct PaintBuffer {
     handle: isize,
@@ -1705,7 +1907,11 @@ impl PaintBuffer {
                 let bg_r = f32::from(pixel.rgbRed);
                 let bg_g = f32::from(pixel.rgbGreen);
                 let bg_b = f32::from(pixel.rgbBlue);
-                let bg_a = f32::from(pixel.rgbReserved);
+                let bg_a = if !glass && pixel.rgbReserved == 0 {
+                    255.0
+                } else {
+                    f32::from(pixel.rgbReserved)
+                };
 
                 let track_cov = (0.5 - d_track).clamp(0.0, 1.0);
                 let inner_cov = (0.5 - (d_track + 1.0)).clamp(0.0, 1.0);
@@ -2785,7 +2991,7 @@ unsafe fn set_acrylic_composition(window: HWND, enable: bool) -> bool {
         let func: SetWindowCompositionAttributeFn = std::mem::transmute(proc_addr);
         let mut policy = AccentPolicy {
             accent_state: if enable { 4 } else { 0 },
-            accent_flags: if enable { 0 } else { 2 },
+            accent_flags: 2,
             gradient_color: if enable { ACRYLIC_TINT_COLOR } else { 0 },
             animation_id: 0,
         };
@@ -2836,11 +3042,26 @@ pub fn enable_backdrop(window: HWND) -> bool {
             std::mem::size_of_val(&round) as u32,
         );
         let can_glass = PAINT_RUNTIME.with(|runtime| runtime.initialized)
+            && user_acrylic_enabled()
             && transparency_enabled()
             && DwmIsCompositionEnabled().is_ok_and(|value| value.as_bool());
         if !can_glass {
             disable_backdrop(window);
             return false;
+        }
+        let disable_transitions = 1i32;
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            (&disable_transitions as *const i32).cast(),
+            std::mem::size_of_val(&disable_transitions) as u32,
+        );
+        if glass_enabled(window) {
+            let _ = set_acrylic_composition(window, true);
+            if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
+                sync_search_alpha(window, search);
+            }
+            return true;
         }
         // Reset Win11 SystemBackdrop (DWMSBT_AUTO) and client frame margins to {0} so DWM does not
         // replace Acrylic with solid active black or inactive #2B2B2B grey; enable per-pixel client
@@ -2908,6 +3129,13 @@ pub fn disable_backdrop(window: HWND) {
             DWMWA_SYSTEMBACKDROP_TYPE,
             (&none as *const i32).cast(),
             std::mem::size_of_val(&none) as u32,
+        );
+        let allow_transitions = 0i32;
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            (&allow_transitions as *const i32).cast(),
+            std::mem::size_of_val(&allow_transitions) as u32,
         );
         let _ = DwmExtendFrameIntoClientArea(window, &MARGINS::default());
         if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
@@ -3511,7 +3739,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
         let mut class = [0u16; 32];
         let count = GetClassNameW(window, &mut class).max(0) as usize;
         let static_text = String::from_utf16_lossy(&class[..count]) == "Static";
-        let checkbox = matches!(id, 107 | 108 | 121);
+        let checkbox = matches!(id, 107 | 108 | 121 | ACRYLIC);
         let status_edit = id == 113;
         let mut status_selected = false;
         if status_edit {
@@ -3547,34 +3775,39 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                     let hot = is_hot(window) && !disabled;
                     let t = toggle_progress(id, checked, parent);
                     toggle_state = (checked, pressed, disabled, hot, t);
+                    let glass = theme.0 != 0;
                     if hot || pressed {
                         fill(buffer.dc, area, CARD_LIT);
-                        if theme.0 != 0 {
-                            let row_mask = RoundedMask {
-                                ellipse: s(8),
-                                border: HIGHLIGHT,
-                                border_width: 1.0,
-                                border_alpha: if pressed { 148 } else { 116 },
-                                fill_alpha: if pressed { 96 } else { 78 },
-                                focus: 0,
-                                focus_inset: 0.0,
-                                host_color: surface_color,
-                                host_alpha: surface_alpha,
-                                top_rim: CREAM,
-                                bottom_rim: 0,
-                                sheen_strength: 0.04,
-                            };
-                            buffer.apply_rounded_rect_mask(area, &row_mask)
-                        } else {
-                            true
-                        }
+                        let row_mask = RoundedMask {
+                            ellipse: s(8),
+                            border: if glass || pressed { HIGHLIGHT } else { LINE },
+                            border_width: 1.0,
+                            border_alpha: if !glass {
+                                255
+                            } else if pressed {
+                                148
+                            } else {
+                                116
+                            },
+                            fill_alpha: if !glass {
+                                255
+                            } else if pressed {
+                                96
+                            } else {
+                                78
+                            },
+                            focus: 0,
+                            focus_inset: 0.0,
+                            host_color: surface_color,
+                            host_alpha: if glass { surface_alpha } else { 255 },
+                            top_rim: if glass { CREAM } else { GLASS_RIM },
+                            bottom_rim: if glass { 0 } else { INK },
+                            sheen_strength: if glass { 0.04 } else { 0.02 },
+                        };
+                        buffer.apply_rounded_rect_mask(area, &row_mask)
                     } else {
                         fill(buffer.dc, area, surface_color);
-                        if theme.0 != 0 {
-                            buffer.tint_background(area, surface_alpha)
-                        } else {
-                            true
-                        }
+                        buffer.tint_background(area, if glass { surface_alpha } else { 255 })
                     }
                 } else {
                     fill(buffer.dc, area, surface_color);
@@ -3786,7 +4019,7 @@ unsafe extern "system" fn control_proc(
             }
             WM_MOUSEMOVE => {
                 let ctrl_id = GetDlgCtrlID(window) as usize;
-                let interactive = owner_draw || matches!(ctrl_id, 107 | 108 | 121);
+                let interactive = owner_draw || matches!(ctrl_id, 107 | 108 | 121 | ACRYLIC);
                 if interactive {
                     let prev_hot = ANIM.with(|a| {
                         let mut state = a.borrow_mut();
@@ -4520,6 +4753,8 @@ mod tests {
             assert_eq!(layout.preferences_title.top, layout.resources_title.top);
             assert_eq!(area(107).left, area(108).left);
             assert_eq!(area(107).left, area(121).left);
+            assert_eq!(area(107).left, area(ACRYLIC).left);
+            assert!(area(ACRYLIC).top > area(108).bottom);
             assert_eq!(area(MEMORY_INFO).left, area(CACHE_INFO).left);
             assert!(area(FPS).bottom + 12 <= area(AUDIO).top);
             assert_eq!(area(SOURCES_BACK).top, layout.sources_title.top);
@@ -4608,6 +4843,23 @@ mod tests {
                     .0
                     .iter()
                     .all(|p| p[..3].iter().all(|c| *c <= p[3]))
+            );
+            std::slice::from_raw_parts_mut(bits as *mut u32, 60 * 32).fill(0);
+            let buf_opaque = PaintBuffer::new(dc, full).expect("opaque toggle buffer");
+            fill(buf_opaque.dc, full, CARD);
+            assert!(buf_opaque.draw_toggle_switch(track, 1.0, false, false, false, false));
+            assert!(buf_opaque.opaque());
+            assert!(buf_opaque.finish());
+            let _ = GdiFlush();
+            let px_opaque = std::slice::from_raw_parts(bits as *const u8, 60 * 32 * 4);
+            assert_eq!(
+                at(px_opaque, 60, 11, 6),
+                [
+                    (CARD & 255) as u8,
+                    ((CARD >> 8) & 255) as u8,
+                    ((CARD >> 16) & 255) as u8,
+                    255,
+                ]
             );
             SelectObject(dc, prev);
             let _ = DeleteObject(bitmap);

@@ -993,7 +993,7 @@ impl App {
                 (
                     visuals::SETTINGS_NOTE,
                     w!("STATIC"),
-                    "Session lock and display sleep always pause playback.",
+                    "Session lock and display sleep always pause playback. Acrylic blur requires Windows Transparency effects to be enabled.",
                     SS_LEFT.0 | SS_NOPREFIX.0,
                 ),
                 (
@@ -1054,6 +1054,12 @@ impl App {
                     STARTUP,
                     w!("BUTTON"),
                     "Start with Windows",
+                    BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::ACRYLIC,
+                    w!("BUTTON"),
+                    "Acrylic blur (Windows transparency On)",
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -1183,7 +1189,7 @@ impl App {
                 )
                 .map_err(native_error)?;
                 self.controls.push((id, child));
-                if matches!(id, BATTERY | STARTUP | 121) {
+                if matches!(id, BATTERY | STARTUP | 121 | visuals::ACRYLIC) {
                     let _ = windows::Win32::UI::Controls::SetWindowTheme(child, w!(""), w!(""));
                 }
             }
@@ -1267,6 +1273,12 @@ impl App {
                 self.control(BATTERY),
                 BM_SETCHECK,
                 WPARAM(self.settings.pause_battery as usize),
+                LPARAM(0),
+            );
+            SendMessageW(
+                self.control(visuals::ACRYLIC),
+                BM_SETCHECK,
+                WPARAM(self.settings.acrylic_blur as usize),
                 LPARAM(0),
             );
             if let Ok(enabled) = startup_enabled() {
@@ -1591,7 +1603,8 @@ impl App {
             } else {
                 SWP_NOREDRAW
             };
-            if font_dirty || self.layout_state != Some((dpi, width, height)) {
+            let size_changed = font_dirty || self.layout_state != Some((dpi, width, height));
+            if size_changed {
                 let layout = visuals::Layout::new(width, height);
                 for (id, control) in &self.controls {
                     if let Some(area) = layout.control(*id) {
@@ -1644,7 +1657,7 @@ impl App {
                     }
                 }
             }
-            if repaint {
+            if repaint && size_changed {
                 for (_, control) in &self.controls {
                     let _ = InvalidateRect(*control, None, true);
                 }
@@ -3845,6 +3858,29 @@ impl App {
                     return Err(error);
                 }
             }
+            visuals::ACRYLIC => {
+                let enabled = unsafe {
+                    SendMessageW(
+                        self.control(visuals::ACRYLIC),
+                        BM_GETCHECK,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                    .0
+                } == BST_CHECKED.0 as isize;
+                self.settings.acrylic_blur = enabled;
+                self.save()?;
+                visuals::set_user_acrylic(enabled);
+                let _ = visuals::enable_backdrop(self.hwnd);
+                unsafe {
+                    let _ = RedrawWindow(
+                        self.hwnd,
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                    );
+                }
+            }
             _ => {}
         }
         Ok(false)
@@ -3870,7 +3906,7 @@ impl App {
         let frozen = if repaint_now {
             None
         } else {
-            Some(self.freeze_controls_matching(|_| true))
+            Some(self.freeze_controls_matching(|id| !visuals::is_body_control(id)))
         };
         let update_result = if tab == visuals::Tab::Library {
             self.refresh_library_with_options(repaint_now, repaint_now)
@@ -3881,7 +3917,7 @@ impl App {
             self.apply_layout_with_visibility(repaint_now, repaint_now)
         };
         if let Some(frozen) = frozen.as_deref() {
-            self.unfreeze_controls_matching(frozen, |_| true);
+            self.unfreeze_controls_matching(frozen, |id| !visuals::is_body_control(id));
         }
         update_result?;
         let focus = match tab {
@@ -3891,7 +3927,24 @@ impl App {
             visuals::Tab::Library => visuals::TAB_LIBRARY,
         };
         if let (Some(c), Some(old)) = (clip, old_layer) {
-            let hidden = self.visible_controls_for(true);
+            let view = self.library_view();
+            let mut new_controls = Vec::with_capacity(self.controls.len());
+            let mut hidden = Vec::new();
+            let mut to_hide = Vec::new();
+            for &(id, control) in &self.controls {
+                let currently_visible =
+                    unsafe { GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 };
+                if visuals::is_body_control(id) {
+                    if self.control_visible(id, &view) {
+                        new_controls.push((id, control));
+                        hidden.push(control);
+                    } else if currently_visible {
+                        to_hide.push(control);
+                    }
+                } else if currently_visible {
+                    new_controls.push((id, control));
+                }
+            }
             // SAFETY: keep focus on a non-hidden HWND during the 200ms body slide, then restore target focus.
             unsafe {
                 let holder = if visuals::is_body_control(focus) {
@@ -3901,19 +3954,20 @@ impl App {
                 };
                 let _ = SetFocus(holder);
             }
-            if let Some(new) = visuals::capture_region(self.hwnd, c, &self.controls) {
+            if let Some(new) = visuals::capture_region_controls(self.hwnd, c, &new_controls) {
                 let dir = if previous == visuals::Tab::Library {
                     -1
                 } else {
                     1
                 };
-                visuals::begin_transition(
+                visuals::begin_transition_with_hide(
                     self.hwnd,
                     c,
                     dir,
                     visuals::TAB_TRANSITION_MS,
                     old,
                     new,
+                    &to_hide,
                     hidden,
                     Some(self.control(focus)),
                     true,
@@ -3942,6 +3996,9 @@ impl App {
                 }
                 return Ok(());
             }
+        }
+        if !repaint_now {
+            self.apply_layout_with_visibility(false, true)?;
         }
         // SAFETY: move focus off controls hidden by this tab change and force clean repaint.
         unsafe {
@@ -4304,6 +4361,7 @@ pub fn run() -> Result<(), String> {
             WPARAM(ICON_SMALL as usize),
             LPARAM(app.small_icon.0.0 as isize),
         );
+        visuals::set_user_acrylic(app.settings.acrylic_blur);
         let _ = visuals::enable_backdrop(hwnd);
         let _ = SetWindowPos(
             hwnd,
@@ -4696,12 +4754,6 @@ unsafe extern "system" fn window_proc(
                 visuals::cancel_transition(window);
                 if wparam.0 == SIZE_MINIMIZED as usize {
                     return LRESULT(0);
-                }
-                if matches!(wparam.0 as u32, SIZE_RESTORED | SIZE_MAXIMIZED)
-                    && visuals::glass_enabled(window)
-                {
-                    let _ = visuals::enable_backdrop(window);
-                    let _ = InvalidateRect(window, None, true);
                 }
                 post(LAYOUT, WPARAM(0), LPARAM(0));
                 LRESULT(0)

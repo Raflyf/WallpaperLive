@@ -19,6 +19,7 @@ pub struct Settings {
     pub audio_enabled: bool,
     pub pause_fullscreen: bool,
     pub fps: u32,
+    pub acrylic_blur: bool,
 }
 
 impl Default for Settings {
@@ -32,6 +33,7 @@ impl Default for Settings {
             audio_enabled: false,
             pause_fullscreen: true,
             fps: 30,
+            acrylic_blur: true,
         }
     }
 }
@@ -88,13 +90,29 @@ impl Settings {
                 path.display()
             ));
         }
+        if !self.acrylic_blur {
+            content.push_str("acrylic=false\n");
+        }
         Ok(content)
     }
     pub fn decode(text: &str) -> Result<Self, String> {
         if text.len() > 4 * 1024 * 1024 {
             return Err("Configuration is too large".into());
         }
-        let lines: Vec<_> = text.lines().collect();
+        let mut lines: Vec<_> = text.lines().collect();
+        let mut acrylic = None;
+        if lines.first() == Some(&"version=4")
+            && lines
+                .last()
+                .is_some_and(|line| line.starts_with("acrylic="))
+        {
+            let line = lines.pop().unwrap_or("");
+            acrylic = Some(match line {
+                "acrylic=true" => true,
+                "acrylic=false" => false,
+                _ => return Err("Invalid acrylic blur setting".into()),
+            });
+        }
         let legacy = lines.len() == 5 && lines[0] == "version=1";
         let previous = lines.len() == 7 && lines[0] == "version=2";
         let current = lines.len() == 8 && lines[0] == "version=3";
@@ -192,6 +210,7 @@ impl Settings {
             audio_enabled,
             pause_fullscreen,
             fps,
+            acrylic_blur: acrylic.unwrap_or(true),
         })
     }
 }
@@ -365,9 +384,19 @@ mod tests {
             audio_enabled: true,
             pause_fullscreen: false,
             fps: 45,
+            acrylic_blur: false,
         };
         assert_eq!(Settings::decode(&s.encode().unwrap()).unwrap(), s);
+        assert!(
+            Settings::decode(
+                &s.encode()
+                    .unwrap()
+                    .replace("acrylic=false", "acrylic=maybe")
+            )
+            .is_err()
+        );
         let empty = Settings::default();
+        assert!(empty.acrylic_blur);
         assert_eq!(Settings::decode(&empty.encode().unwrap()).unwrap(), empty);
     }
 
