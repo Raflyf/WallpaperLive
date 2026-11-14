@@ -1462,6 +1462,7 @@ pub fn clear() {
 #[derive(Default)]
 struct TransitionBackdrop {
     active: bool,
+    captured_while_visible: bool,
     hwnd: isize,
     win_rect: RECT,
     mon_rect: RECT,
@@ -3988,6 +3989,7 @@ pub fn invalidate_backdrop_cache() {
     });
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn prime_backdrop_capture(window: HWND) {
     if window.0.is_null() || !os_window_animations_enabled() {
         return;
@@ -4014,7 +4016,14 @@ pub fn backdrop_transition_active(window: HWND) -> bool {
         })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+pub fn backdrop_captured_while_visible(window: HWND) -> bool {
+    !window.0.is_null()
+        && TRANSITION_BACKDROP.with(|slot| {
+            let bd = slot.borrow();
+            bd.active && bd.hwnd == window.0 as isize && bd.captured_while_visible
+        })
+}
+
 pub fn clear_backdrop_transition(window: HWND) {
     if window.0.is_null() {
         return;
@@ -4023,6 +4032,7 @@ pub fn clear_backdrop_transition(window: HWND) {
         let mut bd = slot.borrow_mut();
         if bd.hwnd == window.0 as isize {
             bd.active = false;
+            bd.captured_while_visible = false;
         }
     });
 }
@@ -4049,7 +4059,11 @@ pub fn begin_backdrop_transition(window: HWND) {
             return;
         }
         capture_transition_backdrop(window);
-        TRANSITION_BACKDROP.with(|slot| slot.borrow_mut().active = true);
+        TRANSITION_BACKDROP.with(|slot| {
+            let mut bd = slot.borrow_mut();
+            bd.active = true;
+            bd.captured_while_visible = !iconic_or_hidden;
+        });
         if !iconic_or_hidden {
             let _ = RedrawWindow(
                 window,
@@ -4057,6 +4071,12 @@ pub fn begin_backdrop_transition(window: HWND) {
                 None,
                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
             );
+            // Flush the alpha=255 frame to DWM before DefWindowProcW snapshots the From visual.
+            if windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled()
+                .is_ok_and(|enabled| enabled.as_bool())
+            {
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            }
         }
     }
 }
@@ -4071,6 +4091,7 @@ pub fn finish_backdrop_transition(window: HWND) {
         let mut bd = slot.borrow_mut();
         if window.0.is_null() || bd.hwnd == window.0 as isize {
             bd.active = false;
+            bd.captured_while_visible = false;
         }
     });
     if window.0.is_null() {
@@ -4078,7 +4099,10 @@ pub fn finish_backdrop_transition(window: HWND) {
     }
     // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND once restore animation finishes.
     unsafe {
-        if !IsWindow(window).as_bool() || IsIconic(window).as_bool() {
+        if !IsWindow(window).as_bool()
+            || IsIconic(window).as_bool()
+            || !IsWindowVisible(window).as_bool()
+        {
             return;
         }
         if glass_enabled(window) && user_acrylic_enabled() && transparency_enabled() {
@@ -6470,6 +6494,7 @@ mod tests {
                 let _ = ShowWindow(parent, SW_SHOWNA);
                 begin_backdrop_transition(parent);
                 assert!(backdrop_transition_active(parent));
+                assert!(!backdrop_captured_while_visible(parent));
                 TRANSITION_BACKDROP.with(|slot| {
                     assert_eq!(slot.borrow().pixels[0], 0xDEAD_BEEF);
                 });
@@ -6477,6 +6502,7 @@ mod tests {
                 let _ = ShowWindow(parent, SW_HIDE);
                 begin_backdrop_transition(parent);
                 assert!(backdrop_transition_active(parent));
+                assert!(!backdrop_captured_while_visible(parent));
                 TRANSITION_BACKDROP.with(|slot| {
                     let bd = slot.borrow();
                     assert_eq!((bd.width, bd.height), (480, 270));
@@ -6485,6 +6511,16 @@ mod tests {
                 });
                 clear_backdrop_transition(parent);
                 assert!(!backdrop_transition_active(parent));
+                assert!(!backdrop_captured_while_visible(parent));
+
+                // Visible fresh capture marks captured_while_visible so interrupted minimize->restore refreshes.
+                let _ = ShowWindow(parent, SW_SHOWNA);
+                begin_backdrop_transition(parent);
+                assert!(backdrop_transition_active(parent));
+                assert!(backdrop_captured_while_visible(parent));
+                clear_backdrop_transition(parent);
+                assert!(!backdrop_transition_active(parent));
+                assert!(!backdrop_captured_while_visible(parent));
             }
 
             let _ = RemovePropW(parent, GLASS_PROPERTY);
