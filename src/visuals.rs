@@ -352,8 +352,9 @@ pub const BORDER_ALPHA: u8 = 185;
 const DIVIDER_ALPHA: u8 = 136;
 const SEARCH_ALPHA: u8 = 255;
 pub const DROPDOWN_ALPHA: u8 = 116;
-// Lighter smoked Ink Acrylic tint so wallpaper colors & blur shine clearly both focused and unfocused.
-const ACRYLIC_TINT_COLOR: u32 = 0x1411_1111;
+// Warm-stone Acrylic tint (ABGR: AA=0x14, B=0x4e, G=0x51, R=0x53; Y~81) avoids Win11 DWM's
+// ~90% dark Luminosity crush so idle frosted glass stays bright while MUTED keeps >= 4.5:1 over white.
+const ACRYLIC_TINT_COLOR: u32 = 0x144e_5153;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -3349,6 +3350,27 @@ fn map_backdrop_overlay_rects(
     (dr > dl && db > dt).then_some((rect(dl, dt, dr, db), rect(sl, st, sr, sb)))
 }
 
+fn tint_transition_backdrop_pixel(px: u32) -> u32 {
+    let tint_a = (ACRYLIC_TINT_COLOR >> 24) & 255;
+    let tint_b = (ACRYLIC_TINT_COLOR >> 16) & 255;
+    let tint_g = (ACRYLIC_TINT_COLOR >> 8) & 255;
+    let tint_r = ACRYLIC_TINT_COLOR & 255;
+    let r = (px >> 16) & 255;
+    let g = (px >> 8) & 255;
+    let b = px & 255;
+    let y_px = ((77 * r + 150 * g + 29 * b + 128) >> 8) as i32;
+    let y_tint = ((77 * tint_r + 150 * tint_g + 29 * tint_b + 128) >> 8) as i32;
+    let delta = (y_tint - y_px) * 224 / 255;
+    let blend = |ch: u32, tint_ch: u32| -> u32 {
+        let shifted = (ch as i32 + delta).clamp(0, 255) as u32;
+        (shifted * (255 - tint_a) + tint_ch * tint_a + 127) / 255
+    };
+    let out_r = blend(r, tint_r);
+    let out_g = blend(g, tint_g);
+    let out_b = blend(b, tint_b);
+    0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b
+}
+
 unsafe fn capture_transition_backdrop(window: HWND) {
     const BACKDROP_W: i32 = 320;
     const BACKDROP_H: i32 = 180;
@@ -3530,10 +3552,7 @@ unsafe fn capture_transition_backdrop(window: HWND) {
                                     );
                                 }
                                 for px in &mut buf {
-                                    let r = (((*px >> 16) & 255) * 235 + 17 * 20 + 127) / 255;
-                                    let g = (((*px >> 8) & 255) * 235 + 17 * 20 + 127) / 255;
-                                    let b = ((*px & 255) * 235 + 17 * 20 + 127) / 255;
-                                    *px = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+                                    *px = tint_transition_backdrop_pixel(*px);
                                 }
                                 captured = Some(buf);
                             }
@@ -3555,7 +3574,8 @@ unsafe fn capture_transition_backdrop(window: HWND) {
                 || bd.pixels.len() != total
             {
                 bd.pixels.clear();
-                bd.pixels.resize(total, 0xFF11_1111);
+                bd.pixels
+                    .resize(total, tint_transition_backdrop_pixel(0xFF11_1111));
             }
             bd.hwnd = window.0 as isize;
             bd.win_rect = win_rect;
@@ -5801,6 +5821,48 @@ mod tests {
     }
 
     #[test]
+    fn tint_transition_backdrop_pixel_matches_warm_stone_frosted_glass() {
+        let rgb = |px: u32| -> (u32, u32, u32) { ((px >> 16) & 255, (px >> 8) & 255, px & 255) };
+        let luma = |px: u32| -> u32 {
+            let (r, g, b) = rgb(px);
+            (77 * r + 150 * g + 29 * b + 128) >> 8
+        };
+
+        let dark = tint_transition_backdrop_pixel(0xFF20_2020);
+        let bright = tint_transition_backdrop_pixel(0xFFB0_B0B0);
+        let fallback = tint_transition_backdrop_pixel(0xFF11_1111);
+        let black = tint_transition_backdrop_pixel(0xFF00_0000);
+        let white = tint_transition_backdrop_pixel(0xFFFF_FFFF);
+        for px in [dark, bright, fallback, black, white] {
+            assert_eq!(px >> 24, 0xFF);
+        }
+        assert!((75..=92).contains(&luma(dark)));
+        assert!((75..=92).contains(&luma(bright)));
+        assert!((72..=102).contains(&luma(black)));
+        assert!((72..=102).contains(&luma(white)));
+        assert!(luma(white) - luma(black) >= 12);
+        assert!((73..=82).contains(&luma(fallback)));
+
+        let peach = tint_transition_backdrop_pixel(0xFFE0_88A0);
+        assert_eq!(peach >> 24, 0xFF);
+        assert!((75..=92).contains(&luma(peach)));
+        let (pr, pg, pb) = rgb(peach);
+        assert!(pr > pb && pb > pg);
+
+        let amber_peach = tint_transition_backdrop_pixel(0xFFD8_9870);
+        assert_eq!(amber_peach >> 24, 0xFF);
+        assert!((75..=92).contains(&luma(amber_peach)));
+        let (ar, ag, ab) = rgb(amber_peach);
+        assert!(ar > ag && ag > ab);
+
+        let cyan = tint_transition_backdrop_pixel(0xFF20_90D0);
+        assert_eq!(cyan >> 24, 0xFF);
+        assert!((75..=92).contains(&luma(cyan)));
+        let (cr, cg, cb) = rgb(cyan);
+        assert!(cb > cg && cg > cr);
+    }
+
+    #[test]
     fn search_control_print_opaque_bkmode_and_end_transition_show() {
         unsafe extern "system" fn test_ctlcolor_subclass(
             window: HWND,
@@ -5957,7 +6019,7 @@ mod tests {
         assert_eq!(CARD_ALPHA, 56);
         assert_eq!(BORDER_ALPHA, 185);
         assert_eq!(DROPDOWN_ALPHA, 116);
-        assert_eq!(ACRYLIC_TINT_COLOR, 0x1411_1111);
+        assert_eq!(ACRYLIC_TINT_COLOR, 0x144e_5153);
         assert_eq!(ease_out_quart(-0.5), 0.0);
         assert_eq!(ease_out_quart(0.0), 0.0);
         assert_eq!(ease_out_quart(1.0), 1.0);
