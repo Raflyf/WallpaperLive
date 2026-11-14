@@ -7156,25 +7156,36 @@ mod tests {
                 assert!(!visuals::backdrop_transition_active(hwnd));
                 let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
 
+                let finish_restore_on_timer = || {
+                    let _ =
+                        SendMessageW(hwnd, WM_TIMER, WPARAM(RESTORE_BACKDROP_TIMER_ID), LPARAM(0));
+                    if visuals::backdrop_fading(hwnd) {
+                        assert!(visuals::backdrop_transition_active(hwnd));
+                        visuals::expire_backdrop_fade_for_test(hwnd);
+                        let _ =
+                            SendMessageW(hwnd, WM_TIMER, WPARAM(visuals::ANIM_TIMER_ID), LPARAM(0));
+                    }
+                    assert!(!visuals::backdrop_fading(hwnd));
+                    assert!(!visuals::backdrop_transition_active(hwnd));
+                    assert!(!visuals::backdrop_captured_while_visible(hwnd));
+                };
+
                 // Non-drag size change activates transition backdrop; WM_SIZE preserves it
-                // until RESTORE_BACKDROP_TIMER_ID fires.
+                // until RESTORE_BACKDROP_TIMER_ID starts fade-out and ANIM_TIMER_ID completes it.
                 send_pos(0, 0, 1400, 900, SWP_NOZORDER | SWP_NOACTIVATE);
                 assert!(visuals::backdrop_transition_active(hwnd));
                 let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_MAXIMIZED as usize), LPARAM(0));
                 assert!(visuals::backdrop_transition_active(hwnd));
                 let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_RESTORED as usize), LPARAM(0));
                 assert!(visuals::backdrop_transition_active(hwnd));
-                let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(RESTORE_BACKDROP_TIMER_ID), LPARAM(0));
-                assert!(!visuals::backdrop_transition_active(hwnd));
-                assert!(!visuals::backdrop_captured_while_visible(hwnd));
+                finish_restore_on_timer();
 
                 let _ = SendMessageW(hwnd, WM_QUERYOPEN, WPARAM(0), LPARAM(0));
                 assert!(visuals::backdrop_transition_active(hwnd));
-                let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(RESTORE_BACKDROP_TIMER_ID), LPARAM(0));
-                assert!(!visuals::backdrop_transition_active(hwnd));
+                finish_restore_on_timer();
 
                 // Minimize keeps transition backdrop active across SIZE_MINIMIZED and
-                // subsequent SIZE_RESTORED until RESTORE_BACKDROP_TIMER_ID fires.
+                // subsequent SIZE_RESTORED until RESTORE_BACKDROP_TIMER_ID + fade complete.
                 send_pos(-32000, -32000, 160, 28, SWP_NOZORDER | SWP_NOACTIVATE);
                 assert!(visuals::backdrop_transition_active(hwnd));
                 let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_MINIMIZED as usize), LPARAM(0));
@@ -7183,14 +7194,11 @@ mod tests {
                 let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_RESTORED as usize), LPARAM(0));
                 assert!(GetPropW(hwnd, ICONIC_PROPERTY).0.is_null());
                 assert!(visuals::backdrop_transition_active(hwnd));
-                let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(RESTORE_BACKDROP_TIMER_ID), LPARAM(0));
-                assert!(!visuals::backdrop_transition_active(hwnd));
-                assert!(!visuals::backdrop_captured_while_visible(hwnd));
+                finish_restore_on_timer();
 
                 let _ = SendMessageW(hwnd, WM_QUERYOPEN, WPARAM(0), LPARAM(0));
                 assert!(visuals::backdrop_transition_active(hwnd));
-                let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(RESTORE_BACKDROP_TIMER_ID), LPARAM(0));
-                assert!(!visuals::backdrop_transition_active(hwnd));
+                finish_restore_on_timer();
 
                 visuals::disable_backdrop(hwnd);
             }

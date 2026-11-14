@@ -4253,6 +4253,17 @@ pub fn begin_backdrop_fade(window: HWND) {
     arm_anim_timer(window);
 }
 
+#[cfg(test)]
+pub fn expire_backdrop_fade_for_test(window: HWND) {
+    TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        if bd.active && bd.fading && (window.0.is_null() || bd.hwnd == window.0 as isize) {
+            bd.fade_start =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(1000));
+        }
+    });
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn end_minimize_backdrop_transition(window: HWND) {
     clear_backdrop_transition(window);
