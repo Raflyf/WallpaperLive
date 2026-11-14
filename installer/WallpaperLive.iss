@@ -1,7 +1,7 @@
 #ifndef AppExe
   #define AppExe "..\target\release\wallpaperlive.exe"
 #endif
-#define AppVersion "0.2.0"
+#define AppVersion "0.2.1"
 #define DecoderURL "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261107/mpv-dev-x86_64-20261107-git-9028187538.7z"
 #define ArchiveSHA256 "df7c433a2d481fdaf6163b201f26abbb0eff0c215c51368397088c6d8f7a001b"
 #define DecoderSHA256 "c91949577ae9cc2d500208da51f2c4a24cfa7a02d0ce6e130bf67ec738b450bb"

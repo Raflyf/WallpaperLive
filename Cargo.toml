@@ -1,6 +1,6 @@
 [package]
 name = "wallpaperlive"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 autoexamples = false
 license = "GPL-3.0-or-later"

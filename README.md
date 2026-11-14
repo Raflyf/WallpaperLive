@@ -6,7 +6,7 @@
 <p align="center"><strong>Bring your own live wallpapers.</strong><br>A native Windows app for applying your local videos, GIFs and images as desktop wallpapers.</p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/release-v0.2.0-586575" alt="Release v0.2.0"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.2.1"><img src="https://img.shields.io/badge/release-v0.2.1-586575" alt="Release v0.2.1"></a>
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
   <a href="https://saweria.co/BuyMatcha"><img src="https://img.shields.io/badge/Saweria-BuyMatcha-faae2b" alt="Saweria"></a>
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.0/wallpaperlivesetup-v0.2.0.exe"><strong>Download Windows installer</strong></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.1/wallpaperlivesetup-v0.2.1.exe"><strong>Download Windows installer</strong></a>
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
@@ -113,13 +113,13 @@ The desktop capture also shows 0 MB/s disk and 0 Mbps network; paused shows 0 MB
 
 ## Download and install
 
-1. [Download wallpaperlivesetup-v0.2.0.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.0/wallpaperlivesetup-v0.2.0.exe) and run it as your normal Windows user.
+1. [Download wallpaperlivesetup-v0.2.1.exe](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.1/wallpaperlivesetup-v0.2.1.exe) and run it as your normal Windows user.
 2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.0/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.1/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
 
-Installer downloads include the release version, such as `wallpaperlivesetup-v0.2.0.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
+Installer downloads include the release version, such as `wallpaperlivesetup-v0.2.1.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
@@ -192,7 +192,7 @@ For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a re
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 ```
 
-Setup File version is `0.2.0.0`; Product version is `0.2.0`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
+Setup File version is `0.2.1.0`; Product version is `0.2.1`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
 
 The app and Start-menu shortcut use the same stable taskbar identity, `Raflyf.WallpaperLive`. Large and small icons are registered before the panel window is created; the executable also embeds the product ICO for the Windows shell. CI does not prove how an existing Windows taskbar renders it.
 
