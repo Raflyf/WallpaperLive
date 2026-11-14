@@ -80,7 +80,7 @@ const SAWERIA_URL: &str = "https://saweria.co/BuyMatcha";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 const RESTORE_BACKDROP_TIMER_ID: usize = 4;
-const RESTORE_BACKDROP_MS: u32 = 360;
+const RESTORE_BACKDROP_MS: u32 = 320;
 const ICONIC_PROPERTY: PCWSTR = w!("WallpaperLive.Iconic");
 const SIZE_MOVE_PROPERTY: PCWSTR = w!("WallpaperLive.SizeMove");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3826,6 +3826,8 @@ impl App {
             HIDE => {
                 if self.tray_present {
                     unsafe {
+                        let _ = KillTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID);
+                        visuals::clear_backdrop_transition(self.hwnd);
                         let _ = ShowWindow(self.hwnd, SW_HIDE);
                     }
                     self.cancel_thumbnails();
@@ -4564,7 +4566,7 @@ pub fn run() -> Result<(), String> {
                     }
                     WM_TIMER if message.wParam.0 == RESTORE_BACKDROP_TIMER_ID => {
                         let _ = KillTimer(hwnd, RESTORE_BACKDROP_TIMER_ID);
-                        visuals::finish_backdrop_transition(hwnd);
+                        visuals::begin_backdrop_fade(hwnd);
                         Ok(false)
                     }
                     WM_TIMER => app.tick().map(|_| false),
@@ -4836,6 +4838,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_DESTROY => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                visuals::clear_backdrop_transition(window);
                 let _ = RemovePropW(window, ICONIC_PROPERTY);
                 let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
                 PostQuitMessage(0);
@@ -4843,6 +4846,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_NCDESTROY => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                visuals::clear_backdrop_transition(window);
                 let _ = RemovePropW(window, ICONIC_PROPERTY);
                 let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
                 DefWindowProcW(window, message, wparam, lparam)
@@ -4865,6 +4869,7 @@ unsafe extern "system" fn window_proc(
                 if visuals::os_window_animations_enabled() {
                     if !visuals::backdrop_transition_active(window)
                         || visuals::backdrop_captured_while_visible(window)
+                        || visuals::backdrop_fading(window)
                     {
                         visuals::begin_backdrop_transition(window);
                     }
@@ -4881,7 +4886,9 @@ unsafe extern "system" fn window_proc(
                 let animate_backdrop = visuals::os_window_animations_enabled();
                 if !iconic && pos.x <= -30000 && pos.y <= -30000 {
                     if animate_backdrop {
-                        if !visuals::backdrop_transition_active(window) {
+                        if !visuals::backdrop_transition_active(window)
+                            || visuals::backdrop_fading(window)
+                        {
                             visuals::begin_backdrop_transition(window);
                         }
                         let _ =
@@ -4895,6 +4902,7 @@ unsafe extern "system" fn window_proc(
                     if animate_backdrop {
                         if !visuals::backdrop_transition_active(window)
                             || visuals::backdrop_captured_while_visible(window)
+                            || visuals::backdrop_fading(window)
                         {
                             visuals::begin_backdrop_transition(window);
                         }
@@ -4914,7 +4922,8 @@ unsafe extern "system" fn window_proc(
                             let cur_w = rect.right - rect.left;
                             let cur_h = rect.bottom - rect.top;
                             if (pos.cx != cur_w || pos.cy != cur_h)
-                                && !visuals::backdrop_transition_active(window)
+                                && (!visuals::backdrop_transition_active(window)
+                                    || visuals::backdrop_fading(window))
                             {
                                 visuals::begin_backdrop_transition(window);
                                 let _ = SetTimer(
@@ -4965,9 +4974,13 @@ unsafe extern "system" fn window_proc(
                 post(LAYOUT, WPARAM(0), LPARAM(0));
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == visuals::ANIM_TIMER_ID => {
+                let _ = visuals::tick_animations(window);
+                LRESULT(0)
+            }
             WM_TIMER if wparam.0 == RESTORE_BACKDROP_TIMER_ID => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
-                visuals::finish_backdrop_transition(window);
+                visuals::begin_backdrop_fade(window);
                 LRESULT(0)
             }
             WM_DWMCOMPOSITIONCHANGED
@@ -7063,7 +7076,7 @@ mod tests {
             }
         }
         let _guard = ResetOsAnim;
-        assert_eq!(RESTORE_BACKDROP_MS, 360);
+        assert_eq!(RESTORE_BACKDROP_MS, 320);
         // SAFETY: isolated hidden test window registered and destroyed solely within this test.
         unsafe {
             let instance = GetModuleHandleW(None).expect("module handle");

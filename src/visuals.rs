@@ -368,6 +368,22 @@ fn ease_out_quart(t: f32) -> f32 {
     1.0 - inv * inv * inv * inv
 }
 
+fn smoothstep(t: f32) -> f32 {
+    let clamped = t.clamp(0.0, 1.0);
+    clamped * clamped * (3.0 - 2.0 * clamped)
+}
+
+fn backdrop_fade_weight(fading: bool, elapsed_ms: f32, duration_ms: u32) -> u32 {
+    if !fading {
+        return 255;
+    }
+    if duration_ms == 0 {
+        return 0;
+    }
+    let raw = (elapsed_ms / duration_ms as f32).clamp(0.0, 1.0);
+    ((1.0 - smoothstep(raw)) * 255.0).round().clamp(0.0, 255.0) as u32
+}
+
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
     (f32::from(a) + (f32::from(b) - f32::from(a)) * t)
@@ -566,6 +582,7 @@ pub fn thumbnail(path: PathBuf, image: HBITMAP) {
     });
 }
 pub const ANIM_TIMER_ID: usize = 3;
+const BACKDROP_FADE_MS: u32 = 220;
 const TAB_ANIM_MS: u32 = 210;
 const TOGGLE_ANIM_MS: u32 = 150;
 pub const PAGE_ANIM_MS: u32 = 250;
@@ -758,7 +775,7 @@ pub fn caption_down() -> Option<CaptionButton> {
 }
 
 fn disarm_timer_if_idle(window: HWND) {
-    let active = ANIM.with(|a| a.borrow().has_active());
+    let active = ANIM.with(|a| a.borrow().has_active()) || any_backdrop_fading();
     if !active {
         ANIM.with(|a| {
             let mut state = a.borrow_mut();
@@ -1347,6 +1364,14 @@ pub fn tick_animations(window: HWND) -> bool {
             state.tab_slide = None;
             state.toggles.clear();
         });
+        TRANSITION_BACKDROP.with(|slot| {
+            let mut bd = slot.borrow_mut();
+            if bd.fading && (window.0.is_null() || bd.hwnd == window.0 as isize) {
+                bd.fading = false;
+                bd.fade_start = None;
+                bd.fade_duration_ms = 0;
+            }
+        });
         disarm_timer_if_idle(window);
         return false;
     }
@@ -1355,6 +1380,8 @@ pub fn tick_animations(window: HWND) -> bool {
     let mut invalidate_toggles = Vec::new();
     let mut finished_transition = None;
     let mut transition_clip = None;
+    let mut fade_tick = false;
+    let mut finish_fade = false;
     ANIM.with(|a| {
         let mut state = a.borrow_mut();
         if let Some(slide) = &state.tab_slide {
@@ -1386,6 +1413,30 @@ pub fn tick_animations(window: HWND) -> bool {
             }
         }
     });
+    TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        if bd.active && bd.fading && bd.hwnd == window.0 as isize {
+            let hidden = unsafe { !IsWindowVisible(window).as_bool() };
+            let elapsed_ms = bd
+                .fade_start
+                .map(|start| now.duration_since(start).as_secs_f32() * 1000.0)
+                .unwrap_or(bd.fade_duration_ms as f32);
+            if hidden
+                || !os_window_animations_enabled()
+                || !glass_enabled(window)
+                || !user_acrylic_enabled()
+                || !transparency_enabled()
+                || elapsed_ms >= bd.fade_duration_ms as f32
+            {
+                bd.fading = false;
+                bd.fade_start = None;
+                bd.fade_duration_ms = 0;
+                finish_fade = true;
+            } else {
+                fade_tick = true;
+            }
+        }
+    });
     unsafe {
         if invalidate_tabs {
             for tab_id in [TAB_LIBRARY, TAB_SETTINGS] {
@@ -1405,7 +1456,7 @@ pub fn tick_animations(window: HWND) -> bool {
         }
         if let Some(anim) = finished_transition {
             end_transition(window, anim);
-        } else if let Some(clip) = transition_clip {
+        } else if !fade_tick && let Some(clip) = transition_clip {
             let _ = RedrawWindow(
                 window,
                 Some(&clip),
@@ -1414,8 +1465,28 @@ pub fn tick_animations(window: HWND) -> bool {
             );
         }
     }
+    if finish_fade {
+        finish_backdrop_transition(window);
+    } else if fade_tick {
+        // SAFETY: window and child controls are live UI-thread HWNDs; SEARCH is opaque CARD so ValidateRect prevents caret flicker.
+        unsafe {
+            let _ = RedrawWindow(
+                window,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN,
+            );
+            if let Ok(search) = GetDlgItem(window, SEARCH as i32)
+                && !search.0.is_null()
+                && IsWindowVisible(search).as_bool()
+            {
+                let _ = ValidateRect(search, None);
+            }
+            let _ = RedrawWindow(window, None, None, RDW_UPDATENOW | RDW_ALLCHILDREN);
+        }
+    }
     disarm_timer_if_idle(window);
-    ANIM.with(|a| a.borrow().has_active())
+    ANIM.with(|a| a.borrow().has_active()) || backdrop_fading(window)
 }
 
 pub fn set_tab(tab: Tab) {
@@ -1463,6 +1534,9 @@ pub fn clear() {
 struct TransitionBackdrop {
     active: bool,
     captured_while_visible: bool,
+    fading: bool,
+    fade_start: Option<Instant>,
+    fade_duration_ms: u32,
     hwnd: isize,
     win_rect: RECT,
     mon_rect: RECT,
@@ -1472,6 +1546,17 @@ struct TransitionBackdrop {
     raw_pixels: Vec<u32>,
     raw_mon_rect: RECT,
     wallpaper_key: Option<PathBuf>,
+}
+impl TransitionBackdrop {
+    fn reset_state(&mut self) -> bool {
+        let was_fading = self.fading;
+        self.active = false;
+        self.captured_while_visible = false;
+        self.fading = false;
+        self.fade_start = None;
+        self.fade_duration_ms = 0;
+        was_fading
+    }
 }
 
 #[inline(always)]
@@ -2471,6 +2556,14 @@ impl PaintBuffer {
             if bd.pixels.len() < total_bg {
                 return;
             }
+            let elapsed_ms = bd
+                .fade_start
+                .map(|start| start.elapsed().as_secs_f32() * 1000.0)
+                .unwrap_or(0.0);
+            let weight = backdrop_fade_weight(bd.fading, elapsed_ms, bd.fade_duration_ms);
+            if weight == 0 {
+                return;
+            }
             // SAFETY: self.target is valid for the buffered paint session until EndBufferedPaint.
             let dc_wnd = unsafe { WindowFromDC(self.target) };
             let (root, ox, oy) = if !dc_wnd.0.is_null() {
@@ -2549,24 +2642,31 @@ impl PaintBuffer {
                     .iter()
                     .zip(&mut pixels[dst_row..dst_row + width as usize])
                 {
-                    if pixel.rgbReserved < 255 {
-                        let bg = bg_row[bx];
-                        let bg_r = (bg >> 16) & 255;
-                        let bg_g = (bg >> 8) & 255;
-                        let bg_b = bg & 255;
-                        let inv = 255 - u32::from(pixel.rgbReserved);
-                        let add_r = bg_r * inv + 127;
-                        let add_g = bg_g * inv + 127;
-                        let add_b = bg_b * inv + 127;
-                        pixel.rgbRed = (u32::from(pixel.rgbRed) + ((add_r + 1 + (add_r >> 8)) >> 8))
-                            .min(255) as u8;
-                        pixel.rgbGreen = (u32::from(pixel.rgbGreen)
-                            + ((add_g + 1 + (add_g >> 8)) >> 8))
-                            .min(255) as u8;
-                        pixel.rgbBlue = (u32::from(pixel.rgbBlue)
-                            + ((add_b + 1 + (add_b >> 8)) >> 8))
-                            .min(255) as u8;
-                        pixel.rgbReserved = 255;
+                    let a_ui = u32::from(pixel.rgbReserved);
+                    if a_ui < 255 {
+                        let inv_ui = 255 - a_ui;
+                        let bg_factor = if weight >= 255 {
+                            inv_ui
+                        } else {
+                            div255_round(inv_ui * weight)
+                        };
+                        if bg_factor > 0 {
+                            let bg = bg_row[bx];
+                            let bg_r = (bg >> 16) & 255;
+                            let bg_g = (bg >> 8) & 255;
+                            let bg_b = bg & 255;
+                            let out_a = (a_ui + bg_factor).min(255) as u8;
+                            pixel.rgbRed = (u32::from(pixel.rgbRed)
+                                + div255_round(bg_r * bg_factor))
+                            .min(u32::from(out_a)) as u8;
+                            pixel.rgbGreen =
+                                (u32::from(pixel.rgbGreen) + div255_round(bg_g * bg_factor))
+                                    .min(u32::from(out_a)) as u8;
+                            pixel.rgbBlue =
+                                (u32::from(pixel.rgbBlue) + div255_round(bg_b * bg_factor))
+                                    .min(u32::from(out_a)) as u8;
+                            pixel.rgbReserved = out_a;
+                        }
                     }
                 }
             }
@@ -4016,6 +4116,21 @@ pub fn backdrop_transition_active(window: HWND) -> bool {
         })
 }
 
+fn any_backdrop_fading() -> bool {
+    TRANSITION_BACKDROP.with(|slot| {
+        let bd = slot.borrow();
+        bd.active && bd.fading
+    })
+}
+
+pub fn backdrop_fading(window: HWND) -> bool {
+    !window.0.is_null()
+        && TRANSITION_BACKDROP.with(|slot| {
+            let bd = slot.borrow();
+            bd.active && bd.fading && bd.hwnd == window.0 as isize
+        })
+}
+
 pub fn backdrop_captured_while_visible(window: HWND) -> bool {
     !window.0.is_null()
         && TRANSITION_BACKDROP.with(|slot| {
@@ -4024,17 +4139,25 @@ pub fn backdrop_captured_while_visible(window: HWND) -> bool {
         })
 }
 
-pub fn clear_backdrop_transition(window: HWND) {
-    if window.0.is_null() {
+fn reset_transition_backdrop(window: HWND, allow_null: bool) {
+    if window.0.is_null() && !allow_null {
         return;
     }
-    TRANSITION_BACKDROP.with(|slot| {
+    let cleared_fading = TRANSITION_BACKDROP.with(|slot| {
         let mut bd = slot.borrow_mut();
-        if bd.hwnd == window.0 as isize {
-            bd.active = false;
-            bd.captured_while_visible = false;
+        if (allow_null && window.0.is_null()) || bd.hwnd == window.0 as isize {
+            bd.reset_state()
+        } else {
+            false
         }
     });
+    if cleared_fading {
+        disarm_timer_if_idle(window);
+    }
+}
+
+pub fn clear_backdrop_transition(window: HWND) {
+    reset_transition_backdrop(window, false);
 }
 
 pub fn begin_backdrop_transition(window: HWND) {
@@ -4055,7 +4178,7 @@ pub fn begin_backdrop_transition(window: HWND) {
             return;
         }
         let iconic_or_hidden = IsIconic(window).as_bool() || !IsWindowVisible(window).as_bool();
-        if backdrop_transition_active(window) && !iconic_or_hidden {
+        if backdrop_transition_active(window) && !backdrop_fading(window) && !iconic_or_hidden {
             return;
         }
         capture_transition_backdrop(window);
@@ -4063,7 +4186,11 @@ pub fn begin_backdrop_transition(window: HWND) {
             let mut bd = slot.borrow_mut();
             bd.active = true;
             bd.captured_while_visible = !iconic_or_hidden;
+            bd.fading = false;
+            bd.fade_start = None;
+            bd.fade_duration_ms = 0;
         });
+        disarm_timer_if_idle(window);
         if !iconic_or_hidden {
             let _ = RedrawWindow(
                 window,
@@ -4081,19 +4208,58 @@ pub fn begin_backdrop_transition(window: HWND) {
     }
 }
 
+/// Starts a smoothstep fade-out of the baked transition backdrop into live Acrylic.
+pub fn begin_backdrop_fade(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    if !os_window_animations_enabled() {
+        finish_backdrop_transition(window);
+        return;
+    }
+    // SAFETY: checks window visibility and Acrylic eligibility on the UI thread before starting fade.
+    let can_fade = unsafe {
+        IsWindow(window).as_bool()
+            && !IsIconic(window).as_bool()
+            && IsWindowVisible(window).as_bool()
+            && glass_enabled(window)
+            && user_acrylic_enabled()
+            && transparency_enabled()
+    };
+    if !can_fade {
+        finish_backdrop_transition(window);
+        return;
+    }
+    let started = TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        if !bd.active || bd.hwnd != window.0 as isize || bd.pixels.is_empty() {
+            return false;
+        }
+        if !bd.fading {
+            bd.fading = true;
+            bd.fade_start = Some(Instant::now());
+            bd.fade_duration_ms = BACKDROP_FADE_MS;
+        }
+        true
+    });
+    if !started {
+        return;
+    }
+    // Re-enable live hardware Acrylic behind the dissolving transition snapshot before the first fade tick.
+    // SAFETY: window is a live non-iconic HWND on the UI thread.
+    unsafe {
+        let _ = set_acrylic_composition(window, true);
+    }
+    arm_anim_timer(window);
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn end_minimize_backdrop_transition(window: HWND) {
     clear_backdrop_transition(window);
 }
 
 pub fn finish_backdrop_transition(window: HWND) {
-    TRANSITION_BACKDROP.with(|slot| {
-        let mut bd = slot.borrow_mut();
-        if window.0.is_null() || bd.hwnd == window.0 as isize {
-            bd.active = false;
-            bd.captured_while_visible = false;
-        }
-    });
+    reset_transition_backdrop(window, true);
     if window.0.is_null() {
         return;
     }
@@ -4261,12 +4427,7 @@ pub fn enable_backdrop(window: HWND) -> bool {
 
 pub fn disable_backdrop(window: HWND) {
     use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
-    TRANSITION_BACKDROP.with(|slot| {
-        let mut bd = slot.borrow_mut();
-        if bd.hwnd == window.0 as isize {
-            bd.active = false;
-        }
-    });
+    reset_transition_backdrop(window, false);
     unsafe {
         let was_enabled = glass_enabled(window);
         let _ = RemovePropW(window, GLASS_PROPERTY);
@@ -6518,9 +6679,30 @@ mod tests {
                 begin_backdrop_transition(parent);
                 assert!(backdrop_transition_active(parent));
                 assert!(backdrop_captured_while_visible(parent));
+
+                // Starting fade dissolves into live Acrylic across ticks, and a new transition resets fade back to full hold.
+                begin_backdrop_fade(parent);
+                assert!(backdrop_transition_active(parent));
+                assert!(backdrop_fading(parent));
+                assert!(tick_animations(parent));
+                begin_backdrop_transition(parent);
+                assert!(backdrop_transition_active(parent));
+                assert!(!backdrop_fading(parent));
+
+                begin_backdrop_fade(parent);
+                assert!(backdrop_fading(parent));
+                TRANSITION_BACKDROP.with(|slot| {
+                    slot.borrow_mut().fade_start =
+                        Some(Instant::now() - std::time::Duration::from_millis(300));
+                });
+                assert!(!tick_animations(parent));
+                assert!(!backdrop_fading(parent));
+                assert!(!backdrop_transition_active(parent));
+
                 clear_backdrop_transition(parent);
                 assert!(!backdrop_transition_active(parent));
                 assert!(!backdrop_captured_while_visible(parent));
+                assert!(!backdrop_fading(parent));
             }
 
             let _ = RemovePropW(parent, GLASS_PROPERTY);
@@ -7272,6 +7454,49 @@ mod tests {
                 assert_eq!(out[(15 * w + 15) as usize], 0xFF90_A0B0);
                 assert_eq!(out[0], 0);
             }
+
+            // Mid-fade dissolves backdrop weight smoothly without hard-cutting to alpha=0.
+            assert_eq!(backdrop_fade_weight(false, 999.0, 220), 255);
+            assert_eq!(backdrop_fade_weight(true, 0.0, 220), 255);
+            assert_eq!(backdrop_fade_weight(true, 110.0, 220), 128);
+            assert_eq!(backdrop_fade_weight(true, 220.0, 220), 0);
+            assert!(backdrop_fade_weight(true, 55.0, 220) > 128);
+            assert!(backdrop_fade_weight(true, 165.0, 220) < 128);
+
+            TRANSITION_BACKDROP.with(|slot| {
+                let mut bd = slot.borrow_mut();
+                bd.fading = true;
+                bd.fade_start = Some(Instant::now() - std::time::Duration::from_millis(110));
+                bd.fade_duration_ms = 220;
+            });
+            std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
+            let buffer = PaintBuffer::new_for_window(dc, dirty, win.0 as isize, Some(live_origin))
+                .expect("fading paint buffer");
+            assert!(buffer.finish());
+            let _ = GdiFlush();
+            let faded_px =
+                std::slice::from_raw_parts(bits as *const u32, total)[(15 * w + 15) as usize];
+            let faded_a = (faded_px >> 24) & 255;
+            let faded_r = (faded_px >> 16) & 255;
+            let faded_g = (faded_px >> 8) & 255;
+            let faded_b = faded_px & 255;
+            assert!(faded_a > 0 && faded_a < 255);
+            assert!(faded_r <= faded_a && faded_g <= faded_a && faded_b <= faded_a);
+
+            // Completed fade leaves empty pixels at alpha=0 cleanly.
+            TRANSITION_BACKDROP.with(|slot| {
+                slot.borrow_mut().fade_start =
+                    Some(Instant::now() - std::time::Duration::from_millis(300));
+            });
+            std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
+            let buffer = PaintBuffer::new_for_window(dc, dirty, win.0 as isize, Some(live_origin))
+                .expect("finished fade paint buffer");
+            assert!(buffer.finish());
+            let _ = GdiFlush();
+            assert_eq!(
+                std::slice::from_raw_parts(bits as *const u32, total)[(15 * w + 15) as usize],
+                0
+            );
 
             SelectObject(dc, prev);
             let _ = DeleteObject(bmp);
