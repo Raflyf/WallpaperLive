@@ -4239,7 +4239,9 @@ pub fn os_window_animations_enabled() -> bool {
 pub fn invalidate_backdrop_cache() {
     TRANSITION_BACKDROP.with(|slot| {
         let mut bd = slot.borrow_mut();
-        bd.pixels = Vec::new();
+        if !bd.active {
+            bd.pixels = Vec::new();
+        }
         bd.raw_pixels = Vec::new();
         bd.raw_mon_rect = RECT::default();
         bd.wallpaper_key = None;
