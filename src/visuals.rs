@@ -3,6 +3,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::Instant,
 };
 use windows::{
@@ -102,6 +103,21 @@ pub fn is_body_control(id: usize) -> bool {
         id,
         TAB_LIBRARY | TAB_SETTINGS | 101 | ADD_FOLDER | 110 | 113
     )
+}
+
+#[inline]
+fn caption_buttons_for_dp(width: i32) -> [(CaptionButton, Rect); 3] {
+    let r = |x, y, w, h| Rect {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    };
+    [
+        (CaptionButton::Minimize, r(width - 134, 18, 36, 36)),
+        (CaptionButton::Maximize, r(width - 94, 18, 36, 36)),
+        (CaptionButton::Close, r(width - 54, 18, 36, 36)),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,11 +239,7 @@ impl Layout {
             settings_dividers,
             sources_divider,
             caption_divider: r(width - 146, 22, 1, 28),
-            caption_buttons: [
-                (CaptionButton::Minimize, r(width - 134, 18, 36, 36)),
-                (CaptionButton::Maximize, r(width - 94, 18, 36, 36)),
-                (CaptionButton::Close, r(width - 54, 18, 36, 36)),
-            ],
+            caption_buttons: caption_buttons_for_dp(width),
             tile_rects,
             controls: [
                 (101, r(width - 406, 18, 118, 36)),
@@ -532,9 +544,11 @@ pub fn has_thumbnail(path: &Path) -> bool {
 }
 pub fn retain_thumbnails(paths: &[PathBuf]) {
     SKIN.with(|s| {
-        s.borrow_mut()
-            .thumbnails
-            .retain(|path, _| paths.contains(path))
+        let mut skin = s.borrow_mut();
+        skin.thumbnails.retain(|path, _| paths.contains(path));
+        if skin.thumbnails.is_empty() && skin.thumbnails.capacity() > 0 {
+            skin.thumbnails.shrink_to_fit();
+        }
     });
 }
 pub fn remove_thumbnail(path: &Path) {
@@ -650,7 +664,7 @@ fn is_hot(window: HWND) -> bool {
     !window.0.is_null() && ANIM.with(|a| a.borrow().hot == window.0 as isize)
 }
 
-fn anim_interval_ms() -> u32 {
+fn monitor_frame_interval_ms() -> u32 {
     use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
     let mut info = DWM_TIMING_INFO {
         cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
@@ -662,12 +676,19 @@ fn anim_interval_ms() -> u32 {
         && info.rateRefresh.uiNumerator > 0
         && info.rateRefresh.uiDenominator > 0
     {
-        let ms = (info.rateRefresh.uiDenominator as f64 * 1000.0
+        return (info.rateRefresh.uiDenominator as f64 * 1000.0
             / info.rateRefresh.uiNumerator as f64)
             .floor() as u32;
-        return ms.clamp(8, 16);
     }
     16
+}
+
+fn anim_interval_ms() -> u32 {
+    monitor_frame_interval_ms().clamp(8, 16)
+}
+
+pub fn drag_pacing_ms() -> u32 {
+    ((monitor_frame_interval_ms().clamp(4, 16) * 3) / 4).clamp(4, 12)
 }
 
 fn arm_anim_timer(window: HWND) {
@@ -699,9 +720,9 @@ pub fn caption_cluster_rect(window: HWND) -> Option<RECT> {
         return None;
     }
     let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
-    let layout = Layout::new(client.right * 96 / dpi, client.bottom.max(1) * 96 / dpi);
-    let first = layout.caption_buttons[0].1;
-    let last = layout.caption_buttons[2].1;
+    let buttons = caption_buttons_for_dp(client.right * 96 / dpi);
+    let first = buttons[0].1;
+    let last = buttons[2].1;
     Some(rect(
         first.left * dpi / 96 - 2,
         first.top * dpi / 96 - 2,
@@ -723,8 +744,8 @@ pub fn caption_button_hit(window: HWND, x: i32, y: i32) -> Option<CaptionButton>
         return None;
     }
     let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
-    let layout = Layout::new(client.right * 96 / dpi, client.bottom * 96 / dpi);
-    layout.caption_buttons.iter().find_map(|(btn, r)| {
+    let buttons = caption_buttons_for_dp(client.right * 96 / dpi);
+    buttons.iter().find_map(|(btn, r)| {
         let left = r.left * dpi / 96;
         let top = r.top * dpi / 96;
         let right = r.right * dpi / 96;
@@ -891,20 +912,8 @@ unsafe fn set_child_visible_no_redraw(child: HWND, visible: bool) {
     };
     unsafe {
         if !visible || IsWindow(child).as_bool() {
-            let is_search = GetDlgCtrlID(child) as usize == SEARCH;
-            if is_search && !visible {
-                let extended = GetWindowLongPtrW(child, GWL_EXSTYLE);
-                let stripped = extended & !(WS_EX_LAYERED.0 as isize);
-                if stripped != extended {
-                    SetWindowLongPtrW(child, GWL_EXSTYLE, stripped);
-                }
-            } else if is_search && visible {
-                let extended = GetWindowLongPtrW(child, GWL_EXSTYLE);
-                let layered = extended | WS_EX_LAYERED.0 as isize;
-                if layered != extended {
-                    SetWindowLongPtrW(child, GWL_EXSTYLE, layered);
-                }
-                sync_search_alpha(GetParent(child).unwrap_or_default(), child);
+            if GetDlgCtrlID(child) as usize == SEARCH {
+                sync_search_layering(GetParent(child).unwrap_or_default(), child, visible);
             }
             let _ = SetWindowPos(
                 child,
@@ -916,6 +925,12 @@ unsafe fn set_child_visible_no_redraw(child: HWND, visible: bool) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | flag,
             );
         }
+    }
+}
+
+pub(crate) unsafe fn sync_child_visibility(child: HWND, visible: bool) {
+    unsafe {
+        set_child_visible_no_redraw(child, visible);
     }
 }
 
@@ -943,6 +958,7 @@ unsafe fn paint_children_with_visibility(
 ) {
     // SAFETY: parent and child HWNDs live on this synchronous UI thread; DIB pointer bounds validated.
     unsafe {
+        let clip_rgn = CreateRectRgn(0, 0, 0, 0);
         for &(id, child) in controls {
             if child.0.is_null()
                 || (require_visible && GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0)
@@ -1107,12 +1123,10 @@ unsafe fn paint_children_with_visibility(
                 let _ = IntersectClipRect(dc, clip.left, clip.top, clip.right, clip.bottom);
             }
             let _ = SetViewportOrgEx(dc, child_rect.left, child_rect.top, None);
-            let clip_rgn = CreateRectRgn(0, 0, 0, 0);
-            if GetWindowRgn(child, clip_rgn).0 != ERROR {
+            if !clip_rgn.0.is_null() && GetWindowRgn(child, clip_rgn).0 != ERROR {
                 let _ = OffsetRgn(clip_rgn, child_rect.left, child_rect.top);
                 let _ = ExtSelectClipRgn(dc, clip_rgn, RGN_AND);
             }
-            let _ = DeleteObject(clip_rgn);
             SendMessageW(
                 child,
                 WM_PRINT,
@@ -1120,6 +1134,9 @@ unsafe fn paint_children_with_visibility(
                 LPARAM((PRF_CLIENT | PRF_NONCLIENT | PRF_ERASEBKGND) as isize),
             );
             let _ = RestoreDC(dc, state);
+        }
+        if !clip_rgn.0.is_null() {
+            let _ = DeleteObject(clip_rgn);
         }
     }
 }
@@ -1527,7 +1544,10 @@ pub fn clear() {
         }
     });
     TRANSITION_BACKDROP.with(|slot| *slot.borrow_mut() = TransitionBackdrop::default());
+    BX_COLS_SCRATCH.with(|slot| *slot.borrow_mut() = Vec::new());
     SYNCED_LAYOUT.with(|slot| slot.set(None));
+    invalidate_theme_cache();
+    invalidate_os_settings_cache();
 }
 
 #[derive(Default)]
@@ -1555,6 +1575,7 @@ impl TransitionBackdrop {
         self.fading = false;
         self.fade_start = None;
         self.fade_duration_ms = 0;
+        self.pixels = Vec::new();
         was_fading
     }
 }
@@ -1644,15 +1665,88 @@ impl Drop for PaintRuntime {
         }
     }
 }
+#[derive(Default)]
+struct CachedTheme {
+    primary_hwnd: isize,
+    primary: HTHEME,
+    fallback: HTHEME,
+}
+impl CachedTheme {
+    fn invalidate(&mut self) {
+        if self.primary.0 != 0 {
+            unsafe {
+                let _ = CloseThemeData(self.primary);
+            }
+            self.primary = HTHEME(0);
+        }
+        self.primary_hwnd = 0;
+        if self.fallback.0 != 0 {
+            unsafe {
+                let _ = CloseThemeData(self.fallback);
+            }
+            self.fallback = HTHEME(0);
+        }
+    }
+    unsafe fn get_or_open(&mut self, window: HWND) -> HTHEME {
+        if window.0.is_null() {
+            if self.fallback.0 == 0 {
+                self.fallback = unsafe { OpenThemeData(HWND::default(), w!("WINDOW")) };
+            }
+            return self.fallback;
+        }
+        if unsafe { !IsWindow(window).as_bool() } {
+            return HTHEME(0);
+        }
+        let key = window.0 as isize;
+        if self.primary_hwnd == key && self.primary.0 != 0 {
+            return self.primary;
+        }
+        if self.primary.0 != 0 {
+            unsafe {
+                let _ = CloseThemeData(self.primary);
+            }
+            self.primary = HTHEME(0);
+        }
+        let opened = unsafe { OpenThemeData(window, w!("WINDOW")) };
+        if opened.0 != 0 {
+            self.primary_hwnd = key;
+            self.primary = opened;
+        } else {
+            self.primary_hwnd = 0;
+        }
+        opened
+    }
+}
+impl Drop for CachedTheme {
+    fn drop(&mut self) {
+        self.invalidate();
+    }
+}
+
 thread_local! {
     static PAINT_RUNTIME: PaintRuntime = PaintRuntime::new();
     static GLASS_BUFFER: Cell<isize> = const { Cell::new(0) };
     static TEXT_THEME: Cell<HTHEME> = const { Cell::new(HTHEME(0)) };
+    static THEME_CACHE: RefCell<CachedTheme> = RefCell::new(CachedTheme::default());
+    static OS_SETTINGS_CACHE: Cell<(Option<bool>, Option<bool>)> = const { Cell::new((None, None)) };
+    static BX_COLS_SCRATCH: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     static USER_ACRYLIC: Cell<bool> = const { Cell::new(true) };
     static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
     static TRANSITION_BACKDROP: RefCell<TransitionBackdrop> = RefCell::new(TransitionBackdrop::default());
     static SYNCED_LAYOUT: Cell<Option<(isize, i32, i32, i32)>> = const { Cell::new(None) };
     static IN_CAPTURE_REGION: Cell<bool> = const { Cell::new(false) };
+}
+
+unsafe fn cached_window_theme(window: HWND) -> HTHEME {
+    THEME_CACHE.with(|cache| unsafe { cache.borrow_mut().get_or_open(window) })
+}
+
+pub fn invalidate_theme_cache() {
+    THEME_CACHE.with(|cache| cache.borrow_mut().invalidate());
+}
+
+pub fn invalidate_os_settings_cache() {
+    OS_SETTINGS_CACHE.with(|cache| cache.set((None, None)));
 }
 
 pub fn set_user_acrylic(enabled: bool) {
@@ -1670,6 +1764,46 @@ struct PaintBuffer {
     window_hwnd: isize,
     client_origin: Option<POINT>,
 }
+#[inline(always)]
+fn fill_interior_pixel(
+    pixel: &mut RGBQUAD,
+    fill_alpha: u8,
+    sheen_w: f32,
+    sheen_target_r: f32,
+    sheen_target_g: f32,
+    sheen_target_b: f32,
+) {
+    if pixel.rgbReserved != 0 {
+        return;
+    }
+    if sheen_w == 0.0 {
+        if fill_alpha < 255 {
+            pixel.rgbRed = premul_channel(pixel.rgbRed, fill_alpha);
+            pixel.rgbGreen = premul_channel(pixel.rgbGreen, fill_alpha);
+            pixel.rgbBlue = premul_channel(pixel.rgbBlue, fill_alpha);
+        }
+        pixel.rgbReserved = fill_alpha;
+        return;
+    }
+    let apply = |c: u8, target: f32| -> u8 {
+        let cf = f32::from(c);
+        (cf + (target - cf) * sheen_w).clamp(0.0, 255.0).round() as u8
+    };
+    let r = apply(pixel.rgbRed, sheen_target_r);
+    let g = apply(pixel.rgbGreen, sheen_target_g);
+    let b = apply(pixel.rgbBlue, sheen_target_b);
+    if fill_alpha < 255 {
+        pixel.rgbRed = premul_channel(r, fill_alpha);
+        pixel.rgbGreen = premul_channel(g, fill_alpha);
+        pixel.rgbBlue = premul_channel(b, fill_alpha);
+    } else {
+        pixel.rgbRed = r;
+        pixel.rgbGreen = g;
+        pixel.rgbBlue = b;
+    }
+    pixel.rgbReserved = fill_alpha;
+}
+
 impl PaintBuffer {
     unsafe fn new(target: HDC, area: RECT) -> Option<Self> {
         // SAFETY: forwards to buffered paint initialization without attached root window override.
@@ -1925,31 +2059,14 @@ impl PaintBuffer {
                 if y_deep && xi >= edge_band && xi < bounds_w - edge_band
                     || y_inner && xi >= corner_band && xi < bounds_w - corner_band
                 {
-                    if pixel.rgbReserved == 0 {
-                        let (r, g, b) = if sheen_w > 0.0 {
-                            (
-                                apply_sheen(f32::from(pixel.rgbRed), sheen_target_r, sheen_w),
-                                apply_sheen(f32::from(pixel.rgbGreen), sheen_target_g, sheen_w),
-                                apply_sheen(f32::from(pixel.rgbBlue), sheen_target_b, sheen_w),
-                            )
-                        } else {
-                            (
-                                f32::from(pixel.rgbRed),
-                                f32::from(pixel.rgbGreen),
-                                f32::from(pixel.rgbBlue),
-                            )
-                        };
-                        if mask.fill_alpha < 255 {
-                            pixel.rgbRed = premul_channel(r.round() as u8, mask.fill_alpha);
-                            pixel.rgbGreen = premul_channel(g.round() as u8, mask.fill_alpha);
-                            pixel.rgbBlue = premul_channel(b.round() as u8, mask.fill_alpha);
-                        } else {
-                            pixel.rgbRed = r.round() as u8;
-                            pixel.rgbGreen = g.round() as u8;
-                            pixel.rgbBlue = b.round() as u8;
-                        }
-                        pixel.rgbReserved = mask.fill_alpha;
-                    }
+                    fill_interior_pixel(
+                        pixel,
+                        mask.fill_alpha,
+                        sheen_w,
+                        sheen_target_r,
+                        sheen_target_g,
+                        sheen_target_b,
+                    );
                     continue;
                 }
                 let px = xi as f32 + 0.5;
@@ -1957,31 +2074,14 @@ impl PaintBuffer {
                 let qy = (py - hh).abs() - (hh - radius);
                 let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
                 if d <= -safe_inset {
-                    if pixel.rgbReserved == 0 {
-                        let (r, g, b) = if sheen_w > 0.0 {
-                            (
-                                apply_sheen(f32::from(pixel.rgbRed), sheen_target_r, sheen_w),
-                                apply_sheen(f32::from(pixel.rgbGreen), sheen_target_g, sheen_w),
-                                apply_sheen(f32::from(pixel.rgbBlue), sheen_target_b, sheen_w),
-                            )
-                        } else {
-                            (
-                                f32::from(pixel.rgbRed),
-                                f32::from(pixel.rgbGreen),
-                                f32::from(pixel.rgbBlue),
-                            )
-                        };
-                        if mask.fill_alpha < 255 {
-                            pixel.rgbRed = premul_channel(r.round() as u8, mask.fill_alpha);
-                            pixel.rgbGreen = premul_channel(g.round() as u8, mask.fill_alpha);
-                            pixel.rgbBlue = premul_channel(b.round() as u8, mask.fill_alpha);
-                        } else {
-                            pixel.rgbRed = r.round() as u8;
-                            pixel.rgbGreen = g.round() as u8;
-                            pixel.rgbBlue = b.round() as u8;
-                        }
-                        pixel.rgbReserved = mask.fill_alpha;
-                    }
+                    fill_interior_pixel(
+                        pixel,
+                        mask.fill_alpha,
+                        sheen_w,
+                        sheen_target_r,
+                        sheen_target_g,
+                        sheen_target_b,
+                    );
                     continue;
                 }
                 let shape_cov = (0.5 - d).clamp(0.0, 1.0);
@@ -2622,54 +2722,59 @@ impl PaintBuffer {
             let mon_h = (bd.mon_rect.bottom - bd.mon_rect.top).max(1);
             let bw = bd.width;
             let bh = bd.height;
-            let bx_cols: Vec<usize> = (0..width)
-                .map(|x| {
+            // SAFETY: GetBufferedPaintBits owns stride * buffer height RGBQUADs until EndBufferedPaint.
+            let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
+            BX_COLS_SCRATCH.with(|scratch| {
+                let mut bx_cols = scratch.borrow_mut();
+                bx_cols.clear();
+                bx_cols.extend((0..width).map(|x| {
                     let sx = win_left + ox + self.area.left + x;
                     let rel_x = (sx - bd.mon_rect.left).clamp(0, mon_w - 1);
                     ((rel_x as i64 * bw as i64) / mon_w as i64).clamp(0, (bw - 1) as i64) as usize
-                })
-                .collect();
-            // SAFETY: GetBufferedPaintBits owns stride * buffer height RGBQUADs until EndBufferedPaint.
-            let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
-            for y in 0..height {
-                let sy = win_top + oy + self.area.top + y;
-                let rel_y = (sy - bd.mon_rect.top).clamp(0, mon_h - 1);
-                let by =
-                    ((rel_y as i64 * bh as i64) / mon_h as i64).clamp(0, (bh - 1) as i64) as usize;
-                let bg_row = &bd.pixels[by * bw as usize..(by + 1) * bw as usize];
-                let dst_row = y as usize * stride as usize;
-                for (&bx, pixel) in bx_cols
-                    .iter()
-                    .zip(&mut pixels[dst_row..dst_row + width as usize])
-                {
-                    let a_ui = u32::from(pixel.rgbReserved);
-                    if a_ui < 255 {
-                        let inv_ui = 255 - a_ui;
-                        let bg_factor = if weight >= 255 {
-                            inv_ui
-                        } else {
-                            div255_round(inv_ui * weight)
-                        };
-                        if bg_factor > 0 {
-                            let bg = bg_row[bx];
-                            let bg_r = (bg >> 16) & 255;
-                            let bg_g = (bg >> 8) & 255;
-                            let bg_b = bg & 255;
-                            let out_a = (a_ui + bg_factor).min(255) as u8;
-                            pixel.rgbRed = (u32::from(pixel.rgbRed)
-                                + div255_round(bg_r * bg_factor))
-                            .min(u32::from(out_a)) as u8;
-                            pixel.rgbGreen =
-                                (u32::from(pixel.rgbGreen) + div255_round(bg_g * bg_factor))
-                                    .min(u32::from(out_a)) as u8;
-                            pixel.rgbBlue =
-                                (u32::from(pixel.rgbBlue) + div255_round(bg_b * bg_factor))
-                                    .min(u32::from(out_a)) as u8;
-                            pixel.rgbReserved = out_a;
+                }));
+                for y in 0..height {
+                    let sy = win_top + oy + self.area.top + y;
+                    let rel_y = (sy - bd.mon_rect.top).clamp(0, mon_h - 1);
+                    let by = ((rel_y as i64 * bh as i64) / mon_h as i64).clamp(0, (bh - 1) as i64)
+                        as usize;
+                    let bg_row = &bd.pixels[by * bw as usize..(by + 1) * bw as usize];
+                    let dst_row = y as usize * stride as usize;
+                    for (&bx, pixel) in bx_cols
+                        .iter()
+                        .zip(&mut pixels[dst_row..dst_row + width as usize])
+                    {
+                        let a_ui = u32::from(pixel.rgbReserved);
+                        if a_ui < 255 {
+                            let inv_ui = 255 - a_ui;
+                            let bg_factor = if weight >= 255 {
+                                inv_ui
+                            } else {
+                                div255_round(inv_ui * weight)
+                            };
+                            if bg_factor > 0 {
+                                let bg = bg_row[bx];
+                                let bg_r = (bg >> 16) & 255;
+                                let bg_g = (bg >> 8) & 255;
+                                let bg_b = bg & 255;
+                                let out_a = (a_ui + bg_factor).min(255) as u8;
+                                pixel.rgbRed = (u32::from(pixel.rgbRed)
+                                    + div255_round(bg_r * bg_factor))
+                                .min(u32::from(out_a))
+                                    as u8;
+                                pixel.rgbGreen = (u32::from(pixel.rgbGreen)
+                                    + div255_round(bg_g * bg_factor))
+                                .min(u32::from(out_a))
+                                    as u8;
+                                pixel.rgbBlue = (u32::from(pixel.rgbBlue)
+                                    + div255_round(bg_b * bg_factor))
+                                .min(u32::from(out_a))
+                                    as u8;
+                                pixel.rgbReserved = out_a;
+                            }
                         }
                     }
                 }
-            }
+            });
         });
     }
     unsafe fn finish(mut self) -> bool {
@@ -2745,7 +2850,27 @@ unsafe fn label(
         let old = SelectObject(dc, font);
         SetTextColor(dc, rgb(color));
         SetBkMode(dc, TRANSPARENT);
-        let mut text: Vec<u16> = text.encode_utf16().collect();
+        let mut stack = [0u16; 256];
+        let mut heap = Vec::new();
+        let text_buf: &mut [u16] = {
+            let mut len = 0usize;
+            let mut overflow = false;
+            for unit in text.encode_utf16() {
+                if len == stack.len() {
+                    overflow = true;
+                    break;
+                }
+                stack[len] = unit;
+                len += 1;
+            }
+            if overflow {
+                heap.extend_from_slice(&stack);
+                heap.extend(text.encode_utf16().skip(stack.len()));
+                &mut heap
+            } else {
+                &mut stack[..len]
+            }
+        };
         let mut r = r;
         let theme = TEXT_THEME.with(Cell::get);
         let painted = theme.0 != 0
@@ -2754,7 +2879,7 @@ unsafe fn label(
                 dc,
                 0,
                 0,
-                &text,
+                text_buf,
                 flags | DT_NOPREFIX,
                 &mut r,
                 Some(&DTTOPTS {
@@ -2766,7 +2891,7 @@ unsafe fn label(
             )
             .is_ok();
         if !painted {
-            DrawTextW(dc, &mut text, &mut r, flags | DT_NOPREFIX);
+            DrawTextW(dc, text_buf, &mut r, flags | DT_NOPREFIX);
             let buffer = GLASS_BUFFER.with(Cell::get);
             if buffer != 0 {
                 let _ = GdiFlush();
@@ -2837,9 +2962,15 @@ fn extension(path: &Path) -> String {
 fn window_text(hwnd: HWND) -> String {
     unsafe {
         let n = GetWindowTextLengthW(hwnd).clamp(0, 32768) as usize;
-        let mut text = vec![0u16; n + 1];
-        let n = GetWindowTextW(hwnd, &mut text).max(0) as usize;
-        String::from_utf16_lossy(&text[..n])
+        if n < 256 {
+            let mut buf = [0u16; 256];
+            let written = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+            String::from_utf16_lossy(&buf[..written])
+        } else {
+            let mut text = vec![0u16; n + 1];
+            let written = GetWindowTextW(hwnd, &mut text).max(0) as usize;
+            String::from_utf16_lossy(&text[..written])
+        }
     }
 }
 
@@ -2875,7 +3006,7 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
         if let Some(buffer) = PaintBuffer::new(item.hDC, item.rcItem) {
             let glass = glass_enabled(parent);
             let theme = if glass {
-                OpenThemeData(parent, w!("WINDOW"))
+                cached_window_theme(parent)
             } else {
                 HTHEME(0)
             };
@@ -2888,9 +3019,6 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
             let ok = draw_item_into(&buffered, glass, Some(&buffer));
             TEXT_THEME.with(|slot| slot.set(old_theme));
             GLASS_BUFFER.with(|slot| slot.set(old_buffer));
-            if theme.0 != 0 {
-                let _ = CloseThemeData(theme);
-            }
             if ok && buffer.finish() {
                 return;
             }
@@ -3404,8 +3532,11 @@ struct AccentPolicy {
 }
 
 pub fn transparency_enabled() -> bool {
+    if let Some(cached) = OS_SETTINGS_CACHE.with(|cache| cache.get().0) {
+        return cached;
+    }
     // SAFETY: read-only OS high-contrast flag and HKCU transparency registry setting.
-    unsafe {
+    let value = unsafe {
         let mut hc = HIGHCONTRASTW {
             cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
             ..Default::default()
@@ -3419,35 +3550,45 @@ pub fn transparency_enabled() -> bool {
         .is_ok()
             && hc.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
         {
-            return false;
+            false
+        } else {
+            let mut enabled = 1u32;
+            let mut bytes = std::mem::size_of::<u32>() as u32;
+            let status = RegGetValueW(
+                HKEY_CURRENT_USER,
+                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+                w!("EnableTransparency"),
+                RRF_RT_REG_DWORD,
+                None,
+                Some((&mut enabled as *mut u32).cast()),
+                Some(&mut bytes),
+            );
+            !(status.is_ok() && bytes == std::mem::size_of::<u32>() as u32 && enabled == 0)
         }
-        let mut enabled = 1u32;
-        let mut bytes = std::mem::size_of::<u32>() as u32;
-        let status = RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("EnableTransparency"),
-            RRF_RT_REG_DWORD,
-            None,
-            Some((&mut enabled as *mut u32).cast()),
-            Some(&mut bytes),
-        );
-        !(status.is_ok() && bytes == std::mem::size_of::<u32>() as u32 && enabled == 0)
-    }
+    };
+    OS_SETTINGS_CACHE.with(|cache| {
+        let (_, anim) = cache.get();
+        cache.set((Some(value), anim));
+    });
+    value
 }
 
 unsafe fn set_acrylic_composition(window: HWND, enable: bool) -> bool {
     type SetWindowCompositionAttributeFn =
         unsafe extern "system" fn(HWND, *mut WindowCompositionAttribData) -> BOOL;
+    static SWCA_FN: OnceLock<Option<SetWindowCompositionAttributeFn>> = OnceLock::new();
     // SAFETY: user32.dll is permanently resident in GUI processes and stack buffers outlive the call.
     unsafe {
-        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else {
+        let Some(func) = *SWCA_FN.get_or_init(|| {
+            let user32 = GetModuleHandleW(w!("user32.dll")).ok()?;
+            let proc_addr = GetProcAddress(user32, s!("SetWindowCompositionAttribute"))?;
+            Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                SetWindowCompositionAttributeFn,
+            >(proc_addr))
+        }) else {
             return false;
         };
-        let Some(proc_addr) = GetProcAddress(user32, s!("SetWindowCompositionAttribute")) else {
-            return false;
-        };
-        let func: SetWindowCompositionAttributeFn = std::mem::transmute(proc_addr);
         let mut policy = AccentPolicy {
             accent_state: if enable { 4 } else { 0 },
             accent_flags: 2,
@@ -3463,17 +3604,26 @@ unsafe fn set_acrylic_composition(window: HWND, enable: bool) -> bool {
     }
 }
 
-unsafe fn sync_search_alpha(parent: HWND, search: HWND) {
+unsafe fn sync_search_layering(parent: HWND, search: HWND, visible: bool) {
     if search.0.is_null() {
         return;
     }
-    let alpha = if !parent.0.is_null() && glass_enabled(parent) {
-        SEARCH_ALPHA
-    } else {
-        255
-    };
+    // SAFETY: UI thread controls parent/child window styles; only visible SEARCH under glass needs WS_EX_LAYERED.
     unsafe {
-        let _ = SetLayeredWindowAttributes(search, COLORREF(0), alpha, LWA_ALPHA);
+        let needs_layered = visible && !parent.0.is_null() && glass_enabled(parent);
+        let extended = GetWindowLongPtrW(search, GWL_EXSTYLE);
+        if needs_layered {
+            let layered = extended | WS_EX_LAYERED.0 as isize;
+            if layered != extended {
+                SetWindowLongPtrW(search, GWL_EXSTYLE, layered);
+            }
+            let _ = SetLayeredWindowAttributes(search, COLORREF(0), SEARCH_ALPHA, LWA_ALPHA);
+        } else {
+            let stripped = extended & !(WS_EX_LAYERED.0 as isize);
+            if stripped != extended {
+                SetWindowLongPtrW(search, GWL_EXSTYLE, stripped);
+            }
+        }
     }
 }
 
@@ -4040,6 +4190,7 @@ thread_local! {
 #[cfg(test)]
 pub fn set_os_animations_for_test(enabled: Option<bool>) {
     OS_ANIM_OVERRIDE.with(|slot| slot.set(enabled));
+    invalidate_os_settings_cache();
 }
 
 pub fn os_window_animations_enabled() -> bool {
@@ -4047,8 +4198,11 @@ pub fn os_window_animations_enabled() -> bool {
     if let Some(enabled) = OS_ANIM_OVERRIDE.with(Cell::get) {
         return enabled;
     }
+    if let Some(cached) = OS_SETTINGS_CACHE.with(|cache| cache.get().1) {
+        return cached;
+    }
     // SAFETY: read-only OS animation queries via stack-allocated BOOL and ANIMATIONINFO.
-    unsafe {
+    let enabled = unsafe {
         let mut client_anim = BOOL(1);
         if SystemParametersInfoW(
             SPI_GETCLIENTAREAANIMATION,
@@ -4059,31 +4213,34 @@ pub fn os_window_animations_enabled() -> bool {
         .is_ok()
             && !client_anim.as_bool()
         {
-            return false;
+            false
+        } else {
+            let mut anim = ANIMATIONINFO {
+                cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32,
+                iMinAnimate: 1,
+            };
+            !(SystemParametersInfoW(
+                SPI_GETANIMATION,
+                anim.cbSize,
+                Some((&mut anim as *mut ANIMATIONINFO).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .is_ok()
+                && anim.iMinAnimate == 0)
         }
-        let mut anim = ANIMATIONINFO {
-            cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32,
-            iMinAnimate: 1,
-        };
-        if SystemParametersInfoW(
-            SPI_GETANIMATION,
-            anim.cbSize,
-            Some((&mut anim as *mut ANIMATIONINFO).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-        .is_ok()
-            && anim.iMinAnimate == 0
-        {
-            return false;
-        }
-    }
-    true
+    };
+    OS_SETTINGS_CACHE.with(|cache| {
+        let (tr, _) = cache.get();
+        cache.set((tr, Some(enabled)));
+    });
+    enabled
 }
 
 pub fn invalidate_backdrop_cache() {
     TRANSITION_BACKDROP.with(|slot| {
         let mut bd = slot.borrow_mut();
-        bd.raw_pixels.clear();
+        bd.pixels = Vec::new();
+        bd.raw_pixels = Vec::new();
         bd.raw_mon_rect = RECT::default();
         bd.wallpaper_key = None;
     });
@@ -4413,7 +4570,7 @@ pub fn enable_backdrop(window: HWND) -> bool {
         if glass_enabled(window) {
             let _ = set_acrylic_composition(window, true);
             if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
-                sync_search_alpha(window, search);
+                sync_search_layering(window, search, IsWindowVisible(search).as_bool());
             }
             return true;
         }
@@ -4430,7 +4587,7 @@ pub fn enable_backdrop(window: HWND) -> bool {
             return false;
         }
         if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
-            sync_search_alpha(window, search);
+            sync_search_layering(window, search, IsWindowVisible(search).as_bool());
         }
         true
     }
@@ -4439,6 +4596,7 @@ pub fn enable_backdrop(window: HWND) -> bool {
 pub fn disable_backdrop(window: HWND) {
     use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
     reset_transition_backdrop(window, false);
+    invalidate_backdrop_cache();
     unsafe {
         let was_enabled = glass_enabled(window);
         let _ = RemovePropW(window, GLASS_PROPERTY);
@@ -4465,7 +4623,7 @@ pub fn disable_backdrop(window: HWND) {
         );
         let _ = DwmExtendFrameIntoClientArea(window, &MARGINS::default());
         if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
-            sync_search_alpha(window, search);
+            sync_search_layering(window, search, IsWindowVisible(search).as_bool());
         }
         if was_enabled {
             let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
@@ -4566,7 +4724,7 @@ pub unsafe fn paint_into_rect(window: HWND, target: HDC, clip_rect: Option<RECT>
         {
             let glass = glass_enabled(window);
             let theme = if glass {
-                OpenThemeData(window, w!("WINDOW"))
+                cached_window_theme(window)
             } else {
                 HTHEME::default()
             };
@@ -4581,9 +4739,6 @@ pub unsafe fn paint_into_rect(window: HWND, target: HDC, clip_rect: Option<RECT>
             );
             TEXT_THEME.with(|slot| slot.set(old_theme));
             GLASS_BUFFER.with(|slot| slot.set(old_buffer));
-            if theme.0 != 0 {
-                let _ = CloseThemeData(theme);
-            }
             let ready = rendered && ((glass && theme.0 != 0) || buffer.opaque());
             if ready && buffer.finish() {
                 if glass && theme.0 == 0 {
@@ -5090,11 +5245,9 @@ pub fn prepare_control(window: HWND) -> Result<(), String> {
         let count = GetClassNameW(window, &mut class).max(0) as usize;
         let class_name = String::from_utf16_lossy(&class[..count]);
         if class_name == "Edit" && GetDlgCtrlID(window) as usize == SEARCH {
-            // Native editing, selection and caret repaint outside WM_PAINT; composite this child with frosted alpha.
-            let extended = GetWindowLongPtrW(window, GWL_EXSTYLE);
-            SetWindowLongPtrW(window, GWL_EXSTYLE, extended | WS_EX_LAYERED.0 as isize);
+            // Native editing, selection and caret repaint outside WM_PAINT; composite this child with frosted alpha only while visible under glass.
             let parent = GetParent(window).unwrap_or_default();
-            sync_search_alpha(parent, window);
+            sync_search_layering(parent, window, IsWindowVisible(window).as_bool());
         }
         let button = class_name == "Button";
         if button {
@@ -5112,32 +5265,9 @@ pub fn prepare_control(window: HWND) -> Result<(), String> {
     Ok(())
 }
 
-pub fn round_control(window: HWND) -> Result<(), String> {
-    unsafe {
-        let mut class = [0u16; 32];
-        let count = GetClassNameW(window, &mut class).max(0) as usize;
-        if String::from_utf16_lossy(&class[..count]) != "Button"
-            || GetWindowLongW(window, GWL_STYLE) as u32 & 0xf != BS_OWNERDRAW as u32
-        {
-            return Ok(());
-        }
-        let mut area = RECT::default();
-        GetClientRect(window, &mut area).map_err(|e| e.to_string())?;
-        if area.right <= 0 || area.bottom <= 0 {
-            return Ok(());
-        }
-        let id = GetDlgCtrlID(window) as usize;
-        let dpi = GetDpiForWindow(window).max(96) as i32;
-        let radius = control_corner_ellipse(id, dpi);
-        let region = CreateRoundRectRgn(0, 0, area.right + 1, area.bottom + 1, radius, radius);
-        if region.0.is_null() {
-            return Err("Could not create the control's rounded region".into());
-        }
-        if SetWindowRgn(window, region, false) == 0 {
-            let _ = DeleteObject(region);
-            return Err("Could not apply the control's rounded region".into());
-        }
-    }
+pub fn round_control(_window: HWND) -> Result<(), String> {
+    // Owner-drawn buttons and cards already paint exact host-matched anti-aliased rounded corners
+    // without allocating per-HWND GDI SetWindowRgn clipping regions.
     Ok(())
 }
 
@@ -5184,7 +5314,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                 let glass = glass_enabled(parent);
                 let (surface_color, surface_alpha) = control_surface(id);
                 let theme = if glass {
-                    OpenThemeData(parent, w!("WINDOW"))
+                    cached_window_theme(parent)
                 } else {
                     HTHEME(0)
                 };
@@ -5328,7 +5458,6 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                 TEXT_THEME.with(|slot| slot.set(old_theme));
                 GLASS_BUFFER.with(|slot| slot.set(old_buffer));
                 if theme.0 != 0 {
-                    let _ = CloseThemeData(theme);
                     if alpha_ok && buffer.finish() {
                         return;
                     }
@@ -5555,7 +5684,7 @@ pub(crate) unsafe fn paint_dropdown_into(
             return false;
         };
         let theme = if glass {
-            OpenThemeData(HWND::default(), w!("WINDOW"))
+            cached_window_theme(HWND::default())
         } else {
             HTHEME(0)
         };
@@ -5677,9 +5806,6 @@ pub(crate) unsafe fn paint_dropdown_into(
         })();
         TEXT_THEME.with(|slot| slot.set(old_theme));
         GLASS_BUFFER.with(|slot| slot.set(old_buffer));
-        if theme.0 != 0 {
-            let _ = CloseThemeData(theme);
-        }
         ok && buffer.finish()
     }
 }
@@ -6893,6 +7019,16 @@ mod tests {
                 },
             );
             assert_ne!(GetWindowLongW(search, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            assert_eq!(
+                GetWindowLongPtrW(search, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
+                0
+            );
+            let _ = SetPropW(
+                parent,
+                GLASS_PROPERTY,
+                windows::Win32::Foundation::HANDLE(parent.0),
+            );
+            set_child_visible_no_redraw(search, true);
             assert_ne!(
                 GetWindowLongPtrW(search, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
                 0
@@ -6906,6 +7042,12 @@ mod tests {
             set_child_visible_no_redraw(search, true);
             assert_ne!(GetWindowLongW(search, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
             assert_ne!(
+                GetWindowLongPtrW(search, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
+                0
+            );
+            let _ = RemovePropW(parent, GLASS_PROPERTY);
+            set_child_visible_no_redraw(search, true);
+            assert_eq!(
                 GetWindowLongPtrW(search, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
                 0
             );
@@ -7514,6 +7656,41 @@ mod tests {
             let _ = DeleteDC(dc);
             let _ = DestroyWindow(win);
         }
+        clear();
+    }
+
+    #[test]
+    fn caption_buttons_for_dp_and_drag_pacing_stay_exact() {
+        for width in [980, 1180, 1600, 2560] {
+            assert_eq!(
+                caption_buttons_for_dp(width),
+                Layout::new(width, 800).caption_buttons
+            );
+        }
+        assert!((4..=12).contains(&drag_pacing_ms()));
+    }
+
+    #[test]
+    fn backdrop_cleanup_and_cache_invalidation_release_allocations() {
+        TRANSITION_BACKDROP.with(|slot| {
+            let mut bd = slot.borrow_mut();
+            bd.active = true;
+            bd.pixels = vec![1; 1024];
+            bd.raw_pixels = vec![2; 1024];
+            let _ = bd.reset_state();
+            assert_eq!(bd.pixels.capacity(), 0);
+            assert_eq!(bd.raw_pixels.len(), 1024);
+        });
+        invalidate_backdrop_cache();
+        TRANSITION_BACKDROP.with(|slot| {
+            let bd = slot.borrow();
+            assert_eq!(bd.pixels.capacity(), 0);
+            assert_eq!(bd.raw_pixels.capacity(), 0);
+        });
+        invalidate_os_settings_cache();
+        invalidate_theme_cache();
+        let _ = transparency_enabled();
+        let _ = os_window_animations_enabled();
         clear();
     }
 }

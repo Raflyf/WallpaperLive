@@ -81,9 +81,149 @@ const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 const RESTORE_BACKDROP_TIMER_ID: usize = 4;
 const RESTORE_BACKDROP_MS: u32 = 320;
+const DRAG_MOVE_TIMER_ID: usize = 5;
 const ICONIC_PROPERTY: PCWSTR = w!("WallpaperLive.Iconic");
 const SIZE_MOVE_PROPERTY: PCWSTR = w!("WallpaperLive.SizeMove");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[derive(Default)]
+struct DragMoveState {
+    hwnd: isize,
+    interval_ms: u32,
+    last_commit: Option<Instant>,
+    pending: Option<(i32, i32)>,
+    timer_armed: bool,
+    flushing: bool,
+}
+
+thread_local! {
+    static DRAG_MOVE: std::cell::RefCell<DragMoveState> =
+        std::cell::RefCell::new(DragMoveState::default());
+}
+
+fn enter_drag_move(window: HWND) {
+    let interval_ms = visuals::drag_pacing_ms().max(4);
+    DRAG_MOVE.with(|cell| {
+        *cell.borrow_mut() = DragMoveState {
+            hwnd: window.0 as isize,
+            interval_ms,
+            ..Default::default()
+        };
+    });
+}
+
+fn maybe_coalesce_drag_move(window: HWND, pos: &mut WINDOWPOS) {
+    let now = Instant::now();
+    let timer_action = DRAG_MOVE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.hwnd != window.0 as isize || state.flushing {
+            return None;
+        }
+        let interval = state.interval_ms.max(4);
+        let due = state.last_commit.is_none_or(|last| {
+            now.saturating_duration_since(last) >= Duration::from_millis(u64::from(interval))
+        });
+        if due {
+            state.last_commit = Some(now);
+            state.pending = None;
+            let had_timer = std::mem::take(&mut state.timer_armed);
+            Some((false, had_timer, interval))
+        } else {
+            state.pending = Some((pos.x, pos.y));
+            pos.flags |= SWP_NOMOVE;
+            if !state.timer_armed {
+                state.timer_armed = true;
+                Some((true, false, interval))
+            } else {
+                None
+            }
+        }
+    });
+    if let Some((arm, kill, interval)) = timer_action {
+        // SAFETY: window is a live UI thread HWND owning DRAG_MOVE_TIMER_ID.
+        unsafe {
+            if kill {
+                let _ = KillTimer(window, DRAG_MOVE_TIMER_ID);
+            } else if arm {
+                let _ = SetTimer(window, DRAG_MOVE_TIMER_ID, interval, None);
+            }
+        }
+    }
+}
+
+fn clear_pending_drag_move(window: HWND) {
+    let kill = DRAG_MOVE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.hwnd != window.0 as isize {
+            return false;
+        }
+        state.pending = None;
+        std::mem::take(&mut state.timer_armed)
+    });
+    if kill {
+        // SAFETY: window is a live UI thread HWND.
+        unsafe {
+            let _ = KillTimer(window, DRAG_MOVE_TIMER_ID);
+        }
+    }
+}
+
+unsafe fn flush_drag_move(window: HWND) {
+    let pending = DRAG_MOVE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.hwnd != window.0 as isize {
+            return (None, false);
+        }
+        let kill = std::mem::take(&mut state.timer_armed);
+        let pending = state.pending.take();
+        if pending.is_some() {
+            state.flushing = true;
+            state.last_commit = Some(Instant::now());
+        }
+        (pending, kill)
+    });
+    if pending.1 {
+        unsafe {
+            let _ = KillTimer(window, DRAG_MOVE_TIMER_ID);
+        }
+    }
+    if let Some((x, y)) = pending.0 {
+        unsafe {
+            let _ = SetWindowPos(
+                window,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        DRAG_MOVE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            if state.hwnd == window.0 as isize {
+                state.flushing = false;
+            }
+        });
+    }
+}
+
+unsafe fn reset_drag_move(window: HWND) {
+    let active = DRAG_MOVE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.hwnd != window.0 as isize {
+            return false;
+        }
+        let armed = state.timer_armed;
+        *state = DragMoveState::default();
+        armed
+    });
+    if active {
+        unsafe {
+            let _ = KillTimer(window, DRAG_MOVE_TIMER_ID);
+        }
+    }
+}
 
 fn playback_position(playback: &Playback) -> Option<f64> {
     playback
@@ -282,11 +422,18 @@ fn format_playback_specs(
     limit_fps: u32,
     include_note: bool,
 ) -> String {
-    let mut parts = Vec::with_capacity(6);
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64);
+    let push_sep = |buf: &mut String| {
+        if !buf.is_empty() {
+            buf.push_str(", ");
+        }
+    };
     if info.width > 0 && info.height > 0 {
-        parts.push(format!("{}x{}", info.width, info.height));
+        let _ = write!(out, "{}x{}", info.width, info.height);
     }
-    parts.push(format_fps_summary(
+    push_sep(&mut out);
+    out.push_str(&format_fps_summary(
         info.fps,
         limit_fps,
         specs.is_some_and(|s| s.still_image),
@@ -295,24 +442,37 @@ fn format_playback_specs(
         specs.and_then(|s| s.codec.as_deref()),
         specs.is_some_and(|s| s.hdr),
     ) {
-        (Some(codec), true) => parts.push(format!("{codec} HDR")),
-        (Some(codec), false) => parts.push(codec.into()),
-        (None, true) => parts.push("HDR".into()),
+        (Some(codec), true) => {
+            push_sep(&mut out);
+            let _ = write!(out, "{codec} HDR");
+        }
+        (Some(codec), false) => {
+            push_sep(&mut out);
+            out.push_str(codec);
+        }
+        (None, true) => {
+            push_sep(&mut out);
+            out.push_str("HDR");
+        }
         (None, false) => {}
     }
     if let Some(secs) = specs.and_then(|s| s.duration_secs) {
-        parts.push(format_duration(secs));
+        push_sep(&mut out);
+        out.push_str(&format_duration(secs));
     }
     if let Some(bytes) = specs.and_then(|s| s.file_bytes) {
-        parts.push(format_bytes(bytes));
+        push_sep(&mut out);
+        out.push_str(&format_bytes(bytes));
     }
     if specs.is_some_and(|s| s.has_audio) {
-        parts.push("Audio".into());
+        push_sep(&mut out);
+        out.push_str("Audio");
     }
     if include_note && !info.note.is_empty() {
-        parts.push(info.note.clone());
+        push_sep(&mut out);
+        out.push_str(&info.note);
     }
-    parts.join(", ")
+    out
 }
 fn dormant_grace(reasons: &PauseReasons) -> Option<Duration> {
     if reasons.manual {
@@ -584,6 +744,7 @@ struct App {
     pause_trimmed: bool,
     wts_tick: u8,
     status_cache: std::cell::RefCell<(String, &'static str, &'static str, Option<bool>)>,
+    status_dirty: std::cell::Cell<bool>,
     page: usize,
     tab: visuals::Tab,
     thumbnail_pending: Option<PathBuf>,
@@ -1532,7 +1693,14 @@ impl App {
         folders
     }
     fn layout(&mut self) -> Result<(), String> {
-        self.apply_layout(true)
+        self.apply_layout(true)?;
+        if self.status_dirty.get()
+            && !self.hwnd.0.is_null()
+            && unsafe { IsWindowVisible(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool() }
+        {
+            self.update_status();
+        }
+        Ok(())
     }
     fn control_visible(&self, id: usize, view: &[PathBuf]) -> bool {
         let populated = if (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id) {
@@ -1641,24 +1809,7 @@ impl App {
                     let was_visible =
                         GetWindowLongW(*control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
                     if was_visible != visible {
-                        let _ = SetWindowPos(
-                            *control,
-                            None,
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE
-                                | SWP_NOSIZE
-                                | SWP_NOZORDER
-                                | SWP_NOACTIVATE
-                                | SWP_NOREDRAW
-                                | if visible {
-                                    SWP_SHOWWINDOW
-                                } else {
-                                    SWP_HIDEWINDOW
-                                },
-                        );
+                        visuals::sync_child_visibility(*control, visible);
                         if repaint && !size_changed {
                             let _ = InvalidateRect(
                                 if visible { *control } else { self.hwnd },
@@ -1821,24 +1972,7 @@ impl App {
                 let was_visible = GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
                 let visible = self.control_visible(id, &view);
                 if was_visible != visible {
-                    let _ = SetWindowPos(
-                        child,
-                        None,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE
-                            | SWP_NOSIZE
-                            | SWP_NOZORDER
-                            | SWP_NOACTIVATE
-                            | SWP_NOREDRAW
-                            | if visible {
-                                SWP_SHOWWINDOW
-                            } else {
-                                SWP_HIDEWINDOW
-                            },
-                    );
+                    visuals::sync_child_visibility(child, visible);
                 }
                 if was_frozen || visible {
                     let _ = ValidateRect(child, None);
@@ -2001,24 +2135,7 @@ impl App {
                     let visible = self.control_visible(id, &view);
                     let was_visible = GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
                     if was_visible != visible {
-                        let _ = SetWindowPos(
-                            control,
-                            None,
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE
-                                | SWP_NOSIZE
-                                | SWP_NOZORDER
-                                | SWP_NOACTIVATE
-                                | SWP_NOREDRAW
-                                | if visible {
-                                    SWP_SHOWWINDOW
-                                } else {
-                                    SWP_HIDEWINDOW
-                                },
-                        );
+                        visuals::sync_child_visibility(control, visible);
                     }
                     let _ = RedrawWindow(control, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                 }
@@ -2605,6 +2722,9 @@ impl App {
                     RESTORE_BACKDROP_MS,
                     None,
                 );
+            }
+            if self.status_dirty.get() {
+                self.update_status();
             }
             let _ = SetForegroundWindow(self.hwnd);
             SendMessageW(
@@ -3340,6 +3460,13 @@ impl App {
         if self.multi_dispatch {
             return;
         }
+        if !self.hwnd.0.is_null()
+            && unsafe { !IsWindowVisible(self.hwnd).as_bool() || IsIconic(self.hwnd).as_bool() }
+        {
+            self.status_dirty.set(true);
+            return;
+        }
+        self.status_dirty.set(false);
         let status = if let Some(error) = &self.error {
             format!("Error: {error}")
         } else if self.displays.iter().any(DisplayState::active) {
@@ -3828,6 +3955,7 @@ impl App {
                     unsafe {
                         let _ = KillTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID);
                         visuals::clear_backdrop_transition(self.hwnd);
+                        visuals::invalidate_backdrop_cache();
                         let _ = ShowWindow(self.hwnd, SW_HIDE);
                     }
                     self.cancel_thumbnails();
@@ -4416,6 +4544,7 @@ pub fn run() -> Result<(), String> {
             pause_trimmed: false,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
+            status_dirty: std::cell::Cell::new(false),
             page: 0,
             tab: visuals::Tab::Library,
             thumbnail_pending: None,
@@ -4567,6 +4696,10 @@ pub fn run() -> Result<(), String> {
                     WM_TIMER if message.wParam.0 == RESTORE_BACKDROP_TIMER_ID => {
                         let _ = KillTimer(hwnd, RESTORE_BACKDROP_TIMER_ID);
                         visuals::begin_backdrop_fade(hwnd);
+                        Ok(false)
+                    }
+                    WM_TIMER if message.wParam.0 == DRAG_MOVE_TIMER_ID => {
+                        flush_drag_move(hwnd);
                         Ok(false)
                     }
                     WM_TIMER => app.tick().map(|_| false),
@@ -4830,15 +4963,20 @@ unsafe extern "system" fn window_proc(
             }
             WM_ENTERSIZEMOVE => {
                 let _ = SetPropW(window, SIZE_MOVE_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+                enter_drag_move(window);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_EXITSIZEMOVE => {
+                flush_drag_move(window);
+                reset_drag_move(window);
                 let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_DESTROY => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                reset_drag_move(window);
                 visuals::clear_backdrop_transition(window);
+                visuals::invalidate_theme_cache();
                 let _ = RemovePropW(window, ICONIC_PROPERTY);
                 let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
                 PostQuitMessage(0);
@@ -4846,7 +4984,9 @@ unsafe extern "system" fn window_proc(
             }
             WM_NCDESTROY => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                reset_drag_move(window);
                 visuals::clear_backdrop_transition(window);
+                visuals::invalidate_theme_cache();
                 let _ = RemovePropW(window, ICONIC_PROPERTY);
                 let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
                 DefWindowProcW(window, message, wparam, lparam)
@@ -4883,6 +5023,15 @@ unsafe extern "system" fn window_proc(
             WM_WINDOWPOSCHANGING if lparam.0 != 0 => {
                 let pos = &mut *(lparam.0 as *mut WINDOWPOS);
                 let iconic = IsIconic(window).as_bool();
+                if !iconic && (pos.flags.0 & SWP_NOSIZE.0) != 0 && pos.x > -30000 {
+                    if (pos.flags.0 & (SWP_NOMOVE.0 | SWP_HIDEWINDOW.0)) == 0
+                        && !GetPropW(window, SIZE_MOVE_PROPERTY).0.is_null()
+                    {
+                        maybe_coalesce_drag_move(window, pos);
+                    }
+                    return DefWindowProcW(window, message, wparam, lparam);
+                }
+                clear_pending_drag_move(window);
                 let animate_backdrop = visuals::os_window_animations_enabled();
                 if !iconic && pos.x <= -30000 && pos.y <= -30000 {
                     if animate_backdrop {
@@ -4983,10 +5132,18 @@ unsafe extern "system" fn window_proc(
                 visuals::begin_backdrop_fade(window);
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == DRAG_MOVE_TIMER_ID => {
+                flush_drag_move(window);
+                LRESULT(0)
+            }
             WM_DWMCOMPOSITIONCHANGED
             | WM_DWMCOLORIZATIONCOLORCHANGED
             | WM_THEMECHANGED
             | WM_SETTINGCHANGE => {
+                visuals::invalidate_os_settings_cache();
+                if matches!(message, WM_DWMCOMPOSITIONCHANGED | WM_THEMECHANGED) {
+                    visuals::invalidate_theme_cache();
+                }
                 let was_glass = visuals::glass_enabled(window);
                 let is_glass = visuals::enable_backdrop(window);
                 if !visuals::os_window_animations_enabled()
@@ -5005,6 +5162,7 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_DPICHANGED => {
+                visuals::invalidate_theme_cache();
                 if lparam.0 != 0 {
                     let rect = *(lparam.0 as *const RECT);
                     let _ = SetWindowPos(
@@ -5221,6 +5379,7 @@ mod tests {
             pause_trimmed: false,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
+            status_dirty: std::cell::Cell::new(false),
             page: 0,
             tab: visuals::Tab::Library,
             thumbnail_pending: None,
@@ -6636,6 +6795,7 @@ mod tests {
             pause_trimmed: false,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
+            status_dirty: std::cell::Cell::new(false),
             page: 0,
             tab: visuals::Tab::Library,
             thumbnail_pending: None,
@@ -7202,6 +7362,171 @@ mod tests {
 
                 visuals::disable_backdrop(hwnd);
             }
+
+            let _ = DestroyWindow(hwnd);
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
+            if atom != 0 {
+                let _ = UnregisterClassW(class_name, instance);
+            }
+        }
+    }
+
+    #[test]
+    fn drag_move_coalesces_rapid_moves_and_flushes_on_timer_snap_and_exit() {
+        // SAFETY: isolated hidden HWND created and destroyed within this test thread.
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("module handle");
+            let class_name = w!("WallpaperLive.DragMoveCoalesceTest");
+            let atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            });
+            assert!(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+            let hwnd = CreateWindowExW(
+                WS_EX_CONTROLPARENT | WS_EX_NOACTIVATE,
+                class_name,
+                w!("WallpaperLive Drag Move Test"),
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                100,
+                100,
+                1040,
+                720,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("drag move test window");
+
+            let send_pos = |x, y, cx, cy, flags| {
+                let mut pos = WINDOWPOS {
+                    hwnd,
+                    hwndInsertAfter: HWND::default(),
+                    x,
+                    y,
+                    cx,
+                    cy,
+                    flags,
+                };
+                assert_eq!(
+                    SendMessageW(
+                        hwnd,
+                        WM_WINDOWPOSCHANGING,
+                        WPARAM(0),
+                        LPARAM((&mut pos as *mut WINDOWPOS) as isize),
+                    ),
+                    LRESULT(0)
+                );
+                pos.flags
+            };
+
+            let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
+            assert!(!GetPropW(hwnd, SIZE_MOVE_PROPERTY).0.is_null());
+            DRAG_MOVE.with(|cell| {
+                let st = cell.borrow();
+                assert_eq!(st.hwnd, hwnd.0 as isize);
+                assert!((4..=12).contains(&st.interval_ms));
+            });
+
+            // First move commits immediately without SWP_NOMOVE.
+            let first = send_pos(110, 110, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_eq!(first.0 & SWP_NOMOVE.0, 0);
+
+            // Lock interval wide during test assertions so VM scheduling jitter cannot race.
+            DRAG_MOVE.with(|cell| {
+                let mut st = cell.borrow_mut();
+                st.interval_ms = 5_000;
+                st.last_commit = Some(Instant::now());
+            });
+
+            let second = send_pos(125, 115, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_ne!(second.0 & SWP_NOMOVE.0, 0);
+            let third = send_pos(140, 122, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_ne!(third.0 & SWP_NOMOVE.0, 0);
+            DRAG_MOVE.with(|cell| {
+                let st = cell.borrow();
+                assert_eq!(st.pending, Some((140, 122)));
+                assert!(st.timer_armed);
+            });
+
+            // Pacing timer flushes coalesced coordinates synchronously to HWND.
+            let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(DRAG_MOVE_TIMER_ID), LPARAM(0));
+            let mut wr = RECT::default();
+            GetWindowRect(hwnd, &mut wr).expect("window rect after timer flush");
+            assert_eq!((wr.left, wr.top), (140, 122));
+            DRAG_MOVE.with(|cell| {
+                let st = cell.borrow();
+                assert_eq!(st.pending, None);
+                assert!(!st.timer_armed);
+            });
+
+            // Aero Snap / size changes pass unthrottled and discard stale pending moves.
+            let queued = send_pos(155, 130, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_ne!(queued.0 & SWP_NOMOVE.0, 0);
+            let snap = send_pos(0, 0, 960, 720, SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_eq!(snap.0 & SWP_NOMOVE.0, 0);
+            DRAG_MOVE.with(|cell| {
+                let st = cell.borrow();
+                assert_eq!(st.pending, None);
+                assert!(!st.timer_armed);
+            });
+
+            // Ending drag flushes any pending coordinates before clearing SIZE_MOVE_PROPERTY.
+            let tail = send_pos(175, 140, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_ne!(tail.0 & SWP_NOMOVE.0, 0);
+            let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
+            GetWindowRect(hwnd, &mut wr).expect("window rect after exit flush");
+            assert_eq!((wr.left, wr.top), (175, 140));
+            assert!(GetPropW(hwnd, SIZE_MOVE_PROPERTY).0.is_null());
+            DRAG_MOVE.with(|cell| assert_eq!(cell.borrow().hwnd, 0));
+
+            let _ = DestroyWindow(hwnd);
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
+            if atom != 0 {
+                let _ = UnregisterClassW(class_name, instance);
+            }
+        }
+    }
+
+    #[test]
+    fn update_status_skips_hidden_window_and_marks_dirty() {
+        // SAFETY: isolated hidden HWND without controls testing status_dirty skip fast-path.
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("module handle");
+            let class_name = w!("WallpaperLive.HiddenStatusTest");
+            let atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            });
+            assert!(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                class_name,
+                w!("Hidden Status Test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                640,
+                480,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("hidden status test window");
+            let mut app = fixture();
+            app.hwnd = hwnd;
+            app.settings.fps = 60;
+            assert!(!app.status_dirty.get());
+            app.update_status();
+            assert!(app.status_dirty.get());
+            assert!(app.status_cache.borrow().0.is_empty());
 
             let _ = DestroyWindow(hwnd);
             let mut msg = MSG::default();
