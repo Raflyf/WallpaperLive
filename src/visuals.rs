@@ -5196,6 +5196,24 @@ mod tests {
 
     #[test]
     fn search_control_print_opaque_bkmode_and_end_transition_show() {
+        unsafe extern "system" fn test_ctlcolor_subclass(
+            window: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+            _id: usize,
+            _data: usize,
+        ) -> LRESULT {
+            if matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC)
+                && let Some(handled) = unsafe {
+                    control_colors(message, HDC(wparam.0 as *mut _), HWND(lparam.0 as *mut _))
+                }
+            {
+                return handled;
+            }
+            unsafe { DefSubclassProc(window, message, wparam, lparam) }
+        }
+
         // SAFETY: hidden WS_POPUP parent and child EDIT live only on this thread and are destroyed before returning.
         unsafe {
             let parent = CreateWindowExW(
@@ -5213,6 +5231,7 @@ mod tests {
                 None,
             )
             .expect("test parent");
+            assert!(SetWindowSubclass(parent, Some(test_ctlcolor_subclass), 991, 0).as_bool());
             let search = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("EDIT"),
@@ -5306,6 +5325,7 @@ mod tests {
             let _ = DeleteObject(child_bmp);
             let _ = DeleteDC(child_dc);
 
+            let _ = RemoveWindowSubclass(parent, Some(test_ctlcolor_subclass), 991);
             let _ = DestroyWindow(parent);
         }
     }
