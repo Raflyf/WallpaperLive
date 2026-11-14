@@ -13,10 +13,15 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ## v0.2.1
 
+### Changed
+
+- Pace header drag moves (`DragMoveState`, `maybe_coalesce_drag_move`, `DRAG_MOVE_TIMER_ID`, `flush_drag_move`, and `drag_pacing_ms()` scaled to 3/4 of `monitor_frame_interval_ms()` clamped to `4..=12ms`) across `WM_ENTERSIZEMOVE`, move-only `WM_WINDOWPOSCHANGING`, `WM_TIMER`, and `WM_EXITSIZEMOVE` to cut DWM composition and CPU spikes during window dragging while preserving live Acrylic transparency without visual changes.
+- Reduce idle and interactive CPU, allocation, and GDI handle overhead: cache `OpenThemeData` handles in `THEME_CACHE`, cache OS transparency and animation flags in `OS_SETTINGS_CACHE`, compute button layouts without per-control `SetWindowRgn` allocations, stream non-sheen interior fills in `PaintBuffer` (`fill_interior_pixel`), defer hidden-window status text formatting (`status_dirty` flushed on `App::show`/`App::layout`), and reuse thread-local blur/UTF-16 stack scratch buffers.
+
 ### Fixed
 
 - Eliminate the ~0.4-1s solid grey Acrylic loading flash when Windows animation effects are disabled (`os_window_animations_enabled` querying `SPI_GETCLIENTAREAANIMATION` and `SPI_GETANIMATION` skips synthetic transition captures and pre-arms `enable_backdrop` before `ShowWindow` so minimize, maximize, unmaximize, and taskbar restore keep live hardware Acrylic at `0ms`).
-- Preserve chromatic frosted Acrylic fidelity (`tint_transition_backdrop_pixel` with `240/255` chroma preservation, `y_target = 65 + (y_px * 30 + 127) / 255`, and `20/255` blend toward `(77, 78, 80)`), smooth border interpolation (`fill_occluded_backdrop_from_border`), playback cache invalidation (`invalidate_backdrop_cache` when `finish_load` activates live playback), and frosted hidden/tray `App::show` transitions when Windows animations are enabled.
+- Preserve chromatic frosted Acrylic fidelity (`tint_transition_backdrop_pixel` with `240/255` chroma preservation, `y_target = 65 + (y_px * 30 + 127) / 255`, and `20/255` blend toward `(77, 78, 80)`), smooth border interpolation (`fill_occluded_backdrop_from_border`), playback cache invalidation (`invalidate_backdrop_cache` when `finish_load` activates live playback while keeping active transition `pixels` intact), and frosted hidden/tray `App::show` transitions when Windows animations are enabled.
 - Eliminate split-second blur-loss blinks and abrupt end-of-transition snaps across minimize, maximize, unmaximize, taskbar restore, and tray reopen: flush visible `alpha = 255` transition surfaces to DWM via `DwmFlush()` before `DefWindowProcW` snapshots the zoom/minimize `From` sprite, track `backdrop_captured_while_visible` and `backdrop_fading` so interrupted minimize->restore or chained `SC_RESTORE` -> `WM_QUERYOPEN` -> `WM_WINDOWPOSCHANGING` / state changes refresh cleanly without duplicate blur work, hold for `RESTORE_BACKDROP_MS = 320`, and invoke `begin_backdrop_fade` on visible windows to smoothly dissolve via `smoothstep` (`backdrop_fade_weight` over `BACKDROP_FADE_MS = 220` via `ANIM_TIMER_ID` vsync ticks, skipping opaque `SEARCH` with `ValidateRect`) back into live hardware `ACCENT_ENABLE_ACRYLICBLURBEHIND`.
 
 ### Verification and limits
