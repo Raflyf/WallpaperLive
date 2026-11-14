@@ -80,7 +80,7 @@ const SAWERIA_URL: &str = "https://saweria.co/BuyMatcha";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 const RESTORE_BACKDROP_TIMER_ID: usize = 4;
-const RESTORE_BACKDROP_MS: u32 = 340;
+const RESTORE_BACKDROP_MS: u32 = 240;
 const ICONIC_PROPERTY: PCWSTR = w!("WallpaperLive.Iconic");
 const SIZE_MOVE_PROPERTY: PCWSTR = w!("WallpaperLive.SizeMove");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1663,7 +1663,7 @@ impl App {
                             let _ = InvalidateRect(
                                 if visible { *control } else { self.hwnd },
                                 None,
-                                true,
+                                false,
                             );
                         }
                     }
@@ -2585,22 +2585,27 @@ impl App {
     fn show(&mut self) {
         // SAFETY: own panel only; showing a hidden maximized window preserves its state.
         unsafe {
+            let _ = visuals::enable_backdrop(self.hwnd);
             let iconic = IsIconic(self.hwnd).as_bool();
-            if iconic {
-                visuals::begin_backdrop_transition(self.hwnd);
-            } else if !IsWindowVisible(self.hwnd).as_bool() {
-                visuals::prime_backdrop_capture(self.hwnd);
+            let animate_backdrop = visuals::os_window_animations_enabled();
+            if animate_backdrop {
+                if iconic {
+                    visuals::begin_backdrop_transition(self.hwnd);
+                } else if !IsWindowVisible(self.hwnd).as_bool() {
+                    visuals::prime_backdrop_capture(self.hwnd);
+                }
+            } else {
+                let _ = KillTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID);
+                visuals::clear_backdrop_transition(self.hwnd);
             }
             let _ = ShowWindow(self.hwnd, if iconic { SW_RESTORE } else { SW_SHOW });
-            if iconic {
+            if iconic && animate_backdrop {
                 let _ = SetTimer(
                     self.hwnd,
                     RESTORE_BACKDROP_TIMER_ID,
                     RESTORE_BACKDROP_MS,
                     None,
                 );
-            } else {
-                let _ = visuals::enable_backdrop(self.hwnd);
             }
             let _ = SetForegroundWindow(self.hwnd);
             SendMessageW(
@@ -3266,6 +3271,7 @@ impl App {
         }
         self.loaded = true;
         visuals::playing(Some(playing_path));
+        visuals::invalidate_backdrop_cache();
         for i in 0..9 {
             unsafe {
                 let _ = InvalidateRect(self.control(visuals::TILE_BASE + i), None, false);
@@ -4072,7 +4078,7 @@ impl App {
         // SAFETY: move focus off controls hidden by this tab change and force clean repaint.
         unsafe {
             let _ = SetFocus(self.control(focus));
-            let _ = InvalidateRect(self.hwnd, None, true);
+            let _ = InvalidateRect(self.hwnd, None, false);
             let _ = UpdateWindow(self.hwnd);
         }
         Ok(())
@@ -4845,48 +4851,63 @@ unsafe extern "system" fn window_proc(
             WM_SYSCOMMAND => {
                 let cmd = (wparam.0 & 0xfff0) as u32;
                 if matches!(cmd, SC_MINIMIZE | SC_MAXIMIZE | SC_RESTORE) {
-                    visuals::begin_backdrop_transition(window);
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
+                    if visuals::os_window_animations_enabled() {
+                        visuals::begin_backdrop_transition(window);
+                        let _ =
+                            SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
+                    } else {
+                        let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                        visuals::clear_backdrop_transition(window);
+                    }
                 }
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_QUERYOPEN => {
-                visuals::begin_backdrop_transition(window);
-                let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
+                if visuals::os_window_animations_enabled() {
+                    visuals::begin_backdrop_transition(window);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
+                } else {
+                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                    visuals::clear_backdrop_transition(window);
+                }
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_WINDOWPOSCHANGING if lparam.0 != 0 => {
                 let pos = &mut *(lparam.0 as *mut WINDOWPOS);
                 let iconic = IsIconic(window).as_bool();
+                let animate_backdrop = visuals::os_window_animations_enabled();
                 if !iconic && pos.x <= -30000 && pos.y <= -30000 {
-                    if !visuals::backdrop_transition_active(window) {
+                    if animate_backdrop && !visuals::backdrop_transition_active(window) {
                         visuals::begin_backdrop_transition(window);
+                        let _ =
+                            SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                     }
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                 } else if iconic
                     && (pos.flags.0 & SWP_HIDEWINDOW.0 == 0)
                     && (pos.flags.0 & SWP_SHOWWINDOW.0 != 0
                         || (pos.x > -30000 && (pos.flags.0 & SWP_NOMOVE.0) == 0))
                 {
-                    if !visuals::backdrop_transition_active(window) {
+                    if animate_backdrop && !visuals::backdrop_transition_active(window) {
                         visuals::begin_backdrop_transition(window);
+                        let _ =
+                            SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                     }
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                     if (pos.flags.0 & SWP_NOSIZE.0) == 0 {
                         pos.flags |= SWP_NOCOPYBITS;
                     }
                 } else if !iconic && (pos.flags.0 & SWP_NOSIZE.0) == 0 {
-                    if (pos.flags.0 & SWP_HIDEWINDOW.0) == 0
+                    if animate_backdrop
+                        && (pos.flags.0 & SWP_HIDEWINDOW.0) == 0
                         && GetPropW(window, SIZE_MOVE_PROPERTY).0.is_null()
                     {
                         let mut rect = RECT::default();
                         if GetWindowRect(window, &mut rect).is_ok() {
                             let cur_w = rect.right - rect.left;
                             let cur_h = rect.bottom - rect.top;
-                            if pos.cx != cur_w || pos.cy != cur_h {
-                                if !visuals::backdrop_transition_active(window) {
-                                    visuals::begin_backdrop_transition(window);
-                                }
+                            if (pos.cx != cur_w || pos.cy != cur_h)
+                                && !visuals::backdrop_transition_active(window)
+                            {
+                                visuals::begin_backdrop_transition(window);
                                 let _ = SetTimer(
                                     window,
                                     RESTORE_BACKDROP_TIMER_ID,
@@ -4902,12 +4923,13 @@ unsafe extern "system" fn window_proc(
             }
             WM_SIZE => {
                 visuals::cancel_transition(window);
+                let animate_backdrop = visuals::os_window_animations_enabled();
+                if !animate_backdrop && visuals::backdrop_transition_active(window) {
+                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                    visuals::clear_backdrop_transition(window);
+                }
                 if wparam.0 == SIZE_MINIMIZED as usize {
                     let _ = SetPropW(window, ICONIC_PROPERTY, HANDLE(std::ptr::dangling_mut()));
-                    if visuals::backdrop_transition_active(window) {
-                        let _ =
-                            SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
-                    }
                     return LRESULT(0);
                 }
                 visuals::sync_child_positions(window);
@@ -4922,7 +4944,11 @@ unsafe extern "system" fn window_proc(
                         None,
                         RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
                     );
-                    if was_iconic || visuals::backdrop_transition_active(window) {
+                    if was_iconic
+                        && animate_backdrop
+                        && !visuals::backdrop_transition_active(window)
+                    {
+                        visuals::begin_backdrop_transition(window);
                         let _ =
                             SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                     }
@@ -4941,7 +4967,12 @@ unsafe extern "system" fn window_proc(
             | WM_SETTINGCHANGE => {
                 let was_glass = visuals::glass_enabled(window);
                 let is_glass = visuals::enable_backdrop(window);
-                if message != WM_SETTINGCHANGE || is_glass != was_glass {
+                if !visuals::os_window_animations_enabled()
+                    && visuals::backdrop_transition_active(window)
+                {
+                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                    visuals::finish_backdrop_transition(window);
+                } else if message != WM_SETTINGCHANGE || is_glass != was_glass {
                     let _ = RedrawWindow(
                         window,
                         None,
@@ -7016,7 +7047,14 @@ mod tests {
 
     #[test]
     fn backdrop_transition_stays_active_across_state_changes_and_clears_on_timer() {
-        assert_eq!(RESTORE_BACKDROP_MS, 340);
+        struct ResetOsAnim;
+        impl Drop for ResetOsAnim {
+            fn drop(&mut self) {
+                visuals::set_os_animations_for_test(None);
+            }
+        }
+        let _guard = ResetOsAnim;
+        assert_eq!(RESTORE_BACKDROP_MS, 240);
         // SAFETY: isolated hidden test window registered and destroyed solely within this test.
         unsafe {
             let instance = GetModuleHandleW(None).expect("module handle");
@@ -7072,7 +7110,25 @@ mod tests {
             assert!(GetPropW(hwnd, SIZE_MOVE_PROPERTY).0.is_null());
 
             if visuals::enable_backdrop(hwnd) {
-                // Interactive border drag must not activate transition backdrop.
+                // With OS window animations disabled, keep live Acrylic immediately at 0ms.
+                visuals::set_os_animations_for_test(Some(false));
+                send_pos(0, 0, 1400, 900, SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(!visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_MAXIMIZE as usize), LPARAM(0));
+                assert!(!visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_QUERYOPEN, WPARAM(0), LPARAM(0));
+                assert!(!visuals::backdrop_transition_active(hwnd));
+                send_pos(-32000, -32000, 160, 28, SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(!visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_MINIMIZED as usize), LPARAM(0));
+                assert!(!GetPropW(hwnd, ICONIC_PROPERTY).0.is_null());
+                assert!(!visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_RESTORED as usize), LPARAM(0));
+                assert!(GetPropW(hwnd, ICONIC_PROPERTY).0.is_null());
+                assert!(!visuals::backdrop_transition_active(hwnd));
+
+                // With OS window animations enabled: interactive drag keeps live Acrylic.
+                visuals::set_os_animations_for_test(Some(true));
                 let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
                 send_pos(100, 100, 1180, 780, SWP_NOZORDER | SWP_NOACTIVATE);
                 assert!(!visuals::backdrop_transition_active(hwnd));

@@ -3586,21 +3586,90 @@ fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let g = (px >> 8) & 255;
     let b = px & 255;
     let y_px = (77 * r + 150 * g + 29 * b + 128) >> 8;
-    let desat = |ch: u32| -> u32 { (ch * 51 + y_px * 204 + 127) / 255 };
+    // Preserve ~94% of wallpaper chroma before the 20/255 tint blend (~0.87 total, matching Win11 DWM Acrylic).
+    let desat = |ch: u32| -> u32 { (ch * 240 + y_px * 15 + 127) / 255 };
     let dr = desat(r);
     let dg = desat(g);
     let db = desat(b);
     let y_desat = (77 * dr + 150 * dg + 29 * db + 128) >> 8;
-    let y_target = 68 + (y_px * 24 + 127) / 255;
+    let y_target = 65 + (y_px * 30 + 127) / 255;
     let dy = y_target as i32 - y_desat as i32;
     let blend = |ch: u32, tint_ch: u32| -> u32 {
         let shifted = (ch as i32 + dy).clamp(0, 255) as u32;
-        (shifted * 219 + tint_ch * 36 + 127) / 255
+        (shifted * 235 + tint_ch * 20 + 127) / 255
     };
     let out_r = blend(dr, tint_r);
     let out_g = blend(dg, tint_g);
     let out_b = blend(db, tint_b);
     0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b
+}
+
+fn blend_u32_rgb(a: u32, b: u32, weight_b: u32, span: u32) -> u32 {
+    let span = span.max(1);
+    let weight_a = span.saturating_sub(weight_b);
+    let half = span / 2;
+    let ch = |shift: u32| -> u32 {
+        let ca = (a >> shift) & 255;
+        let cb = (b >> shift) & 255;
+        (ca * weight_a + cb * weight_b + half) / span
+    };
+    0xFF00_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+fn fill_occluded_backdrop_from_border(buf: &mut [u32], width: i32, height: i32, dst: RECT) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let w = width as usize;
+    let has_left = dst.left > 0;
+    let has_right = dst.right < width;
+    let has_top = dst.top > 0;
+    let has_bottom = dst.bottom < height;
+    let dst_w = (dst.right - dst.left) as u32;
+    let dst_h = (dst.bottom - dst.top) as u32;
+    if (!has_left && !has_right && !has_top && !has_bottom) || dst_w == 0 || dst_h == 0 {
+        for y in dst.top.max(0)..dst.bottom.min(height) {
+            let row = y as usize * w;
+            let x0 = dst.left.max(0) as usize;
+            let x1 = dst.right.min(width) as usize;
+            if x1 > x0 {
+                buf[row + x0..row + x1].fill(0xFF08_090C);
+            }
+        }
+        return;
+    }
+    let top_row = has_top.then(|| ((dst.top - 1) as usize) * w);
+    let bottom_row = has_bottom.then(|| (dst.bottom as usize) * w);
+    for y in dst.top.max(0)..dst.bottom.min(height) {
+        let row = y as usize * w;
+        let left_px = has_left.then(|| buf[row + (dst.left - 1) as usize]);
+        let right_px = has_right.then(|| buf[row + dst.right as usize]);
+        let wy = (y - dst.top + 1) as u32;
+        for x in dst.left.max(0)..dst.right.min(width) {
+            let horiz = match (left_px, right_px) {
+                (Some(l), Some(r)) => {
+                    Some(blend_u32_rgb(l, r, (x - dst.left + 1) as u32, dst_w + 1))
+                }
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            };
+            let top_px = top_row.map(|tr| buf[tr + x as usize]);
+            let bottom_px = bottom_row.map(|br| buf[br + x as usize]);
+            let vert = match (top_px, bottom_px) {
+                (Some(t), Some(b)) => Some(blend_u32_rgb(t, b, wy, dst_h + 1)),
+                (Some(t), None) => Some(t),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            buf[row + x as usize] = match (horiz, vert) {
+                (Some(h), Some(v)) => blend_u32_rgb(h, v, 1, 2),
+                (Some(h), None) => h,
+                (None, Some(v)) => v,
+                (None, None) => 0xFF08_090C,
+            };
+        }
+    }
 }
 
 unsafe fn capture_transition_backdrop(window: HWND) {
@@ -3800,12 +3869,12 @@ unsafe fn capture_transition_backdrop(window: HWND) {
                                             win_rect, mon_rect, BACKDROP_W, BACKDROP_H,
                                         )
                                     {
-                                        for y in dst.top..dst.bottom {
-                                            let row = y as usize * BACKDROP_W as usize;
-                                            raw_buf
-                                                [row + dst.left as usize..row + dst.right as usize]
-                                                .fill(0xFF08_090C);
-                                        }
+                                        fill_occluded_backdrop_from_border(
+                                            &mut raw_buf,
+                                            BACKDROP_W,
+                                            BACKDROP_H,
+                                            dst,
+                                        );
                                     }
                                     captured_raw = Some(raw_buf);
                                 }
@@ -3862,8 +3931,65 @@ unsafe fn capture_transition_backdrop(window: HWND) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static OS_ANIM_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub fn set_os_animations_for_test(enabled: Option<bool>) {
+    OS_ANIM_OVERRIDE.with(|slot| slot.set(enabled));
+}
+
+pub fn os_window_animations_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = OS_ANIM_OVERRIDE.with(Cell::get) {
+        return enabled;
+    }
+    // SAFETY: read-only OS animation queries via stack-allocated BOOL and ANIMATIONINFO.
+    unsafe {
+        let mut client_anim = BOOL(1);
+        if SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&mut client_anim as *mut BOOL).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && !client_anim.as_bool()
+        {
+            return false;
+        }
+        let mut anim = ANIMATIONINFO {
+            cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32,
+            iMinAnimate: 1,
+        };
+        if SystemParametersInfoW(
+            SPI_GETANIMATION,
+            anim.cbSize,
+            Some((&mut anim as *mut ANIMATIONINFO).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && anim.iMinAnimate == 0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn invalidate_backdrop_cache() {
+    TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        bd.raw_pixels.clear();
+        bd.raw_mon_rect = RECT::default();
+        bd.wallpaper_key = None;
+    });
+}
+
 pub fn prime_backdrop_capture(window: HWND) {
-    if window.0.is_null() {
+    if window.0.is_null() || !os_window_animations_enabled() {
         return;
     }
     // SAFETY: primes cached desktop pixels before first ShowWindow without toggling active backdrop state.
@@ -3903,6 +4029,10 @@ pub fn clear_backdrop_transition(window: HWND) {
 
 pub fn begin_backdrop_transition(window: HWND) {
     if window.0.is_null() {
+        return;
+    }
+    if !os_window_animations_enabled() {
+        clear_backdrop_transition(window);
         return;
     }
     // SAFETY: bakes blurred desktop backdrop into PaintBuffer during DWM minimize/restore transitions.
@@ -6234,8 +6364,17 @@ mod tests {
         clear();
     }
 
+    struct ResetOsAnim;
+    impl Drop for ResetOsAnim {
+        fn drop(&mut self) {
+            set_os_animations_for_test(None);
+        }
+    }
+
     #[test]
     fn backdrop_transition_active_clear_and_idempotency() {
+        let _guard = ResetOsAnim;
+        set_os_animations_for_test(Some(true));
         clear();
         assert!(!backdrop_transition_active(HWND::default()));
         clear_backdrop_transition(HWND::default());
@@ -6296,6 +6435,21 @@ mod tests {
 
             if user_acrylic_enabled() && transparency_enabled() {
                 clear();
+                set_os_animations_for_test(Some(false));
+                let _ = ShowWindow(parent, SW_HIDE);
+                prime_backdrop_capture(parent);
+                TRANSITION_BACKDROP.with(|slot| {
+                    assert!(slot.borrow().raw_pixels.is_empty());
+                });
+                TRANSITION_BACKDROP.with(|slot| {
+                    let mut bd = slot.borrow_mut();
+                    bd.active = true;
+                    bd.hwnd = parent.0 as isize;
+                });
+                begin_backdrop_transition(parent);
+                assert!(!backdrop_transition_active(parent));
+
+                set_os_animations_for_test(Some(true));
                 begin_backdrop_transition(parent);
                 assert!(backdrop_transition_active(parent));
                 TRANSITION_BACKDROP.with(|slot| {
@@ -6305,7 +6459,15 @@ mod tests {
                     assert_eq!(bd.raw_pixels.len(), 480 * 270);
                     bd.pixels[0] = 0xDEAD_BEEF;
                 });
+                invalidate_backdrop_cache();
+                TRANSITION_BACKDROP.with(|slot| {
+                    let bd = slot.borrow();
+                    assert!(bd.raw_pixels.is_empty());
+                    assert!(bd.wallpaper_key.is_none());
+                    assert!(bd.active);
+                });
                 // Visible + active remains idempotent.
+                let _ = ShowWindow(parent, SW_SHOWNA);
                 begin_backdrop_transition(parent);
                 assert!(backdrop_transition_active(parent));
                 TRANSITION_BACKDROP.with(|slot| {
@@ -6332,6 +6494,28 @@ mod tests {
     }
 
     #[test]
+    fn fill_occluded_backdrop_from_border_interpolates_or_falls_back() {
+        let w = 10i32;
+        let h = 8i32;
+        let mut buf = vec![0xFF20_4080u32; (w * h) as usize];
+        // Partial interior hole gets smooth border interpolation without #08090C black fill.
+        for y in 2..6 {
+            for x in 2..8 {
+                buf[(y * w + x) as usize] = 0;
+            }
+        }
+        fill_occluded_backdrop_from_border(&mut buf, w, h, rect(2, 2, 8, 6));
+        assert!(
+            buf[(3 * w + 4) as usize] == 0xFF20_4080,
+            "uniform blue border should fill interior without black seam"
+        );
+
+        let mut full = vec![0xFF20_4080u32; (w * h) as usize];
+        fill_occluded_backdrop_from_border(&mut full, w, h, rect(0, 0, w, h));
+        assert!(full.iter().all(|&px| px == 0xFF08_090C));
+    }
+
+    #[test]
     fn tint_transition_backdrop_pixel_matches_cool_neutral_acrylic() {
         let rgb = |px: u32| -> (u32, u32, u32) { ((px >> 16) & 255, (px >> 8) & 255, px & 255) };
         let luma = |px: u32| -> u32 {
@@ -6349,43 +6533,44 @@ mod tests {
         for px in [dark, mid, bright, neutral_dark, fallback, black, white] {
             assert_eq!(px >> 24, 0xFF);
         }
-        assert!((66..=74).contains(&luma(black)));
-        assert!((66..=74).contains(&luma(neutral_dark)));
-        assert!((66..=76).contains(&luma(fallback)));
-        assert!((66..=76).contains(&luma(dark)));
-        assert!((74..=85).contains(&luma(mid)));
-        assert!((78..=88).contains(&luma(bright)));
-        assert!((86..=94).contains(&luma(white)));
-        assert!(luma(white) - luma(black) >= 15);
+        assert!((64..=72).contains(&luma(black)));
+        assert!((64..=72).contains(&luma(neutral_dark)));
+        assert!((65..=74).contains(&luma(fallback)));
+        assert!((66..=75).contains(&luma(dark)));
+        assert!((76..=86).contains(&luma(mid)));
+        assert!((80..=90).contains(&luma(bright)));
+        assert!((90..=98).contains(&luma(white)));
+        assert!(luma(white) - luma(black) >= 20);
         let (ndr, _ndg, ndb) = rgb(neutral_dark);
         assert!(ndb >= ndr);
 
         let orange = tint_transition_backdrop_pixel(0xFFE0_8820);
         assert_eq!(orange >> 24, 0xFF);
-        assert!((72..=90).contains(&luma(orange)));
+        assert!((76..=94).contains(&luma(orange)));
         let (or, og, ob) = rgb(orange);
         assert!(or > og && og > ob);
-        assert!(or - ob <= 40);
+        assert!(or - ob >= 100);
 
         let peach = tint_transition_backdrop_pixel(0xFFE0_88A0);
         assert_eq!(peach >> 24, 0xFF);
-        assert!((72..=92).contains(&luma(peach)));
+        assert!((76..=94).contains(&luma(peach)));
         let (pr, pg, pb) = rgb(peach);
         assert!(pr > pb && pb > pg);
+        assert!(pr - pg >= 50);
 
         let amber_peach = tint_transition_backdrop_pixel(0xFFD8_9870);
         assert_eq!(amber_peach >> 24, 0xFF);
-        assert!((72..=92).contains(&luma(amber_peach)));
+        assert!((76..=94).contains(&luma(amber_peach)));
         let (ar, ag, ab) = rgb(amber_peach);
         assert!(ar > ag && ag > ab);
-        assert!(ar - ab <= 25);
+        assert!(ar - ab >= 65);
 
         let cyan = tint_transition_backdrop_pixel(0xFF20_90D0);
         assert_eq!(cyan >> 24, 0xFF);
         assert!((72..=90).contains(&luma(cyan)));
         let (cr, cg, cb) = rgb(cyan);
         assert!(cb > cg && cg > cr);
-        assert!(cb - cr <= 36);
+        assert!(cb - cr >= 100);
     }
 
     #[test]
