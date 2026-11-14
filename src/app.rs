@@ -80,6 +80,7 @@ const SAWERIA_URL: &str = "https://saweria.co/BuyMatcha";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 const RESTORE_BACKDROP_TIMER_ID: usize = 4;
+const RESTORE_BACKDROP_MS: u32 = 240;
 const ICONIC_PROPERTY: PCWSTR = w!("WallpaperLive.Iconic");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -1600,7 +1601,13 @@ impl App {
             }
             let width = r.right * 96 / dpi;
             let height = r.bottom * 96 / dpi;
-            let size_changed = font_dirty || self.layout_state != Some((dpi, width, height));
+            let synced_by_wm_size =
+                !font_dirty && visuals::take_synced_layout(self.hwnd, dpi, width, height);
+            if synced_by_wm_size {
+                self.layout_state = Some((dpi, width, height));
+            }
+            let size_changed = !synced_by_wm_size
+                && (font_dirty || self.layout_state != Some((dpi, width, height)));
             if size_changed {
                 let layout = visuals::Layout::new(width, height);
                 for (id, control) in &self.controls {
@@ -2585,7 +2592,12 @@ impl App {
             }
             let _ = ShowWindow(self.hwnd, if iconic { SW_RESTORE } else { SW_SHOW });
             if iconic {
-                let _ = SetTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID, 170, None);
+                let _ = SetTimer(
+                    self.hwnd,
+                    RESTORE_BACKDROP_TIMER_ID,
+                    RESTORE_BACKDROP_MS,
+                    None,
+                );
             } else {
                 let _ = visuals::enable_backdrop(self.hwnd);
             }
@@ -4819,30 +4831,39 @@ unsafe extern "system" fn window_proc(
                 if cmd == SC_MINIMIZE {
                     let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                     visuals::begin_backdrop_transition(window);
-                } else if cmd == SC_RESTORE || cmd == SC_MAXIMIZE {
+                } else if (cmd == SC_RESTORE || cmd == SC_MAXIMIZE) && IsIconic(window).as_bool() {
                     visuals::begin_backdrop_transition(window);
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 170, None);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                 }
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_QUERYOPEN => {
                 visuals::begin_backdrop_transition(window);
-                let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 170, None);
+                let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_WINDOWPOSCHANGING if lparam.0 != 0 => {
-                let pos = &*(lparam.0 as *const WINDOWPOS);
+                let pos = &mut *(lparam.0 as *mut WINDOWPOS);
                 let iconic = IsIconic(window).as_bool();
                 if !iconic && pos.x <= -30000 && pos.y <= -30000 {
-                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
-                    visuals::begin_backdrop_transition(window);
+                    if !visuals::backdrop_transition_active(window) {
+                        let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                        visuals::begin_backdrop_transition(window);
+                    }
                 } else if iconic
                     && (pos.flags.0 & SWP_HIDEWINDOW.0 == 0)
                     && (pos.flags.0 & SWP_SHOWWINDOW.0 != 0
                         || (pos.x > -30000 && (pos.flags.0 & SWP_NOMOVE.0) == 0))
                 {
-                    visuals::begin_backdrop_transition(window);
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 170, None);
+                    if !visuals::backdrop_transition_active(window) {
+                        visuals::begin_backdrop_transition(window);
+                    }
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
+                    if (pos.flags.0 & SWP_NOSIZE.0) == 0 {
+                        pos.flags |= SWP_NOCOPYBITS;
+                    }
+                } else if !iconic && (pos.flags.0 & SWP_NOSIZE.0) == 0 {
+                    pos.flags |= SWP_NOCOPYBITS;
                 }
                 DefWindowProcW(window, message, wparam, lparam)
             }
@@ -4859,6 +4880,9 @@ unsafe extern "system" fn window_proc(
                     let was_iconic = !GetPropW(window, ICONIC_PROPERTY).0.is_null();
                     if was_iconic {
                         let _ = RemovePropW(window, ICONIC_PROPERTY);
+                    } else {
+                        let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                        visuals::clear_backdrop_transition(window);
                     }
                     let _ = RedrawWindow(
                         window,
@@ -4867,7 +4891,8 @@ unsafe extern "system" fn window_proc(
                         RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
                     );
                     if was_iconic {
-                        let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 170, None);
+                        let _ =
+                            SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                     }
                 }
                 post(LAYOUT, WPARAM(0), LPARAM(0));
@@ -6881,6 +6906,76 @@ mod tests {
             );
 
             let _ = DestroyWindow(hwnd);
+            if atom != 0 {
+                let _ = UnregisterClassW(class_name, instance);
+            }
+        }
+    }
+
+    #[test]
+    fn window_pos_changing_sets_nocopybits_for_non_iconic_resize_only() {
+        // SAFETY: isolated hidden test window registered and destroyed solely within this test.
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("module handle");
+            let class_name = w!("WallpaperLive.WindowPosChangingTest");
+            let atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            });
+            assert!(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+            let hwnd = CreateWindowExW(
+                WS_EX_CONTROLPARENT | WS_EX_NOACTIVATE,
+                class_name,
+                w!("WallpaperLive WindowPosChanging Test"),
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                100,
+                100,
+                1040,
+                720,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("windowposchanging test window");
+
+            let send_pos = |x, y, cx, cy, flags| -> SET_WINDOW_POS_FLAGS {
+                let mut pos = WINDOWPOS {
+                    hwnd,
+                    hwndInsertAfter: HWND::default(),
+                    x,
+                    y,
+                    cx,
+                    cy,
+                    flags,
+                };
+                assert_eq!(
+                    SendMessageW(
+                        hwnd,
+                        WM_WINDOWPOSCHANGING,
+                        WPARAM(0),
+                        LPARAM((&mut pos as *mut WINDOWPOS) as isize),
+                    ),
+                    LRESULT(0)
+                );
+                pos.flags
+            };
+
+            let resize_flags = send_pos(120, 120, 1200, 800, SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_ne!(resize_flags.0 & SWP_NOCOPYBITS.0, 0);
+
+            let move_flags = send_pos(160, 160, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_eq!(move_flags.0 & SWP_NOCOPYBITS.0, 0);
+
+            let minimize_flags = send_pos(-32000, -32000, 160, 28, SWP_NOZORDER | SWP_NOACTIVATE);
+            assert_eq!(minimize_flags.0 & SWP_NOCOPYBITS.0, 0);
+            visuals::clear_backdrop_transition(hwnd);
+
+            let _ = DestroyWindow(hwnd);
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
             if atom != 0 {
                 let _ = UnregisterClassW(class_name, instance);
             }

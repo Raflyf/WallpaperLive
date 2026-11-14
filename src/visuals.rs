@@ -1436,6 +1436,7 @@ pub fn clear() {
         }
     });
     TRANSITION_BACKDROP.with(|slot| *slot.borrow_mut() = TransitionBackdrop::default());
+    SYNCED_LAYOUT.with(|slot| slot.set(None));
 }
 
 #[derive(Default)]
@@ -1475,6 +1476,7 @@ thread_local! {
     static USER_ACRYLIC: Cell<bool> = const { Cell::new(true) };
     static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
     static TRANSITION_BACKDROP: RefCell<TransitionBackdrop> = RefCell::new(TransitionBackdrop::default());
+    static SYNCED_LAYOUT: Cell<Option<(isize, i32, i32, i32)>> = const { Cell::new(None) };
 }
 
 pub fn set_user_acrylic(enabled: bool) {
@@ -3604,6 +3606,26 @@ pub fn prime_backdrop_capture(window: HWND) {
     }
 }
 
+pub fn backdrop_transition_active(window: HWND) -> bool {
+    !window.0.is_null()
+        && TRANSITION_BACKDROP.with(|slot| {
+            let bd = slot.borrow();
+            bd.active && bd.hwnd == window.0 as isize
+        })
+}
+
+pub fn clear_backdrop_transition(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        if bd.hwnd == window.0 as isize {
+            bd.active = false;
+        }
+    });
+}
+
 pub fn begin_backdrop_transition(window: HWND) {
     if window.0.is_null() {
         return;
@@ -3614,6 +3636,7 @@ pub fn begin_backdrop_transition(window: HWND) {
             || !glass_enabled(window)
             || !user_acrylic_enabled()
             || !transparency_enabled()
+            || backdrop_transition_active(window)
         {
             return;
         }
@@ -3631,15 +3654,7 @@ pub fn begin_backdrop_transition(window: HWND) {
 }
 
 pub fn end_minimize_backdrop_transition(window: HWND) {
-    if window.0.is_null() {
-        return;
-    }
-    TRANSITION_BACKDROP.with(|slot| {
-        let mut bd = slot.borrow_mut();
-        if bd.hwnd == window.0 as isize {
-            bd.active = false;
-        }
-    });
+    clear_backdrop_transition(window);
 }
 
 pub fn finish_backdrop_transition(window: HWND) {
@@ -3683,8 +3698,13 @@ pub fn sync_child_positions(window: HWND) {
             return;
         }
         let dpi = GetDpiForWindow(window).max(96) as i32;
+        let width = r.right * 96 / dpi;
+        let height = r.bottom * 96 / dpi;
+        if width <= 0 || height <= 0 {
+            return;
+        }
         let scale = |n: i32| n * dpi / 96;
-        let layout = Layout::new(r.right * 96 / dpi, r.bottom * 96 / dpi);
+        let layout = Layout::new(width, height);
         let mut items = Vec::new();
         let mut cur = GetWindow(window, GW_CHILD).ok();
         while let Some(child) = cur {
@@ -3694,6 +3714,7 @@ pub fn sync_child_positions(window: HWND) {
             }
             cur = GetWindow(child, GW_HWNDNEXT).ok();
         }
+        let mut synced = items.is_empty();
         if !items.is_empty()
             && let Ok(mut hdwp) = BeginDeferWindowPos(items.len() as i32)
         {
@@ -3716,17 +3737,31 @@ pub fn sync_child_positions(window: HWND) {
                     }
                 }
             }
-            if valid {
-                let _ = EndDeferWindowPos(hdwp);
+            if valid && EndDeferWindowPos(hdwp).is_ok() {
+                synced = true;
             }
             for (child, _) in items {
                 let _ = round_control(child);
             }
         }
+        if synced {
+            SYNCED_LAYOUT.with(|slot| slot.set(Some((window.0 as isize, dpi, width, height))));
+        }
         if glass_enabled(window) && user_acrylic_enabled() && transparency_enabled() {
             let _ = set_acrylic_composition(window, true);
         }
     }
+}
+
+pub fn take_synced_layout(window: HWND, dpi: i32, width: i32, height: i32) -> bool {
+    SYNCED_LAYOUT.with(|slot| {
+        let matched =
+            !window.0.is_null() && slot.get() == Some((window.0 as isize, dpi, width, height));
+        if matched {
+            slot.set(None);
+        }
+        matched
+    })
 }
 
 pub fn enable_backdrop(window: HWND) -> bool {
@@ -5821,6 +5856,89 @@ mod tests {
     }
 
     #[test]
+    fn backdrop_transition_active_clear_and_idempotency() {
+        clear();
+        assert!(!backdrop_transition_active(HWND::default()));
+        clear_backdrop_transition(HWND::default());
+
+        // SAFETY: hidden WS_POPUP window lives only on this thread and is destroyed before returning.
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                240,
+                120,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("test parent");
+            assert!(!backdrop_transition_active(parent));
+            SetPropW(
+                parent,
+                GLASS_PROPERTY,
+                windows::Win32::Foundation::HANDLE(parent.0),
+            )
+            .expect("glass prop");
+
+            let sentinel = vec![0x1234_5678u32; 4];
+            TRANSITION_BACKDROP.with(|slot| {
+                let mut bd = slot.borrow_mut();
+                bd.active = true;
+                bd.hwnd = parent.0 as isize;
+                bd.width = 2;
+                bd.height = 2;
+                bd.pixels = sentinel.clone();
+            });
+            assert!(backdrop_transition_active(parent));
+            let other = HWND(std::ptr::dangling_mut());
+            assert!(!backdrop_transition_active(other));
+
+            // Idempotent when already active for this HWND: must not re-capture or overwrite pixels.
+            begin_backdrop_transition(parent);
+            assert!(backdrop_transition_active(parent));
+            TRANSITION_BACKDROP.with(|slot| {
+                let bd = slot.borrow();
+                assert_eq!((bd.width, bd.height), (2, 2));
+                assert_eq!(bd.pixels, sentinel);
+            });
+
+            clear_backdrop_transition(other);
+            assert!(backdrop_transition_active(parent));
+
+            clear_backdrop_transition(parent);
+            assert!(!backdrop_transition_active(parent));
+
+            if user_acrylic_enabled() && transparency_enabled() {
+                clear();
+                begin_backdrop_transition(parent);
+                assert!(backdrop_transition_active(parent));
+                TRANSITION_BACKDROP.with(|slot| {
+                    let mut bd = slot.borrow_mut();
+                    assert!(!bd.pixels.is_empty());
+                    bd.pixels[0] = 0xDEAD_BEEF;
+                });
+                begin_backdrop_transition(parent);
+                assert!(backdrop_transition_active(parent));
+                TRANSITION_BACKDROP.with(|slot| {
+                    assert_eq!(slot.borrow().pixels[0], 0xDEAD_BEEF);
+                });
+                clear_backdrop_transition(parent);
+                assert!(!backdrop_transition_active(parent));
+            }
+
+            let _ = RemovePropW(parent, GLASS_PROPERTY);
+            let _ = DestroyWindow(parent);
+        }
+        clear();
+    }
+
+    #[test]
     fn tint_transition_backdrop_pixel_matches_warm_stone_frosted_glass() {
         let rgb = |px: u32| -> (u32, u32, u32) { ((px >> 16) & 255, (px >> 8) & 255, px & 255) };
         let luma = |px: u32| -> u32 {
@@ -6249,5 +6367,99 @@ mod tests {
             assert_eq!(pts[1].y, expected.bottom * dpi / 96);
             let _ = DestroyWindow(parent);
         }
+    }
+
+    #[test]
+    fn take_synced_layout_consumes_once_and_rejects_mismatches() {
+        clear();
+        sync_child_positions(HWND::default());
+        assert!(!take_synced_layout(
+            HWND::default(),
+            96,
+            MIN_CLIENT_WIDTH,
+            MIN_CLIENT_HEIGHT
+        ));
+
+        // SAFETY: hidden WS_POPUP windows and child BUTTON live only on this thread and are destroyed before returning.
+        unsafe {
+            let zero_win = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("zero-sized parent");
+            let mut zr = RECT::default();
+            GetClientRect(zero_win, &mut zr).expect("zero client");
+            sync_child_positions(zero_win);
+            if zr.right <= zr.left || zr.bottom <= zr.top {
+                assert!(SYNCED_LAYOUT.with(Cell::get).is_none());
+            }
+            let _ = DestroyWindow(zero_win);
+            clear();
+
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                MIN_CLIENT_WIDTH,
+                MIN_CLIENT_HEIGHT,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("test parent");
+            let _child = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("BUTTON"),
+                w!("Library"),
+                WS_CHILD | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                0,
+                0,
+                10,
+                10,
+                parent,
+                HMENU(TAB_LIBRARY as *mut _),
+                None,
+                None,
+            )
+            .expect("test tab button");
+
+            sync_child_positions(parent);
+            let mut client = RECT::default();
+            GetClientRect(parent, &mut client).expect("parent client");
+            let dpi = GetDpiForWindow(parent).max(96) as i32;
+            let width = client.right * 96 / dpi;
+            let height = client.bottom * 96 / dpi;
+
+            assert!(!take_synced_layout(HWND::default(), dpi, width, height));
+            assert!(!take_synced_layout(
+                HWND(std::ptr::dangling_mut()),
+                dpi,
+                width,
+                height
+            ));
+            assert!(!take_synced_layout(parent, dpi + 24, width, height));
+            assert!(!take_synced_layout(parent, dpi, width + 1, height));
+            assert!(!take_synced_layout(parent, dpi, width, height + 1));
+
+            assert!(take_synced_layout(parent, dpi, width, height));
+            assert!(!take_synced_layout(parent, dpi, width, height));
+
+            let _ = DestroyWindow(parent);
+        }
+        clear();
     }
 }
