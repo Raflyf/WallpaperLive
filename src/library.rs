@@ -1,4 +1,4 @@
-use crate::core::{supported_extension, validate_media, validate_path_syntax};
+use crate::core::{live_extension, supported_extension, validate_media, validate_path_syntax};
 use std::{
     collections::BTreeMap,
     fs,
@@ -100,7 +100,7 @@ pub fn scan_folder(source: &Path) -> Result<Vec<PathBuf>, String> {
                     return Err("Folder changed during import. No files were imported.".into());
                 }
                 pending.push(folder);
-            } else if metadata.is_file() && supported_extension(&path) {
+            } else if metadata.is_file() && live_extension(&path) {
                 let file = validate_media(&path)?;
                 if !in_folder(&file, &root) {
                     return Err("File changed during import. No files were imported.".into());
@@ -296,10 +296,21 @@ mod tests {
         let original = root.join("one.mp4");
         fs::write(&original, b"original fixture, not decoder media").unwrap();
         fs::write(root.join("nested/two.GIF"), b"second fixture").unwrap();
+        let preview_jpg = root.join("preview.jpg");
+        fs::write(&preview_jpg, b"static jpg").unwrap();
+        fs::write(root.join("nested/cover.JPEG"), b"static jpeg").unwrap();
+        fs::write(root.join("still.png"), b"static png").unwrap();
+        fs::write(root.join("frame.webp"), b"static webp").unwrap();
+        fs::write(root.join("thumb.BMP"), b"static bmp").unwrap();
         fs::write(root.join("ignored.txt"), b"not media").unwrap();
         let imported = scan_folder(&root).unwrap();
         assert_eq!(imported.len(), 2);
-        assert!(imported.iter().all(|path| in_folder(path, &root)));
+        assert!(
+            imported
+                .iter()
+                .all(|path| in_folder(path, &root) && live_extension(path))
+        );
+        assert!(validate_media(&preview_jpg).is_ok());
         assert_eq!(
             fs::read(&original).unwrap(),
             b"original fixture, not decoder media"

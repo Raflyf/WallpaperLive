@@ -79,6 +79,8 @@ const SUPPORT_URL: &str = "https://yapp.ink/raflyf";
 const SAWERIA_URL: &str = "https://saweria.co/BuyMatcha";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
+const RESTORE_BACKDROP_TIMER_ID: usize = 4;
+const ICONIC_PROPERTY: PCWSTR = w!("WallpaperLive.Iconic");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn playback_position(playback: &Playback) -> Option<f64> {
@@ -1781,8 +1783,10 @@ impl App {
             let _ = EnableWindow(self.control(visuals::REMOVE), !self.marked.is_empty());
             if repaint {
                 let _ = InvalidateRect(self.hwnd, None, false);
-                for (_, h) in &self.controls {
-                    let _ = InvalidateRect(*h, None, false);
+                for &(id, h) in &self.controls {
+                    if id != visuals::SEARCH {
+                        let _ = InvalidateRect(h, None, false);
+                    }
                 }
             }
         }
@@ -1947,6 +1951,13 @@ impl App {
         if let (Some(c), Some(old)) = (clip, old_layer)
             && let Some(new) = visuals::capture_region(self.hwnd, c, &self.controls)
         {
+            // SAFETY: synchronously commit pager label/button state cleanly before frame 0 of the slide.
+            unsafe {
+                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
+                    let _ =
+                        RedrawWindow(self.control(id), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                }
+            }
             let dir = if delta > 0 { -1 } else { 1 };
             visuals::begin_transition(
                 self.hwnd,
@@ -1959,13 +1970,6 @@ impl App {
                 None,
                 false,
             );
-            // SAFETY: synchronously commit pager label/button state cleanly at frame 0 of the slide.
-            unsafe {
-                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
-                    let _ =
-                        RedrawWindow(self.control(id), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
-                }
-            }
             return Ok(());
         }
         // SAFETY: fallback repaint when capture could not be acquired.
@@ -2163,25 +2167,20 @@ impl App {
         }
         Ok(())
     }
+    fn thumbnail_paused(&self) -> bool {
+        self.reasons.locked
+            || self.reasons.remote
+            || self.reasons.disconnected
+            || self.reasons.display_off
+            || self.reasons.suspended
+    }
     fn thumbnail_paths(&self) -> Vec<PathBuf> {
-        self.ordered_thumbnail_paths(unsafe { IsWindowVisible(self.hwnd) }.as_bool())
+        self.ordered_thumbnail_paths(unsafe {
+            IsWindowVisible(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool()
+        })
     }
     fn ordered_thumbnail_paths(&self, visible: bool) -> Vec<PathBuf> {
-        if self.tab != visuals::Tab::Library
-            || self.reasons.reason().is_some()
-            || self.preparation.is_some()
-            || self
-                .displays
-                .iter()
-                .any(|display| display.preparation_thread.is_some())
-            || (!self.displays.is_empty()
-                && self
-                    .displays
-                    .iter()
-                    .all(|display| display.pause_reason.is_some()))
-            || self.dormant.is_some()
-            || !visible
-        {
+        if self.tab != visuals::Tab::Library || self.thumbnail_paused() || !visible {
             return Vec::new();
         }
         let view = self.library_view();
@@ -2222,28 +2221,32 @@ impl App {
             return;
         }
         let paths = self.thumbnail_paths();
-        if self
+        let mut results: Vec<_> = self.thumbnail_rx.try_iter().collect();
+        let worker_done = self
             .thumbnail_thread
             .as_ref()
-            .is_some_and(|(_, worker)| worker.is_finished())
-        {
-            let Some((cancelled, worker)) = self.thumbnail_thread.take() else {
-                return;
+            .is_some_and(|(_, worker)| worker.is_finished());
+        if !results.is_empty() || worker_done {
+            let was_cancelled = if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
+                let _ = worker.join();
+                self.thumbnail_pending = None;
+                results.extend(self.thumbnail_rx.try_iter());
+                cancelled.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                false
             };
-            let _ = worker.join();
-            self.thumbnail_pending = None;
             let mut loaded = Vec::new();
-            for (path, result) in self.thumbnail_rx.try_iter() {
-                if !cancelled.load(std::sync::atomic::Ordering::Relaxed)
-                    && self.library.contains(&path)
-                {
-                    match result.and_then(|bytes| crate::thumbnail::bitmap(&bytes)) {
-                        Ok(bitmap) => {
-                            visuals::thumbnail(path.clone(), bitmap);
-                            loaded.push(path);
-                        }
-                        Err(_) => {
-                            self.thumbnail_failed.insert(path);
+            if !was_cancelled {
+                for (path, result) in results {
+                    if self.library.contains(&path) {
+                        match result.and_then(|bytes| crate::thumbnail::bitmap(&bytes)) {
+                            Ok(bitmap) => {
+                                visuals::thumbnail(path.clone(), bitmap);
+                                loaded.push(path);
+                            }
+                            Err(_) => {
+                                self.thumbnail_failed.insert(path);
+                            }
                         }
                     }
                 }
@@ -2515,6 +2518,11 @@ impl App {
         }
         validate_media(path)?;
         self.cancel_thumbnails();
+        if let Some((_, worker)) = self.thumbnail_thread.take() {
+            let _ = worker.join();
+            self.thumbnail_pending = None;
+            while self.thumbnail_rx.try_recv().is_ok() {}
+        }
         self.thumbnail_failed.remove(path);
         visuals::remove_thumbnail(path);
         self.request_thumbnails();
@@ -2523,15 +2531,18 @@ impl App {
     fn show(&mut self) {
         // SAFETY: own panel only; showing a hidden maximized window preserves its state.
         unsafe {
-            let _ = ShowWindow(
-                self.hwnd,
-                if IsIconic(self.hwnd).as_bool() {
-                    SW_RESTORE
-                } else {
-                    SW_SHOW
-                },
-            );
-            let _ = visuals::enable_backdrop(self.hwnd);
+            let iconic = IsIconic(self.hwnd).as_bool();
+            let hidden = !IsWindowVisible(self.hwnd).as_bool();
+            let transitioning = iconic || hidden;
+            if transitioning {
+                visuals::begin_backdrop_transition(self.hwnd);
+            }
+            let _ = ShowWindow(self.hwnd, if iconic { SW_RESTORE } else { SW_SHOW });
+            if transitioning {
+                let _ = SetTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID, 280, None);
+            } else {
+                let _ = visuals::enable_backdrop(self.hwnd);
+            }
             let _ = SetForegroundWindow(self.hwnd);
             SendMessageW(
                 self.hwnd,
@@ -2627,7 +2638,6 @@ impl App {
             (rect.bottom - rect.top) as u32,
         );
         self.cancel_preparation();
-        self.cancel_thumbnails();
         self.dormant = None;
         self.paused_since = None;
         self.pause_trimmed = false;
@@ -2952,7 +2962,7 @@ impl App {
                 self.cancel_preparation();
                 self.preparation = preparation;
             }
-            if !self.multi_dispatch {
+            if !self.multi_dispatch && self.thumbnail_paused() {
                 self.cancel_thumbnails();
             }
             self.launch_preparation()?;
@@ -3955,6 +3965,38 @@ impl App {
                 let _ = SetFocus(holder);
             }
             if let Some(new) = visuals::capture_region_controls(self.hwnd, c, &new_controls) {
+                // SAFETY: flush header tab pills and Settings-toggled Add buttons before frame 0 starts.
+                unsafe {
+                    let _ = RedrawWindow(
+                        self.control(visuals::TAB_LIBRARY),
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_UPDATENOW,
+                    );
+                    let _ = RedrawWindow(
+                        self.control(visuals::TAB_SETTINGS),
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_UPDATENOW,
+                    );
+                    if (previous == visuals::Tab::Settings) != (tab == visuals::Tab::Settings) {
+                        let mut client = RECT::default();
+                        if GetClientRect(self.hwnd, &mut client).is_ok() {
+                            let header_clip = RECT {
+                                left: 0,
+                                top: 0,
+                                right: client.right,
+                                bottom: c.top,
+                            };
+                            let _ = RedrawWindow(
+                                self.hwnd,
+                                Some(&header_clip),
+                                None,
+                                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                            );
+                        }
+                    }
+                }
                 let dir = if previous == visuals::Tab::Library {
                     -1
                 } else {
@@ -3972,28 +4014,6 @@ impl App {
                     Some(self.control(focus)),
                     true,
                 );
-                // SAFETY: invalidate header tab pills on frame 0 and refresh Add buttons when toggling Settings.
-                unsafe {
-                    let _ = InvalidateRect(self.control(visuals::TAB_LIBRARY), None, false);
-                    let _ = InvalidateRect(self.control(visuals::TAB_SETTINGS), None, false);
-                    if (previous == visuals::Tab::Settings) != (tab == visuals::Tab::Settings) {
-                        let mut client = RECT::default();
-                        if GetClientRect(self.hwnd, &mut client).is_ok() {
-                            let header_clip = RECT {
-                                left: 0,
-                                top: 0,
-                                right: client.right,
-                                bottom: c.top,
-                            };
-                            let _ = RedrawWindow(
-                                self.hwnd,
-                                Some(&header_clip),
-                                None,
-                                RDW_INVALIDATE | RDW_ALLCHILDREN,
-                            );
-                        }
-                    }
-                }
                 return Ok(());
             }
         }
@@ -4032,6 +4052,7 @@ impl Drop for App {
             let _ = KillTimer(self.hwnd, 1);
             let _ = KillTimer(self.hwnd, 2);
             let _ = KillTimer(self.hwnd, visuals::ANIM_TIMER_ID);
+            let _ = KillTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID);
             let _ = WTSUnRegisterSessionNotification(self.hwnd);
             for notification in self.power.drain(..) {
                 let _ = UnregisterPowerSettingNotification(notification);
@@ -4487,6 +4508,11 @@ pub fn run() -> Result<(), String> {
                         let _ = visuals::tick_animations(hwnd);
                         Ok(false)
                     }
+                    WM_TIMER if message.wParam.0 == RESTORE_BACKDROP_TIMER_ID => {
+                        let _ = KillTimer(hwnd, RESTORE_BACKDROP_TIMER_ID);
+                        visuals::finish_backdrop_transition(hwnd);
+                        Ok(false)
+                    }
                     WM_TIMER => app.tick().map(|_| false),
                     POWER => {
                         app.wts_tick = 0;
@@ -4747,15 +4773,63 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                let _ = RemovePropW(window, ICONIC_PROPERTY);
                 PostQuitMessage(0);
                 LRESULT(0)
+            }
+            WM_SYSCOMMAND => {
+                let cmd = (wparam.0 & 0xfff0) as u32;
+                if cmd == SC_MINIMIZE {
+                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                    visuals::begin_backdrop_transition(window);
+                } else if cmd == SC_RESTORE || cmd == SC_MAXIMIZE {
+                    visuals::begin_backdrop_transition(window);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 280, None);
+                }
+                DefWindowProcW(window, message, wparam, lparam)
+            }
+            WM_WINDOWPOSCHANGING if lparam.0 != 0 => {
+                let pos = &*(lparam.0 as *const WINDOWPOS);
+                let iconic = IsIconic(window).as_bool();
+                if !iconic && pos.x <= -30000 && pos.y <= -30000 {
+                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                    visuals::begin_backdrop_transition(window);
+                } else if iconic
+                    && (pos.flags.0 & SWP_HIDEWINDOW.0 == 0)
+                    && (pos.flags.0 & SWP_SHOWWINDOW.0 != 0
+                        || (pos.x > -30000 && (pos.flags.0 & SWP_NOMOVE.0) == 0))
+                {
+                    visuals::begin_backdrop_transition(window);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 280, None);
+                }
+                DefWindowProcW(window, message, wparam, lparam)
             }
             WM_SIZE => {
                 visuals::cancel_transition(window);
                 if wparam.0 == SIZE_MINIMIZED as usize {
+                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                    let _ = SetPropW(window, ICONIC_PROPERTY, HANDLE(std::ptr::dangling_mut()));
                     return LRESULT(0);
                 }
+                if matches!(wparam.0 as u32, SIZE_RESTORED | SIZE_MAXIMIZED)
+                    && !GetPropW(window, ICONIC_PROPERTY).0.is_null()
+                {
+                    let _ = RemovePropW(window, ICONIC_PROPERTY);
+                    let _ = RedrawWindow(
+                        window,
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                    );
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 280, None);
+                }
                 post(LAYOUT, WPARAM(0), LPARAM(0));
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == RESTORE_BACKDROP_TIMER_ID => {
+                let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                visuals::finish_backdrop_transition(window);
                 LRESULT(0)
             }
             WM_DWMCOMPOSITIONCHANGED
@@ -6596,6 +6670,32 @@ mod tests {
 
         app.tab = visuals::Tab::Settings;
         assert!(app.ordered_thumbnail_paths(true).is_empty());
+    }
+
+    #[test]
+    fn ordered_thumbnail_paths_allows_playback_pauses_and_stops_when_offscreen() {
+        let mut app = fixture();
+        app.tab = visuals::Tab::Library;
+        app.library = vec![PathBuf::from(r"C:\wallpapers\clip.mp4")];
+        app.reasons.battery = true;
+        app.reasons.manual = true;
+        app.reasons.maximized = true;
+        app.reasons.fullscreen = true;
+        app.preparation = Some((app.library[0].clone(), (1920, 1080), 30));
+        assert_eq!(app.ordered_thumbnail_paths(true), app.library);
+
+        for pause in [
+            |r: &mut PauseReasons, v| r.locked = v,
+            |r: &mut PauseReasons, v| r.remote = v,
+            |r: &mut PauseReasons, v| r.disconnected = v,
+            |r: &mut PauseReasons, v| r.display_off = v,
+            |r: &mut PauseReasons, v| r.suspended = v,
+        ] {
+            pause(&mut app.reasons, true);
+            assert!(app.ordered_thumbnail_paths(true).is_empty());
+            pause(&mut app.reasons, false);
+        }
+        assert_eq!(app.ordered_thumbnail_paths(true), app.library);
     }
 
     #[test]

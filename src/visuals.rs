@@ -23,9 +23,7 @@ use windows::{
                 ODS_SELECTED, OpenThemeData,
             },
             HiDpi::GetDpiForWindow,
-            Input::KeyboardAndMouse::{
-                GetFocus, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-            },
+            Input::KeyboardAndMouse::{SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
@@ -907,12 +905,6 @@ unsafe fn paint_children_with_visibility(
 ) {
     // SAFETY: parent and child HWNDs live on this synchronous UI thread; DIB pointer bounds validated.
     unsafe {
-        let dpi = if parent.0.is_null() {
-            96
-        } else {
-            GetDpiForWindow(parent).max(96) as i32
-        };
-        let s = |v: i32| v * dpi / 96;
         for &(id, child) in controls {
             if child.0.is_null()
                 || (require_visible && GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0)
@@ -944,116 +936,129 @@ unsafe fn paint_children_with_visibility(
                 continue;
             }
             if id == SEARCH {
-                let mut saved = Vec::new();
-                let bounds = dib_bits.and_then(|(bits, w, h)| {
-                    if bits.is_null() || w <= 0 || h <= 0 {
-                        return None;
-                    }
-                    let x0 = child_rect.left.max(0);
-                    let y0 = child_rect.top.max(0);
-                    let x1 = child_rect.right.min(w);
-                    let y1 = child_rect.bottom.min(h);
-                    (x1 > x0 && y1 > y0).then_some((bits, w, h, x0, y0, x1, y1))
-                });
-                if let Some((bits, w, h, x0, y0, x1, y1)) = bounds {
-                    let _ = GdiFlush();
-                    let slice = std::slice::from_raw_parts(bits, (w * h) as usize);
-                    saved.reserve(((x1 - x0) * (y1 - y0)) as usize);
-                    for y in y0..y1 {
-                        let row = y as usize * w as usize;
-                        for x in x0..x1 {
-                            saved.push(slice[row + x as usize]);
-                        }
-                    }
+                let cw = child_rect.right - child_rect.left;
+                let ch = child_rect.bottom - child_rect.top;
+                if cw <= 0 || ch <= 0 {
+                    continue;
                 }
-                let state = SaveDC(dc);
-                fill(dc, child_rect, LINE);
-                let inner = rect(
-                    child_rect.left + 1,
-                    child_rect.top + 1,
-                    child_rect.right - 1,
-                    child_rect.bottom - 1,
-                );
-                fill(dc, inner, CARD);
-                let text = window_text(child);
-                let text_rect = rect(
-                    inner.left + s(10),
-                    inner.top,
-                    inner.right - s(10),
-                    inner.bottom,
-                );
-                if !text.is_empty() {
-                    label(
-                        dc,
-                        &text,
-                        text_rect,
-                        s(14),
-                        false,
-                        TEXT,
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                    );
-                } else if GetFocus() != child {
-                    label(
-                        dc,
-                        "Search by filename",
-                        text_rect,
-                        s(14),
-                        false,
-                        MUTED,
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                    );
-                }
-                let _ = RestoreDC(dc, state);
-                if let Some((bits, w, h, x0, y0, x1, y1)) = bounds {
-                    let _ = GdiFlush();
-                    let a = if glass_enabled(parent) {
-                        SEARCH_ALPHA
-                    } else {
-                        255
-                    };
-                    let inv = 255u8 - a;
-                    let slice = std::slice::from_raw_parts_mut(bits, (w * h) as usize);
-                    let mut idx = 0usize;
-                    for y in y0..y1 {
-                        let row = y as usize * w as usize;
-                        for x in x0..x1 {
-                            let bg = saved[idx];
-                            idx += 1;
-                            let src = slice[row + x as usize];
-                            if a == 255 {
-                                slice[row + x as usize] = (255u32 << 24) | (src & 0x00ff_ffff);
+                let temp_dc = CreateCompatibleDC(dc);
+                if !temp_dc.0.is_null() {
+                    let mut temp_bits = std::ptr::null_mut();
+                    if let Ok(temp_bmp) = CreateDIBSection(
+                        temp_dc,
+                        &BITMAPINFO {
+                            bmiHeader: BITMAPINFOHEADER {
+                                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                                biWidth: cw,
+                                biHeight: -ch,
+                                biPlanes: 1,
+                                biBitCount: 32,
+                                biCompression: BI_RGB.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        DIB_RGB_COLORS,
+                        &mut temp_bits,
+                        None,
+                        0,
+                    ) {
+                        let prev_bmp = SelectObject(temp_dc, temp_bmp);
+                        if !temp_bits.is_null() {
+                            let total = (cw * ch) as usize;
+                            std::slice::from_raw_parts_mut(temp_bits as *mut u32, total).fill(CARD);
+                            SendMessageW(
+                                child,
+                                WM_PRINT,
+                                WPARAM(temp_dc.0 as usize),
+                                LPARAM((PRF_CLIENT | PRF_NONCLIENT | PRF_ERASEBKGND) as isize),
+                            );
+                            let _ = GdiFlush();
+                            let bounds = dib_bits.and_then(|(bits, w, h)| {
+                                if bits.is_null() || w <= 0 || h <= 0 {
+                                    return None;
+                                }
+                                let x0 = child_rect.left.max(0);
+                                let y0 = child_rect.top.max(0);
+                                let x1 = child_rect.right.min(w);
+                                let y1 = child_rect.bottom.min(h);
+                                (x1 > x0 && y1 > y0).then_some((bits, w, h, x0, y0, x1, y1))
+                            });
+                            if let Some((bits, w, h, x0, y0, x1, y1)) = bounds {
+                                let _ = GdiFlush();
+                                let a = if glass_enabled(parent) {
+                                    SEARCH_ALPHA
+                                } else {
+                                    255
+                                };
+                                let inv = 255u8 - a;
+                                let temp_slice =
+                                    std::slice::from_raw_parts(temp_bits as *const u32, total);
+                                let dst_slice =
+                                    std::slice::from_raw_parts_mut(bits, (w * h) as usize);
+                                for y in y0..y1 {
+                                    let dst_row = y as usize * w as usize;
+                                    let src_row = (y - child_rect.top) as usize * cw as usize;
+                                    for x in x0..x1 {
+                                        let src =
+                                            temp_slice[src_row + (x - child_rect.left) as usize];
+                                        if a == 255 {
+                                            dst_slice[dst_row + x as usize] =
+                                                (255u32 << 24) | (src & 0x00ff_ffff);
+                                        } else {
+                                            let bg = dst_slice[dst_row + x as usize];
+                                            let bg_a = ((bg >> 24) & 255) as u8;
+                                            let bg_r = ((bg >> 16) & 255) as u8;
+                                            let bg_g = ((bg >> 8) & 255) as u8;
+                                            let bg_b = (bg & 255) as u8;
+                                            let src_r = ((src >> 16) & 255) as u8;
+                                            let src_g = ((src >> 8) & 255) as u8;
+                                            let src_b = (src & 255) as u8;
+                                            let out_a = (u16::from(a)
+                                                + (u16::from(bg_a) * u16::from(inv) + 127) / 255)
+                                                .min(255)
+                                                as u8;
+                                            let out_r = (u16::from(premul_channel(src_r, a))
+                                                + (u16::from(bg_r) * u16::from(inv) + 127) / 255)
+                                                .min(u16::from(out_a))
+                                                as u8;
+                                            let out_g = (u16::from(premul_channel(src_g, a))
+                                                + (u16::from(bg_g) * u16::from(inv) + 127) / 255)
+                                                .min(u16::from(out_a))
+                                                as u8;
+                                            let out_b = (u16::from(premul_channel(src_b, a))
+                                                + (u16::from(bg_b) * u16::from(inv) + 127) / 255)
+                                                .min(u16::from(out_a))
+                                                as u8;
+                                            dst_slice[dst_row + x as usize] = (u32::from(out_a)
+                                                << 24)
+                                                | (u32::from(out_r) << 16)
+                                                | (u32::from(out_g) << 8)
+                                                | u32::from(out_b);
+                                        }
+                                    }
+                                }
                             } else {
-                                let bg_a = ((bg >> 24) & 255) as u8;
-                                let bg_r = ((bg >> 16) & 255) as u8;
-                                let bg_g = ((bg >> 8) & 255) as u8;
-                                let bg_b = (bg & 255) as u8;
-                                let src_r = ((src >> 16) & 255) as u8;
-                                let src_g = ((src >> 8) & 255) as u8;
-                                let src_b = (src & 255) as u8;
-                                let out_a = (u16::from(a)
-                                    + (u16::from(bg_a) * u16::from(inv) + 127) / 255)
-                                    .min(255) as u8;
-                                let out_r = (u16::from(premul_channel(src_r, a))
-                                    + (u16::from(bg_r) * u16::from(inv) + 127) / 255)
-                                    .min(u16::from(out_a))
-                                    as u8;
-                                let out_g = (u16::from(premul_channel(src_g, a))
-                                    + (u16::from(bg_g) * u16::from(inv) + 127) / 255)
-                                    .min(u16::from(out_a))
-                                    as u8;
-                                let out_b = (u16::from(premul_channel(src_b, a))
-                                    + (u16::from(bg_b) * u16::from(inv) + 127) / 255)
-                                    .min(u16::from(out_a))
-                                    as u8;
-                                slice[row + x as usize] = (u32::from(out_a) << 24)
-                                    | (u32::from(out_r) << 16)
-                                    | (u32::from(out_g) << 8)
-                                    | u32::from(out_b);
+                                let _ = BitBlt(
+                                    dc,
+                                    child_rect.left,
+                                    child_rect.top,
+                                    cw,
+                                    ch,
+                                    temp_dc,
+                                    0,
+                                    0,
+                                    SRCCOPY,
+                                );
                             }
                         }
+                        SelectObject(temp_dc, prev_bmp);
+                        let _ = DeleteObject(temp_bmp);
+                        let _ = DeleteDC(temp_dc);
+                        continue;
                     }
+                    let _ = DeleteDC(temp_dc);
                 }
-                continue;
             }
             let state = SaveDC(dc);
             let _ = SetViewportOrgEx(dc, child_rect.left, child_rect.top, None);
@@ -1220,24 +1225,27 @@ pub fn begin_transition_with_hide(
             for &child in to_hide {
                 set_child_visible_no_redraw(child, false);
             }
+            if !window.0.is_null() && IsWindow(window).as_bool() {
+                let _ = RedrawWindow(window, Some(&clip), None, RDW_INVALIDATE | RDW_UPDATENOW);
+            }
             for &child in &hidden {
                 set_child_visible_no_redraw(child, true);
             }
-            if !window.0.is_null() && IsWindow(window).as_bool() {
-                let _ = RedrawWindow(
-                    window,
-                    Some(&clip),
-                    None,
-                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
-                );
+            if let Some(target) = restore_focus
+                && !target.0.is_null()
+                && IsWindow(target).as_bool()
+                && IsWindowVisible(target).as_bool()
+            {
+                let _ = SetFocus(target);
             }
-        }
-        if let Some(target) = restore_focus
-            && !target.0.is_null()
-        {
-            unsafe {
-                if IsWindow(target).as_bool() && IsWindowVisible(target).as_bool() {
-                    let _ = SetFocus(target);
+            for &child in &hidden {
+                if !child.0.is_null() && IsWindow(child).as_bool() {
+                    let _ = RedrawWindow(
+                        child,
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW,
+                    );
                 }
             }
         }
@@ -1269,7 +1277,16 @@ pub fn begin_transition_with_hide(
 
 fn end_transition(window: HWND, anim: TransitionAnim) {
     unsafe {
-        for child in anim.hidden {
+        // Repaint the parent clip before unhiding children so WS_CLIPCHILDREN cannot trap transition pixels behind WS_EX_LAYERED SEARCH.
+        if !window.0.is_null() && IsWindow(window).as_bool() {
+            let _ = RedrawWindow(
+                window,
+                Some(&anim.clip),
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW,
+            );
+        }
+        for &child in &anim.hidden {
             set_child_visible_no_redraw(child, true);
         }
         if let Some(target) = anim.restore_focus
@@ -1279,13 +1296,15 @@ fn end_transition(window: HWND, anim: TransitionAnim) {
         {
             let _ = SetFocus(target);
         }
-        if !window.0.is_null() && IsWindow(window).as_bool() {
-            let _ = RedrawWindow(
-                window,
-                Some(&anim.clip),
-                None,
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
-            );
+        for &child in &anim.hidden {
+            if !child.0.is_null() && IsWindow(child).as_bool() {
+                let _ = RedrawWindow(
+                    child,
+                    None,
+                    None,
+                    RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW,
+                );
+            }
         }
     }
     drop(anim.old_layer);
@@ -3018,51 +3037,11 @@ unsafe fn sync_search_alpha(parent: HWND, search: HWND) {
     }
 }
 
-pub fn enable_backdrop(window: HWND) -> bool {
+unsafe fn apply_accent_acrylic(window: HWND) -> bool {
     use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
-    if window.0.is_null() {
-        return false;
-    }
-    // SAFETY: all attributes, composition flags, and properties belong to this window HWND.
+    // SAFETY: window is a live HWND; DWM calls and transient blur region stay on UI thread.
     unsafe {
-        let dark = 1i32;
-        let round = DWMWCP_ROUND.0;
         let auto = DWMSBT_AUTO.0;
-        let acrylic = DWMSBT_TRANSIENTWINDOW.0;
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            (&dark as *const i32).cast(),
-            std::mem::size_of_val(&dark) as u32,
-        );
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            (&round as *const i32).cast(),
-            std::mem::size_of_val(&round) as u32,
-        );
-        let can_glass = PAINT_RUNTIME.with(|runtime| runtime.initialized)
-            && user_acrylic_enabled()
-            && transparency_enabled()
-            && DwmIsCompositionEnabled().is_ok_and(|value| value.as_bool());
-        if !can_glass {
-            disable_backdrop(window);
-            return false;
-        }
-        let disable_transitions = 1i32;
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_TRANSITIONS_FORCEDISABLED,
-            (&disable_transitions as *const i32).cast(),
-            std::mem::size_of_val(&disable_transitions) as u32,
-        );
-        if glass_enabled(window) {
-            let _ = set_acrylic_composition(window, true);
-            if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
-                sync_search_alpha(window, search);
-            }
-            return true;
-        }
         // Reset Win11 SystemBackdrop (DWMSBT_AUTO) and client frame margins to {0} so DWM does not
         // replace Acrylic with solid active black or inactive #2B2B2B grey; enable per-pixel client
         // alpha via DwmEnableBlurBehindWindow + SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND).
@@ -3084,15 +3063,129 @@ pub fn enable_backdrop(window: HWND) -> bool {
         if !region.0.is_null() {
             let _ = DeleteObject(region);
         }
-        let backdrop_ok = blur_ok
-            && (set_acrylic_composition(window, true)
-                || DwmSetWindowAttribute(
-                    window,
-                    DWMWA_SYSTEMBACKDROP_TYPE,
-                    (&acrylic as *const i32).cast(),
-                    std::mem::size_of_val(&acrylic) as u32,
-                )
-                .is_ok());
+        blur_ok && set_acrylic_composition(window, true)
+    }
+}
+
+unsafe fn apply_hybrid_acrylic(window: HWND) -> bool {
+    use windows::Win32::Graphics::Dwm::*;
+    // SAFETY: window is a live HWND; falls back to DWMSBT_TRANSIENTWINDOW only if AccentPolicy fails.
+    unsafe {
+        if apply_accent_acrylic(window) {
+            return true;
+        }
+        let acrylic = DWMSBT_TRANSIENTWINDOW.0;
+        DwmSetWindowAttribute(
+            window,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&acrylic as *const i32).cast(),
+            std::mem::size_of_val(&acrylic) as u32,
+        )
+        .is_ok()
+    }
+}
+
+pub fn begin_backdrop_transition(window: HWND) {
+    use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
+    if window.0.is_null() {
+        return;
+    }
+    // SAFETY: switches DWM to native DWMSBT_TRANSIENTWINDOW for minimize/restore transition while preserving GLASS_PROPERTY.
+    unsafe {
+        if !glass_enabled(window) || !user_acrylic_enabled() || !transparency_enabled() {
+            return;
+        }
+        let _ = set_acrylic_composition(window, false);
+        let blur = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE,
+            fEnable: false.into(),
+            ..Default::default()
+        };
+        let _ = DwmEnableBlurBehindWindow(window, &blur);
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(window, &margins);
+        let acrylic = DWMSBT_TRANSIENTWINDOW.0;
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&acrylic as *const i32).cast(),
+            std::mem::size_of_val(&acrylic) as u32,
+        );
+    }
+}
+
+pub fn finish_backdrop_transition(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND once restore animation finishes.
+    unsafe {
+        if IsIconic(window).as_bool() {
+            return;
+        }
+        if glass_enabled(window) && user_acrylic_enabled() && transparency_enabled() {
+            if apply_accent_acrylic(window) {
+                if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
+                    sync_search_alpha(window, search);
+                }
+            } else {
+                let _ = enable_backdrop(window);
+            }
+        } else {
+            let _ = enable_backdrop(window);
+        }
+    }
+}
+
+pub fn enable_backdrop(window: HWND) -> bool {
+    use windows::Win32::Graphics::Dwm::*;
+    if window.0.is_null() {
+        return false;
+    }
+    // SAFETY: all attributes, composition flags, and properties belong to this window HWND.
+    unsafe {
+        let dark = 1i32;
+        let round = DWMWCP_ROUND.0;
+        let allow_transitions = 0i32;
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const i32).cast(),
+            std::mem::size_of_val(&dark) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&round as *const i32).cast(),
+            std::mem::size_of_val(&round) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            window,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            (&allow_transitions as *const i32).cast(),
+            std::mem::size_of_val(&allow_transitions) as u32,
+        );
+        let can_glass = PAINT_RUNTIME.with(|runtime| runtime.initialized)
+            && user_acrylic_enabled()
+            && transparency_enabled()
+            && DwmIsCompositionEnabled().is_ok_and(|value| value.as_bool());
+        if !can_glass {
+            disable_backdrop(window);
+            return false;
+        }
+        if glass_enabled(window) {
+            let _ = apply_hybrid_acrylic(window);
+            if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
+                sync_search_alpha(window, search);
+            }
+            return true;
+        }
+        let backdrop_ok = apply_hybrid_acrylic(window);
         let enabled = backdrop_ok
             && SetPropW(
                 window,
@@ -4268,7 +4361,7 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
     // SAFETY: native control requests a persistent UI-owned brush, deleted only after windows close.
     unsafe {
         let id = GetDlgCtrlID(window) as usize;
-        if id == 113 {
+        if matches!(id, 113 | SEARCH) {
             SetBkMode(dc, OPAQUE);
         } else {
             SetBkMode(dc, TRANSPARENT);
@@ -5091,6 +5184,129 @@ mod tests {
             SelectObject(dc, prev);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn backdrop_transition_handles_null_hwnd_safely() {
+        begin_backdrop_transition(HWND::default());
+        finish_backdrop_transition(HWND::default());
+        assert!(!glass_enabled(HWND::default()));
+    }
+
+    #[test]
+    fn search_control_print_opaque_bkmode_and_end_transition_show() {
+        // SAFETY: hidden WS_POPUP parent and child EDIT live only on this thread and are destroyed before returning.
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                240,
+                80,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("test parent");
+            let search = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                16,
+                16,
+                180,
+                32,
+                parent,
+                HMENU(SEARCH as *mut _),
+                None,
+                None,
+            )
+            .expect("test search edit");
+            prepare_control(search).expect("prepare search control");
+
+            let dc = CreateCompatibleDC(None);
+            let _ = SetBkMode(dc, TRANSPARENT);
+            assert!(control_colors(WM_CTLCOLOREDIT, dc, search).is_some());
+            assert_eq!(GetBkColor(dc), rgb(CARD));
+            assert_ne!(SetBkMode(dc, TRANSPARENT), TRANSPARENT.0 as i32);
+            let _ = DeleteDC(dc);
+
+            let layer = capture_region_controls(parent, rect(0, 0, 240, 80), &[(SEARCH, search)])
+                .expect("captured search layer");
+            let inside = layer.pixels[(32 * 240 + 150) as usize];
+            assert_eq!(inside, (255u32 << 24) | CARD);
+
+            assert_eq!(GetWindowLongW(search, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            end_transition(
+                parent,
+                TransitionAnim {
+                    clip: rect(0, 0, 240, 80),
+                    direction: 1,
+                    start: Instant::now(),
+                    duration_ms: 1,
+                    old_layer: CapturedLayer {
+                        pixels: vec![0; 240 * 80],
+                        width: 240,
+                        height: 80,
+                    },
+                    new_layer: CapturedLayer {
+                        pixels: vec![0; 240 * 80],
+                        width: 240,
+                        height: 80,
+                    },
+                    hidden: vec![search],
+                    restore_focus: None,
+                    covers_body: false,
+                },
+            );
+            assert_ne!(GetWindowLongW(search, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+
+            let child_dc = CreateCompatibleDC(None);
+            let mut child_bits = std::ptr::null_mut();
+            let child_bmp = CreateDIBSection(
+                child_dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: 240,
+                        biHeight: -80,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut child_bits,
+                None,
+                0,
+            )
+            .expect("child test DIB");
+            let prev_bmp = SelectObject(child_dc, child_bmp);
+            std::slice::from_raw_parts_mut(child_bits as *mut u32, 240 * 80).fill(0);
+            paint_children_into(
+                parent,
+                child_dc,
+                &[(SEARCH, search)],
+                None,
+                Some((child_bits as *mut u32, 240, 80)),
+            );
+            let _ = GdiFlush();
+            let child_px = std::slice::from_raw_parts(child_bits as *const u32, 240 * 80);
+            assert_eq!(child_px[0], 0);
+            assert_eq!(child_px[32 * 240 + 150], (255u32 << 24) | CARD);
+            SelectObject(child_dc, prev_bmp);
+            let _ = DeleteObject(child_bmp);
+            let _ = DeleteDC(child_dc);
+
+            let _ = DestroyWindow(parent);
         }
     }
 }

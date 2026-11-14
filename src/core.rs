@@ -319,30 +319,23 @@ pub fn validate_path_syntax(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-pub fn supported_extension(path: &Path) -> bool {
+fn extension_lowercase(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+}
+pub fn live_extension(path: &Path) -> bool {
     matches!(
-        path.extension()
-            .and_then(|s| s.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some(
-            "mp4"
-                | "gif"
-                | "mkv"
-                | "webm"
-                | "mov"
-                | "avi"
-                | "mpg"
-                | "mpeg"
-                | "m4v"
-                | "apng"
-                | "png"
-                | "jpg"
-                | "jpeg"
-                | "bmp"
-                | "webp"
-        )
+        extension_lowercase(path).as_deref(),
+        Some("mp4" | "gif" | "mkv" | "webm" | "mov" | "avi" | "mpg" | "mpeg" | "m4v" | "apng")
     )
+}
+pub fn supported_extension(path: &Path) -> bool {
+    live_extension(path)
+        || matches!(
+            extension_lowercase(path).as_deref(),
+            Some("png" | "jpg" | "jpeg" | "bmp" | "webp")
+        )
 }
 pub fn validate_media(path: &Path) -> Result<PathBuf, String> {
     validate_path_syntax(path)?;
@@ -572,6 +565,26 @@ mod tests {
             assert!(!supported_extension(Path::new(&format!(
                 "wallpaper.{extension}"
             ))));
+        }
+    }
+
+    #[test]
+    fn live_extensions_exclude_static_images() {
+        for extension in [
+            "mp4", "MP4", "GIF", "mkv", "webm", "mov", "avi", "mpg", "mpeg", "m4v", "apng",
+        ] {
+            assert!(
+                live_extension(Path::new(&format!("wallpaper.{extension}"))),
+                "{extension}"
+            );
+        }
+        for extension in [
+            "jpg", "JPG", "jpeg", "JPEG", "png", "PNG", "bmp", "BMP", "webp", "WEBP", "exe",
+        ] {
+            assert!(
+                !live_extension(Path::new(&format!("preview.{extension}"))),
+                "{extension}"
+            );
         }
     }
 
