@@ -80,8 +80,9 @@ const SAWERIA_URL: &str = "https://saweria.co/BuyMatcha";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 const RESTORE_BACKDROP_TIMER_ID: usize = 4;
-const RESTORE_BACKDROP_MS: u32 = 240;
+const RESTORE_BACKDROP_MS: u32 = 340;
 const ICONIC_PROPERTY: PCWSTR = w!("WallpaperLive.Iconic");
+const SIZE_MOVE_PROPERTY: PCWSTR = w!("WallpaperLive.SizeMove");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn playback_position(playback: &Playback) -> Option<f64> {
@@ -4820,18 +4821,30 @@ unsafe extern "system" fn window_proc(
                 post(ACTION, WPARAM(HIDE), LPARAM(0));
                 LRESULT(0)
             }
+            WM_ENTERSIZEMOVE => {
+                let _ = SetPropW(window, SIZE_MOVE_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+                DefWindowProcW(window, message, wparam, lparam)
+            }
+            WM_EXITSIZEMOVE => {
+                let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
+                DefWindowProcW(window, message, wparam, lparam)
+            }
             WM_DESTROY => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                 let _ = RemovePropW(window, ICONIC_PROPERTY);
+                let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
+            WM_NCDESTROY => {
+                let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
+                let _ = RemovePropW(window, ICONIC_PROPERTY);
+                let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
+                DefWindowProcW(window, message, wparam, lparam)
+            }
             WM_SYSCOMMAND => {
                 let cmd = (wparam.0 & 0xfff0) as u32;
-                if cmd == SC_MINIMIZE {
-                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
-                    visuals::begin_backdrop_transition(window);
-                } else if (cmd == SC_RESTORE || cmd == SC_MAXIMIZE) && IsIconic(window).as_bool() {
+                if matches!(cmd, SC_MINIMIZE | SC_MAXIMIZE | SC_RESTORE) {
                     visuals::begin_backdrop_transition(window);
                     let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                 }
@@ -4847,9 +4860,9 @@ unsafe extern "system" fn window_proc(
                 let iconic = IsIconic(window).as_bool();
                 if !iconic && pos.x <= -30000 && pos.y <= -30000 {
                     if !visuals::backdrop_transition_active(window) {
-                        let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                         visuals::begin_backdrop_transition(window);
                     }
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                 } else if iconic
                     && (pos.flags.0 & SWP_HIDEWINDOW.0 == 0)
                     && (pos.flags.0 & SWP_SHOWWINDOW.0 != 0
@@ -4863,6 +4876,26 @@ unsafe extern "system" fn window_proc(
                         pos.flags |= SWP_NOCOPYBITS;
                     }
                 } else if !iconic && (pos.flags.0 & SWP_NOSIZE.0) == 0 {
+                    if (pos.flags.0 & SWP_HIDEWINDOW.0) == 0
+                        && GetPropW(window, SIZE_MOVE_PROPERTY).0.is_null()
+                    {
+                        let mut rect = RECT::default();
+                        if GetWindowRect(window, &mut rect).is_ok() {
+                            let cur_w = rect.right - rect.left;
+                            let cur_h = rect.bottom - rect.top;
+                            if pos.cx != cur_w || pos.cy != cur_h {
+                                if !visuals::backdrop_transition_active(window) {
+                                    visuals::begin_backdrop_transition(window);
+                                }
+                                let _ = SetTimer(
+                                    window,
+                                    RESTORE_BACKDROP_TIMER_ID,
+                                    RESTORE_BACKDROP_MS,
+                                    None,
+                                );
+                            }
+                        }
+                    }
                     pos.flags |= SWP_NOCOPYBITS;
                 }
                 DefWindowProcW(window, message, wparam, lparam)
@@ -4870,9 +4903,11 @@ unsafe extern "system" fn window_proc(
             WM_SIZE => {
                 visuals::cancel_transition(window);
                 if wparam.0 == SIZE_MINIMIZED as usize {
-                    let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                     let _ = SetPropW(window, ICONIC_PROPERTY, HANDLE(std::ptr::dangling_mut()));
-                    visuals::end_minimize_backdrop_transition(window);
+                    if visuals::backdrop_transition_active(window) {
+                        let _ =
+                            SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
+                    }
                     return LRESULT(0);
                 }
                 visuals::sync_child_positions(window);
@@ -4880,9 +4915,6 @@ unsafe extern "system" fn window_proc(
                     let was_iconic = !GetPropW(window, ICONIC_PROPERTY).0.is_null();
                     if was_iconic {
                         let _ = RemovePropW(window, ICONIC_PROPERTY);
-                    } else {
-                        let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
-                        visuals::clear_backdrop_transition(window);
                     }
                     let _ = RedrawWindow(
                         window,
@@ -4890,7 +4922,7 @@ unsafe extern "system" fn window_proc(
                         None,
                         RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
                     );
-                    if was_iconic {
+                    if was_iconic || visuals::backdrop_transition_active(window) {
                         let _ =
                             SetTimer(window, RESTORE_BACKDROP_TIMER_ID, RESTORE_BACKDROP_MS, None);
                     }
@@ -6972,6 +7004,106 @@ mod tests {
             let minimize_flags = send_pos(-32000, -32000, 160, 28, SWP_NOZORDER | SWP_NOACTIVATE);
             assert_eq!(minimize_flags.0 & SWP_NOCOPYBITS.0, 0);
             visuals::clear_backdrop_transition(hwnd);
+
+            let _ = DestroyWindow(hwnd);
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
+            if atom != 0 {
+                let _ = UnregisterClassW(class_name, instance);
+            }
+        }
+    }
+
+    #[test]
+    fn backdrop_transition_stays_active_across_state_changes_and_clears_on_timer() {
+        assert_eq!(RESTORE_BACKDROP_MS, 340);
+        // SAFETY: isolated hidden test window registered and destroyed solely within this test.
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("module handle");
+            let class_name = w!("WallpaperLive.BackdropTransitionCoordTest");
+            let atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            });
+            assert!(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+            let hwnd = CreateWindowExW(
+                WS_EX_CONTROLPARENT | WS_EX_NOACTIVATE,
+                class_name,
+                w!("WallpaperLive Backdrop Transition Coord Test"),
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                100,
+                100,
+                1040,
+                720,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("backdrop transition test window");
+
+            let send_pos = |x, y, cx, cy, flags| {
+                let mut pos = WINDOWPOS {
+                    hwnd,
+                    hwndInsertAfter: HWND::default(),
+                    x,
+                    y,
+                    cx,
+                    cy,
+                    flags,
+                };
+                assert_eq!(
+                    SendMessageW(
+                        hwnd,
+                        WM_WINDOWPOSCHANGING,
+                        WPARAM(0),
+                        LPARAM((&mut pos as *mut WINDOWPOS) as isize),
+                    ),
+                    LRESULT(0)
+                );
+            };
+
+            assert!(GetPropW(hwnd, SIZE_MOVE_PROPERTY).0.is_null());
+            let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
+            assert!(!GetPropW(hwnd, SIZE_MOVE_PROPERTY).0.is_null());
+            let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
+            assert!(GetPropW(hwnd, SIZE_MOVE_PROPERTY).0.is_null());
+
+            if visuals::enable_backdrop(hwnd) {
+                // Interactive border drag must not activate transition backdrop.
+                let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
+                send_pos(100, 100, 1180, 780, SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(!visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
+
+                // Non-drag size change activates transition backdrop; WM_SIZE preserves it
+                // until RESTORE_BACKDROP_TIMER_ID fires.
+                send_pos(0, 0, 1400, 900, SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_MAXIMIZED as usize), LPARAM(0));
+                assert!(visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_RESTORED as usize), LPARAM(0));
+                assert!(visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(RESTORE_BACKDROP_TIMER_ID), LPARAM(0));
+                assert!(!visuals::backdrop_transition_active(hwnd));
+
+                // Minimize keeps transition backdrop active across SIZE_MINIMIZED and
+                // subsequent SIZE_RESTORED until RESTORE_BACKDROP_TIMER_ID fires.
+                send_pos(-32000, -32000, 160, 28, SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_MINIMIZED as usize), LPARAM(0));
+                assert!(!GetPropW(hwnd, ICONIC_PROPERTY).0.is_null());
+                assert!(visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_SIZE, WPARAM(SIZE_RESTORED as usize), LPARAM(0));
+                assert!(GetPropW(hwnd, ICONIC_PROPERTY).0.is_null());
+                assert!(visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(RESTORE_BACKDROP_TIMER_ID), LPARAM(0));
+                assert!(!visuals::backdrop_transition_active(hwnd));
+
+                visuals::disable_backdrop(hwnd);
+            }
 
             let _ = DestroyWindow(hwnd);
             let mut msg = MSG::default();

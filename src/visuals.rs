@@ -352,9 +352,9 @@ pub const BORDER_ALPHA: u8 = 185;
 const DIVIDER_ALPHA: u8 = 136;
 const SEARCH_ALPHA: u8 = 255;
 pub const DROPDOWN_ALPHA: u8 = 116;
-// Warm-stone Acrylic tint (ABGR: AA=0x14, B=0x4e, G=0x51, R=0x53; Y~81) avoids Win11 DWM's
-// ~90% dark Luminosity crush so idle frosted glass stays bright while MUTED keeps >= 4.5:1 over white.
-const ACRYLIC_TINT_COLOR: u32 = 0x144e_5153;
+// Cool-neutral slate Acrylic tint (ABGR: AA=0x14, B=0x50=80, G=0x4e=78, R=0x4d=77) matches
+// idle Win11 DWM Acrylic (~70, 70, 72 with R-B = -2..-3) while MUTED keeps >= 4.5:1 over white.
+const ACRYLIC_TINT_COLOR: u32 = 0x1450_4e4d;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -648,7 +648,7 @@ fn anim_interval_ms() -> u32 {
         let ms = (info.rateRefresh.uiDenominator as f64 * 1000.0
             / info.rateRefresh.uiNumerator as f64)
             .floor() as u32;
-        return ms.clamp(6, 16);
+        return ms.clamp(8, 16);
     }
     16
 }
@@ -999,10 +999,14 @@ unsafe fn paint_children_with_visibility(
                                 if bits.is_null() || w <= 0 || h <= 0 {
                                     return None;
                                 }
-                                let x0 = child_rect.left.max(0);
-                                let y0 = child_rect.top.max(0);
-                                let x1 = child_rect.right.min(w);
-                                let y1 = child_rect.bottom.min(h);
+                                let (cx0, cy0, cx1, cy1) = match filter_clip {
+                                    Some(clip) => (clip.left, clip.top, clip.right, clip.bottom),
+                                    None => (0, 0, w, h),
+                                };
+                                let x0 = child_rect.left.max(0).max(cx0);
+                                let y0 = child_rect.top.max(0).max(cy0);
+                                let x1 = child_rect.right.min(w).min(cx1);
+                                let y1 = child_rect.bottom.min(h).min(cy1);
                                 (x1 > x0 && y1 > y0).then_some((bits, w, h, x0, y0, x1, y1))
                             });
                             if let Some((bits, w, h, x0, y0, x1, y1)) = bounds {
@@ -1082,6 +1086,9 @@ unsafe fn paint_children_with_visibility(
                 }
             }
             let state = SaveDC(dc);
+            if let Some(clip) = filter_clip {
+                let _ = IntersectClipRect(dc, clip.left, clip.top, clip.right, clip.bottom);
+            }
             let _ = SetViewportOrgEx(dc, child_rect.left, child_rect.top, None);
             let clip_rgn = CreateRectRgn(0, 0, 0, 0);
             if GetWindowRgn(child, clip_rgn).0 != ERROR {
@@ -1157,7 +1164,15 @@ pub fn capture_region(
         let prev = SelectObject(dc, bitmap);
         let total = (client.right * client.bottom) as usize;
         std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
-        paint_into(window, dc);
+        struct CaptureRegionGuard(bool);
+        impl Drop for CaptureRegionGuard {
+            fn drop(&mut self) {
+                IN_CAPTURE_REGION.with(|c| c.set(self.0));
+            }
+        }
+        let _capture_guard = CaptureRegionGuard(IN_CAPTURE_REGION.with(|c| c.replace(true)));
+        paint_into_rect(window, dc, Some(bounds));
+        drop(_capture_guard);
         let require_visible = CAPTURE_REQUIRE_VISIBLE.with(Cell::get);
         paint_children_with_visibility(
             window,
@@ -1391,7 +1406,12 @@ pub fn tick_animations(window: HWND) -> bool {
         if let Some(anim) = finished_transition {
             end_transition(window, anim);
         } else if let Some(clip) = transition_clip {
-            let _ = RedrawWindow(window, Some(&clip), None, RDW_INVALIDATE | RDW_UPDATENOW);
+            let _ = RedrawWindow(
+                window,
+                Some(&clip),
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN,
+            );
         }
     }
     disarm_timer_if_idle(window);
@@ -1448,6 +1468,75 @@ struct TransitionBackdrop {
     width: i32,
     height: i32,
     pixels: Vec<u32>,
+    raw_pixels: Vec<u32>,
+    raw_mon_rect: RECT,
+    wallpaper_key: Option<PathBuf>,
+}
+
+#[inline(always)]
+fn div255_round(v: u32) -> u32 {
+    let q = v + 127;
+    (q + 1 + (q >> 8)) >> 8
+}
+
+#[inline(always)]
+fn sample_row_subpixel(row: &[u32], width: i32, sx_fp: i32) -> (u32, u32, u32, u32) {
+    let x0 = sx_fp >> 8;
+    if x0 + 1 < 0 || x0 >= width {
+        return (0, 0, 0, 0);
+    }
+    let fx = (sx_fp & 255) as u32;
+    let p0 = if x0 >= 0 && x0 < width {
+        row[x0 as usize]
+    } else {
+        0
+    };
+    if fx == 0 {
+        return (
+            (p0 >> 16) & 255,
+            (p0 >> 8) & 255,
+            p0 & 255,
+            (p0 >> 24) & 255,
+        );
+    }
+    let p1 = if x0 + 1 >= 0 && x0 + 1 < width {
+        row[(x0 + 1) as usize]
+    } else {
+        0
+    };
+    if (p0 | p1) == 0 {
+        return (0, 0, 0, 0);
+    }
+    let inv = 256 - fx;
+    (
+        (((p0 >> 16) & 255) * inv + ((p1 >> 16) & 255) * fx + 128) >> 8,
+        (((p0 >> 8) & 255) * inv + ((p1 >> 8) & 255) * fx + 128) >> 8,
+        ((p0 & 255) * inv + (p1 & 255) * fx + 128) >> 8,
+        (((p0 >> 24) & 255) * inv + ((p1 >> 24) & 255) * fx + 128) >> 8,
+    )
+}
+
+#[inline(always)]
+fn write_transition_pixel(
+    pixel: &mut RGBQUAD,
+    mut fr: u32,
+    mut fg: u32,
+    mut fb: u32,
+    mut fa: u32,
+    glass_active: bool,
+) {
+    if !glass_active {
+        let inv = 255 - fa;
+        fr = (fr + div255_round(u32::from(pixel.rgbRed) * inv)).min(255);
+        fg = (fg + div255_round(u32::from(pixel.rgbGreen) * inv)).min(255);
+        fb = (fb + div255_round(u32::from(pixel.rgbBlue) * inv)).min(255);
+        fa = 255;
+    }
+    let out_a = fa as u8;
+    pixel.rgbRed = fr.min(fa) as u8;
+    pixel.rgbGreen = fg.min(fa) as u8;
+    pixel.rgbBlue = fb.min(fa) as u8;
+    pixel.rgbReserved = out_a;
 }
 
 struct PaintRuntime {
@@ -1477,6 +1566,7 @@ thread_local! {
     static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
     static TRANSITION_BACKDROP: RefCell<TransitionBackdrop> = RefCell::new(TransitionBackdrop::default());
     static SYNCED_LAYOUT: Cell<Option<(isize, i32, i32, i32)>> = const { Cell::new(None) };
+    static IN_CAPTURE_REGION: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn set_user_acrylic(enabled: bool) {
@@ -1491,9 +1581,20 @@ struct PaintBuffer {
     target: HDC,
     dc: HDC,
     area: RECT,
+    window_hwnd: isize,
+    client_origin: Option<POINT>,
 }
 impl PaintBuffer {
     unsafe fn new(target: HDC, area: RECT) -> Option<Self> {
+        // SAFETY: forwards to buffered paint initialization without attached root window override.
+        unsafe { Self::new_for_window(target, area, 0, None) }
+    }
+    unsafe fn new_for_window(
+        target: HDC,
+        area: RECT,
+        window_hwnd: isize,
+        client_origin: Option<POINT>,
+    ) -> Option<Self> {
         if target.0.is_null()
             || area.right <= area.left
             || area.bottom <= area.top
@@ -1523,6 +1624,8 @@ impl PaintBuffer {
             target,
             dc,
             area,
+            window_hwnd,
+            client_origin,
         })
     }
     unsafe fn opaque(&self) -> bool {
@@ -1531,6 +1634,13 @@ impl PaintBuffer {
     unsafe fn tint_background(&self, area: RECT, alpha: u8) -> bool {
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
+        let y0 = area.top.max(self.area.top);
+        let y1 = area.bottom.min(self.area.bottom);
+        let x0 = area.left.max(self.area.left);
+        let x1 = area.right.min(self.area.right);
+        if y0 >= y1 || x0 >= x1 {
+            return true;
+        }
         let mut bits = std::ptr::null_mut();
         let mut stride = 0;
         if unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
@@ -1548,11 +1658,10 @@ impl PaintBuffer {
         };
         // SAFETY: GetBufferedPaintBits owns stride * buffer height RGBQUADs until EndBufferedPaint.
         let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
-        for y in area.top.max(self.area.top)..area.bottom.min(self.area.bottom) {
-            for x in area.left.max(self.area.left)..area.right.min(self.area.right) {
-                let i =
-                    (y - self.area.top) as usize * stride as usize + (x - self.area.left) as usize;
-                let pixel = &mut pixels[i];
+        for y in y0..y1 {
+            let row = (y - self.area.top) as usize * stride as usize;
+            for x in x0..x1 {
+                let pixel = &mut pixels[row + (x - self.area.left) as usize];
                 if pixel.rgbReserved == 0 {
                     pixel.rgbBlue = premul_channel(pixel.rgbBlue, alpha);
                     pixel.rgbGreen = premul_channel(pixel.rgbGreen, alpha);
@@ -1566,6 +1675,13 @@ impl PaintBuffer {
     unsafe fn clear_alpha(&self, area: RECT) -> bool {
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
+        let y0 = area.top.max(self.area.top);
+        let y1 = area.bottom.min(self.area.bottom);
+        let x0 = area.left.max(self.area.left);
+        let x1 = area.right.min(self.area.right);
+        if y0 >= y1 || x0 >= x1 {
+            return true;
+        }
         let mut bits = std::ptr::null_mut();
         let mut stride = 0;
         if unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
@@ -1582,9 +1698,9 @@ impl PaintBuffer {
             return false;
         };
         let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
-        for y in area.top.max(self.area.top)..area.bottom.min(self.area.bottom) {
+        for y in y0..y1 {
             let row = (y - self.area.top) as usize * stride as usize;
-            for x in area.left.max(self.area.left)..area.right.min(self.area.right) {
+            for x in x0..x1 {
                 pixels[row + (x - self.area.left) as usize].rgbReserved = 0;
             }
         }
@@ -1848,7 +1964,11 @@ impl PaintBuffer {
         let height = self.area.bottom - self.area.top;
         let tw = track.right - track.left;
         let th = track.bottom - track.top;
-        if width <= 0 || height <= 0 || tw <= 4 || th <= 4 {
+        let y0 = (track.top - 1).max(self.area.top);
+        let y1 = (track.bottom + 2).min(self.area.bottom);
+        let x0 = (track.left - 1).max(self.area.left);
+        let x1 = (track.right + 1).min(self.area.right);
+        if width <= 0 || height <= 0 || tw <= 4 || th <= 4 || y0 >= y1 || x0 >= x1 {
             return true;
         }
         let mut bits = std::ptr::null_mut();
@@ -1936,10 +2056,6 @@ impl PaintBuffer {
                 (src_a + dst_a * inv).clamp(0.0, 255.0),
             )
         };
-        let y0 = (track.top - 1).max(self.area.top);
-        let y1 = (track.bottom + 2).min(self.area.bottom);
-        let x0 = (track.left - 1).max(self.area.left);
-        let x1 = (track.right + 1).min(self.area.right);
         for y in y0..y1 {
             let row = (y - self.area.top) as usize * stride as usize;
             let py = (y - track.top) as f32 + 0.5;
@@ -2029,6 +2145,13 @@ impl PaintBuffer {
     ) -> bool {
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
+        let y0 = trans.clip.top.max(self.area.top);
+        let y1 = trans.clip.bottom.min(self.area.bottom);
+        let x0 = trans.clip.left.max(self.area.left);
+        let x1 = trans.clip.right.min(self.area.right);
+        if y0 >= y1 || x0 >= x1 {
+            return true;
+        }
         let mut bits = std::ptr::null_mut();
         let mut stride = 0;
         if width <= 0
@@ -2069,58 +2192,111 @@ impl PaintBuffer {
         let w_old = ((1.0 - old_ease) * 256.0).round().clamp(0.0, 256.0) as u32;
         let w_new = (ease * 256.0).round().clamp(0.0, 256.0) as u32;
         let w_sum = (w_old + w_new).max(256);
-        let sample_subpixel_x =
-            |layer: &CapturedLayer, lx_fp: i32, ly: i32| -> (u32, u32, u32, u32) {
-                if ly < 0 || ly >= layer.height {
-                    return (0, 0, 0, 0);
+        let sx_old_start = ((x0 - trans.clip.left) << 8) - dx_old_fp;
+        let sx_new_start = ((x0 - trans.clip.left) << 8) - dx_new_fp;
+        let col_start = (x0 - self.area.left) as usize;
+        let row_len = (x1 - x0) as usize;
+        if w_old == 0 {
+            for y in y0..y1 {
+                let dst_start = (y - self.area.top) as usize * stride as usize + col_start;
+                let row_pixels = &mut pixels[dst_start..dst_start + row_len];
+                let ly = y - trans.clip.top;
+                if ly < 0 || ly >= trans.new_layer.height {
+                    if glass_active {
+                        row_pixels.fill(RGBQUAD::default());
+                    } else {
+                        for pixel in row_pixels {
+                            pixel.rgbReserved = 255;
+                        }
+                    }
+                    continue;
                 }
-                let x0 = lx_fp >> 8;
-                let fx = (lx_fp & 255) as u32;
-                let inv = 256u32 - fx;
-                let row = (ly * layer.width) as usize;
-                let p0 = if x0 >= 0 && x0 < layer.width {
-                    layer.pixels[row + x0 as usize]
+                let new_row = &trans.new_layer.pixels[(ly * trans.new_layer.width) as usize..];
+                let mut sx_new = sx_new_start;
+                if w_new == 256 {
+                    for pixel in row_pixels {
+                        let (nr, ng, nb, na) =
+                            sample_row_subpixel(new_row, trans.new_layer.width, sx_new);
+                        sx_new += 256;
+                        if (nr | ng | nb | na) == 0 {
+                            if glass_active {
+                                *pixel = RGBQUAD::default();
+                            } else {
+                                pixel.rgbReserved = 255;
+                            }
+                        } else {
+                            write_transition_pixel(pixel, nr, ng, nb, na, glass_active);
+                        }
+                    }
                 } else {
-                    0
-                };
-                let p1 = if x0 + 1 >= 0 && x0 + 1 < layer.width {
-                    layer.pixels[row + (x0 + 1) as usize]
-                } else {
-                    0
-                };
-                let mix_ch = |shift: u32| -> u32 {
-                    (((p0 >> shift) & 255) * inv + ((p1 >> shift) & 255) * fx + 128) >> 8
-                };
-                (mix_ch(16), mix_ch(8), mix_ch(0), mix_ch(24))
-            };
-        let y0 = trans.clip.top.max(self.area.top);
-        let y1 = trans.clip.bottom.min(self.area.bottom);
-        let x0 = trans.clip.left.max(self.area.left);
-        let x1 = trans.clip.right.min(self.area.right);
-        for y in y0..y1 {
-            let row = (y - self.area.top) as usize * stride as usize;
-            let ly = y - trans.clip.top;
-            for x in x0..x1 {
-                let lx_fp = (x - trans.clip.left) << 8;
-                let (or, og, ob, oa) = sample_subpixel_x(&trans.old_layer, lx_fp - dx_old_fp, ly);
-                let (nr, ng, nb, na) = sample_subpixel_x(&trans.new_layer, lx_fp - dx_new_fp, ly);
-                let mut fr = (or * w_old + nr * w_new + w_sum / 2) / w_sum;
-                let mut fg = (og * w_old + ng * w_new + w_sum / 2) / w_sum;
-                let mut fb = (ob * w_old + nb * w_new + w_sum / 2) / w_sum;
-                let mut fa = ((oa * w_old + na * w_new + w_sum / 2) / w_sum).min(255);
-                let pixel = &mut pixels[row + (x - self.area.left) as usize];
-                if !glass_active {
-                    let inv = 255u32.saturating_sub(fa);
-                    fr = (fr + ((u32::from(pixel.rgbRed) * inv + 127) / 255)).min(255);
-                    fg = (fg + ((u32::from(pixel.rgbGreen) * inv + 127) / 255)).min(255);
-                    fb = (fb + ((u32::from(pixel.rgbBlue) * inv + 127) / 255)).min(255);
-                    fa = 255;
+                    for pixel in row_pixels {
+                        let (nr, ng, nb, na) =
+                            sample_row_subpixel(new_row, trans.new_layer.width, sx_new);
+                        sx_new += 256;
+                        if (nr | ng | nb | na) == 0 {
+                            if glass_active {
+                                *pixel = RGBQUAD::default();
+                            } else {
+                                pixel.rgbReserved = 255;
+                            }
+                        } else {
+                            let fr = (nr * w_new + 128) >> 8;
+                            let fg = (ng * w_new + 128) >> 8;
+                            let fb = (nb * w_new + 128) >> 8;
+                            let fa = ((na * w_new + 128) >> 8).min(255);
+                            write_transition_pixel(pixel, fr, fg, fb, fa, glass_active);
+                        }
+                    }
                 }
-                let out_a = fa as u8;
-                pixel.rgbRed = fr.min(fa) as u8;
-                pixel.rgbGreen = fg.min(fa) as u8;
-                pixel.rgbBlue = fb.min(fa) as u8;
-                pixel.rgbReserved = out_a;
+            }
+        } else {
+            let half_w = w_sum >> 1;
+            for y in y0..y1 {
+                let dst_start = (y - self.area.top) as usize * stride as usize + col_start;
+                let row_pixels = &mut pixels[dst_start..dst_start + row_len];
+                let ly = y - trans.clip.top;
+                let old_row = (ly >= 0 && ly < trans.old_layer.height)
+                    .then(|| &trans.old_layer.pixels[(ly * trans.old_layer.width) as usize..]);
+                let new_row = (ly >= 0 && ly < trans.new_layer.height)
+                    .then(|| &trans.new_layer.pixels[(ly * trans.new_layer.width) as usize..]);
+                let mut sx_old = sx_old_start;
+                let mut sx_new = sx_new_start;
+                for pixel in row_pixels {
+                    let (or, og, ob, oa) = match old_row {
+                        Some(row) => sample_row_subpixel(row, trans.old_layer.width, sx_old),
+                        None => (0, 0, 0, 0),
+                    };
+                    let (nr, ng, nb, na) = match new_row {
+                        Some(row) => sample_row_subpixel(row, trans.new_layer.width, sx_new),
+                        None => (0, 0, 0, 0),
+                    };
+                    sx_old += 256;
+                    sx_new += 256;
+                    if (oa | na | or | og | ob | nr | ng | nb) == 0 {
+                        if glass_active {
+                            *pixel = RGBQUAD::default();
+                        } else {
+                            pixel.rgbReserved = 255;
+                        }
+                        continue;
+                    }
+                    let (fr, fg, fb, fa) = if w_sum == 256 {
+                        (
+                            (or * w_old + nr * w_new + 128) >> 8,
+                            (og * w_old + ng * w_new + 128) >> 8,
+                            (ob * w_old + nb * w_new + 128) >> 8,
+                            ((oa * w_old + na * w_new + 128) >> 8).min(255),
+                        )
+                    } else {
+                        (
+                            (or * w_old + nr * w_new + half_w) / w_sum,
+                            (og * w_old + ng * w_new + half_w) / w_sum,
+                            (ob * w_old + nb * w_new + half_w) / w_sum,
+                            ((oa * w_old + na * w_new + half_w) / w_sum).min(255),
+                        )
+                    };
+                    write_transition_pixel(pixel, fr, fg, fb, fa, glass_active);
+                }
             }
         }
         true
@@ -2135,6 +2311,13 @@ impl PaintBuffer {
     ) -> bool {
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
+        let y0 = area.top.max(self.area.top);
+        let y1 = area.bottom.min(self.area.bottom);
+        let x0 = area.left.max(self.area.left);
+        let x1 = area.right.min(self.area.right);
+        if y0 >= y1 || x0 >= x1 {
+            return true;
+        }
         let mut bits = std::ptr::null_mut();
         let mut stride = 0;
         if width <= 0
@@ -2181,10 +2364,6 @@ impl PaintBuffer {
             let d4 = segment_dist(px, py, left, bottom, left, top);
             d1.min(d2).min(d3).min(d4)
         };
-        let y0 = area.top.max(self.area.top);
-        let y1 = area.bottom.min(self.area.bottom);
-        let x0 = area.left.max(self.area.left);
-        let x1 = area.right.min(self.area.right);
         for y in y0..y1 {
             let row = (y - self.area.top) as usize * stride as usize;
             let py = y as f32 + 0.5;
@@ -2274,6 +2453,9 @@ impl PaintBuffer {
         true
     }
     unsafe fn blend_transition_backdrop(&self) {
+        if IN_CAPTURE_REGION.with(Cell::get) {
+            return;
+        }
         let width = self.area.right - self.area.left;
         let height = self.area.bottom - self.area.top;
         if width <= 0 || height <= 0 {
@@ -2290,34 +2472,42 @@ impl PaintBuffer {
             }
             // SAFETY: self.target is valid for the buffered paint session until EndBufferedPaint.
             let dc_wnd = unsafe { WindowFromDC(self.target) };
-            if dc_wnd.0.is_null() {
-                return;
-            }
-            let anc = unsafe { GetAncestor(dc_wnd, GA_ROOT) };
-            let root = if anc.0.is_null() { dc_wnd } else { anc };
-            if root.0 as isize != bd.hwnd {
-                return;
-            }
-            let (ox, oy) = if dc_wnd == root {
-                (0, 0)
-            } else {
-                let mut pts = [POINT::default()];
-                unsafe {
-                    MapWindowPoints(dc_wnd, root, &mut pts);
+            let (root, ox, oy) = if !dc_wnd.0.is_null() {
+                let anc = unsafe { GetAncestor(dc_wnd, GA_ROOT) };
+                let root = if anc.0.is_null() { dc_wnd } else { anc };
+                if root.0 as isize != bd.hwnd {
+                    return;
                 }
-                (pts[0].x, pts[0].y)
-            };
-            let (win_left, win_top) = unsafe {
-                if !IsIconic(root).as_bool() && IsWindowVisible(root).as_bool() {
-                    let mut pt = POINT::default();
-                    if ClientToScreen(root, &mut pt).as_bool() {
-                        (pt.x, pt.y)
-                    } else {
-                        (bd.win_rect.left, bd.win_rect.top)
+                let (ox, oy) = if dc_wnd == root {
+                    (0, 0)
+                } else {
+                    let mut pts = [POINT::default()];
+                    unsafe {
+                        MapWindowPoints(dc_wnd, root, &mut pts);
                     }
+                    (pts[0].x, pts[0].y)
+                };
+                (root, ox, oy)
+            } else if self.window_hwnd != 0 && self.window_hwnd == bd.hwnd {
+                (HWND(self.window_hwnd as *mut _), 0, 0)
+            } else {
+                return;
+            };
+            let (win_left, win_top) = if let Some(pt) = self.client_origin {
+                (pt.x, pt.y)
+            } else if unsafe {
+                IsWindow(root).as_bool()
+                    && !IsIconic(root).as_bool()
+                    && IsWindowVisible(root).as_bool()
+            } {
+                let mut pt = POINT::default();
+                if unsafe { ClientToScreen(root, &mut pt).as_bool() } {
+                    (pt.x, pt.y)
                 } else {
                     (bd.win_rect.left, bd.win_rect.top)
                 }
+            } else {
+                (bd.win_rect.left, bd.win_rect.top)
             };
             let mut bits = std::ptr::null_mut();
             let mut stride = 0;
@@ -2338,6 +2528,13 @@ impl PaintBuffer {
             let mon_h = (bd.mon_rect.bottom - bd.mon_rect.top).max(1);
             let bw = bd.width;
             let bh = bd.height;
+            let bx_cols: Vec<usize> = (0..width)
+                .map(|x| {
+                    let sx = win_left + ox + self.area.left + x;
+                    let rel_x = (sx - bd.mon_rect.left).clamp(0, mon_w - 1);
+                    ((rel_x as i64 * bw as i64) / mon_w as i64).clamp(0, (bw - 1) as i64) as usize
+                })
+                .collect();
             // SAFETY: GetBufferedPaintBits owns stride * buffer height RGBQUADs until EndBufferedPaint.
             let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
             for y in 0..height {
@@ -2345,26 +2542,29 @@ impl PaintBuffer {
                 let rel_y = (sy - bd.mon_rect.top).clamp(0, mon_h - 1);
                 let by =
                     ((rel_y as i64 * bh as i64) / mon_h as i64).clamp(0, (bh - 1) as i64) as usize;
-                let bg_row = by * bw as usize;
+                let bg_row = &bd.pixels[by * bw as usize..(by + 1) * bw as usize];
                 let dst_row = y as usize * stride as usize;
-                for x in 0..width {
-                    let pixel = &mut pixels[dst_row + x as usize];
+                for (&bx, pixel) in bx_cols
+                    .iter()
+                    .zip(&mut pixels[dst_row..dst_row + width as usize])
+                {
                     if pixel.rgbReserved < 255 {
-                        let sx = win_left + ox + self.area.left + x;
-                        let rel_x = (sx - bd.mon_rect.left).clamp(0, mon_w - 1);
-                        let bx = ((rel_x as i64 * bw as i64) / mon_w as i64)
-                            .clamp(0, (bw - 1) as i64) as usize;
-                        let bg = bd.pixels[bg_row + bx];
-                        let bg_r = ((bg >> 16) & 255) as u16;
-                        let bg_g = ((bg >> 8) & 255) as u16;
-                        let bg_b = (bg & 255) as u16;
-                        let inv = u16::from(255 - pixel.rgbReserved);
-                        pixel.rgbRed =
-                            (u16::from(pixel.rgbRed) + (bg_r * inv + 127) / 255).min(255) as u8;
-                        pixel.rgbGreen =
-                            (u16::from(pixel.rgbGreen) + (bg_g * inv + 127) / 255).min(255) as u8;
-                        pixel.rgbBlue =
-                            (u16::from(pixel.rgbBlue) + (bg_b * inv + 127) / 255).min(255) as u8;
+                        let bg = bg_row[bx];
+                        let bg_r = (bg >> 16) & 255;
+                        let bg_g = (bg >> 8) & 255;
+                        let bg_b = bg & 255;
+                        let inv = 255 - u32::from(pixel.rgbReserved);
+                        let add_r = bg_r * inv + 127;
+                        let add_g = bg_g * inv + 127;
+                        let add_b = bg_b * inv + 127;
+                        pixel.rgbRed = (u32::from(pixel.rgbRed) + ((add_r + 1 + (add_r >> 8)) >> 8))
+                            .min(255) as u8;
+                        pixel.rgbGreen = (u32::from(pixel.rgbGreen)
+                            + ((add_g + 1 + (add_g >> 8)) >> 8))
+                            .min(255) as u8;
+                        pixel.rgbBlue = (u32::from(pixel.rgbBlue)
+                            + ((add_b + 1 + (add_b >> 8)) >> 8))
+                            .min(255) as u8;
                         pixel.rgbReserved = 255;
                     }
                 }
@@ -3314,6 +3514,40 @@ fn active_wallpaper_bitmap() -> Option<HBITMAP> {
     })
 }
 
+fn current_wallpaper_key() -> Option<PathBuf> {
+    SKIN.with(|s| s.borrow().playing.first().cloned())
+}
+
+fn map_rect_to_backdrop(
+    win_rect: RECT,
+    mon_rect: RECT,
+    backdrop_w: i32,
+    backdrop_h: i32,
+) -> Option<RECT> {
+    if backdrop_w <= 0 || backdrop_h <= 0 {
+        return None;
+    }
+    let mon_w = mon_rect.right - mon_rect.left;
+    let mon_h = mon_rect.bottom - mon_rect.top;
+    if mon_w <= 0 || mon_h <= 0 {
+        return Some(rect(0, 0, backdrop_w, backdrop_h));
+    }
+    let wl = (win_rect.left - mon_rect.left).clamp(0, mon_w);
+    let wt = (win_rect.top - mon_rect.top).clamp(0, mon_h);
+    let wr = (win_rect.right - mon_rect.left).clamp(0, mon_w);
+    let wb = (win_rect.bottom - mon_rect.top).clamp(0, mon_h);
+    if wr <= wl || wb <= wt {
+        return None;
+    }
+    let dl = (wl as i64 * backdrop_w as i64 / mon_w as i64) as i32;
+    let dt = (wt as i64 * backdrop_h as i64 / mon_h as i64) as i32;
+    let dr = ((wr as i64 * backdrop_w as i64 + mon_w as i64 - 1) / mon_w as i64)
+        .min(backdrop_w as i64) as i32;
+    let db = ((wb as i64 * backdrop_h as i64 + mon_h as i64 - 1) / mon_h as i64)
+        .min(backdrop_h as i64) as i32;
+    (dr > dl && db > dt).then_some(rect(dl, dt, dr, db))
+}
+
 fn map_backdrop_overlay_rects(
     win_rect: RECT,
     mon_rect: RECT,
@@ -3330,53 +3564,49 @@ fn map_backdrop_overlay_rects(
     if mon_w <= 0 || mon_h <= 0 {
         return Some((rect(0, 0, backdrop_w, backdrop_h), rect(0, 0, bmp_w, bmp_h)));
     }
+    let dst = map_rect_to_backdrop(win_rect, mon_rect, backdrop_w, backdrop_h)?;
     let wl = (win_rect.left - mon_rect.left).clamp(0, mon_w);
     let wt = (win_rect.top - mon_rect.top).clamp(0, mon_h);
     let wr = (win_rect.right - mon_rect.left).clamp(0, mon_w);
     let wb = (win_rect.bottom - mon_rect.top).clamp(0, mon_h);
-    if wr <= wl || wb <= wt {
-        return None;
-    }
-    let dl = (wl as i64 * backdrop_w as i64 / mon_w as i64) as i32;
-    let dt = (wt as i64 * backdrop_h as i64 / mon_h as i64) as i32;
-    let dr = ((wr as i64 * backdrop_w as i64 + mon_w as i64 - 1) / mon_w as i64)
-        .min(backdrop_w as i64) as i32;
-    let db = ((wb as i64 * backdrop_h as i64 + mon_h as i64 - 1) / mon_h as i64)
-        .min(backdrop_h as i64) as i32;
     let sl = (wl as i64 * bmp_w as i64 / mon_w as i64).clamp(0, (bmp_w - 1) as i64) as i32;
     let st = (wt as i64 * bmp_h as i64 / mon_h as i64).clamp(0, (bmp_h - 1) as i64) as i32;
     let sr = ((wr as i64 * bmp_w as i64 + mon_w as i64 - 1) / mon_w as i64)
         .clamp(sl as i64 + 1, bmp_w as i64) as i32;
     let sb = ((wb as i64 * bmp_h as i64 + mon_h as i64 - 1) / mon_h as i64)
         .clamp(st as i64 + 1, bmp_h as i64) as i32;
-    (dr > dl && db > dt).then_some((rect(dl, dt, dr, db), rect(sl, st, sr, sb)))
+    Some((dst, rect(sl, st, sr, sb)))
 }
 
 fn tint_transition_backdrop_pixel(px: u32) -> u32 {
-    let tint_a = (ACRYLIC_TINT_COLOR >> 24) & 255;
     let tint_b = (ACRYLIC_TINT_COLOR >> 16) & 255;
     let tint_g = (ACRYLIC_TINT_COLOR >> 8) & 255;
     let tint_r = ACRYLIC_TINT_COLOR & 255;
     let r = (px >> 16) & 255;
     let g = (px >> 8) & 255;
     let b = px & 255;
-    let y_px = ((77 * r + 150 * g + 29 * b + 128) >> 8) as i32;
-    let y_tint = ((77 * tint_r + 150 * tint_g + 29 * tint_b + 128) >> 8) as i32;
-    let delta = (y_tint - y_px) * 224 / 255;
+    let y_px = (77 * r + 150 * g + 29 * b + 128) >> 8;
+    let desat = |ch: u32| -> u32 { (ch * 51 + y_px * 204 + 127) / 255 };
+    let dr = desat(r);
+    let dg = desat(g);
+    let db = desat(b);
+    let y_desat = (77 * dr + 150 * dg + 29 * db + 128) >> 8;
+    let y_target = 68 + (y_px * 24 + 127) / 255;
+    let dy = y_target as i32 - y_desat as i32;
     let blend = |ch: u32, tint_ch: u32| -> u32 {
-        let shifted = (ch as i32 + delta).clamp(0, 255) as u32;
-        (shifted * (255 - tint_a) + tint_ch * tint_a + 127) / 255
+        let shifted = (ch as i32 + dy).clamp(0, 255) as u32;
+        (shifted * 219 + tint_ch * 36 + 127) / 255
     };
-    let out_r = blend(r, tint_r);
-    let out_g = blend(g, tint_g);
-    let out_b = blend(b, tint_b);
+    let out_r = blend(dr, tint_r);
+    let out_g = blend(dg, tint_g);
+    let out_b = blend(db, tint_b);
     0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b
 }
 
 unsafe fn capture_transition_backdrop(window: HWND) {
-    const BACKDROP_W: i32 = 320;
-    const BACKDROP_H: i32 = 180;
-    const BACKDROP_BLUR_RADIUS: i32 = 9;
+    const BACKDROP_W: i32 = 480;
+    const BACKDROP_H: i32 = 270;
+    const BACKDROP_BLUR_RADIUS: i32 = 5;
     // SAFETY: window is a live HWND; screen DC, memory DC, and DIB section are freed before returning.
     unsafe {
         let iconic = IsIconic(window).as_bool();
@@ -3432,20 +3662,20 @@ unsafe fn capture_transition_backdrop(window: HWND) {
             win_rect
         };
         let total = (BACKDROP_W * BACKDROP_H) as usize;
-        let overlay_bmp = if !iconic && visible {
-            active_wallpaper_bitmap()
-        } else {
-            None
-        };
-        let cache_matches = TRANSITION_BACKDROP.with(|slot| {
+        let wp_key = current_wallpaper_key();
+        let cached_raw = TRANSITION_BACKDROP.with(|slot| {
             let bd = slot.borrow();
-            bd.hwnd == window.0 as isize && bd.mon_rect == mon_rect && bd.pixels.len() == total
+            (!bd.raw_pixels.is_empty()
+                && bd.hwnd == window.0 as isize
+                && bd.raw_mon_rect == mon_rect
+                && bd.wallpaper_key == wp_key
+                && bd.raw_pixels.len() == total)
+                .then(|| bd.raw_pixels.clone())
         });
-        let should_capture = iconic || !visible || overlay_bmp.is_some() || !cache_matches;
         let mon_w = mon_rect.right - mon_rect.left;
         let mon_h = mon_rect.bottom - mon_rect.top;
-        let mut captured = None;
-        if should_capture && mon_w > 0 && mon_h > 0 {
+        let mut captured_raw: Option<Vec<u32>> = None;
+        if mon_w > 0 && mon_h > 0 {
             let screen = GetDC(None);
             if !screen.0.is_null() {
                 let mem_dc = CreateCompatibleDC(screen);
@@ -3489,74 +3719,96 @@ unsafe fn capture_transition_backdrop(window: HWND) {
                             )
                             .as_bool()
                             {
-                                if let Some(hbmp) = overlay_bmp {
-                                    let mut bm = BITMAP::default();
-                                    if GetObjectW(
-                                        hbmp,
-                                        std::mem::size_of::<BITMAP>() as i32,
-                                        Some((&mut bm as *mut BITMAP).cast()),
-                                    ) != 0
-                                        && bm.bmWidth > 0
-                                        && bm.bmHeight > 0
-                                    {
-                                        let bmp_dc = CreateCompatibleDC(screen);
-                                        if !bmp_dc.0.is_null() {
-                                            let old_bmp = SelectObject(bmp_dc, hbmp);
-                                            if !old_bmp.is_invalid() {
-                                                if let Some((dst, src)) = map_backdrop_overlay_rects(
-                                                    win_rect,
-                                                    mon_rect,
-                                                    BACKDROP_W,
-                                                    BACKDROP_H,
-                                                    bm.bmWidth,
-                                                    bm.bmHeight,
-                                                ) {
-                                                    let _ = SetStretchBltMode(mem_dc, HALFTONE);
-                                                    let _ = SetBrushOrgEx(mem_dc, 0, 0, None);
-                                                    let _ = StretchBlt(
-                                                        mem_dc,
-                                                        dst.left,
-                                                        dst.top,
-                                                        dst.right - dst.left,
-                                                        dst.bottom - dst.top,
-                                                        bmp_dc,
-                                                        src.left,
-                                                        src.top,
-                                                        src.right - src.left,
-                                                        src.bottom - src.top,
-                                                        SRCCOPY,
-                                                    );
-                                                }
-                                                SelectObject(bmp_dc, old_bmp);
-                                            }
-                                            let _ = DeleteDC(bmp_dc);
+                                if iconic || !visible {
+                                    let _ = GdiFlush();
+                                    captured_raw = Some(
+                                        std::slice::from_raw_parts(bits as *const u32, total)
+                                            .to_vec(),
+                                    );
+                                } else if let Some(prev_raw) = cached_raw.as_ref() {
+                                    let _ = GdiFlush();
+                                    let mut raw_buf =
+                                        std::slice::from_raw_parts(bits as *const u32, total)
+                                            .to_vec();
+                                    if let Some(dst) = map_rect_to_backdrop(
+                                        win_rect, mon_rect, BACKDROP_W, BACKDROP_H,
+                                    ) {
+                                        for y in dst.top..dst.bottom {
+                                            let row = y as usize * BACKDROP_W as usize;
+                                            let x0 = dst.left as usize;
+                                            let x1 = dst.right as usize;
+                                            raw_buf[row + x0..row + x1]
+                                                .copy_from_slice(&prev_raw[row + x0..row + x1]);
                                         }
                                     }
+                                    captured_raw = Some(raw_buf);
+                                } else {
+                                    let mut overlaid = false;
+                                    if let Some(hbmp) = active_wallpaper_bitmap() {
+                                        let mut bm = BITMAP::default();
+                                        if GetObjectW(
+                                            hbmp,
+                                            std::mem::size_of::<BITMAP>() as i32,
+                                            Some((&mut bm as *mut BITMAP).cast()),
+                                        ) != 0
+                                            && bm.bmWidth > 0
+                                            && bm.bmHeight > 0
+                                        {
+                                            let bmp_dc = CreateCompatibleDC(screen);
+                                            if !bmp_dc.0.is_null() {
+                                                let old_bmp = SelectObject(bmp_dc, hbmp);
+                                                if !old_bmp.is_invalid() {
+                                                    if let Some((dst, src)) =
+                                                        map_backdrop_overlay_rects(
+                                                            win_rect,
+                                                            mon_rect,
+                                                            BACKDROP_W,
+                                                            BACKDROP_H,
+                                                            bm.bmWidth,
+                                                            bm.bmHeight,
+                                                        )
+                                                    {
+                                                        let _ = SetStretchBltMode(mem_dc, HALFTONE);
+                                                        let _ = SetBrushOrgEx(mem_dc, 0, 0, None);
+                                                        overlaid = StretchBlt(
+                                                            mem_dc,
+                                                            dst.left,
+                                                            dst.top,
+                                                            dst.right - dst.left,
+                                                            dst.bottom - dst.top,
+                                                            bmp_dc,
+                                                            src.left,
+                                                            src.top,
+                                                            src.right - src.left,
+                                                            src.bottom - src.top,
+                                                            SRCCOPY,
+                                                        )
+                                                        .as_bool();
+                                                    }
+                                                    SelectObject(bmp_dc, old_bmp);
+                                                }
+                                                let _ = DeleteDC(bmp_dc);
+                                            }
+                                        }
+                                    }
+                                    let _ = GdiFlush();
+                                    let mut raw_buf =
+                                        std::slice::from_raw_parts(bits as *const u32, total)
+                                            .to_vec();
+                                    if !overlaid
+                                        && let Some(dst) = map_rect_to_backdrop(
+                                            win_rect, mon_rect, BACKDROP_W, BACKDROP_H,
+                                        )
+                                    {
+                                        for y in dst.top..dst.bottom {
+                                            let row = y as usize * BACKDROP_W as usize;
+                                            raw_buf
+                                                [row + dst.left as usize..row + dst.right as usize]
+                                                .fill(0xFF08_090C);
+                                        }
+                                    }
+                                    captured_raw = Some(raw_buf);
                                 }
-                                let _ = GdiFlush();
-                                let mut buf =
-                                    std::slice::from_raw_parts(bits as *const u32, total).to_vec();
-                                let mut temp = vec![0u32; total];
-                                for _ in 0..3 {
-                                    box_blur_horizontal(
-                                        &buf,
-                                        &mut temp,
-                                        BACKDROP_W,
-                                        BACKDROP_H,
-                                        BACKDROP_BLUR_RADIUS,
-                                    );
-                                    box_blur_vertical(
-                                        &temp,
-                                        &mut buf,
-                                        BACKDROP_W,
-                                        BACKDROP_H,
-                                        BACKDROP_BLUR_RADIUS,
-                                    );
-                                }
-                                for px in &mut buf {
-                                    *px = tint_transition_backdrop_pixel(*px);
-                                }
-                                captured = Some(buf);
                             }
                         }
                         SelectObject(mem_dc, prev);
@@ -3567,18 +3819,40 @@ unsafe fn capture_transition_backdrop(window: HWND) {
                 let _ = ReleaseDC(None, screen);
             }
         }
+        let next_raw = if let Some(raw) = captured_raw {
+            raw
+        } else if let Some(prev_raw) = cached_raw {
+            prev_raw
+        } else {
+            vec![0xFF08_090C; total]
+        };
+        let mut buf = next_raw.clone();
+        let mut temp = vec![0u32; total];
+        for _ in 0..3 {
+            box_blur_horizontal(
+                &buf,
+                &mut temp,
+                BACKDROP_W,
+                BACKDROP_H,
+                BACKDROP_BLUR_RADIUS,
+            );
+            box_blur_vertical(
+                &temp,
+                &mut buf,
+                BACKDROP_W,
+                BACKDROP_H,
+                BACKDROP_BLUR_RADIUS,
+            );
+        }
+        for px in &mut buf {
+            *px = tint_transition_backdrop_pixel(*px);
+        }
         TRANSITION_BACKDROP.with(|slot| {
             let mut bd = slot.borrow_mut();
-            if let Some(buf) = captured {
-                bd.pixels = buf;
-            } else if bd.hwnd != window.0 as isize
-                || bd.mon_rect != mon_rect
-                || bd.pixels.len() != total
-            {
-                bd.pixels.clear();
-                bd.pixels
-                    .resize(total, tint_transition_backdrop_pixel(0xFF11_1111));
-            }
+            bd.pixels = buf;
+            bd.raw_pixels = next_raw;
+            bd.raw_mon_rect = mon_rect;
+            bd.wallpaper_key = wp_key;
             bd.hwnd = window.0 as isize;
             bd.win_rect = win_rect;
             bd.mon_rect = mon_rect;
@@ -3614,6 +3888,7 @@ pub fn backdrop_transition_active(window: HWND) -> bool {
         })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn clear_backdrop_transition(window: HWND) {
     if window.0.is_null() {
         return;
@@ -3636,13 +3911,16 @@ pub fn begin_backdrop_transition(window: HWND) {
             || !glass_enabled(window)
             || !user_acrylic_enabled()
             || !transparency_enabled()
-            || backdrop_transition_active(window)
         {
+            return;
+        }
+        let iconic_or_hidden = IsIconic(window).as_bool() || !IsWindowVisible(window).as_bool();
+        if backdrop_transition_active(window) && !iconic_or_hidden {
             return;
         }
         capture_transition_backdrop(window);
         TRANSITION_BACKDROP.with(|slot| slot.borrow_mut().active = true);
-        if !IsIconic(window).as_bool() && IsWindowVisible(window).as_bool() {
+        if !iconic_or_hidden {
             let _ = RedrawWindow(
                 window,
                 None,
@@ -3653,6 +3931,7 @@ pub fn begin_backdrop_transition(window: HWND) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn end_minimize_backdrop_transition(window: HWND) {
     clear_backdrop_transition(window);
 }
@@ -3868,17 +4147,67 @@ pub fn disable_backdrop(window: HWND) {
     }
 }
 
+fn intersect_rects(a: RECT, b: RECT) -> Option<RECT> {
+    let left = a.left.max(b.left);
+    let top = a.top.max(b.top);
+    let right = a.right.min(b.right);
+    let bottom = a.bottom.min(b.bottom);
+    (right > left && bottom > top).then_some(rect(left, top, right, bottom))
+}
+
+fn rects_intersect(a: RECT, b: RECT) -> bool {
+    a.right.min(b.right) > a.left.max(b.left) && a.bottom.min(b.bottom) > a.top.max(b.top)
+}
+
+fn rect_contains(outer: RECT, inner: RECT) -> bool {
+    outer.left <= inner.left
+        && outer.top <= inner.top
+        && outer.right >= inner.right
+        && outer.bottom >= inner.bottom
+}
+
+fn subtract_rect(base: RECT, hole: RECT) -> [Option<RECT>; 4] {
+    let Some(cut) = intersect_rects(base, hole) else {
+        return [Some(base), None, None, None];
+    };
+    let top = (cut.top > base.top).then_some(rect(base.left, base.top, base.right, cut.top));
+    let bottom =
+        (cut.bottom < base.bottom).then_some(rect(base.left, cut.bottom, base.right, base.bottom));
+    let left = (cut.left > base.left).then_some(rect(base.left, cut.top, cut.left, cut.bottom));
+    let right =
+        (cut.right < base.right).then_some(rect(cut.right, cut.top, base.right, cut.bottom));
+    [top, bottom, left, right]
+}
+
 pub unsafe fn paint(window: HWND) {
     // SAFETY: UI-thread BeginPaint/EndPaint pair; supplied HDC is valid until EndPaint.
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let dc = BeginPaint(window, &mut ps);
-        paint_into(window, dc);
+        let mut client = RECT::default();
+        if GetClientRect(window, &mut client).is_ok()
+            && ps.rcPaint.right > ps.rcPaint.left
+            && ps.rcPaint.bottom > ps.rcPaint.top
+        {
+            if let Some(dirty) = intersect_rects(ps.rcPaint, client) {
+                paint_into_rect(window, dc, Some(dirty));
+            }
+        } else {
+            paint_into_rect(window, dc, None);
+        }
         let _ = EndPaint(window, &ps);
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub unsafe fn paint_into(window: HWND, target: HDC) {
+    // SAFETY: buffers, theme handle and target DC stay on this synchronous UI-thread call.
+    unsafe {
+        paint_into_rect(window, target, None);
+    }
+}
+
+pub unsafe fn paint_into_rect(window: HWND, target: HDC, clip_rect: Option<RECT>) {
     // SAFETY: buffers, theme handle and target DC stay on this synchronous UI-thread call.
     unsafe {
         let mut client = RECT::default();
@@ -3889,7 +4218,26 @@ pub unsafe fn paint_into(window: HWND, target: HDC) {
         {
             return;
         }
-        if let Some(buffer) = PaintBuffer::new(target, client) {
+        let area = match clip_rect {
+            Some(clip) => match intersect_rects(clip, client) {
+                Some(dirty) => dirty,
+                None => return,
+            },
+            None => client,
+        };
+        let client_origin = if !window.0.is_null()
+            && IsWindow(window).as_bool()
+            && !IsIconic(window).as_bool()
+            && IsWindowVisible(window).as_bool()
+        {
+            let mut pt = POINT::default();
+            ClientToScreen(window, &mut pt).as_bool().then_some(pt)
+        } else {
+            None
+        };
+        if let Some(buffer) =
+            PaintBuffer::new_for_window(target, area, window.0 as isize, client_origin)
+        {
             let glass = glass_enabled(window);
             let theme = if glass {
                 OpenThemeData(window, w!("WINDOW"))
@@ -3898,7 +4246,13 @@ pub unsafe fn paint_into(window: HWND, target: HDC) {
             };
             let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
             let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
-            let rendered = paint_scene(window, buffer.dc, Some(&buffer), glass && theme.0 != 0);
+            let rendered = paint_scene(
+                window,
+                buffer.dc,
+                Some(&buffer),
+                glass && theme.0 != 0,
+                area,
+            );
             TEXT_THEME.with(|slot| slot.set(old_theme));
             GLASS_BUFFER.with(|slot| slot.set(old_buffer));
             if theme.0 != 0 {
@@ -3913,7 +4267,14 @@ pub unsafe fn paint_into(window: HWND, target: HDC) {
             }
         }
         disable_backdrop(window);
-        paint_scene(window, target, None, false);
+        let saved = SaveDC(target);
+        if clip_rect.is_some() {
+            let _ = IntersectClipRect(target, area.left, area.top, area.right, area.bottom);
+        }
+        paint_scene(window, target, None, false, area);
+        if saved != 0 {
+            let _ = RestoreDC(target, saved);
+        }
     }
 }
 
@@ -3922,6 +4283,7 @@ unsafe fn paint_scene(
     dc: HDC,
     buffer: Option<&PaintBuffer>,
     glass_active: bool,
+    dirty: RECT,
 ) -> bool {
     // SAFETY: caller supplies a valid drawing HDC; this function owns no paint session.
     unsafe {
@@ -3935,12 +4297,15 @@ unsafe fn paint_scene(
             let skin = skin.borrow();
             (skin.tab, skin.tiles.is_empty(), skin.library_empty)
         });
-        let (has_transition, covers_body) = ANIM.with(|a| {
+        let (has_transition, covers_body, trans_clip) = ANIM.with(|a| {
             a.borrow()
                 .transition
                 .as_ref()
-                .map_or((false, false), |t| (true, t.covers_body))
+                .map_or((false, false, RECT::default()), |t| {
+                    (true, t.covers_body, t.clip)
+                })
         });
+        let skip_trans_bg = glass_active && buffer.is_some() && has_transition;
         let divider_px = scale(1).max(1);
         let divider_color = if glass_active { GLASS_RIM } else { LINE };
         let top_divider = rect(0, 0, scale(layout.client.right), divider_px);
@@ -4004,77 +4369,100 @@ unsafe fn paint_scene(
                 })
             }
         };
+        let fill_clipped = |r: RECT, color: u32| {
+            let Some(sub) = intersect_rects(r, dirty) else {
+                return;
+            };
+            if skip_trans_bg {
+                for piece in subtract_rect(sub, trans_clip).into_iter().flatten() {
+                    fill(dc, piece, color);
+                }
+            } else {
+                fill(dc, sub, color);
+            }
+        };
+        let should_paint_box =
+            |r: RECT| rects_intersect(r, dirty) && !(skip_trans_bg && rect_contains(trans_clip, r));
 
-        fill(dc, pixels(layout.client), BODY);
-        fill(dc, pixels(layout.header), BODY);
-        fill(dc, top_divider, divider_color);
-        fill(dc, header_divider, divider_color);
-        fill(dc, caption_divider, divider_color);
+        fill_clipped(pixels(layout.client), BODY);
+        fill_clipped(pixels(layout.header), BODY);
+        fill_clipped(top_divider, divider_color);
+        fill_clipped(header_divider, divider_color);
+        fill_clipped(caption_divider, divider_color);
         for &(btn, area) in &layout.caption_buttons {
-            if let Some((bg, border, _)) = caption_style(btn) {
-                raised_rounded(dc, pixels(area), bg, border, border, scale(8));
+            let area_px = pixels(area);
+            if should_paint_box(area_px)
+                && let Some((bg, border, _)) = caption_style(btn)
+            {
+                raised_rounded(dc, area_px, bg, border, border, scale(8));
             }
         }
         if !covers_body {
             match tab {
                 Tab::Library => {
-                    fill(dc, pixels(layout.sidebar), CARD);
-                    fill(dc, side_divider, divider_color);
+                    fill_clipped(pixels(layout.sidebar), CARD);
+                    fill_clipped(side_divider, divider_color);
                     if let Some(div) = side_inner_divider {
-                        fill(dc, div, divider_color);
+                        fill_clipped(div, divider_color);
                     }
                 }
                 Tab::Settings => {
-                    raised_rounded(
-                        dc,
-                        pixels(layout.settings_preferences_panel),
-                        CARD,
-                        LINE,
-                        HIGHLIGHT,
-                        scale(12),
-                    );
-                    raised_rounded(
-                        dc,
-                        pixels(layout.settings_resources_panel),
-                        CARD,
-                        LINE,
-                        HIGHLIGHT,
-                        scale(12),
-                    );
+                    let prefs_px = pixels(layout.settings_preferences_panel);
+                    if should_paint_box(prefs_px) {
+                        raised_rounded(dc, prefs_px, CARD, LINE, HIGHLIGHT, scale(12));
+                    }
+                    let res_px = pixels(layout.settings_resources_panel);
+                    if should_paint_box(res_px) {
+                        raised_rounded(dc, res_px, CARD, LINE, HIGHLIGHT, scale(12));
+                    }
                     if let Some(div) = prefs_divider {
-                        fill(dc, div, divider_color);
+                        fill_clipped(div, divider_color);
                     }
                     if let Some(div) = resources_divider {
-                        fill(dc, div, divider_color);
+                        fill_clipped(div, divider_color);
                     }
                 }
                 Tab::Sources => {
-                    raised_rounded(
-                        dc,
-                        pixels(layout.sources_panel),
-                        CARD,
-                        LINE,
-                        HIGHLIGHT,
-                        scale(12),
-                    );
+                    let src_px = pixels(layout.sources_panel);
+                    if should_paint_box(src_px) {
+                        raised_rounded(dc, src_px, CARD, LINE, HIGHLIGHT, scale(12));
+                    }
                     if let Some(div) = sources_divider {
-                        fill(dc, div, divider_color);
+                        fill_clipped(div, divider_color);
                     }
                 }
             }
         }
-        fill(dc, pixels(layout.footer), FOOTER);
-        fill(dc, footer_divider, divider_color);
+        fill_clipped(pixels(layout.footer), FOOTER);
+        fill_clipped(footer_divider, divider_color);
         if let Some(buffer) = buffer {
             if glass_active {
-                let mut div_ok = buffer.tint_background(top_divider, DIVIDER_ALPHA)
-                    && buffer.tint_background(header_divider, DIVIDER_ALPHA)
-                    && buffer.tint_background(caption_divider, DIVIDER_ALPHA)
-                    && buffer.tint_background(footer_divider, DIVIDER_ALPHA);
+                let tint_clipped = |r: RECT, alpha: u8| -> bool {
+                    let Some(sub) = intersect_rects(r, dirty) else {
+                        return true;
+                    };
+                    if skip_trans_bg {
+                        for piece in subtract_rect(sub, trans_clip).into_iter().flatten() {
+                            if !buffer.tint_background(piece, alpha) {
+                                return false;
+                            }
+                        }
+                        true
+                    } else {
+                        buffer.tint_background(sub, alpha)
+                    }
+                };
+                let mut div_ok = tint_clipped(top_divider, DIVIDER_ALPHA)
+                    && tint_clipped(header_divider, DIVIDER_ALPHA)
+                    && tint_clipped(caption_divider, DIVIDER_ALPHA)
+                    && tint_clipped(footer_divider, DIVIDER_ALPHA);
                 for &(btn, area) in &layout.caption_buttons {
-                    if let Some((_, border, alpha)) = caption_style(btn) {
+                    let area_px = pixels(area);
+                    if should_paint_box(area_px)
+                        && let Some((_, border, alpha)) = caption_style(btn)
+                    {
                         div_ok &= buffer.apply_rounded_rect_mask(
-                            pixels(area),
+                            area_px,
                             &RoundedMask {
                                 ellipse: scale(8),
                                 border,
@@ -4111,41 +4499,38 @@ unsafe fn paint_scene(
                 } else {
                     match tab {
                         Tab::Library => {
-                            let inner_ok = side_inner_divider
-                                .is_none_or(|d| buffer.tint_background(d, DIVIDER_ALPHA));
+                            let inner_ok =
+                                side_inner_divider.is_none_or(|d| tint_clipped(d, DIVIDER_ALPHA));
                             inner_ok
-                                && buffer.tint_background(side_divider, DIVIDER_ALPHA)
-                                && buffer.tint_background(pixels(layout.sidebar), CARD_ALPHA)
+                                && tint_clipped(side_divider, DIVIDER_ALPHA)
+                                && tint_clipped(pixels(layout.sidebar), CARD_ALPHA)
                         }
                         Tab::Settings => {
-                            let p_div_ok = prefs_divider
-                                .is_none_or(|d| buffer.tint_background(d, DIVIDER_ALPHA));
-                            let r_div_ok = resources_divider
-                                .is_none_or(|d| buffer.tint_background(d, DIVIDER_ALPHA));
+                            let p_div_ok =
+                                prefs_divider.is_none_or(|d| tint_clipped(d, DIVIDER_ALPHA));
+                            let r_div_ok =
+                                resources_divider.is_none_or(|d| tint_clipped(d, DIVIDER_ALPHA));
+                            let prefs_px = pixels(layout.settings_preferences_panel);
+                            let res_px = pixels(layout.settings_resources_panel);
                             p_div_ok
                                 && r_div_ok
-                                && buffer.apply_rounded_rect_mask(
-                                    pixels(layout.settings_preferences_panel),
-                                    &card_mask,
-                                )
-                                && buffer.apply_rounded_rect_mask(
-                                    pixels(layout.settings_resources_panel),
-                                    &card_mask,
-                                )
+                                && (!should_paint_box(prefs_px)
+                                    || buffer.apply_rounded_rect_mask(prefs_px, &card_mask))
+                                && (!should_paint_box(res_px)
+                                    || buffer.apply_rounded_rect_mask(res_px, &card_mask))
                         }
                         Tab::Sources => {
-                            let s_div_ok = sources_divider
-                                .is_none_or(|d| buffer.tint_background(d, DIVIDER_ALPHA));
+                            let s_div_ok =
+                                sources_divider.is_none_or(|d| tint_clipped(d, DIVIDER_ALPHA));
+                            let src_px = pixels(layout.sources_panel);
                             s_div_ok
-                                && buffer.apply_rounded_rect_mask(
-                                    pixels(layout.sources_panel),
-                                    &card_mask,
-                                )
+                                && (!should_paint_box(src_px)
+                                    || buffer.apply_rounded_rect_mask(src_px, &card_mask))
                         }
                     }
                 };
                 // Window canvas, elevated cards, and dividers all transmit the acrylic backdrop at layered alpha levels.
-                if !div_ok || !panel_ok || !buffer.tint_background(client, PANEL_ALPHA) {
+                if !div_ok || !panel_ok || !tint_clipped(client, PANEL_ALPHA) {
                     return false;
                 }
             }
@@ -4160,8 +4545,13 @@ unsafe fn paint_scene(
                 }
             }
         }
-        label(
-            dc,
+        let label_clipped =
+            |text: &str, r: RECT, px: i32, bold: bool, color: u32, flags: DRAW_TEXT_FORMAT| {
+                if rects_intersect(r, dirty) {
+                    label(dc, text, r, px, bold, color, flags);
+                }
+            };
+        label_clipped(
             "WallpaperLive",
             pixels(layout.title),
             scale(21),
@@ -4175,6 +4565,9 @@ unsafe fn paint_scene(
             let focused = !window.0.is_null() && GetForegroundWindow() == window;
             for &(btn, area) in &layout.caption_buttons {
                 let area_px = pixels(area);
+                if !rects_intersect(area_px, dirty) {
+                    continue;
+                }
                 let active = caption_hot == Some(btn) || caption_down == Some(btn);
                 let glyph_color = if active || focused {
                     TEXT_ON_DARK
@@ -4214,8 +4607,7 @@ unsafe fn paint_scene(
         if !covers_body {
             match tab {
                 Tab::Library => {
-                    label(
-                        dc,
+                    label_clipped(
                         "Library",
                         pixels(layout.library_title),
                         scale(25),
@@ -4223,8 +4615,7 @@ unsafe fn paint_scene(
                         TEXT,
                         DT_SINGLELINE,
                     );
-                    label(
-                        dc,
+                    label_clipped(
                         "Bring your own live wallpapers.",
                         pixels(layout.library_note),
                         scale(13),
@@ -4234,8 +4625,7 @@ unsafe fn paint_scene(
                     );
                     if empty_view && !has_transition {
                         let area = layout.library;
-                        label(
-                            dc,
+                        label_clipped(
                             if empty_library {
                                 "No wallpapers yet"
                             } else {
@@ -4250,8 +4640,7 @@ unsafe fn paint_scene(
                             TEXT,
                             DT_SINGLELINE | DT_END_ELLIPSIS,
                         );
-                        label(
-                            dc,
+                        label_clipped(
                             if empty_library {
                                 "Add a media file or folder. Originals stay where they are."
                             } else {
@@ -4267,8 +4656,7 @@ unsafe fn paint_scene(
                             MUTED,
                             DT_WORDBREAK,
                         );
-                        label(
-                            dc,
+                        label_clipped(
                             if empty_library {
                                 "MP4  GIF  MKV  WebM  MOV  AVI"
                             } else {
@@ -4285,8 +4673,7 @@ unsafe fn paint_scene(
                             DT_SINGLELINE | DT_END_ELLIPSIS,
                         );
                     }
-                    label(
-                        dc,
+                    label_clipped(
                         "Selected wallpaper",
                         pixels(layout.preview_title),
                         scale(16),
@@ -4294,8 +4681,7 @@ unsafe fn paint_scene(
                         TEXT,
                         DT_SINGLELINE,
                     );
-                    label(
-                        dc,
+                    label_clipped(
                         "Display",
                         pixels(layout.display_label),
                         scale(13),
@@ -4303,8 +4689,7 @@ unsafe fn paint_scene(
                         MUTED,
                         DT_SINGLELINE,
                     );
-                    label(
-                        dc,
+                    label_clipped(
                         "Placement",
                         pixels(layout.fit_label),
                         scale(13),
@@ -4314,8 +4699,7 @@ unsafe fn paint_scene(
                     );
                 }
                 Tab::Settings => {
-                    label(
-                        dc,
+                    label_clipped(
                         "Settings",
                         pixels(layout.settings_title),
                         scale(25),
@@ -4323,8 +4707,7 @@ unsafe fn paint_scene(
                         TEXT,
                         DT_SINGLELINE,
                     );
-                    label(
-                        dc,
+                    label_clipped(
                         "Playback preferences and application details",
                         pixels(layout.settings_subtitle),
                         scale(13),
@@ -4332,8 +4715,7 @@ unsafe fn paint_scene(
                         MUTED,
                         DT_SINGLELINE,
                     );
-                    label(
-                        dc,
+                    label_clipped(
                         "Playback & startup",
                         pixels(layout.preferences_title),
                         scale(16),
@@ -4341,8 +4723,7 @@ unsafe fn paint_scene(
                         TEXT,
                         DT_SINGLELINE,
                     );
-                    label(
-                        dc,
+                    label_clipped(
                         "Resources & support",
                         pixels(layout.resources_title),
                         scale(16),
@@ -4352,8 +4733,7 @@ unsafe fn paint_scene(
                     );
                 }
                 Tab::Sources => {
-                    label(
-                        dc,
+                    label_clipped(
                         "Where to find wallpapers",
                         pixels(layout.sources_title),
                         scale(25),
@@ -4361,8 +4741,7 @@ unsafe fn paint_scene(
                         TEXT,
                         DT_SINGLELINE,
                     );
-                    label(
-                        dc,
+                    label_clipped(
                         "Browse in your browser, then import local media.",
                         pixels(layout.sources_subtitle),
                         scale(14),
@@ -5731,8 +6110,8 @@ mod tests {
     fn anim_interval_ms_stays_within_vsync_clamp_bounds() {
         let interval = anim_interval_ms();
         assert!(
-            (6..=16).contains(&interval),
-            "expected vsync animation interval in 6..=16 ms, got {interval}"
+            (8..=16).contains(&interval),
+            "expected vsync animation interval in 8..=16 ms, got {interval}"
         );
     }
 
@@ -5861,10 +6240,10 @@ mod tests {
         assert!(!backdrop_transition_active(HWND::default()));
         clear_backdrop_transition(HWND::default());
 
-        // SAFETY: hidden WS_POPUP window lives only on this thread and is destroyed before returning.
+        // SAFETY: tool WS_POPUP window lives only on this thread and is destroyed before returning.
         unsafe {
             let parent = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 w!("STATIC"),
                 w!(""),
                 WS_POPUP,
@@ -5899,7 +6278,8 @@ mod tests {
             let other = HWND(std::ptr::dangling_mut());
             assert!(!backdrop_transition_active(other));
 
-            // Idempotent when already active for this HWND: must not re-capture or overwrite pixels.
+            // Idempotent while visible and active: must not re-capture or overwrite pixels.
+            let _ = ShowWindow(parent, SW_SHOWNA);
             begin_backdrop_transition(parent);
             assert!(backdrop_transition_active(parent));
             TRANSITION_BACKDROP.with(|slot| {
@@ -5920,13 +6300,26 @@ mod tests {
                 assert!(backdrop_transition_active(parent));
                 TRANSITION_BACKDROP.with(|slot| {
                     let mut bd = slot.borrow_mut();
-                    assert!(!bd.pixels.is_empty());
+                    assert_eq!((bd.width, bd.height), (480, 270));
+                    assert_eq!(bd.pixels.len(), 480 * 270);
+                    assert_eq!(bd.raw_pixels.len(), 480 * 270);
                     bd.pixels[0] = 0xDEAD_BEEF;
                 });
+                // Visible + active remains idempotent.
                 begin_backdrop_transition(parent);
                 assert!(backdrop_transition_active(parent));
                 TRANSITION_BACKDROP.with(|slot| {
                     assert_eq!(slot.borrow().pixels[0], 0xDEAD_BEEF);
+                });
+                // Hidden/iconic + active re-captures fresh unobstructed desktop pixels.
+                let _ = ShowWindow(parent, SW_HIDE);
+                begin_backdrop_transition(parent);
+                assert!(backdrop_transition_active(parent));
+                TRANSITION_BACKDROP.with(|slot| {
+                    let bd = slot.borrow();
+                    assert_eq!((bd.width, bd.height), (480, 270));
+                    assert_ne!(bd.pixels[0], 0xDEAD_BEEF);
+                    assert_eq!(bd.raw_mon_rect, bd.mon_rect);
                 });
                 clear_backdrop_transition(parent);
                 assert!(!backdrop_transition_active(parent));
@@ -5939,7 +6332,7 @@ mod tests {
     }
 
     #[test]
-    fn tint_transition_backdrop_pixel_matches_warm_stone_frosted_glass() {
+    fn tint_transition_backdrop_pixel_matches_cool_neutral_acrylic() {
         let rgb = |px: u32| -> (u32, u32, u32) { ((px >> 16) & 255, (px >> 8) & 255, px & 255) };
         let luma = |px: u32| -> u32 {
             let (r, g, b) = rgb(px);
@@ -5947,37 +6340,52 @@ mod tests {
         };
 
         let dark = tint_transition_backdrop_pixel(0xFF20_2020);
+        let mid = tint_transition_backdrop_pixel(0xFF80_8080);
         let bright = tint_transition_backdrop_pixel(0xFFB0_B0B0);
+        let neutral_dark = tint_transition_backdrop_pixel(0xFF08_090C);
         let fallback = tint_transition_backdrop_pixel(0xFF11_1111);
         let black = tint_transition_backdrop_pixel(0xFF00_0000);
         let white = tint_transition_backdrop_pixel(0xFFFF_FFFF);
-        for px in [dark, bright, fallback, black, white] {
+        for px in [dark, mid, bright, neutral_dark, fallback, black, white] {
             assert_eq!(px >> 24, 0xFF);
         }
-        assert!((75..=92).contains(&luma(dark)));
-        assert!((75..=92).contains(&luma(bright)));
-        assert!((72..=102).contains(&luma(black)));
-        assert!((72..=102).contains(&luma(white)));
-        assert!(luma(white) - luma(black) >= 12);
-        assert!((73..=82).contains(&luma(fallback)));
+        assert!((66..=74).contains(&luma(black)));
+        assert!((66..=74).contains(&luma(neutral_dark)));
+        assert!((66..=76).contains(&luma(fallback)));
+        assert!((66..=76).contains(&luma(dark)));
+        assert!((74..=85).contains(&luma(mid)));
+        assert!((78..=88).contains(&luma(bright)));
+        assert!((86..=94).contains(&luma(white)));
+        assert!(luma(white) - luma(black) >= 15);
+        let (ndr, _ndg, ndb) = rgb(neutral_dark);
+        assert!(ndb >= ndr);
+
+        let orange = tint_transition_backdrop_pixel(0xFFE0_8820);
+        assert_eq!(orange >> 24, 0xFF);
+        assert!((72..=90).contains(&luma(orange)));
+        let (or, og, ob) = rgb(orange);
+        assert!(or > og && og > ob);
+        assert!(or - ob <= 40);
 
         let peach = tint_transition_backdrop_pixel(0xFFE0_88A0);
         assert_eq!(peach >> 24, 0xFF);
-        assert!((75..=92).contains(&luma(peach)));
+        assert!((72..=92).contains(&luma(peach)));
         let (pr, pg, pb) = rgb(peach);
         assert!(pr > pb && pb > pg);
 
         let amber_peach = tint_transition_backdrop_pixel(0xFFD8_9870);
         assert_eq!(amber_peach >> 24, 0xFF);
-        assert!((75..=92).contains(&luma(amber_peach)));
+        assert!((72..=92).contains(&luma(amber_peach)));
         let (ar, ag, ab) = rgb(amber_peach);
         assert!(ar > ag && ag > ab);
+        assert!(ar - ab <= 25);
 
         let cyan = tint_transition_backdrop_pixel(0xFF20_90D0);
         assert_eq!(cyan >> 24, 0xFF);
-        assert!((75..=92).contains(&luma(cyan)));
+        assert!((72..=90).contains(&luma(cyan)));
         let (cr, cg, cb) = rgb(cyan);
         assert!(cb > cg && cg > cr);
+        assert!(cb - cr <= 36);
     }
 
     #[test]
@@ -6137,7 +6545,7 @@ mod tests {
         assert_eq!(CARD_ALPHA, 56);
         assert_eq!(BORDER_ALPHA, 185);
         assert_eq!(DROPDOWN_ALPHA, 116);
-        assert_eq!(ACRYLIC_TINT_COLOR, 0x144e_5153);
+        assert_eq!(ACRYLIC_TINT_COLOR, 0x1450_4e4d);
         assert_eq!(ease_out_quart(-0.5), 0.0);
         assert_eq!(ease_out_quart(0.0), 0.0);
         assert_eq!(ease_out_quart(1.0), 1.0);
@@ -6459,6 +6867,195 @@ mod tests {
             assert!(!take_synced_layout(parent, dpi, width, height));
 
             let _ = DestroyWindow(parent);
+        }
+        clear();
+    }
+
+    #[test]
+    fn paint_into_rect_partial_dirty_matches_full_and_preserves_outside() {
+        clear();
+        // SAFETY: test-owned hidden parent and offscreen DIBs stay on this UI thread and are freed before exit.
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                MIN_CLIENT_WIDTH,
+                MIN_CLIENT_HEIGHT,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("test parent");
+            let w = MIN_CLIENT_WIDTH;
+            let h = MIN_CLIENT_HEIGHT;
+            let total = (w * h) as usize;
+            let make_dib = || {
+                let dc = CreateCompatibleDC(None);
+                let mut bits = std::ptr::null_mut();
+                let bmp = CreateDIBSection(
+                    dc,
+                    &BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: w,
+                            biHeight: -h,
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    DIB_RGB_COLORS,
+                    &mut bits,
+                    None,
+                    0,
+                )
+                .expect("dib");
+                let prev = SelectObject(dc, bmp);
+                (dc, bmp, prev, bits as *mut u32)
+            };
+
+            let (full_dc, full_bmp, full_prev, full_bits) = make_dib();
+            let (part_dc, part_bmp, part_prev, part_bits) = make_dib();
+            std::slice::from_raw_parts_mut(full_bits, total).fill(0);
+            std::slice::from_raw_parts_mut(part_bits, total).fill(0xDEAD_BEEF);
+
+            let dirty = rect(180, 110, 620, 410);
+            paint_into(parent, full_dc);
+            paint_into_rect(parent, part_dc, Some(dirty));
+            let _ = GdiFlush();
+
+            let full_px = std::slice::from_raw_parts(full_bits as *const u32, total);
+            let part_px = std::slice::from_raw_parts(part_bits as *const u32, total);
+            for y in 0..h {
+                let row = (y * w) as usize;
+                for x in 0..w {
+                    let idx = row + x as usize;
+                    if x >= dirty.left && x < dirty.right && y >= dirty.top && y < dirty.bottom {
+                        assert_eq!(part_px[idx], full_px[idx], "mismatch at ({x}, {y})");
+                    } else {
+                        assert_eq!(
+                            part_px[idx], 0xDEAD_BEEF,
+                            "untouched sentinel changed at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+
+            SelectObject(part_dc, part_prev);
+            let _ = DeleteObject(part_bmp);
+            let _ = DeleteDC(part_dc);
+            SelectObject(full_dc, full_prev);
+            let _ = DeleteObject(full_bmp);
+            let _ = DeleteDC(full_dc);
+            let _ = DestroyWindow(parent);
+        }
+        clear();
+    }
+
+    #[test]
+    fn blend_transition_backdrop_uses_live_client_origin_across_move() {
+        clear();
+        // SAFETY: tool WS_POPUP window and offscreen DIB stay on this thread and are cleaned up before exit.
+        unsafe {
+            let win = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                120,
+                80,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("test window");
+            let _ = ShowWindow(win, SW_SHOWNA);
+            let _ = SetWindowPos(win, None, 240, 0, 120, 80, SWP_NOACTIVATE | SWP_NOZORDER);
+            let mut live_origin = POINT::default();
+            assert!(ClientToScreen(win, &mut live_origin).as_bool());
+
+            let bw = 480i32;
+            let bh = 270i32;
+            let mut pixels = vec![0xFF10_2030u32; (bw * bh) as usize];
+            for y in 0..bh {
+                let row = (y * bw) as usize;
+                pixels[row + 240..row + bw as usize].fill(0xFF90_A0B0);
+            }
+            TRANSITION_BACKDROP.with(|slot| {
+                let mut bd = slot.borrow_mut();
+                bd.active = true;
+                bd.hwnd = win.0 as isize;
+                // Intentionally leave stale win_rect on the left half of the monitor.
+                bd.mon_rect = rect(
+                    live_origin.x - 240,
+                    live_origin.y,
+                    live_origin.x + 240,
+                    live_origin.y + 270,
+                );
+                bd.win_rect = rect(
+                    live_origin.x - 240,
+                    live_origin.y,
+                    live_origin.x - 120,
+                    live_origin.y + 80,
+                );
+                bd.width = bw;
+                bd.height = bh;
+                bd.pixels = pixels;
+            });
+
+            let w = 120i32;
+            let h = 80i32;
+            let total = (w * h) as usize;
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(
+                dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .expect("backdrop map DIB");
+            let prev = SelectObject(dc, bmp);
+            let dirty = rect(10, 10, 60, 50);
+
+            for client_origin in [Some(live_origin), None] {
+                std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
+                let buffer = PaintBuffer::new_for_window(dc, dirty, win.0 as isize, client_origin)
+                    .expect("window paint buffer");
+                assert!(buffer.finish());
+                let _ = GdiFlush();
+                let out = std::slice::from_raw_parts(bits as *const u32, total);
+                assert_eq!(out[(15 * w + 15) as usize], 0xFF90_A0B0);
+                assert_eq!(out[0], 0);
+            }
+
+            SelectObject(dc, prev);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(dc);
+            let _ = DestroyWindow(win);
         }
         clear();
     }
