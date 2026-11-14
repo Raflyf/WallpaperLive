@@ -1600,11 +1600,6 @@ impl App {
             }
             let width = r.right * 96 / dpi;
             let height = r.bottom * 96 / dpi;
-            let noredraw = if repaint {
-                SET_WINDOW_POS_FLAGS(0)
-            } else {
-                SWP_NOREDRAW
-            };
             let size_changed = font_dirty || self.layout_state != Some((dpi, width, height));
             if size_changed {
                 let layout = visuals::Layout::new(width, height);
@@ -1617,7 +1612,7 @@ impl App {
                             scale(area.top),
                             scale(area.right - area.left),
                             scale(area.bottom - area.top),
-                            SWP_NOZORDER | SWP_NOACTIVATE | noredraw,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
                         )
                         .map_err(native_error)?;
                         visuals::round_control(*control)?;
@@ -1649,22 +1644,30 @@ impl App {
                                 | SWP_NOSIZE
                                 | SWP_NOZORDER
                                 | SWP_NOACTIVATE
-                                | noredraw
+                                | SWP_NOREDRAW
                                 | if visible {
                                     SWP_SHOWWINDOW
                                 } else {
                                     SWP_HIDEWINDOW
                                 },
                         );
+                        if repaint && !size_changed {
+                            let _ = InvalidateRect(
+                                if visible { *control } else { self.hwnd },
+                                None,
+                                true,
+                            );
+                        }
                     }
                 }
             }
             if repaint && size_changed {
-                for (_, control) in &self.controls {
-                    let _ = InvalidateRect(*control, None, true);
-                }
-                let _ = InvalidateRect(self.hwnd, None, true);
-                let _ = UpdateWindow(self.hwnd);
+                let _ = RedrawWindow(
+                    self.hwnd,
+                    None,
+                    None,
+                    RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                );
             }
         }
         Ok(())
@@ -1916,68 +1919,103 @@ impl App {
         visuals::cancel_transition(self.hwnd);
         let clip = self.body_clip(true);
         let old_layer = clip.and_then(|c| visuals::capture_region(self.hwnd, c, &self.controls));
-        self.page = next_page;
-        if old_layer.is_none() {
+        let (Some(c), Some(old)) = (clip, old_layer) else {
+            self.page = next_page;
             self.update_page_controls(true, true);
             // SAFETY: updates client area synchronously when page transition layer is unavailable.
             unsafe {
                 let _ = UpdateWindow(self.hwnd);
             }
             return Ok(());
-        }
-        let frozen = self.freeze_controls_matching(|id| {
-            matches!(id, visuals::PREVIOUS | visuals::NEXT | visuals::PAGE)
-        });
-        self.update_page_controls(false, false);
-        self.unfreeze_controls_matching(&frozen, |id| {
-            matches!(id, visuals::PREVIOUS | visuals::NEXT | visuals::PAGE)
-        });
-        if let (Some(c), Some(old)) = (clip, old_layer) {
-            let view = self.library_view();
-            let mut new_controls = Vec::with_capacity(9);
-            let mut hidden = Vec::with_capacity(9);
-            let mut to_hide = Vec::new();
+        };
+        let mut frozen_controls = Vec::with_capacity(12);
+        // SAFETY: freeze all currently visible page controls before updating text/enabled state.
+        unsafe {
             for &(id, control) in &self.controls {
-                if !(visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id) {
-                    continue;
-                }
-                // SAFETY: child HWND belongs to this App and lives until window teardown.
-                let currently_visible =
-                    unsafe { GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 };
-                if self.control_visible(id, &view) {
-                    new_controls.push((id, control));
-                    hidden.push(control);
-                } else if currently_visible {
-                    to_hide.push(control);
+                if id != visuals::SEARCH
+                    && is_page_control(id)
+                    && !control.0.is_null()
+                    && (GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0) != 0
+                {
+                    let _ = SendMessageW(control, WM_SETREDRAW, WPARAM(0), LPARAM(0));
+                    frozen_controls.push(control);
                 }
             }
-            if let Some(new) = visuals::capture_region_controls(self.hwnd, c, &new_controls) {
-                let dir = if delta > 0 { -1 } else { 1 };
-                visuals::begin_transition_with_hide(
-                    self.hwnd,
-                    c,
-                    dir,
-                    visuals::PAGE_ANIM_MS,
-                    old,
-                    new,
-                    &to_hide,
-                    hidden,
-                    None,
-                    false,
-                );
-                // SAFETY: synchronously commit pager label/button state after frame 0 starts.
-                unsafe {
-                    for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
-                        let _ = RedrawWindow(
-                            self.control(id),
+        }
+        self.page = next_page;
+        self.update_page_controls(false, false);
+        // SAFETY: restore WM_SETREDRAW and clear accumulated dirty rects without toggling visibility before capture.
+        unsafe {
+            for &control in &frozen_controls {
+                let _ = SendMessageW(control, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+                let _ = ValidateRect(control, None);
+            }
+        }
+        let view = self.library_view();
+        let mut new_controls = Vec::with_capacity(9);
+        let mut hidden = Vec::with_capacity(9);
+        let mut to_hide = Vec::new();
+        for &(id, control) in &self.controls {
+            if !(visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id) {
+                continue;
+            }
+            // SAFETY: child HWND belongs to this App and lives until window teardown.
+            let currently_visible =
+                unsafe { GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 };
+            if self.control_visible(id, &view) {
+                new_controls.push((id, control));
+                hidden.push(control);
+            } else if currently_visible {
+                to_hide.push(control);
+            }
+        }
+        if let Some(new) = visuals::capture_region_controls(self.hwnd, c, &new_controls) {
+            let dir = if delta > 0 { -1 } else { 1 };
+            visuals::begin_transition_with_hide(
+                self.hwnd,
+                c,
+                dir,
+                visuals::PAGE_ANIM_MS,
+                old,
+                new,
+                &to_hide,
+                hidden,
+                None,
+                false,
+            );
+            // SAFETY: sync pager visibility without redraw and commit pager label/button state after frame 0 starts.
+            unsafe {
+                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
+                    let control = self.control(id);
+                    if control.0.is_null() {
+                        continue;
+                    }
+                    let visible = self.control_visible(id, &view);
+                    let was_visible = GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0;
+                    if was_visible != visible {
+                        let _ = SetWindowPos(
+                            control,
                             None,
-                            None,
-                            RDW_INVALIDATE | RDW_UPDATENOW,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE
+                                | SWP_NOSIZE
+                                | SWP_NOZORDER
+                                | SWP_NOACTIVATE
+                                | SWP_NOREDRAW
+                                | if visible {
+                                    SWP_SHOWWINDOW
+                                } else {
+                                    SWP_HIDEWINDOW
+                                },
                         );
                     }
+                    let _ = RedrawWindow(control, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                 }
-                return Ok(());
             }
+            return Ok(());
         }
         self.update_page_controls(true, true);
         // SAFETY: fallback repaint when capture could not be acquired.
@@ -2540,14 +2578,14 @@ impl App {
         // SAFETY: own panel only; showing a hidden maximized window preserves its state.
         unsafe {
             let iconic = IsIconic(self.hwnd).as_bool();
-            let hidden = !IsWindowVisible(self.hwnd).as_bool();
-            let transitioning = iconic || hidden;
-            if transitioning {
+            if iconic {
                 visuals::begin_backdrop_transition(self.hwnd);
+            } else if !IsWindowVisible(self.hwnd).as_bool() {
+                visuals::prime_backdrop_capture(self.hwnd);
             }
             let _ = ShowWindow(self.hwnd, if iconic { SW_RESTORE } else { SW_SHOW });
-            if transitioning {
-                let _ = SetTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID, 260, None);
+            if iconic {
+                let _ = SetTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID, 170, None);
             } else {
                 let _ = visuals::enable_backdrop(self.hwnd);
             }
@@ -4781,15 +4819,15 @@ unsafe extern "system" fn window_proc(
                 if cmd == SC_MINIMIZE {
                     let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                     visuals::begin_backdrop_transition(window);
-                } else if (cmd == SC_RESTORE || cmd == SC_MAXIMIZE) && IsIconic(window).as_bool() {
+                } else if cmd == SC_RESTORE || cmd == SC_MAXIMIZE {
                     visuals::begin_backdrop_transition(window);
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 260, None);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 170, None);
                 }
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_QUERYOPEN => {
                 visuals::begin_backdrop_transition(window);
-                let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 260, None);
+                let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 170, None);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_WINDOWPOSCHANGING if lparam.0 != 0 => {
@@ -4804,7 +4842,7 @@ unsafe extern "system" fn window_proc(
                         || (pos.x > -30000 && (pos.flags.0 & SWP_NOMOVE.0) == 0))
                 {
                     visuals::begin_backdrop_transition(window);
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 260, None);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 170, None);
                 }
                 DefWindowProcW(window, message, wparam, lparam)
             }
@@ -4816,17 +4854,21 @@ unsafe extern "system" fn window_proc(
                     visuals::end_minimize_backdrop_transition(window);
                     return LRESULT(0);
                 }
-                if matches!(wparam.0 as u32, SIZE_RESTORED | SIZE_MAXIMIZED)
-                    && !GetPropW(window, ICONIC_PROPERTY).0.is_null()
-                {
-                    let _ = RemovePropW(window, ICONIC_PROPERTY);
+                visuals::sync_child_positions(window);
+                if matches!(wparam.0 as u32, SIZE_MAXIMIZED | SIZE_RESTORED) {
+                    let was_iconic = !GetPropW(window, ICONIC_PROPERTY).0.is_null();
+                    if was_iconic {
+                        let _ = RemovePropW(window, ICONIC_PROPERTY);
+                    }
                     let _ = RedrawWindow(
                         window,
                         None,
                         None,
                         RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
                     );
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 260, None);
+                    if was_iconic {
+                        let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 170, None);
+                    }
                 }
                 post(LAYOUT, WPARAM(0), LPARAM(0));
                 LRESULT(0)
