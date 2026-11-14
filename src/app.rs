@@ -1703,25 +1703,6 @@ impl App {
             (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
         }
     }
-    fn visible_controls_for(&self, filter_body: bool) -> Vec<HWND> {
-        self.controls
-            .iter()
-            .filter_map(|(id, control)| {
-                let matches_scope = if filter_body {
-                    visuals::is_body_control(*id)
-                } else {
-                    (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(id)
-                };
-                if !matches_scope {
-                    return None;
-                }
-                // SAFETY: child HWND belongs to this App and lives until window teardown.
-                let visible =
-                    unsafe { GetWindowLongW(*control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 };
-                visible.then_some(*control)
-            })
-            .collect()
-    }
     fn refresh_library(&mut self) -> Result<(), String> {
         self.refresh_library_with_repaint(true)
     }
@@ -1944,34 +1925,61 @@ impl App {
             }
             return Ok(());
         }
-        let frozen = self.freeze_controls_matching(is_page_control);
+        let frozen = self.freeze_controls_matching(|id| {
+            matches!(id, visuals::PREVIOUS | visuals::NEXT | visuals::PAGE)
+        });
         self.update_page_controls(false, false);
-        self.unfreeze_controls_matching(&frozen, is_page_control);
-        let hidden = self.visible_controls_for(false);
-        if let (Some(c), Some(old)) = (clip, old_layer)
-            && let Some(new) = visuals::capture_region(self.hwnd, c, &self.controls)
-        {
-            // SAFETY: synchronously commit pager label/button state cleanly before frame 0 of the slide.
-            unsafe {
-                for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
-                    let _ =
-                        RedrawWindow(self.control(id), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+        self.unfreeze_controls_matching(&frozen, |id| {
+            matches!(id, visuals::PREVIOUS | visuals::NEXT | visuals::PAGE)
+        });
+        if let (Some(c), Some(old)) = (clip, old_layer) {
+            let view = self.library_view();
+            let mut new_controls = Vec::with_capacity(9);
+            let mut hidden = Vec::with_capacity(9);
+            let mut to_hide = Vec::new();
+            for &(id, control) in &self.controls {
+                if !(visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&id) {
+                    continue;
+                }
+                // SAFETY: child HWND belongs to this App and lives until window teardown.
+                let currently_visible =
+                    unsafe { GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 };
+                if self.control_visible(id, &view) {
+                    new_controls.push((id, control));
+                    hidden.push(control);
+                } else if currently_visible {
+                    to_hide.push(control);
                 }
             }
-            let dir = if delta > 0 { -1 } else { 1 };
-            visuals::begin_transition(
-                self.hwnd,
-                c,
-                dir,
-                visuals::PAGE_ANIM_MS,
-                old,
-                new,
-                hidden,
-                None,
-                false,
-            );
-            return Ok(());
+            if let Some(new) = visuals::capture_region_controls(self.hwnd, c, &new_controls) {
+                let dir = if delta > 0 { -1 } else { 1 };
+                visuals::begin_transition_with_hide(
+                    self.hwnd,
+                    c,
+                    dir,
+                    visuals::PAGE_ANIM_MS,
+                    old,
+                    new,
+                    &to_hide,
+                    hidden,
+                    None,
+                    false,
+                );
+                // SAFETY: synchronously commit pager label/button state after frame 0 starts.
+                unsafe {
+                    for id in [visuals::PREVIOUS, visuals::NEXT, visuals::PAGE] {
+                        let _ = RedrawWindow(
+                            self.control(id),
+                            None,
+                            None,
+                            RDW_INVALIDATE | RDW_UPDATENOW,
+                        );
+                    }
+                }
+                return Ok(());
+            }
         }
+        self.update_page_controls(true, true);
         // SAFETY: fallback repaint when capture could not be acquired.
         unsafe {
             let _ = InvalidateRect(self.hwnd, None, true);
@@ -2539,7 +2547,7 @@ impl App {
             }
             let _ = ShowWindow(self.hwnd, if iconic { SW_RESTORE } else { SW_SHOW });
             if transitioning {
-                let _ = SetTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID, 280, None);
+                let _ = SetTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID, 260, None);
             } else {
                 let _ = visuals::enable_backdrop(self.hwnd);
             }
@@ -3965,38 +3973,6 @@ impl App {
                 let _ = SetFocus(holder);
             }
             if let Some(new) = visuals::capture_region_controls(self.hwnd, c, &new_controls) {
-                // SAFETY: flush header tab pills and Settings-toggled Add buttons before frame 0 starts.
-                unsafe {
-                    let _ = RedrawWindow(
-                        self.control(visuals::TAB_LIBRARY),
-                        None,
-                        None,
-                        RDW_INVALIDATE | RDW_UPDATENOW,
-                    );
-                    let _ = RedrawWindow(
-                        self.control(visuals::TAB_SETTINGS),
-                        None,
-                        None,
-                        RDW_INVALIDATE | RDW_UPDATENOW,
-                    );
-                    if (previous == visuals::Tab::Settings) != (tab == visuals::Tab::Settings) {
-                        let mut client = RECT::default();
-                        if GetClientRect(self.hwnd, &mut client).is_ok() {
-                            let header_clip = RECT {
-                                left: 0,
-                                top: 0,
-                                right: client.right,
-                                bottom: c.top,
-                            };
-                            let _ = RedrawWindow(
-                                self.hwnd,
-                                Some(&header_clip),
-                                None,
-                                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
-                            );
-                        }
-                    }
-                }
                 let dir = if previous == visuals::Tab::Library {
                     -1
                 } else {
@@ -4014,6 +3990,28 @@ impl App {
                     Some(self.control(focus)),
                     true,
                 );
+                // SAFETY: invalidate header tab pills and Settings-toggled Add buttons after frame 0 starts.
+                unsafe {
+                    let _ = InvalidateRect(self.control(visuals::TAB_LIBRARY), None, false);
+                    let _ = InvalidateRect(self.control(visuals::TAB_SETTINGS), None, false);
+                    if (previous == visuals::Tab::Settings) != (tab == visuals::Tab::Settings) {
+                        let mut client = RECT::default();
+                        if GetClientRect(self.hwnd, &mut client).is_ok() {
+                            let header_clip = RECT {
+                                left: 0,
+                                top: 0,
+                                right: client.right,
+                                bottom: c.top,
+                            };
+                            let _ = RedrawWindow(
+                                self.hwnd,
+                                Some(&header_clip),
+                                None,
+                                RDW_INVALIDATE | RDW_ALLCHILDREN,
+                            );
+                        }
+                    }
+                }
                 return Ok(());
             }
         }
@@ -4783,10 +4781,15 @@ unsafe extern "system" fn window_proc(
                 if cmd == SC_MINIMIZE {
                     let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                     visuals::begin_backdrop_transition(window);
-                } else if cmd == SC_RESTORE || cmd == SC_MAXIMIZE {
+                } else if (cmd == SC_RESTORE || cmd == SC_MAXIMIZE) && IsIconic(window).as_bool() {
                     visuals::begin_backdrop_transition(window);
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 280, None);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 260, None);
                 }
+                DefWindowProcW(window, message, wparam, lparam)
+            }
+            WM_QUERYOPEN => {
+                visuals::begin_backdrop_transition(window);
+                let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 260, None);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_WINDOWPOSCHANGING if lparam.0 != 0 => {
@@ -4801,7 +4804,7 @@ unsafe extern "system" fn window_proc(
                         || (pos.x > -30000 && (pos.flags.0 & SWP_NOMOVE.0) == 0))
                 {
                     visuals::begin_backdrop_transition(window);
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 280, None);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 260, None);
                 }
                 DefWindowProcW(window, message, wparam, lparam)
             }
@@ -4810,6 +4813,7 @@ unsafe extern "system" fn window_proc(
                 if wparam.0 == SIZE_MINIMIZED as usize {
                     let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                     let _ = SetPropW(window, ICONIC_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+                    visuals::end_minimize_backdrop_transition(window);
                     return LRESULT(0);
                 }
                 if matches!(wparam.0 as u32, SIZE_RESTORED | SIZE_MAXIMIZED)
@@ -4822,7 +4826,7 @@ unsafe extern "system" fn window_proc(
                         None,
                         RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
                     );
-                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 280, None);
+                    let _ = SetTimer(window, RESTORE_BACKDROP_TIMER_ID, 260, None);
                 }
                 post(LAYOUT, WPARAM(0), LPARAM(0));
                 LRESULT(0)

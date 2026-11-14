@@ -350,7 +350,7 @@ const ACTIVE_TILE_ALPHA: u8 = 196;
 const ACTIVE_ALPHA: u8 = 244;
 pub const BORDER_ALPHA: u8 = 220;
 const DIVIDER_ALPHA: u8 = 176;
-const SEARCH_ALPHA: u8 = 208;
+const SEARCH_ALPHA: u8 = 255;
 pub const DROPDOWN_ALPHA: u8 = 156;
 // Lighter smoked Ink Acrylic tint so wallpaper colors & blur shine clearly both focused and unfocused.
 const ACRYLIC_TINT_COLOR: u32 = 0x2211_1111;
@@ -868,6 +868,21 @@ unsafe fn set_child_visible_no_redraw(child: HWND, visible: bool) {
     };
     unsafe {
         if !visible || IsWindow(child).as_bool() {
+            let is_search = GetDlgCtrlID(child) as usize == SEARCH;
+            if is_search && !visible {
+                let extended = GetWindowLongPtrW(child, GWL_EXSTYLE);
+                let stripped = extended & !(WS_EX_LAYERED.0 as isize);
+                if stripped != extended {
+                    SetWindowLongPtrW(child, GWL_EXSTYLE, stripped);
+                }
+            } else if is_search && visible {
+                let extended = GetWindowLongPtrW(child, GWL_EXSTYLE);
+                let layered = extended | WS_EX_LAYERED.0 as isize;
+                if layered != extended {
+                    SetWindowLongPtrW(child, GWL_EXSTYLE, layered);
+                }
+                sync_search_alpha(GetParent(child).unwrap_or_default(), child);
+            }
             let _ = SetWindowPos(
                 child,
                 None,
@@ -1180,7 +1195,7 @@ pub fn capture_region_controls(
     capture_region(window, bounds, controls)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn begin_transition(
     window: HWND,
     clip: RECT,
@@ -1225,9 +1240,6 @@ pub fn begin_transition_with_hide(
             for &child in to_hide {
                 set_child_visible_no_redraw(child, false);
             }
-            if !window.0.is_null() && IsWindow(window).as_bool() {
-                let _ = RedrawWindow(window, Some(&clip), None, RDW_INVALIDATE | RDW_UPDATENOW);
-            }
             for &child in &hidden {
                 set_child_visible_no_redraw(child, true);
             }
@@ -1238,15 +1250,13 @@ pub fn begin_transition_with_hide(
             {
                 let _ = SetFocus(target);
             }
-            for &child in &hidden {
-                if !child.0.is_null() && IsWindow(child).as_bool() {
-                    let _ = RedrawWindow(
-                        child,
-                        None,
-                        None,
-                        RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW,
-                    );
-                }
+            if !window.0.is_null() && IsWindow(window).as_bool() {
+                let _ = RedrawWindow(
+                    window,
+                    Some(&clip),
+                    None,
+                    RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                );
             }
         }
         return;
@@ -1277,15 +1287,6 @@ pub fn begin_transition_with_hide(
 
 fn end_transition(window: HWND, anim: TransitionAnim) {
     unsafe {
-        // Repaint the parent clip before unhiding children so WS_CLIPCHILDREN cannot trap transition pixels behind WS_EX_LAYERED SEARCH.
-        if !window.0.is_null() && IsWindow(window).as_bool() {
-            let _ = RedrawWindow(
-                window,
-                Some(&anim.clip),
-                None,
-                RDW_INVALIDATE | RDW_UPDATENOW,
-            );
-        }
         for &child in &anim.hidden {
             set_child_visible_no_redraw(child, true);
         }
@@ -1296,15 +1297,13 @@ fn end_transition(window: HWND, anim: TransitionAnim) {
         {
             let _ = SetFocus(target);
         }
-        for &child in &anim.hidden {
-            if !child.0.is_null() && IsWindow(child).as_bool() {
-                let _ = RedrawWindow(
-                    child,
-                    None,
-                    None,
-                    RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW,
-                );
-            }
+        if !window.0.is_null() && IsWindow(window).as_bool() {
+            let _ = RedrawWindow(
+                window,
+                Some(&anim.clip),
+                None,
+                RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
         }
     }
     drop(anim.old_layer);
@@ -1430,6 +1429,18 @@ pub fn clear() {
             }
         }
     });
+    TRANSITION_BACKDROP.with(|slot| *slot.borrow_mut() = TransitionBackdrop::default());
+}
+
+#[derive(Default)]
+struct TransitionBackdrop {
+    active: bool,
+    hwnd: isize,
+    win_rect: RECT,
+    mon_rect: RECT,
+    width: i32,
+    height: i32,
+    pixels: Vec<u32>,
 }
 
 struct PaintRuntime {
@@ -1457,6 +1468,7 @@ thread_local! {
     static TEXT_THEME: Cell<HTHEME> = const { Cell::new(HTHEME(0)) };
     static USER_ACRYLIC: Cell<bool> = const { Cell::new(true) };
     static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
+    static TRANSITION_BACKDROP: RefCell<TransitionBackdrop> = RefCell::new(TransitionBackdrop::default());
 }
 
 pub fn set_user_acrylic(enabled: bool) {
@@ -1468,6 +1480,7 @@ pub fn user_acrylic_enabled() -> bool {
 }
 struct PaintBuffer {
     handle: isize,
+    target: HDC,
     dc: HDC,
     area: RECT,
 }
@@ -1497,7 +1510,12 @@ impl PaintBuffer {
             }
             return None;
         }
-        Some(Self { handle, dc, area })
+        Some(Self {
+            handle,
+            target,
+            dc,
+            area,
+        })
     }
     unsafe fn opaque(&self) -> bool {
         unsafe { GdiFlush().as_bool() && BufferedPaintSetAlpha(self.handle, None, 255).is_ok() }
@@ -2235,10 +2253,111 @@ impl PaintBuffer {
         }
         true
     }
+    unsafe fn blend_transition_backdrop(&self) {
+        let width = self.area.right - self.area.left;
+        let height = self.area.bottom - self.area.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        TRANSITION_BACKDROP.with(|slot| {
+            let bd = slot.borrow();
+            if !bd.active || bd.pixels.is_empty() || bd.width <= 0 || bd.height <= 0 {
+                return;
+            }
+            let total_bg = (bd.width as usize).saturating_mul(bd.height as usize);
+            if bd.pixels.len() < total_bg {
+                return;
+            }
+            // SAFETY: self.target is valid for the buffered paint session until EndBufferedPaint.
+            let dc_wnd = unsafe { WindowFromDC(self.target) };
+            if dc_wnd.0.is_null() {
+                return;
+            }
+            let anc = unsafe { GetAncestor(dc_wnd, GA_ROOT) };
+            let root = if anc.0.is_null() { dc_wnd } else { anc };
+            if root.0 as isize != bd.hwnd {
+                return;
+            }
+            let (ox, oy) = if dc_wnd == root {
+                (0, 0)
+            } else {
+                let mut pts = [POINT::default()];
+                unsafe {
+                    MapWindowPoints(dc_wnd, root, &mut pts);
+                }
+                (pts[0].x, pts[0].y)
+            };
+            let (win_left, win_top) = unsafe {
+                if !IsIconic(root).as_bool() && IsWindowVisible(root).as_bool() {
+                    let mut pt = POINT::default();
+                    if ClientToScreen(root, &mut pt).as_bool() {
+                        (pt.x, pt.y)
+                    } else {
+                        (bd.win_rect.left, bd.win_rect.top)
+                    }
+                } else {
+                    (bd.win_rect.left, bd.win_rect.top)
+                }
+            };
+            let mut bits = std::ptr::null_mut();
+            let mut stride = 0;
+            if unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
+                || bits.is_null()
+                || stride < width
+                || !unsafe { GdiFlush() }.as_bool()
+            {
+                return;
+            }
+            let Some(len) = (stride as usize)
+                .checked_mul(height as usize)
+                .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<RGBQUAD>())
+            else {
+                return;
+            };
+            let mon_w = (bd.mon_rect.right - bd.mon_rect.left).max(1);
+            let mon_h = (bd.mon_rect.bottom - bd.mon_rect.top).max(1);
+            let bw = bd.width;
+            let bh = bd.height;
+            // SAFETY: GetBufferedPaintBits owns stride * buffer height RGBQUADs until EndBufferedPaint.
+            let pixels = unsafe { std::slice::from_raw_parts_mut(bits, len) };
+            for y in 0..height {
+                let sy = win_top + oy + self.area.top + y;
+                let rel_y = (sy - bd.mon_rect.top).clamp(0, mon_h - 1);
+                let by =
+                    ((rel_y as i64 * bh as i64) / mon_h as i64).clamp(0, (bh - 1) as i64) as usize;
+                let bg_row = by * bw as usize;
+                let dst_row = y as usize * stride as usize;
+                for x in 0..width {
+                    let pixel = &mut pixels[dst_row + x as usize];
+                    if pixel.rgbReserved < 255 {
+                        let sx = win_left + ox + self.area.left + x;
+                        let rel_x = (sx - bd.mon_rect.left).clamp(0, mon_w - 1);
+                        let bx = ((rel_x as i64 * bw as i64) / mon_w as i64)
+                            .clamp(0, (bw - 1) as i64) as usize;
+                        let bg = bd.pixels[bg_row + bx];
+                        let bg_r = ((bg >> 16) & 255) as u16;
+                        let bg_g = ((bg >> 8) & 255) as u16;
+                        let bg_b = (bg & 255) as u16;
+                        let inv = u16::from(255 - pixel.rgbReserved);
+                        pixel.rgbRed =
+                            (u16::from(pixel.rgbRed) + (bg_r * inv + 127) / 255).min(255) as u8;
+                        pixel.rgbGreen =
+                            (u16::from(pixel.rgbGreen) + (bg_g * inv + 127) / 255).min(255) as u8;
+                        pixel.rgbBlue =
+                            (u16::from(pixel.rgbBlue) + (bg_b * inv + 127) / 255).min(255) as u8;
+                        pixel.rgbReserved = 255;
+                    }
+                }
+            }
+        });
+    }
     unsafe fn finish(mut self) -> bool {
-        let result = unsafe { EndBufferedPaint(self.handle, true) }.is_ok();
-        self.handle = 0;
-        result
+        unsafe {
+            self.blend_transition_backdrop();
+            let result = EndBufferedPaint(self.handle, true).is_ok();
+            self.handle = 0;
+            result
+        }
     }
 }
 impl Drop for PaintBuffer {
@@ -3085,60 +3204,307 @@ unsafe fn apply_hybrid_acrylic(window: HWND) -> bool {
     }
 }
 
-pub fn begin_backdrop_transition(window: HWND) {
-    use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
-    if window.0.is_null() {
+fn box_blur_horizontal(src: &[u32], dst: &mut [u32], width: i32, height: i32, radius: i32) {
+    if width <= 0 || height <= 0 || radius <= 0 {
         return;
     }
-    // SAFETY: switches DWM to native DWMSBT_TRANSIENTWINDOW for minimize/restore transition while preserving GLASS_PROPERTY.
-    unsafe {
-        if !glass_enabled(window) || !user_acrylic_enabled() || !transparency_enabled() {
-            return;
+    let total = (width as usize).saturating_mul(height as usize);
+    if src.len() < total || dst.len() < total {
+        return;
+    }
+    let denom = (radius * 2 + 1) as u32;
+    let half = denom / 2;
+    let max_x = width - 1;
+    for y in 0..height {
+        let row = y as usize * width as usize;
+        let mut sum_r = 0u32;
+        let mut sum_g = 0u32;
+        let mut sum_b = 0u32;
+        for dx in -radius..=radius {
+            let px = src[row + dx.clamp(0, max_x) as usize];
+            sum_r += (px >> 16) & 255;
+            sum_g += (px >> 8) & 255;
+            sum_b += px & 255;
         }
-        let _ = set_acrylic_composition(window, false);
-        let blur = DWM_BLURBEHIND {
-            dwFlags: DWM_BB_ENABLE,
-            fEnable: false.into(),
-            ..Default::default()
-        };
-        let _ = DwmEnableBlurBehindWindow(window, &blur);
-        let margins = MARGINS {
-            cxLeftWidth: -1,
-            cxRightWidth: -1,
-            cyTopHeight: -1,
-            cyBottomHeight: -1,
-        };
-        let _ = DwmExtendFrameIntoClientArea(window, &margins);
-        let acrylic = DWMSBT_TRANSIENTWINDOW.0;
-        let _ = DwmSetWindowAttribute(
-            window,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            (&acrylic as *const i32).cast(),
-            std::mem::size_of_val(&acrylic) as u32,
-        );
+        for x in 0..width {
+            dst[row + x as usize] = (((sum_r + half) / denom) << 16)
+                | (((sum_g + half) / denom) << 8)
+                | ((sum_b + half) / denom);
+            if x + 1 < width {
+                let rem = src[row + (x - radius).clamp(0, max_x) as usize];
+                let add = src[row + (x + 1 + radius).clamp(0, max_x) as usize];
+                sum_r = sum_r + ((add >> 16) & 255) - ((rem >> 16) & 255);
+                sum_g = sum_g + ((add >> 8) & 255) - ((rem >> 8) & 255);
+                sum_b = sum_b + (add & 255) - (rem & 255);
+            }
+        }
     }
 }
 
+fn box_blur_vertical(src: &[u32], dst: &mut [u32], width: i32, height: i32, radius: i32) {
+    if width <= 0 || height <= 0 || radius <= 0 {
+        return;
+    }
+    let total = (width as usize).saturating_mul(height as usize);
+    if src.len() < total || dst.len() < total {
+        return;
+    }
+    let denom = (radius * 2 + 1) as u32;
+    let half = denom / 2;
+    let w = width as usize;
+    let max_y = height - 1;
+    for x in 0..width {
+        let col = x as usize;
+        let mut sum_r = 0u32;
+        let mut sum_g = 0u32;
+        let mut sum_b = 0u32;
+        for dy in -radius..=radius {
+            let px = src[dy.clamp(0, max_y) as usize * w + col];
+            sum_r += (px >> 16) & 255;
+            sum_g += (px >> 8) & 255;
+            sum_b += px & 255;
+        }
+        for y in 0..height {
+            dst[y as usize * w + col] = (((sum_r + half) / denom) << 16)
+                | (((sum_g + half) / denom) << 8)
+                | ((sum_b + half) / denom);
+            if y + 1 < height {
+                let rem = src[(y - radius).clamp(0, max_y) as usize * w + col];
+                let add = src[(y + 1 + radius).clamp(0, max_y) as usize * w + col];
+                sum_r = sum_r + ((add >> 16) & 255) - ((rem >> 16) & 255);
+                sum_g = sum_g + ((add >> 8) & 255) - ((rem >> 8) & 255);
+                sum_b = sum_b + (add & 255) - (rem & 255);
+            }
+        }
+    }
+}
+
+unsafe fn capture_transition_backdrop(window: HWND) {
+    const BACKDROP_W: i32 = 320;
+    const BACKDROP_H: i32 = 180;
+    const BACKDROP_BLUR_RADIUS: i32 = 5;
+    // SAFETY: window is a live HWND; screen DC, memory DC, and DIB section are freed before returning.
+    unsafe {
+        let iconic = IsIconic(window).as_bool();
+        let visible = IsWindowVisible(window).as_bool();
+        let mut win_rect = RECT::default();
+        if iconic {
+            let mut wp = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if GetWindowPlacement(window, &mut wp).is_ok() {
+                if wp.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0 {
+                    let mon = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                        win_rect = mi.rcWork;
+                    } else {
+                        win_rect = wp.rcNormalPosition;
+                    }
+                } else {
+                    win_rect = wp.rcNormalPosition;
+                }
+            } else {
+                let _ = GetWindowRect(window, &mut win_rect);
+            }
+        } else {
+            let mut client = RECT::default();
+            let mut pt = POINT::default();
+            if GetClientRect(window, &mut client).is_ok()
+                && ClientToScreen(window, &mut pt).as_bool()
+            {
+                win_rect = rect(
+                    pt.x + client.left,
+                    pt.y + client.top,
+                    pt.x + client.right,
+                    pt.y + client.bottom,
+                );
+            } else {
+                let _ = GetWindowRect(window, &mut win_rect);
+            }
+        }
+        let mon = MonitorFromRect(&win_rect, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon_rect = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcMonitor
+        } else {
+            win_rect
+        };
+        let total = (BACKDROP_W * BACKDROP_H) as usize;
+        let should_capture = iconic || !visible;
+        let mon_w = mon_rect.right - mon_rect.left;
+        let mon_h = mon_rect.bottom - mon_rect.top;
+        let mut captured = None;
+        if should_capture && mon_w > 0 && mon_h > 0 {
+            let screen = GetDC(None);
+            if !screen.0.is_null() {
+                let mem_dc = CreateCompatibleDC(screen);
+                if !mem_dc.0.is_null() {
+                    let mut bits = std::ptr::null_mut();
+                    if let Ok(bitmap) = CreateDIBSection(
+                        mem_dc,
+                        &BITMAPINFO {
+                            bmiHeader: BITMAPINFOHEADER {
+                                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                                biWidth: BACKDROP_W,
+                                biHeight: -BACKDROP_H,
+                                biPlanes: 1,
+                                biBitCount: 32,
+                                biCompression: BI_RGB.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        DIB_RGB_COLORS,
+                        &mut bits,
+                        None,
+                        0,
+                    ) {
+                        let prev = SelectObject(mem_dc, bitmap);
+                        if !bits.is_null() {
+                            let _ = SetStretchBltMode(mem_dc, HALFTONE);
+                            let _ = SetBrushOrgEx(mem_dc, 0, 0, None);
+                            if StretchBlt(
+                                mem_dc,
+                                0,
+                                0,
+                                BACKDROP_W,
+                                BACKDROP_H,
+                                screen,
+                                mon_rect.left,
+                                mon_rect.top,
+                                mon_w,
+                                mon_h,
+                                SRCCOPY,
+                            )
+                            .as_bool()
+                            {
+                                let _ = GdiFlush();
+                                let mut buf =
+                                    std::slice::from_raw_parts(bits as *const u32, total).to_vec();
+                                let mut temp = vec![0u32; total];
+                                for _ in 0..3 {
+                                    box_blur_horizontal(
+                                        &buf,
+                                        &mut temp,
+                                        BACKDROP_W,
+                                        BACKDROP_H,
+                                        BACKDROP_BLUR_RADIUS,
+                                    );
+                                    box_blur_vertical(
+                                        &temp,
+                                        &mut buf,
+                                        BACKDROP_W,
+                                        BACKDROP_H,
+                                        BACKDROP_BLUR_RADIUS,
+                                    );
+                                }
+                                for px in &mut buf {
+                                    let r = (((*px >> 16) & 255) * 72 + 17 * 183 + 127) / 255;
+                                    let g = (((*px >> 8) & 255) * 72 + 17 * 183 + 127) / 255;
+                                    let b = ((*px & 255) * 72 + 17 * 183 + 127) / 255;
+                                    *px = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+                                }
+                                captured = Some(buf);
+                            }
+                        }
+                        SelectObject(mem_dc, prev);
+                        let _ = DeleteObject(bitmap);
+                    }
+                    let _ = DeleteDC(mem_dc);
+                }
+                let _ = ReleaseDC(None, screen);
+            }
+        }
+        TRANSITION_BACKDROP.with(|slot| {
+            let mut bd = slot.borrow_mut();
+            if let Some(buf) = captured {
+                bd.pixels = buf;
+            } else if bd.hwnd != window.0 as isize
+                || bd.mon_rect != mon_rect
+                || bd.pixels.len() != total
+            {
+                bd.pixels.clear();
+                bd.pixels.resize(total, 0xFF11_1111);
+            }
+            bd.hwnd = window.0 as isize;
+            bd.win_rect = win_rect;
+            bd.mon_rect = mon_rect;
+            bd.width = BACKDROP_W;
+            bd.height = BACKDROP_H;
+        });
+    }
+}
+
+pub fn begin_backdrop_transition(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    // SAFETY: bakes blurred desktop backdrop into PaintBuffer during DWM minimize/restore transitions.
+    unsafe {
+        if !IsWindow(window).as_bool()
+            || !glass_enabled(window)
+            || !user_acrylic_enabled()
+            || !transparency_enabled()
+        {
+            return;
+        }
+        capture_transition_backdrop(window);
+        TRANSITION_BACKDROP.with(|slot| slot.borrow_mut().active = true);
+        if !IsIconic(window).as_bool() && IsWindowVisible(window).as_bool() {
+            let _ = RedrawWindow(
+                window,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
+        }
+    }
+}
+
+pub fn end_minimize_backdrop_transition(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        if bd.hwnd == window.0 as isize {
+            bd.active = false;
+        }
+    });
+}
+
 pub fn finish_backdrop_transition(window: HWND) {
+    TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        if window.0.is_null() || bd.hwnd == window.0 as isize {
+            bd.active = false;
+        }
+    });
     if window.0.is_null() {
         return;
     }
     // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND once restore animation finishes.
     unsafe {
-        if IsIconic(window).as_bool() {
+        if !IsWindow(window).as_bool() || IsIconic(window).as_bool() {
             return;
         }
         if glass_enabled(window) && user_acrylic_enabled() && transparency_enabled() {
-            if apply_accent_acrylic(window) {
-                if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
-                    sync_search_alpha(window, search);
-                }
-            } else {
-                let _ = enable_backdrop(window);
-            }
-        } else {
-            let _ = enable_backdrop(window);
+            let _ = set_acrylic_composition(window, true);
         }
+        let _ = RedrawWindow(
+            window,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+        );
     }
 }
 
@@ -3179,7 +3545,7 @@ pub fn enable_backdrop(window: HWND) -> bool {
             return false;
         }
         if glass_enabled(window) {
-            let _ = apply_hybrid_acrylic(window);
+            let _ = set_acrylic_composition(window, true);
             if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
                 sync_search_alpha(window, search);
             }
@@ -3206,6 +3572,12 @@ pub fn enable_backdrop(window: HWND) -> bool {
 
 pub fn disable_backdrop(window: HWND) {
     use windows::Win32::{Graphics::Dwm::*, UI::Controls::MARGINS};
+    TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        if bd.hwnd == window.0 as isize {
+            bd.active = false;
+        }
+    });
     unsafe {
         let was_enabled = glass_enabled(window);
         let _ = RemovePropW(window, GLASS_PROPERTY);
@@ -5190,8 +5562,41 @@ mod tests {
     #[test]
     fn backdrop_transition_handles_null_hwnd_safely() {
         begin_backdrop_transition(HWND::default());
+        end_minimize_backdrop_transition(HWND::default());
         finish_backdrop_transition(HWND::default());
         assert!(!glass_enabled(HWND::default()));
+    }
+
+    #[test]
+    fn box_blur_and_transition_backdrop_state() {
+        assert_eq!(SEARCH_ALPHA, 255);
+        let w = 24i32;
+        let h = 16i32;
+        let total = (w * h) as usize;
+        let uniform = vec![0x0034_5678u32; total];
+        let mut temp = vec![0u32; total];
+        let mut out = vec![0u32; total];
+        box_blur_horizontal(&uniform, &mut temp, w, h, 5);
+        box_blur_vertical(&temp, &mut out, w, h, 5);
+        assert!(out.iter().all(|&px| px == 0x0034_5678));
+
+        let mut impulse = vec![0u32; total];
+        impulse[(h as usize / 2) * w as usize + (w as usize / 2)] = 0x00FF_FFFF;
+        box_blur_horizontal(&impulse, &mut temp, w, h, 5);
+        box_blur_vertical(&temp, &mut out, w, h, 5);
+        let center = out[(h as usize / 2) * w as usize + (w as usize / 2)];
+        let neighbor = out[(h as usize / 2) * w as usize + (w as usize / 2 + 2)];
+        assert!(center > 0 && neighbor > 0 && center == neighbor);
+
+        let fake_hwnd = HWND(std::ptr::dangling_mut());
+        TRANSITION_BACKDROP.with(|slot| {
+            let mut bd = slot.borrow_mut();
+            bd.active = true;
+            bd.hwnd = fake_hwnd.0 as isize;
+        });
+        end_minimize_backdrop_transition(fake_hwnd);
+        assert!(!TRANSITION_BACKDROP.with(|slot| slot.borrow().active));
+        clear();
     }
 
     #[test]
@@ -5285,6 +5690,22 @@ mod tests {
                 },
             );
             assert_ne!(GetWindowLongW(search, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            assert_ne!(
+                GetWindowLongPtrW(search, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
+                0
+            );
+            set_child_visible_no_redraw(search, false);
+            assert_eq!(GetWindowLongW(search, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            assert_eq!(
+                GetWindowLongPtrW(search, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
+                0
+            );
+            set_child_visible_no_redraw(search, true);
+            assert_ne!(GetWindowLongW(search, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            assert_ne!(
+                GetWindowLongPtrW(search, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
+                0
+            );
 
             let child_dc = CreateCompatibleDC(None);
             let mut child_bits = std::ptr::null_mut();
