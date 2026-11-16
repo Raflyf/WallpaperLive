@@ -4961,6 +4961,13 @@ unsafe extern "system" fn window_proc(
                 post(ACTION, WPARAM(HIDE), LPARAM(0));
                 LRESULT(0)
             }
+            WM_QUERYENDSESSION => LRESULT(1),
+            WM_ENDSESSION => {
+                if wparam.0 != 0 {
+                    post(ACTION, WPARAM(EXIT), LPARAM(0));
+                }
+                LRESULT(0)
+            }
             WM_ENTERSIZEMOVE => {
                 let _ = SetPropW(window, SIZE_MOVE_PROPERTY, HANDLE(std::ptr::dangling_mut()));
                 enter_drag_move(window);
@@ -7799,5 +7806,60 @@ mod tests {
                 .contains("\r\nD1: 1920x1080, 30 FPS native (limit 60) | D2: 2560x1440, 60 FPS"),
             "distinct multi-display specs should show per-display details: {distinct_status}"
         );
+    }
+
+    #[test]
+    fn query_and_end_session_enqueue_exit_only_when_ending() {
+        // SAFETY: isolated hidden test window registered and destroyed solely within this test.
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("module handle");
+            let class_name = w!("WallpaperLive.EndSessionTest");
+            let atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            });
+            assert!(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                class_name,
+                w!("WallpaperLive EndSession Test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                320,
+                200,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("endsession test window");
+
+            assert_eq!(
+                SendMessageW(hwnd, WM_QUERYENDSESSION, WPARAM(0), LPARAM(1)),
+                LRESULT(1)
+            );
+            assert_eq!(
+                SendMessageW(hwnd, WM_ENDSESSION, WPARAM(0), LPARAM(1)),
+                LRESULT(0)
+            );
+            let mut msg = MSG::default();
+            assert!(!PeekMessageW(&mut msg, hwnd, ACTION, ACTION, PM_REMOVE).as_bool());
+
+            assert_eq!(
+                SendMessageW(hwnd, WM_ENDSESSION, WPARAM(1), LPARAM(1)),
+                LRESULT(0)
+            );
+            assert!(PeekMessageW(&mut msg, hwnd, ACTION, ACTION, PM_REMOVE).as_bool());
+            assert_eq!(msg.wParam, WPARAM(EXIT));
+
+            let _ = DestroyWindow(hwnd);
+            while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
+            if atom != 0 {
+                let _ = UnregisterClassW(class_name, instance);
+            }
+        }
     }
 }

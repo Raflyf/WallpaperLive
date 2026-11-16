@@ -57,6 +57,11 @@ Name: "{userprograms}\WallpaperLive"; Filename: "{app}\wallpaperlive.exe"; Worki
 Filename: "{app}\wallpaperlive.exe"; Description: "{cm:LaunchProgram,WallpaperLive}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+const
+  { Must stay in sync with ACTION (WM_APP + 1) and EXIT in src/app.rs. }
+  WM_WALLPAPERLIVE_ACTION = $8001;
+  ID_WALLPAPERLIVE_EXIT = 110;
+
 var
   ConsentPage: TInputOptionWizardPage;
   DownloadPage: TDownloadWizardPage;
@@ -68,23 +73,39 @@ begin
   Result := DownloadDecoder;
 end;
 
-function InitializeSetup: Boolean;
+procedure CloseRunningApplication;
 var
-  ResultCode: Integer;
+  Wnd: HWND;
+  Attempts: Integer;
+  Posted: Boolean;
+begin
+  Posted := False;
+  for Attempts := 0 to 99 do
+  begin
+    if not CheckForMutexes('Local\Raflyf.WallpaperLive') then Exit;
+    if not Posted then
+    begin
+      Wnd := FindWindowByClassName('WallpaperLive.Panel');
+      if Wnd <> 0 then
+      begin
+        PostMessage(Wnd, WM_WALLPAPERLIVE_ACTION, ID_WALLPAPERLIVE_EXIT, 0);
+        Posted := True;
+      end;
+    end;
+    Sleep(50);
+  end;
+end;
+
+function InitializeSetup: Boolean;
 begin
   Result := True;
-  // Automatically terminate running wallpaperlive.exe so user does not have to exit from tray manually
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im wallpaperlive.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(250);
+  CloseRunningApplication;
 end;
 
 function InitializeUninstall: Boolean;
-var
-  ResultCode: Integer;
 begin
   Result := True;
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im wallpaperlive.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(250);
+  CloseRunningApplication;
 end;
 
 procedure InitializeWizard;
@@ -127,12 +148,10 @@ var
   ExistingDecoder: String;
   DecoderDir: String;
   DecoderArchive: String;
-  ResultCode: Integer;
 begin
   Result := '';
   NeedsRestart := False;
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im wallpaperlive.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(150);
+  CloseRunningApplication;
   if not LocalDecoderAvailable and not ConsentPage.Values[0] then begin
     Result := 'Decoder download consent was not granted. Nothing installed.';
     Exit;
