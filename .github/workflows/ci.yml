@@ -125,6 +125,7 @@ jobs:
           - Bring your own live wallpapers. WallpaperLive applies your local files; it does not provide a wallpaper catalog, marketplace or wallpaper downloads.
           - Setup reuses a verified decoder or local archive; otherwise it asks before a one-time decoder download. No wallpapers or decoder binaries are bundled.
           - Setup can launch the app on completion, but does not apply a wallpaper or enable startup automatically. Installation and live desktop testing remain manual.
+          - See [Code signing policy](https://github.com/$env:GH_REPO#code-signing-policy) and [Privacy policy](https://github.com/$env:GH_REPO#privacy-policy).
           "@
           $notes | Set-Content -LiteralPath .\dist\release-notes.md -Encoding utf8
           gh release view $env:RELEASE_TAG --json isDraft --jq '.isDraft' > $null

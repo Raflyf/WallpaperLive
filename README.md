@@ -18,6 +18,8 @@
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
+  &nbsp;·&nbsp; <a href="#code-signing-policy">Code signing policy</a>
+  &nbsp;·&nbsp; <a href="#privacy-policy">Privacy policy</a>
   &nbsp;·&nbsp; <a href="https://saweria.co/BuyMatcha">Saweria</a>
   &nbsp;·&nbsp; <a href="https://yapp.ink/raflyf">Buy me a coffee</a>
 </p>
@@ -117,13 +119,13 @@ The desktop capture also shows 0 MB/s disk and 0 Mbps network; paused shows 0 MB
 2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.1/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases)
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.1/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases) · [Code signing policy](#code-signing-policy)
 
 Installer downloads include the release version, such as `wallpaperlivesetup-v0.2.1.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
-Setup installs per user without administrator rights. It provides an option to launch the app on completion, but does not apply a wallpaper or enable startup automatically. These builds are unsigned: keep Windows security protections enabled. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
+Setup installs per user without administrator rights. It provides an option to launch the app on completion, but does not apply a wallpaper or enable startup automatically. Published builds prior to CI signing activation (including `v0.2.1`) are unsigned: keep Windows security protections enabled. See [Code signing policy](#code-signing-policy) for planned release signing details. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
 
 <details>
 <summary>Offline install or upgrade</summary>
@@ -203,6 +205,25 @@ The app and Start-menu shortcut use the same stable taskbar identity, `Raflyf.Wa
 Support development via [Buy me a coffee](<https://yapp.ink/raflyf>) or [Saweria](<https://saweria.co/BuyMatcha>). Support is optional and does not unlock or restrict features. Links open in your browser.
 
 Both links are directly accessible in **Settings**.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+Releases published prior to SignPath CI integration (including `v0.2.1`) remain unsigned until release signing is enabled in [Windows checks](.github/workflows/ci.yml). Signed releases are built automatically from public repository source on GitHub Actions.
+
+- **Authors / Committers:** [Rafly Firmansyah (`@Raflyf`)](https://github.com/Raflyf)
+- **Reviewers:** [Rafly Firmansyah (`@Raflyf`)](https://github.com/Raflyf) (all pull requests require maintainer review before merge)
+- **Approvers:** [Rafly Firmansyah (`@Raflyf`)](https://github.com/Raflyf) (reviews release tags and approves signing requests)
+- **Privacy policy:** See [Privacy policy](#privacy-policy).
+
+## Privacy policy
+
+WallpaperLive does not collect, store, or transmit personal information, telemetry, analytics, local media file paths, or user preferences to developer servers or third parties. Settings, library entries, thumbnails, and cached SDR media copies are stored locally under `%LOCALAPPDATA%\WallpaperLive`.
+
+- **Update check:** On startup and when triggered manually from the tray menu, WallpaperLive sends a single read-only HTTPS `GET` request to `https://api.github.com/repos/Raflyf/WallpaperLive/releases/latest` with `User-Agent: WallpaperLive/<version>` and cookies, redirects, and authentication disabled. No media paths, settings, or personal identifiers are sent, and release pages open in your browser only after confirmation.
+- **Installer decoder download:** When a verified `libmpv-2.dll` is not already installed or supplied locally beside the installer as `mpv-dev.7z`, Setup requests explicit user consent before downloading the pinned archive from GitHub (`shinchiro/mpv-winbuild-cmake`) and checks SHA256 before extraction.
+- **External website links:** Selecting links under **Where to find wallpapers**, **Settings**, or the tray update notification opens third-party sites in your default browser under their own privacy policies.
 
 ## License
 
