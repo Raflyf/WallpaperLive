@@ -4,6 +4,13 @@ param([Parameter(Mandatory)][string]$Executable, [switch]$VerifyOnly)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$cargo = Get-Content -LiteralPath (Join-Path $root 'Cargo.toml') -Raw
+if ($cargo -notmatch '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+    throw 'Could not determine numeric X.Y.Z version from Cargo.toml.'
+}
+$verMajor = [int]$Matches[1]
+$verMinor = [int]$Matches[2]
+$verPatch = [int]$Matches[3]
 $Executable = (Resolve-Path -LiteralPath $Executable).ProviderPath
 $entry = Get-Item -LiteralPath $Executable
 if ($entry.PSIsContainer) { throw 'Executable must be a regular file.' }
@@ -66,7 +73,126 @@ public static class IconResources {
             return data;
         } finally { FreeLibrary(module); }
     }
-    public static void Apply(string file, byte[] ico, bool verifyOnly) {
+    static byte[] Align4(System.IO.MemoryStream ms) {
+        while ((ms.Position & 3) != 0) ms.WriteByte(0);
+        return null;
+    }
+    static void PatchLength(System.IO.MemoryStream ms, long start) {
+        long end = ms.Position;
+        ms.Position = start;
+        byte[] len = BitConverter.GetBytes((ushort)(end - start));
+        ms.Write(len, 0, 2);
+        ms.Position = end;
+    }
+    static byte[] WriteStringEntry(string key, string value) {
+        using (var ms = new System.IO.MemoryStream())
+        using (var bw = new System.IO.BinaryWriter(ms, System.Text.Encoding.Unicode, true)) {
+            bw.Write((ushort)0);
+            bw.Write((ushort)(value.Length + 1));
+            bw.Write((ushort)1);
+            bw.Write(System.Text.Encoding.Unicode.GetBytes(key + "\0"));
+            Align4(ms);
+            bw.Write(System.Text.Encoding.Unicode.GetBytes(value + "\0"));
+            PatchLength(ms, 0);
+            return ms.ToArray();
+        }
+    }
+    public static byte[] BuildVersionResource(int major, int minor, int patch) {
+        string productVer = string.Format("{0}.{1}.{2}", major, minor, patch);
+        string fileVer = string.Format("{0}.{1}.{2}.0", major, minor, patch);
+        var entries = new[] {
+            new[] { "CompanyName", "Raflyf" },
+            new[] { "FileDescription", "WallpaperLive" },
+            new[] { "FileVersion", fileVer },
+            new[] { "InternalName", "wallpaperlive" },
+            new[] { "LegalCopyright", "GPL-3.0-or-later" },
+            new[] { "OriginalFilename", "wallpaperlive.exe" },
+            new[] { "ProductName", "WallpaperLive" },
+            new[] { "ProductVersion", productVer },
+        };
+        byte[] tableBytes;
+        using (var ms = new System.IO.MemoryStream())
+        using (var bw = new System.IO.BinaryWriter(ms, System.Text.Encoding.Unicode, true)) {
+            bw.Write((ushort)0);
+            bw.Write((ushort)0);
+            bw.Write((ushort)1);
+            bw.Write(System.Text.Encoding.Unicode.GetBytes("040904b0\0"));
+            Align4(ms);
+            for (int i = 0; i < entries.Length; i++) {
+                if (i > 0) Align4(ms);
+                bw.Write(WriteStringEntry(entries[i][0], entries[i][1]));
+            }
+            PatchLength(ms, 0);
+            tableBytes = ms.ToArray();
+        }
+        byte[] stringFileInfo;
+        using (var ms = new System.IO.MemoryStream())
+        using (var bw = new System.IO.BinaryWriter(ms, System.Text.Encoding.Unicode, true)) {
+            bw.Write((ushort)0);
+            bw.Write((ushort)0);
+            bw.Write((ushort)1);
+            bw.Write(System.Text.Encoding.Unicode.GetBytes("StringFileInfo\0"));
+            Align4(ms);
+            bw.Write(tableBytes);
+            PatchLength(ms, 0);
+            stringFileInfo = ms.ToArray();
+        }
+        byte[] varEntry;
+        using (var ms = new System.IO.MemoryStream())
+        using (var bw = new System.IO.BinaryWriter(ms, System.Text.Encoding.Unicode, true)) {
+            bw.Write((ushort)0);
+            bw.Write((ushort)4);
+            bw.Write((ushort)0);
+            bw.Write(System.Text.Encoding.Unicode.GetBytes("Translation\0"));
+            Align4(ms);
+            bw.Write((ushort)0x0409);
+            bw.Write((ushort)0x04B0);
+            PatchLength(ms, 0);
+            varEntry = ms.ToArray();
+        }
+        byte[] varFileInfo;
+        using (var ms = new System.IO.MemoryStream())
+        using (var bw = new System.IO.BinaryWriter(ms, System.Text.Encoding.Unicode, true)) {
+            bw.Write((ushort)0);
+            bw.Write((ushort)0);
+            bw.Write((ushort)1);
+            bw.Write(System.Text.Encoding.Unicode.GetBytes("VarFileInfo\0"));
+            Align4(ms);
+            bw.Write(varEntry);
+            PatchLength(ms, 0);
+            varFileInfo = ms.ToArray();
+        }
+        using (var ms = new System.IO.MemoryStream())
+        using (var bw = new System.IO.BinaryWriter(ms, System.Text.Encoding.Unicode, true)) {
+            bw.Write((ushort)0);
+            bw.Write((ushort)52);
+            bw.Write((ushort)0);
+            bw.Write(System.Text.Encoding.Unicode.GetBytes("VS_VERSION_INFO\0"));
+            Align4(ms);
+            uint msVer = ((uint)major << 16) | (uint)minor;
+            uint lsVer = (uint)patch << 16;
+            bw.Write(0xFEEF04BDu);
+            bw.Write(0x00010000u);
+            bw.Write(msVer);
+            bw.Write(lsVer);
+            bw.Write(msVer);
+            bw.Write(lsVer);
+            bw.Write(0x0000003Fu);
+            bw.Write(0u);
+            bw.Write(0x00040004u);
+            bw.Write(0x00000001u);
+            bw.Write(0u);
+            bw.Write(0u);
+            bw.Write(0u);
+            Align4(ms);
+            bw.Write(stringFileInfo);
+            Align4(ms);
+            bw.Write(varFileInfo);
+            PatchLength(ms, 0);
+            return ms.ToArray();
+        }
+    }
+    public static void Apply(string file, byte[] ico, byte[] versionInfo, bool verifyOnly) {
         if (ico.Length < 6 || ico.Length > 4194304 || BitConverter.ToUInt16(ico, 0) != 0 || BitConverter.ToUInt16(ico, 2) != 1)
             throw new InvalidOperationException("Invalid ICO header");
         int count = BitConverter.ToUInt16(ico, 4);
@@ -93,17 +219,26 @@ public static class IconResources {
                 for (int i = 0; i < count; i++)
                     if (!UpdateResourceW(update, new IntPtr(3), new IntPtr(i + 1), 1033, frames[i], (uint)frames[i].Length)) throw new Win32Exception();
                 if (!UpdateResourceW(update, new IntPtr(14), new IntPtr(1), 1033, group, (uint)group.Length)) throw new Win32Exception();
+                if (!UpdateResourceW(update, new IntPtr(16), new IntPtr(1), 1033, versionInfo, (uint)versionInfo.Length)) throw new Win32Exception();
                 if (!EndUpdateResourceW(update, false)) throw new Win32Exception();
                 update = IntPtr.Zero;
             } finally { if (update != IntPtr.Zero) EndUpdateResourceW(update, true); }
         }
         if (!Read(file, 24, 1).SequenceEqual(manifest)) throw new InvalidOperationException("Application manifest changed");
         if (!Read(file, 14, 1).SequenceEqual(group)) throw new InvalidOperationException("Embedded icon group differs");
+        if (!Read(file, 16, 1).SequenceEqual(versionInfo)) throw new InvalidOperationException("Embedded version resource differs");
         for (int i = 0; i < count; i++)
             if (!Read(file, 3, i + 1).SequenceEqual(frames[i])) throw new InvalidOperationException("Embedded icon frame differs");
     }
 }}
 '@
 }
-[WallpaperLiveBuild.IconResources]::Apply($Executable, $icon, $VerifyOnly.IsPresent)
-Write-Output "Verified executable icon group and all ICO frames; application manifest preserved: $Executable"
+$versionBytes = [WallpaperLiveBuild.IconResources]::BuildVersionResource($verMajor, $verMinor, $verPatch)
+[WallpaperLiveBuild.IconResources]::Apply($Executable, $icon, $versionBytes, $VerifyOnly.IsPresent)
+$info = [Diagnostics.FileVersionInfo]::GetVersionInfo($Executable)
+$expectedProduct = "$verMajor.$verMinor.$verPatch"
+$expectedFile = "$expectedProduct.0"
+if ($info.ProductName.Trim() -ne 'WallpaperLive' -or $info.ProductVersion.Trim() -ne $expectedProduct -or $info.FileVersion.Trim() -ne $expectedFile) {
+    throw "Executable version metadata mismatch: ProductName=$($info.ProductName), ProductVersion=$($info.ProductVersion), FileVersion=$($info.FileVersion)."
+}
+Write-Output "Verified executable icon group, all ICO frames, and version metadata ($expectedProduct); application manifest preserved: $Executable"
