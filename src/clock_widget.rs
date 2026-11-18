@@ -2,7 +2,8 @@ use crate::{
     tray,
     visuals::{
         CLOCK_CTX_24H, CLOCK_CTX_BEHIND_ICONS, CLOCK_CTX_LOCK, CLOCK_CTX_OPEN_SETTINGS,
-        CLOCK_CTX_POS_SAVED, CLOCK_CTX_REMOVE, CLOCK_CTX_SIZE_DELTA, CLOCK_REPOSITION,
+        CLOCK_CTX_PICK_COLOR, CLOCK_CTX_POS_SAVED, CLOCK_CTX_REMOVE, CLOCK_CTX_SIZE_DELTA,
+        CLOCK_REPOSITION,
     },
 };
 use std::{
@@ -14,29 +15,41 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
+            BOOL, COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
         },
-        Graphics::Gdi::{
-            AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, AddFontMemResourceEx, BI_RGB,
-            BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
-            CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-            DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
-            FF_DONTCARE, FW_BOLD, GdiFlush, HDC, HGDIOBJ, OUT_DEFAULT_PRECIS, SelectObject,
-            SetBkMode, SetTextCharacterExtra, SetTextColor, TRANSPARENT,
+        Graphics::{
+            Dwm::DwmFlush,
+            Dxgi::{
+                Common::{
+                    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+                },
+                DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice,
+                IDXGIFactory2, IDXGISwapChain1,
+            },
+            Gdi::{
+                AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, AddFontMemResourceEx, BI_RGB,
+                BITMAPINFO, BITMAPINFOHEADER, BLACK_BRUSH, BLENDFUNCTION, BitBlt,
+                CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+                DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX,
+                DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE, FW_BOLD,
+                GdiFlush, GetDC, GetMonitorInfoW, GetStockObject, HDC, HGDIOBJ,
+                MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromPoint,
+                MonitorFromWindow, OUT_DEFAULT_PRECIS, ReleaseDC, SRCCOPY, ScreenToClient,
+                SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, TRANSPARENT,
+            },
         },
-        Graphics::Gdi::{
-            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-            MonitorFromWindow,
-        },
-        System::LibraryLoader::GetModuleHandleW,
+        System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
-            Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, VK_ESCAPE},
+            Input::KeyboardAndMouse::{
+                GetCapture, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
+            },
             WindowsAndMessaging::*,
         },
     },
-    core::{PCWSTR, w},
+    core::{GUID, HRESULT, IUnknown, Interface, PCSTR, PCWSTR, s, w},
 };
 
 #[link(name = "kernel32")]
@@ -54,8 +67,11 @@ unsafe fn local_time() -> SYSTEMTIME {
 }
 
 const CLOCK_CLASS: PCWSTR = w!("WallpaperLive.DayClock");
+const PICKER_CLASS: PCWSTR = w!("WallpaperLive.ColorPicker");
+const LOUPE_CLASS: PCWSTR = w!("WallpaperLive.ColorLoupe");
 const CLOCK_TIMER_ID: usize = 91;
 const CLOCK_ZORDER_SETTLE_TIMER_ID: usize = 92;
+const CLOCK_ZORDER_LATE_TIMER_ID: usize = 93;
 const CTX_LOCAL_DONE_REPOS: usize = 9001;
 
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
@@ -110,12 +126,418 @@ impl Default for ClockConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopLayer {
+    parent: HWND,
+    icons: HWND,
+    raised: bool,
+}
+
+#[derive(Default)]
+struct DesktopSearch {
+    progman_pid: u32,
+    worker: HWND,
+    icons: HWND,
+}
+
+fn belong_to_pid(hwnd: HWND, expected_pid: u32) -> bool {
+    if hwnd.0.is_null() || expected_pid == 0 {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    pid == expected_pid
+}
+
+fn is_workerw_class(hwnd: HWND) -> bool {
+    let mut cls = [0u16; 16];
+    let len = unsafe { GetClassNameW(hwnd, &mut cls) };
+    len == 7
+        && cls[..7]
+            == [
+                'W' as u16, 'o' as u16, 'r' as u16, 'k' as u16, 'e' as u16, 'r' as u16, 'W' as u16,
+            ]
+}
+
+unsafe extern "system" fn search_desktop_cb(window: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: synchronous EnumWindows reading live Explorer hierarchy.
+    unsafe {
+        let out = &mut *(data.0 as *mut DesktopSearch);
+        if is_workerw_class(window)
+            && belong_to_pid(window, out.progman_pid)
+            && let Ok(icons) = FindWindowExW(window, None, w!("SHELLDLL_DefView"), PCWSTR::null())
+        {
+            out.icons = icons;
+            if let Ok(worker) = FindWindowExW(None, window, w!("WorkerW"), PCWSTR::null()) {
+                out.worker = worker;
+            }
+            return BOOL(0);
+        }
+    }
+    BOOL(1)
+}
+
+fn discover_desktop_layer() -> Option<DesktopLayer> {
+    // SAFETY: Win32 discovery matching desktop.rs and Rainmeter 24H2+ / legacy hierarchy.
+    unsafe {
+        let progman = FindWindowW(w!("Progman"), PCWSTR::null()).ok()?;
+        let mut progman_pid = 0u32;
+        GetWindowThreadProcessId(progman, Some(&mut progman_pid));
+        let raised =
+            GetWindowLongPtrW(progman, GWL_EXSTYLE) as u32 & WS_EX_NOREDIRECTIONBITMAP.0 != 0;
+        let mut msg_res = 0;
+        let _ = SendMessageTimeoutW(
+            progman,
+            0x052c,
+            WPARAM(0xD),
+            LPARAM(1),
+            SMTO_ABORTIFHUNG,
+            1000,
+            Some(&mut msg_res),
+        );
+        if raised {
+            let icons =
+                FindWindowExW(progman, None, w!("SHELLDLL_DefView"), PCWSTR::null()).ok()?;
+            if !IsWindow(progman).as_bool() || !IsWindow(icons).as_bool() {
+                return None;
+            }
+            return Some(DesktopLayer {
+                parent: progman,
+                icons,
+                raised: true,
+            });
+        }
+        let mut search = DesktopSearch {
+            progman_pid,
+            worker: HWND::default(),
+            icons: HWND::default(),
+        };
+        let _ = EnumWindows(
+            Some(search_desktop_cb),
+            LPARAM((&mut search as *mut DesktopSearch) as isize),
+        );
+        if search.worker.0.is_null()
+            || search.icons.0.is_null()
+            || !IsWindow(search.worker).as_bool()
+        {
+            return None;
+        }
+        Some(DesktopLayer {
+            parent: search.worker,
+            icons: search.icons,
+            raised: false,
+        })
+    }
+}
+
+fn layer_still_valid(layer: DesktopLayer) -> bool {
+    !layer.parent.0.is_null()
+        && !layer.icons.0.is_null()
+        && unsafe { IsWindow(layer.parent).as_bool() && IsWindow(layer.icons).as_bool() }
+}
+
+// --- DirectComposition presenter for Win11 24H2+ WS_CHILD behind SHELLDLL_DefView ---
+
+const IID_IDCOMPOSITION_DEVICE: GUID = GUID::from_u128(0xc37ea93a_e7aa_450d_b16f_9746cb0407f3);
+const IID_ID3D11_TEXTURE2D: GUID = GUID::from_u128(0x6f15aaf2_d208_4e89_9ab4_489535d34f9c);
+const D3D_DRIVER_TYPE_HARDWARE: i32 = 1;
+const D3D_DRIVER_TYPE_WARP: i32 = 5;
+const D3D11_CREATE_DEVICE_SINGLETHREADED: u32 = 1;
+const D3D11_CREATE_DEVICE_BGRA_SUPPORT: u32 = 32;
+const D3D11_SDK_VERSION: u32 = 7;
+
+type D3D11CreateDeviceFn = unsafe extern "system" fn(
+    *mut c_void,
+    i32,
+    HMODULE,
+    u32,
+    *const u32,
+    u32,
+    u32,
+    *mut *mut c_void,
+    *mut u32,
+    *mut *mut c_void,
+) -> HRESULT;
+
+type DCompositionCreateDeviceFn =
+    unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+
+struct ComPtr(*mut c_void);
+
+impl ComPtr {
+    fn as_raw(&self) -> *mut c_void {
+        self.0
+    }
+    unsafe fn vtable_slot(&self, idx: usize) -> usize {
+        unsafe {
+            let vtbl = *(self.0 as *const *const usize);
+            *vtbl.add(idx)
+        }
+    }
+}
+
+impl Drop for ComPtr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: owns a valid COM pointer implementing IUnknown (Release at vtable slot 2).
+            unsafe {
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(self.vtable_slot(2));
+                let _ = release(self.0);
+            }
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+struct DCompPresenter {
+    _d3d_device: IUnknown,
+    d3d_ctx: ComPtr,
+    dcomp_device: ComPtr,
+    dcomp_target: ComPtr,
+    dcomp_visual: ComPtr,
+    swap_chain: IDXGISwapChain1,
+    w: u32,
+    h: u32,
+}
+
+impl DCompPresenter {
+    fn new(hwnd: HWND, w: u32, h: u32) -> Option<Self> {
+        let w = w.max(1);
+        let h = h.max(1);
+        // SAFETY: dynamically loads OS system DLLs d3d11.dll/dcomp.dll and uses verified Win32 COM ABI slots.
+        unsafe {
+            let d3d_dll = LoadLibraryW(w!("d3d11.dll")).ok()?;
+            let dcomp_dll = LoadLibraryW(w!("dcomp.dll")).ok()?;
+            let d3d_proc = GetProcAddress(d3d_dll, s!("D3D11CreateDevice") as PCSTR)?;
+            let dcomp_proc = GetProcAddress(dcomp_dll, s!("DCompositionCreateDevice") as PCSTR)?;
+            let create_d3d: D3D11CreateDeviceFn = std::mem::transmute(d3d_proc);
+            let create_dcomp: DCompositionCreateDeviceFn = std::mem::transmute(dcomp_proc);
+
+            let mut dev_raw = std::ptr::null_mut();
+            let mut ctx_raw = std::ptr::null_mut();
+            let attempts = [
+                (
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED,
+                ),
+                (D3D_DRIVER_TYPE_HARDWARE, D3D11_CREATE_DEVICE_BGRA_SUPPORT),
+                (D3D_DRIVER_TYPE_WARP, D3D11_CREATE_DEVICE_BGRA_SUPPORT),
+            ];
+            let mut created = false;
+            for (driver, flags) in attempts {
+                let hr = create_d3d(
+                    std::ptr::null_mut(),
+                    driver,
+                    HMODULE::default(),
+                    flags,
+                    std::ptr::null(),
+                    0,
+                    D3D11_SDK_VERSION,
+                    &mut dev_raw,
+                    std::ptr::null_mut(),
+                    &mut ctx_raw,
+                );
+                if hr.is_ok() && !dev_raw.is_null() && !ctx_raw.is_null() {
+                    created = true;
+                    break;
+                }
+                if !ctx_raw.is_null() {
+                    drop(ComPtr(ctx_raw));
+                    ctx_raw = std::ptr::null_mut();
+                }
+                if !dev_raw.is_null() {
+                    drop(ComPtr(dev_raw));
+                    dev_raw = std::ptr::null_mut();
+                }
+            }
+            if !created {
+                return None;
+            }
+            let d3d_device = IUnknown::from_raw(dev_raw);
+            let d3d_ctx = ComPtr(ctx_raw);
+            let dxgi_device: IDXGIDevice = d3d_device.cast().ok()?;
+            let adapter = dxgi_device.GetAdapter().ok()?;
+            let factory2: IDXGIFactory2 = adapter.GetParent().ok()?;
+
+            let mut dcomp_dev_raw = std::ptr::null_mut();
+            if create_dcomp(
+                dxgi_device.as_raw(),
+                &IID_IDCOMPOSITION_DEVICE,
+                &mut dcomp_dev_raw,
+            )
+            .is_err()
+                || dcomp_dev_raw.is_null()
+            {
+                return None;
+            }
+            let dcomp_device = ComPtr(dcomp_dev_raw);
+
+            // IDCompositionDevice::CreateTargetForHwnd = slot 6
+            let mut target_raw = std::ptr::null_mut();
+            let create_target: unsafe extern "system" fn(
+                *mut c_void,
+                HWND,
+                BOOL,
+                *mut *mut c_void,
+            ) -> HRESULT = std::mem::transmute(dcomp_device.vtable_slot(6));
+            if create_target(dcomp_device.as_raw(), hwnd, BOOL(1), &mut target_raw).is_err()
+                || target_raw.is_null()
+            {
+                return None;
+            }
+            let dcomp_target = ComPtr(target_raw);
+
+            // IDCompositionDevice::CreateVisual = slot 7
+            let mut visual_raw = std::ptr::null_mut();
+            let create_visual: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(dcomp_device.vtable_slot(7));
+            if create_visual(dcomp_device.as_raw(), &mut visual_raw).is_err()
+                || visual_raw.is_null()
+            {
+                return None;
+            }
+            let dcomp_visual = ComPtr(visual_raw);
+
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: w,
+                Height: h,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Stereo: BOOL(0),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                Flags: 0,
+            };
+            let swap_chain = factory2
+                .CreateSwapChainForComposition(&dxgi_device, &desc, None)
+                .ok()?;
+
+            // IDCompositionVisual::SetContent = slot 15; IDCompositionTarget::SetRoot = slot 3; Commit = slot 3
+            let set_content: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+                std::mem::transmute(dcomp_visual.vtable_slot(15));
+            let set_root: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+                std::mem::transmute(dcomp_target.vtable_slot(3));
+            let commit: unsafe extern "system" fn(*mut c_void) -> HRESULT =
+                std::mem::transmute(dcomp_device.vtable_slot(3));
+
+            if set_content(dcomp_visual.as_raw(), swap_chain.as_raw()).is_err()
+                || set_root(dcomp_target.as_raw(), dcomp_visual.as_raw()).is_err()
+                || commit(dcomp_device.as_raw()).is_err()
+            {
+                return None;
+            }
+
+            Some(Self {
+                _d3d_device: d3d_device,
+                d3d_ctx,
+                dcomp_device,
+                dcomp_target,
+                dcomp_visual,
+                swap_chain,
+                w,
+                h,
+            })
+        }
+    }
+
+    fn present_bgra(&mut self, buf: &[u32], w: u32, h: u32) -> bool {
+        let w = w.max(1);
+        let h = h.max(1);
+        if buf.len() < (w as usize).saturating_mul(h as usize) {
+            return false;
+        }
+        // SAFETY: owns D3D11/DXGI/DComp COM objects strictly on the UI thread.
+        unsafe {
+            if self.w != w || self.h != h {
+                if self
+                    .swap_chain
+                    .ResizeBuffers(2, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
+                    .is_err()
+                {
+                    return false;
+                }
+                self.w = w;
+                self.h = h;
+                let set_content: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+                    std::mem::transmute(self.dcomp_visual.vtable_slot(15));
+                let _ = set_content(self.dcomp_visual.as_raw(), self.swap_chain.as_raw());
+            }
+            let Ok(backbuf) = self.swap_chain.GetBuffer::<IUnknown>(0) else {
+                return false;
+            };
+            let mut tex_raw = std::ptr::null_mut();
+            if backbuf.query(&IID_ID3D11_TEXTURE2D, &mut tex_raw).is_err() || tex_raw.is_null() {
+                return false;
+            }
+            let _tex_guard = IUnknown::from_raw(tex_raw);
+
+            // ID3D11DeviceContext::UpdateSubresource = slot 48 (7 DeviceChild + 41 Context methods before it).
+            let update_subresource: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                *const c_void,
+                *const c_void,
+                u32,
+                u32,
+            ) = std::mem::transmute(self.d3d_ctx.vtable_slot(48));
+            update_subresource(
+                self.d3d_ctx.as_raw(),
+                tex_raw,
+                0,
+                std::ptr::null(),
+                buf.as_ptr().cast(),
+                w * 4,
+                0,
+            );
+            if self.swap_chain.Present(0, DXGI_PRESENT(0)).is_err() {
+                return false;
+            }
+            let set_root: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+                std::mem::transmute(self.dcomp_target.vtable_slot(3));
+            let commit: unsafe extern "system" fn(*mut c_void) -> HRESULT =
+                std::mem::transmute(self.dcomp_device.vtable_slot(3));
+            let _ = set_root(self.dcomp_target.as_raw(), self.dcomp_visual.as_raw());
+            commit(self.dcomp_device.as_raw()).is_ok()
+        }
+    }
+}
+
+impl Drop for DCompPresenter {
+    fn drop(&mut self) {
+        // SAFETY: detaches DComp visual before releasing swapchain/target.
+        unsafe {
+            let set_content: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+                std::mem::transmute(self.dcomp_visual.vtable_slot(15));
+            let set_root: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+                std::mem::transmute(self.dcomp_target.vtable_slot(3));
+            let commit: unsafe extern "system" fn(*mut c_void) -> HRESULT =
+                std::mem::transmute(self.dcomp_device.vtable_slot(3));
+            let _ = set_content(self.dcomp_visual.as_raw(), std::ptr::null_mut());
+            let _ = set_root(self.dcomp_target.as_raw(), std::ptr::null_mut());
+            let _ = commit(self.dcomp_device.as_raw());
+        }
+    }
+}
+
 #[derive(Default)]
 struct ClockRuntime {
     hwnd: isize,
     owner: isize,
     action_msg: u32,
     cfg: ClockConfig,
+    behind_attached: bool,
+    cached_layer: Option<DesktopLayer>,
+    dcomp: Option<DCompPresenter>,
     repositioning: bool,
     dragging: bool,
     drag_moved: bool,
@@ -123,8 +545,10 @@ struct ClockRuntime {
     drag_start_y: i32,
     drag_offset_x: i32,
     drag_offset_y: i32,
+    width: i32,
+    height: i32,
     last_stamp: (u16, u16, u16, u16, u16, u16),
-    last_bounds: Option<(i32, i32, i32, i32, bool)>,
+    last_bounds: Option<(i32, i32, i32, i32, bool, bool)>,
     pending_wheel_delta: i32,
     hooks: [isize; 2],
 }
@@ -207,6 +631,7 @@ thread_local! {
     static CLOCK_RUNTIME: RefCell<Option<ClockRuntime>> = const { RefCell::new(None) };
     static CLOCK_SAVED_POS: RefCell<Option<(i32, i32)>> = const { RefCell::new(None) };
     static CLOCK_WHEEL_STEPS: RefCell<i32> = const { RefCell::new(0) };
+    static CLOCK_PICKED_COLOR: Cell<Option<u32>> = const { Cell::new(None) };
     static CLOCK_TEXT_SCRATCH: RefCell<ClockTextScratch> = const { RefCell::new(ClockTextScratch {
         dc: 0,
         bmp: 0,
@@ -216,6 +641,7 @@ thread_local! {
     }) };
     static ALLOW_INTERNAL_HIDE: Cell<bool> = const { Cell::new(false) };
     static IN_ZORDER_SYNC: Cell<bool> = const { Cell::new(false) };
+    static COLOR_PICK_SESSION: RefCell<Option<ColorPickState>> = const { RefCell::new(None) };
 }
 
 fn minute_timer_delay_ms(second: u16) -> u32 {
@@ -231,8 +657,34 @@ pub fn take_wheel_steps() -> i32 {
     CLOCK_WHEEL_STEPS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
+pub fn take_picked_color() -> Option<u32> {
+    CLOCK_PICKED_COLOR.with(|slot| slot.take())
+}
+
 pub fn is_repositioning() -> bool {
     CLOCK_RUNTIME.with(|slot| slot.borrow().as_ref().is_some_and(|rt| rt.repositioning))
+}
+
+/// Central drag zone (`~46% width x 54% height`) prevents accidental drags when touching outer widget margins.
+pub fn drag_handle_rect(w: i32, h: i32) -> RECT {
+    if w <= 0 || h <= 0 {
+        return RECT::default();
+    }
+    let inner_w = (w * 46 / 100).clamp(80.min(w), w);
+    let inner_h = (h * 54 / 100).clamp(48.min(h), h);
+    let left = (w - inner_w) / 2;
+    let top = (h - inner_h) / 2;
+    RECT {
+        left,
+        top,
+        right: left + inner_w,
+        bottom: top + inner_h,
+    }
+}
+
+pub fn in_drag_handle(pt_x: i32, pt_y: i32, w: i32, h: i32) -> bool {
+    let r = drag_handle_rect(w, h);
+    pt_x >= r.left && pt_x < r.right && pt_y >= r.top && pt_y < r.bottom
 }
 
 fn unhook_events(hooks: [isize; 2]) {
@@ -280,16 +732,21 @@ unsafe extern "system" fn win_event_proc(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    let clock_raw = CLOCK_RUNTIME.with(|s| s.borrow().as_ref().map_or(0, |r| r.hwnd));
-    if clock_raw == 0 || event_hwnd.0 as isize == clock_raw {
+    let (clock_raw, behind) = CLOCK_RUNTIME.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map_or((0, false), |r| (r.hwnd, r.behind_attached))
+    });
+    if clock_raw == 0 || behind || event_hwnd.0 as isize == clock_raw {
         return;
     }
     ensure_desktop_visible();
     let clock_hwnd = HWND(clock_raw as *mut c_void);
     if unsafe { IsWindow(clock_hwnd).as_bool() } {
-        // Re-check once after Explorer finishes Win+D transition animation.
+        // Two-stage settle matching Rainmeter INTERVAL_SHOWDESKTOP so slow/rapid Win+D never races.
         unsafe {
-            let _ = SetTimer(clock_hwnd, CLOCK_ZORDER_SETTLE_TIMER_ID, 70, None);
+            let _ = SetTimer(clock_hwnd, CLOCK_ZORDER_SETTLE_TIMER_ID, 60, None);
+            let _ = SetTimer(clock_hwnd, CLOCK_ZORDER_LATE_TIMER_ID, 250, None);
         }
     }
 }
@@ -297,6 +754,7 @@ unsafe extern "system" fn win_event_proc(
 #[derive(Default)]
 struct DesktopTopSearch {
     progman: HWND,
+    progman_pid: u32,
     top_shell: HWND,
 }
 
@@ -311,14 +769,8 @@ unsafe extern "system" fn find_top_shell_cb(window: HWND, data: LPARAM) -> BOOL 
             out.top_shell = window;
             return BOOL(0);
         }
-        let mut cls = [0u16; 32];
-        let len = GetClassNameW(window, &mut cls);
-        if len == 7
-            && cls[..7]
-                == [
-                    'W' as u16, 'o' as u16, 'r' as u16, 'k' as u16, 'e' as u16, 'r' as u16,
-                    'W' as u16,
-                ]
+        if is_workerw_class(window)
+            && belong_to_pid(window, out.progman_pid)
             && FindWindowExW(window, None, w!("SHELLDLL_DefView"), PCWSTR::null()).is_ok()
         {
             out.top_shell = window;
@@ -328,15 +780,37 @@ unsafe extern "system" fn find_top_shell_cb(window: HWND, data: LPARAM) -> BOOL 
     BOOL(1)
 }
 
-fn desktop_insert_after(clock_hwnd: HWND, repositioning: bool) -> HWND {
-    if repositioning {
-        return HWND_TOP;
+fn window_belongs_to_shell(hwnd: HWND, shell_top: HWND, progman: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
     }
-    // SAFETY: walks global Win32 non-topmost Z-order right above the topmost desktop host (Progman/WorkerW).
+    if hwnd == shell_top || hwnd == progman {
+        return true;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    root == shell_top || root == progman
+}
+
+#[derive(Clone, Copy)]
+enum PopupZTarget {
+    ShowDesktopTopmost(HWND),
+    BehindApps(HWND),
+}
+
+fn detect_popup_z_target(clock_hwnd: HWND, repositioning: bool) -> PopupZTarget {
+    if repositioning {
+        return PopupZTarget::ShowDesktopTopmost(HWND::default());
+    }
+    // SAFETY: walks global top-level Z-order to mirror Rainmeter System::PrepareHelperWindow.
     unsafe {
         let progman = FindWindowW(w!("Progman"), PCWSTR::null()).unwrap_or_default();
+        let mut progman_pid = 0u32;
+        if !progman.0.is_null() {
+            GetWindowThreadProcessId(progman, Some(&mut progman_pid));
+        }
         let mut search = DesktopTopSearch {
             progman,
+            progman_pid,
             top_shell: HWND::default(),
         };
         let _ = EnumWindows(
@@ -349,28 +823,46 @@ fn desktop_insert_after(clock_hwnd: HWND, repositioning: bool) -> HWND {
             progman
         };
         if shell_top.0.is_null() {
-            return HWND_BOTTOM;
+            return PopupZTarget::BehindApps(HWND_BOTTOM);
         }
-        let mut prev = GetWindow(shell_top, GW_HWNDPREV).unwrap_or_default();
+
+        let fg = GetForegroundWindow();
+        let mut prev_non_topmost = HWND::default();
+        let mut last_topmost = HWND::default();
+        let mut cur = GetWindow(shell_top, GW_HWNDPREV).unwrap_or_default();
         let mut hops = 0usize;
-        while !prev.0.is_null() && hops < 256 {
+        while !cur.0.is_null() && hops < 256 {
             hops += 1;
-            if prev == clock_hwnd {
-                prev = GetWindow(prev, GW_HWNDPREV).unwrap_or_default();
+            if cur == clock_hwnd || !IsWindowVisible(cur).as_bool() {
+                cur = GetWindow(cur, GW_HWNDPREV).unwrap_or_default();
                 continue;
             }
-            let ex = GetWindowLongPtrW(prev, GWL_EXSTYLE) as u32;
+            let ex = GetWindowLongPtrW(cur, GWL_EXSTYLE) as u32;
             if ex & WS_EX_TOPMOST.0 != 0 {
-                // Reached the bottom of the topmost band; placing at HWND_TOP keeps clock above desktop.
-                return HWND_TOP;
+                if last_topmost.0.is_null() {
+                    last_topmost = cur;
+                }
+                break;
             }
-            return prev;
+            if prev_non_topmost.0.is_null() {
+                prev_non_topmost = cur;
+                break;
+            }
+            cur = GetWindow(cur, GW_HWNDPREV).unwrap_or_default();
         }
-        HWND_TOP
+
+        // Exact Rainmeter ShowDesktop rule: if desktop is foreground or sits directly under TOPMOST band.
+        let show_desktop =
+            prev_non_topmost.0.is_null() || window_belongs_to_shell(fg, shell_top, progman);
+        if show_desktop {
+            PopupZTarget::ShowDesktopTopmost(last_topmost)
+        } else {
+            PopupZTarget::BehindApps(prev_non_topmost)
+        }
     }
 }
 
-fn place_on_desktop(
+fn place_popup_on_desktop(
     hwnd: HWND,
     x: i32,
     y: i32,
@@ -379,62 +871,137 @@ fn place_on_desktop(
     resize_move: bool,
     repositioning: bool,
 ) {
-    let after = desktop_insert_after(hwnd, repositioning);
-    let mut flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
+    let mut base_flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
     if !resize_move {
-        flags |= SWP_NOMOVE | SWP_NOSIZE;
+        base_flags |= SWP_NOMOVE | SWP_NOSIZE;
     }
+    let target = detect_popup_z_target(hwnd, repositioning);
     IN_ZORDER_SYNC.with(|g| g.set(true));
     // SAFETY: owns clock HWND; IN_ZORDER_SYNC prevents WM_WINDOWPOSCHANGING recursion.
     unsafe {
-        let _ = SetWindowPos(hwnd, after, x, y, w, h, flags);
+        match target {
+            PopupZTarget::ShowDesktopTopmost(after_topmost) => {
+                // Step 1: enter topmost band (only below Taskbar/Start/Notifications) so Explorer cannot raise Progman above clock.
+                let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, base_flags);
+                if !after_topmost.0.is_null() && after_topmost != hwnd {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        after_topmost,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
+            }
+            PopupZTarget::BehindApps(prev_app) => {
+                let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                if ex & WS_EX_TOPMOST.0 != 0 {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_NOTOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+                let _ = SetWindowPos(hwnd, prev_app, x, y, w, h, base_flags);
+            }
+        }
     }
     IN_ZORDER_SYNC.with(|g| g.set(false));
 }
 
+fn restore_if_iconic(hwnd: HWND) {
+    // SAFETY: SetWindowPlacement clears minimized WS_MINIMIZE silently without stealing active focus.
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let mut wp = WINDOWPLACEMENT {
+                length: size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if GetWindowPlacement(hwnd, &mut wp).is_ok() {
+                wp.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+                let _ = SetWindowPlacement(hwnd, &wp);
+            }
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        } else if !IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
 pub fn ensure_desktop_visible() {
     let state = CLOCK_RUNTIME.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|rt| (rt.hwnd != 0 && rt.cfg.enabled).then_some((rt.hwnd, rt.repositioning)))
+        slot.borrow().as_ref().and_then(|rt| {
+            (rt.hwnd != 0 && rt.cfg.enabled).then_some((
+                rt.hwnd,
+                rt.behind_attached,
+                rt.cached_layer,
+                rt.repositioning,
+            ))
+        })
     });
-    let Some((raw, repositioning)) = state else {
+    let Some((raw, behind_attached, cached_layer, repositioning)) = state else {
         return;
     };
     let hwnd = HWND(raw as *mut c_void);
     if unsafe { !IsWindow(hwnd).as_bool() } {
         return;
     }
-    if unsafe { IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() } {
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    restore_if_iconic(hwnd);
+
+    if behind_attached && !repositioning {
+        let layer = cached_layer
+            .filter(|&l| layer_still_valid(l))
+            .or_else(discover_desktop_layer);
+        if let Some(l) = layer {
+            let after = if l.raised { l.icons } else { HWND_TOP };
+            IN_ZORDER_SYNC.with(|g| g.set(true));
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    after,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+            IN_ZORDER_SYNC.with(|g| g.set(false));
         }
+    } else {
+        place_popup_on_desktop(hwnd, 0, 0, 0, 0, false, repositioning);
     }
-    place_on_desktop(hwnd, 0, 0, 0, 0, false, repositioning);
 }
 
 pub fn sync_zorder() {
     ensure_desktop_visible();
 }
 
-fn ensure_class() -> Result<(), String> {
+fn ensure_class(name: PCWSTR, proc: WNDPROC, hbr: HGDIOBJ, cursor: PCWSTR) -> Result<(), String> {
     let instance = unsafe { GetModuleHandleW(None) }.map_err(|e| e.to_string())?;
     let mut existing = WNDCLASSEXW::default();
-    if unsafe { GetClassInfoExW(instance, CLOCK_CLASS, &mut existing) }.is_ok() {
+    if unsafe { GetClassInfoExW(instance, name, &mut existing) }.is_ok() {
         return Ok(());
     }
     let wc = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(clock_proc),
+        lpfnWndProc: proc,
         hInstance: instance.into(),
-        lpszClassName: CLOCK_CLASS,
-        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.map_err(|e| e.to_string())?,
+        lpszClassName: name,
+        hCursor: unsafe { LoadCursorW(None, cursor) }.map_err(|e| e.to_string())?,
+        hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(hbr.0),
         ..Default::default()
     };
     if unsafe { RegisterClassExW(&wc) } == 0 {
         let mut check = WNDCLASSEXW::default();
-        if unsafe { GetClassInfoExW(instance, CLOCK_CLASS, &mut check) }.is_err() {
-            return Err("Could not register the desktop clock window class".into());
+        if unsafe { GetClassInfoExW(instance, name, &mut check) }.is_err() {
+            return Err("Could not register desktop clock window class".into());
         }
     }
     Ok(())
@@ -447,11 +1014,12 @@ fn destroy_clock_hwnd(raw: isize, hooks: [isize; 2]) {
     }
     let hwnd = HWND(raw as *mut c_void);
     ALLOW_INTERNAL_HIDE.with(|g| g.set(true));
-    // SAFETY: owns this single unowned popup HWND on the UI thread.
+    // SAFETY: owns this single HWND on UI thread.
     unsafe {
         if IsWindow(hwnd).as_bool() {
             let _ = KillTimer(hwnd, CLOCK_TIMER_ID);
             let _ = KillTimer(hwnd, CLOCK_ZORDER_SETTLE_TIMER_ID);
+            let _ = KillTimer(hwnd, CLOCK_ZORDER_LATE_TIMER_ID);
             let _ = DestroyWindow(hwnd);
         }
     }
@@ -459,6 +1027,7 @@ fn destroy_clock_hwnd(raw: isize, hooks: [isize; 2]) {
 }
 
 pub fn hide_all() {
+    cancel_color_pick();
     let old = CLOCK_RUNTIME.with(|slot| slot.borrow_mut().take().map(|r| (r.hwnd, r.hooks)));
     if let Some((raw, hooks)) = old {
         destroy_clock_hwnd(raw, hooks);
@@ -483,6 +1052,7 @@ pub fn end_reposition(owner: HWND, action_msg: u32, cfg: ClockConfig) {
         if let Some(rt) = slot.borrow_mut().as_mut() {
             rt.repositioning = false;
             rt.dragging = false;
+            rt.drag_moved = false;
         }
     });
     if cfg.enabled {
@@ -495,8 +1065,9 @@ pub fn sync(owner: HWND, action_msg: u32, cfg: ClockConfig) {
     sync_inner(owner, action_msg, cfg, rep);
 }
 
-fn is_click_through(cfg: ClockConfig, repositioning: bool) -> bool {
-    !repositioning && (cfg.locked || cfg.behind_icons)
+/// Pure click-through rule separating `Lock position` (blocks drag/wheel only) from `Behind desktop shortcuts`.
+pub fn is_click_through(cfg: ClockConfig, repositioning: bool) -> bool {
+    !repositioning && cfg.behind_icons
 }
 
 fn sync_inner(owner: HWND, action_msg: u32, cfg: ClockConfig, repositioning: bool) {
@@ -504,53 +1075,161 @@ fn sync_inner(owner: HWND, action_msg: u32, cfg: ClockConfig, repositioning: boo
         hide_all();
         return;
     }
-    if ensure_class().is_err() {
+    if ensure_class(CLOCK_CLASS, Some(clock_proc), HGDIOBJ::default(), IDC_ARROW).is_err() {
         return;
     }
     ensure_quicksand_loaded();
 
-    let (need_create, existing_raw) = CLOCK_RUNTIME.with(|slot| {
+    let want_behind = cfg.behind_icons && !repositioning;
+    let cached_layer = CLOCK_RUNTIME.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|rt| rt.cached_layer.filter(|&l| layer_still_valid(l)))
+    });
+    let layer = if want_behind {
+        cached_layer.or_else(discover_desktop_layer)
+    } else {
+        None
+    };
+    let actual_behind = want_behind && layer.is_some();
+
+    let (need_recreate, old_raw, old_hooks) = CLOCK_RUNTIME.with(|slot| {
         let borrow = slot.borrow();
         let Some(rt) = borrow.as_ref() else {
-            return (true, 0);
+            return (true, 0, [0, 0]);
         };
         let valid = rt.hwnd != 0 && unsafe { IsWindow(HWND(rt.hwnd as *mut c_void)).as_bool() };
-        (!valid, rt.hwnd)
+        if !valid || rt.behind_attached != actual_behind {
+            (true, rt.hwnd, rt.hooks)
+        } else {
+            (false, rt.hwnd, rt.hooks)
+        }
     });
 
-    let click_through = is_click_through(cfg, repositioning);
-    let mut ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-    if click_through {
-        ex |= WS_EX_TRANSPARENT;
-    }
-
-    if need_create {
-        if existing_raw != 0 {
-            destroy_clock_hwnd(existing_raw, [0, 0]);
-        }
+    if need_recreate {
+        CLOCK_RUNTIME.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+        destroy_clock_hwnd(old_raw, old_hooks);
         let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else {
             return;
         };
-        // Rainmeter model: ALWAYS unowned top-level WS_POPUP so minimizing/hiding App or Win+D never hides clock.
-        let Ok(hwnd) = (unsafe {
-            CreateWindowExW(
-                ex,
-                CLOCK_CLASS,
-                w!("WallpaperLive Day Clock"),
-                WS_POPUP,
-                0,
-                0,
-                100,
-                100,
-                HWND::default(),
-                None,
-                instance,
-                None,
-            )
-        }) else {
-            return;
+
+        let mut attached_layer = layer;
+        let mut attached_behind = actual_behind;
+        let mut dcomp: Option<DCompPresenter> = None;
+
+        let hwnd = if let Some(l) = attached_layer {
+            let child_ex = if l.raised {
+                WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+            } else {
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+            };
+            let h = unsafe {
+                CreateWindowExW(
+                    child_ex,
+                    CLOCK_CLASS,
+                    w!("WallpaperLive Day Clock"),
+                    WS_CHILD | WS_CLIPSIBLINGS,
+                    0,
+                    0,
+                    100,
+                    100,
+                    l.parent,
+                    None,
+                    instance,
+                    None,
+                )
+            };
+            match h {
+                Ok(child) if l.raised => {
+                    if let Some(dc) = DCompPresenter::new(child, 400, 176) {
+                        dcomp = Some(dc);
+                        child
+                    } else {
+                        // DComp unavailable on stripped GPU/RDP: cleanly fall back to Rainmeter WS_POPUP.
+                        unsafe {
+                            let _ = DestroyWindow(child);
+                        }
+                        attached_behind = false;
+                        attached_layer = None;
+                        let Ok(pop) = (unsafe {
+                            CreateWindowExW(
+                                WS_EX_LAYERED
+                                    | WS_EX_TOOLWINDOW
+                                    | WS_EX_NOACTIVATE
+                                    | WS_EX_TRANSPARENT,
+                                CLOCK_CLASS,
+                                w!("WallpaperLive Day Clock"),
+                                WS_POPUP,
+                                0,
+                                0,
+                                100,
+                                100,
+                                HWND::default(),
+                                None,
+                                instance,
+                                None,
+                            )
+                        }) else {
+                            return;
+                        };
+                        pop
+                    }
+                }
+                Ok(child) => child,
+                Err(_) => {
+                    attached_behind = false;
+                    attached_layer = None;
+                    let Ok(pop) = (unsafe {
+                        CreateWindowExW(
+                            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                            CLOCK_CLASS,
+                            w!("WallpaperLive Day Clock"),
+                            WS_POPUP,
+                            0,
+                            0,
+                            100,
+                            100,
+                            HWND::default(),
+                            None,
+                            instance,
+                            None,
+                        )
+                    }) else {
+                        return;
+                    };
+                    pop
+                }
+            }
+        } else {
+            let ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            let Ok(pop) = (unsafe {
+                CreateWindowExW(
+                    ex,
+                    CLOCK_CLASS,
+                    w!("WallpaperLive Day Clock"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    100,
+                    100,
+                    HWND::default(),
+                    None,
+                    instance,
+                    None,
+                )
+            }) else {
+                return;
+            };
+            pop
         };
-        let hooks = install_events();
+
+        let hooks = if attached_behind {
+            [0, 0]
+        } else {
+            install_events()
+        };
         let now = unsafe { local_time() };
         unsafe {
             let _ = SetTimer(
@@ -566,6 +1245,9 @@ fn sync_inner(owner: HWND, action_msg: u32, cfg: ClockConfig, repositioning: boo
                 owner: owner.0 as isize,
                 action_msg,
                 cfg,
+                behind_attached: attached_behind,
+                cached_layer: attached_layer,
+                dcomp,
                 repositioning,
                 dragging: false,
                 drag_moved: false,
@@ -573,6 +1255,8 @@ fn sync_inner(owner: HWND, action_msg: u32, cfg: ClockConfig, repositioning: boo
                 drag_start_y: 0,
                 drag_offset_x: 0,
                 drag_offset_y: 0,
+                width: 100,
+                height: 100,
                 last_stamp: (0, 0, 0, 0, 0, 0),
                 last_bounds: None,
                 pending_wheel_delta: 0,
@@ -581,24 +1265,30 @@ fn sync_inner(owner: HWND, action_msg: u32, cfg: ClockConfig, repositioning: boo
         });
         render_and_place(hwnd);
     } else {
-        let hwnd = HWND(existing_raw as *mut c_void);
+        let hwnd = HWND(old_raw as *mut c_void);
         CLOCK_RUNTIME.with(|slot| {
             if let Some(rt) = slot.borrow_mut().as_mut() {
                 rt.owner = owner.0 as isize;
                 rt.action_msg = action_msg;
                 rt.cfg = cfg;
                 rt.repositioning = repositioning;
+                if layer.is_some() {
+                    rt.cached_layer = layer;
+                }
             }
         });
-        unsafe {
-            let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            let next = if click_through {
-                (cur & !WS_EX_TOPMOST.0) | WS_EX_TRANSPARENT.0
-            } else {
-                cur & !(WS_EX_TRANSPARENT.0 | WS_EX_TOPMOST.0)
-            };
-            if next != cur {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+        if !actual_behind {
+            let pass_all = is_click_through(cfg, repositioning);
+            unsafe {
+                let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                let next = if pass_all {
+                    cur | WS_EX_TRANSPARENT.0
+                } else {
+                    cur & !WS_EX_TRANSPARENT.0
+                };
+                if next != cur {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+                }
             }
         }
         render_and_place(hwnd);
@@ -1408,7 +2098,6 @@ fn draw_quicksand_line(
         let b = color & 255;
         let stride = buf_w as usize;
 
-        // Pass 1: subtle drop shadow (+1px, +2px).
         for sy in 0..rh {
             let dy = area.top + sy + 2;
             if dy < 0 || dy >= buf_h {
@@ -1428,7 +2117,6 @@ fn draw_quicksand_line(
                 }
             }
         }
-        // Pass 2: crisp antialiased Quicksand text.
         for sy in 0..rh {
             let dy = area.top + sy;
             if dy < 0 || dy >= buf_h {
@@ -1450,27 +2138,48 @@ fn draw_quicksand_line(
     });
 }
 
+fn draw_corner_brackets(buf: &mut [u32], stride: i32, r: RECT, corner: i32, col: u32) {
+    let rw = r.right - r.left;
+    let rh = r.bottom - r.top;
+    if rw <= 8 || rh <= 8 {
+        return;
+    }
+    let c = corner.min(rw / 4).min(rh / 4);
+    let wu = stride as usize;
+    for t in 0..2 {
+        for x in 0..c {
+            buf[(r.top + t) as usize * wu + (r.left + x) as usize] = col;
+            buf[(r.top + t) as usize * wu + (r.right - 1 - x) as usize] = col;
+            buf[(r.bottom - 1 - t) as usize * wu + (r.left + x) as usize] = col;
+            buf[(r.bottom - 1 - t) as usize * wu + (r.right - 1 - x) as usize] = col;
+        }
+        for y in 0..c {
+            buf[(r.top + y) as usize * wu + (r.left + t) as usize] = col;
+            buf[(r.top + y) as usize * wu + (r.right - 1 - t) as usize] = col;
+            buf[(r.bottom - 1 - y) as usize * wu + (r.left + t) as usize] = col;
+            buf[(r.bottom - 1 - y) as usize * wu + (r.right - 1 - t) as usize] = col;
+        }
+    }
+}
+
 fn draw_reposition_guide(buf: &mut [u32], w: i32, h: i32) {
     if w <= 8 || h <= 8 {
         return;
     }
-    let corner = 18.min(w / 4).min(h / 4);
-    let col = 0xD8F3_EEE3u32;
-    let wu = w as usize;
-    for t in 0..2 {
-        for x in 0..corner {
-            buf[t * wu + x as usize] = col;
-            buf[t * wu + (w - 1 - x) as usize] = col;
-            buf[(h as usize - 1 - t) * wu + x as usize] = col;
-            buf[(h as usize - 1 - t) * wu + (w - 1 - x) as usize] = col;
-        }
-        for y in 0..corner {
-            buf[y as usize * wu + t] = col;
-            buf[y as usize * wu + (w as usize - 1 - t)] = col;
-            buf[(h - 1 - y) as usize * wu + t] = col;
-            buf[(h - 1 - y) as usize * wu + (w as usize - 1 - t)] = col;
-        }
-    }
+    // Outer bounds brackets + subtle center grab-handle hint matching drag_handle_rect.
+    draw_corner_brackets(
+        buf,
+        w,
+        RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        },
+        18,
+        0xD8F3_EEE3,
+    );
+    draw_corner_brackets(buf, w, drag_handle_rect(w, h), 12, 0x90D9_541E);
 }
 
 fn apply_opacity_in_place(buf: &mut [u32], opacity_pct: u32) {
@@ -1499,7 +2208,7 @@ pub fn apply_hit_alpha_in_place(buf: &mut [u32], interactive: bool) {
     if !interactive {
         return;
     }
-    // Rainmeter SolidColor=0,0,0,1 equivalent: invisible alpha=1 lets users click/drag gaps between thin glyphs.
+    // Rainmeter SolidColor=0,0,0,1 equivalent: invisible alpha=1 makes center grab & menu reliable.
     for px in buf {
         if (*px >> 24) == 0 {
             *px = 0x0100_0000;
@@ -1509,11 +2218,28 @@ pub fn apply_hit_alpha_in_place(buf: &mut [u32], interactive: bool) {
 
 fn render_and_place(hwnd: HWND) {
     let snapshot = CLOCK_RUNTIME.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|r| (r.owner, r.cfg, r.repositioning, r.last_bounds))
+        slot.borrow().as_ref().map(|r| {
+            (
+                r.owner,
+                r.cfg,
+                r.behind_attached,
+                r.cached_layer,
+                r.repositioning,
+                r.last_bounds,
+                r.dcomp.is_some(),
+            )
+        })
     });
-    let Some((owner_raw, cfg, repositioning, last_bounds)) = snapshot else {
+    let Some((
+        owner_raw,
+        cfg,
+        behind_attached,
+        cached_layer,
+        repositioning,
+        last_bounds,
+        has_dcomp,
+    )) = snapshot
+    else {
         return;
     };
     let owner = HWND(owner_raw as *mut c_void);
@@ -1531,7 +2257,7 @@ fn render_and_place(hwnd: HWND) {
     let (w, h) = widget_pixel_size(&day_str, cfg.size_pct, dpi);
     let (sx, sy) = resolve_screen_position(cfg.pos, work, w, h);
 
-    // SAFETY: owns offscreen memory DC and 32-bit DIBSection strictly for this synchronous UpdateLayeredWindow call.
+    // SAFETY: owns offscreen memory DC and 32-bit DIBSection strictly for this synchronous frame update.
     unsafe {
         let mem_dc = CreateCompatibleDC(None);
         if mem_dc.0.is_null() {
@@ -1567,78 +2293,129 @@ fn render_and_place(hwnd: HWND) {
             buf.fill(0);
 
             let scale = (cfg.size_pct.clamp(50, 200) as f32 / 100.0) * (dpi as f32 / 96.0);
-            let mut canvas = GlyphCanvas {
-                buf,
-                width: w,
-                height: h,
-            };
-            render_anurati_word(
-                &mut canvas,
-                &day_str,
-                16.0 * scale,
-                50.0 * scale,
-                w as f32 * 0.5,
-                cfg.color,
-            );
-            draw_quicksand_line(
-                &mut canvas,
-                &date_str,
-                RECT {
-                    left: 8,
-                    top: (84.0 * scale).round() as i32,
-                    right: w - 8,
-                    bottom: (118.0 * scale).round() as i32,
-                },
-                (21.0 * scale).round() as i32,
-                (1.5 * scale).round() as i32,
-                cfg.color,
-            );
-            draw_quicksand_line(
-                &mut canvas,
-                &time_str,
-                RECT {
-                    left: 8,
-                    top: (126.0 * scale).round() as i32,
-                    right: w - 8,
-                    bottom: (160.0 * scale).round() as i32,
-                },
-                (20.0 * scale).round() as i32,
-                (1.2 * scale).round() as i32,
-                cfg.color,
-            );
+            {
+                let mut canvas = GlyphCanvas {
+                    buf,
+                    width: w,
+                    height: h,
+                };
+                render_anurati_word(
+                    &mut canvas,
+                    &day_str,
+                    16.0 * scale,
+                    50.0 * scale,
+                    w as f32 * 0.5,
+                    cfg.color,
+                );
+                draw_quicksand_line(
+                    &mut canvas,
+                    &date_str,
+                    RECT {
+                        left: 8,
+                        top: (84.0 * scale).round() as i32,
+                        right: w - 8,
+                        bottom: (118.0 * scale).round() as i32,
+                    },
+                    (21.0 * scale).round() as i32,
+                    (1.5 * scale).round() as i32,
+                    cfg.color,
+                );
+                draw_quicksand_line(
+                    &mut canvas,
+                    &time_str,
+                    RECT {
+                        left: 8,
+                        top: (126.0 * scale).round() as i32,
+                        right: w - 8,
+                        bottom: (160.0 * scale).round() as i32,
+                    },
+                    (20.0 * scale).round() as i32,
+                    (1.2 * scale).round() as i32,
+                    cfg.color,
+                );
+            }
             apply_opacity_in_place(buf, cfg.opacity_pct);
-            apply_hit_alpha_in_place(buf, !is_click_through(cfg, repositioning));
+            apply_hit_alpha_in_place(
+                buf,
+                !behind_attached && !is_click_through(cfg, repositioning),
+            );
             if repositioning {
                 draw_reposition_guide(buf, w, h);
             }
 
-            let dst = POINT { x: sx, y: sy };
-            let size = SIZE { cx: w, cy: h };
-            let src = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let next_bounds = (dst.x, dst.y, w, h, repositioning);
-            if last_bounds != Some(next_bounds) || !IsWindowVisible(hwnd).as_bool() {
-                place_on_desktop(hwnd, dst.x, dst.y, w, h, true, repositioning);
+            let mut dst = POINT { x: sx, y: sy };
+            if behind_attached && let Some(l) = cached_layer.filter(|&l| layer_still_valid(l)) {
+                let mut pts = [dst];
+                MapWindowPoints(None, l.parent, &mut pts);
+                dst = pts[0];
             }
-            let _ = UpdateLayeredWindow(
-                hwnd,
-                None,
-                Some(&dst),
-                Some(&size),
-                mem_dc,
-                Some(&src),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
+
+            let next_bounds = (dst.x, dst.y, w, h, repositioning, behind_attached);
+            if last_bounds != Some(next_bounds) || !IsWindowVisible(hwnd).as_bool() {
+                if behind_attached && let Some(l) = cached_layer.filter(|&l| layer_still_valid(l)) {
+                    let after = if l.raised { l.icons } else { HWND_TOP };
+                    IN_ZORDER_SYNC.with(|g| g.set(true));
+                    let _ = SetWindowPos(
+                        hwnd,
+                        after,
+                        dst.x,
+                        dst.y,
+                        w,
+                        h,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                    IN_ZORDER_SYNC.with(|g| g.set(false));
+                } else {
+                    place_popup_on_desktop(hwnd, dst.x, dst.y, w, h, true, repositioning);
+                }
+            }
+
+            if has_dcomp {
+                let ok = CLOCK_RUNTIME.with(|slot| {
+                    slot.borrow_mut()
+                        .as_mut()
+                        .and_then(|rt| rt.dcomp.as_mut())
+                        .is_some_and(|dc| dc.present_bgra(buf, w as u32, h as u32))
+                });
+                if !ok {
+                    // Rebuild presenter cleanly on device removal/display change.
+                    let rebuilt = DCompPresenter::new(hwnd, w as u32, h as u32).map(|mut dc| {
+                        let _ = dc.present_bgra(buf, w as u32, h as u32);
+                        dc
+                    });
+                    CLOCK_RUNTIME.with(|slot| {
+                        if let Some(rt) = slot.borrow_mut().as_mut() {
+                            rt.dcomp = rebuilt;
+                        }
+                    });
+                }
+            } else {
+                let size = SIZE { cx: w, cy: h };
+                let src = POINT { x: 0, y: 0 };
+                let blend = BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                };
+                let _ = UpdateLayeredWindow(
+                    hwnd,
+                    None,
+                    Some(&dst),
+                    Some(&size),
+                    mem_dc,
+                    Some(&src),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                );
+            }
+
             SelectObject(mem_dc, prev_bmp);
             CLOCK_RUNTIME.with(|slot| {
                 if let Some(state) = slot.borrow_mut().as_mut() {
+                    state.width = w;
+                    state.height = h;
                     state.last_bounds = Some(next_bounds);
                     state.last_stamp = (
                         now.wYear,
@@ -1682,9 +2459,9 @@ fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
         "Lock position (Off)"
     };
     let icons_label = if cfg.behind_icons {
-        "Pass clicks to shortcuts (On)"
+        "Behind desktop shortcuts (On)"
     } else {
-        "Pass clicks to shortcuts (Off)"
+        "Behind desktop shortcuts (Off)"
     };
     let fmt_label = if cfg.use_24h {
         "24-hour clock (On)"
@@ -1694,6 +2471,7 @@ fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
     let mut items: Vec<(usize, &str)> = vec![
         (CLOCK_CTX_SIZE_DELTA + 1, "Bigger\tScroll up"),
         (CLOCK_CTX_SIZE_DELTA + 2, "Smaller\tScroll down"),
+        (CLOCK_CTX_PICK_COLOR, "Pick colour from screen..."),
         (CLOCK_CTX_24H, fmt_label),
         (CLOCK_CTX_LOCK, lock_label),
         (CLOCK_CTX_BEHIND_ICONS, icons_label),
@@ -1722,6 +2500,10 @@ fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
             } else {
                 end_reposition(owner, action_msg, cfg);
             }
+            return;
+        }
+        if choice == CLOCK_CTX_PICK_COLOR {
+            begin_color_pick(owner, action_msg, cfg.color);
             return;
         }
         if owner.0.is_null() {
@@ -1755,6 +2537,7 @@ unsafe extern "system" fn clock_proc(
     unsafe {
         match msg {
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            WM_QUERYOPEN => LRESULT(1),
             WM_SYSCOMMAND => {
                 let cmd = (wparam.0 & 0xFFF0) as u32;
                 if cmd == SC_MINIMIZE || cmd == SC_MAXIMIZE {
@@ -1763,7 +2546,7 @@ unsafe extern "system" fn clock_proc(
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_SIZE if wparam.0 == SIZE_MINIMIZED as usize => {
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                restore_if_iconic(hwnd);
                 ensure_desktop_visible();
                 LRESULT(0)
             }
@@ -1773,35 +2556,61 @@ unsafe extern "system" fn clock_proc(
                     if !ALLOW_INTERNAL_HIDE.with(Cell::get) {
                         pos.flags.0 &= !SWP_HIDEWINDOW.0;
                     }
-                    if !IN_ZORDER_SYNC.with(Cell::get)
-                        && (pos.flags.0 & SWP_NOZORDER.0 == 0)
-                        && !is_repositioning()
-                        && pos.hwndInsertAfter == HWND_BOTTOM
-                    {
-                        pos.hwndInsertAfter = desktop_insert_after(hwnd, false);
+                    if !IN_ZORDER_SYNC.with(Cell::get) {
+                        // Never allow minimize-park offscreen coordinates (-32000, -32000).
+                        if (pos.flags.0 & SWP_NOMOVE.0 == 0) && (pos.x <= -30000 || pos.y <= -30000)
+                        {
+                            pos.flags |= SWP_NOMOVE | SWP_NOSIZE;
+                        }
+                        if (pos.flags.0 & SWP_NOZORDER.0 == 0)
+                            && !is_repositioning()
+                            && !CLOCK_RUNTIME
+                                .with(|s| s.borrow().as_ref().is_some_and(|r| r.behind_attached))
+                        {
+                            // Exact Rainmeter Skin::OnWindowPosChanging rule: keep OS/DWM from bumping z-order.
+                            pos.flags |= SWP_NOZORDER;
+                        }
                     }
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_NCHITTEST => {
-                let pass = CLOCK_RUNTIME.with(|slot| {
-                    slot.borrow()
-                        .as_ref()
-                        .is_none_or(|rt| is_click_through(rt.cfg, rt.repositioning))
+                let sx = (lparam.0 as i32) << 16 >> 16;
+                let sy = (lparam.0 as i32) >> 16;
+                let mut pt = POINT { x: sx, y: sy };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let hit = CLOCK_RUNTIME.with(|slot| {
+                    slot.borrow().as_ref().is_some_and(|rt| {
+                        if rt.behind_attached || is_click_through(rt.cfg, rt.repositioning) {
+                            return false;
+                        }
+                        if rt.repositioning {
+                            return true;
+                        }
+                        // Ignore extreme outer blank margin so adjacent icons stay untouched.
+                        let mx = rt.width * 12 / 100;
+                        let my = rt.height * 12 / 100;
+                        pt.x >= mx && pt.x < rt.width - mx && pt.y >= my && pt.y < rt.height - my
+                    })
                 });
-                if pass {
-                    LRESULT(HTTRANSPARENT as isize)
-                } else {
+                if hit {
                     LRESULT(HTCLIENT as isize)
+                } else {
+                    LRESULT(HTTRANSPARENT as isize)
                 }
             }
             WM_SETCURSOR => {
-                let interactive = CLOCK_RUNTIME.with(|slot| {
-                    slot.borrow()
-                        .as_ref()
-                        .is_some_and(|rt| !is_click_through(rt.cfg, rt.repositioning))
+                let mut cur = POINT::default();
+                let _ = GetCursorPos(&mut cur);
+                let _ = ScreenToClient(hwnd, &mut cur);
+                let can_move = CLOCK_RUNTIME.with(|slot| {
+                    slot.borrow().as_ref().is_some_and(|rt| {
+                        !rt.behind_attached
+                            && (!rt.cfg.locked || rt.repositioning)
+                            && in_drag_handle(cur.x, cur.y, rt.width, rt.height)
+                    })
                 });
-                let cursor = if interactive { IDC_SIZEALL } else { IDC_ARROW };
+                let cursor = if can_move { IDC_SIZEALL } else { IDC_ARROW };
                 if let Ok(h) = LoadCursorW(None, cursor) {
                     SetCursor(h);
                 }
@@ -1809,6 +2618,11 @@ unsafe extern "system" fn clock_proc(
             }
             WM_TIMER if wparam.0 == CLOCK_ZORDER_SETTLE_TIMER_ID => {
                 let _ = KillTimer(hwnd, CLOCK_ZORDER_SETTLE_TIMER_ID);
+                ensure_desktop_visible();
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == CLOCK_ZORDER_LATE_TIMER_ID => {
+                let _ = KillTimer(hwnd, CLOCK_ZORDER_LATE_TIMER_ID);
                 ensure_desktop_visible();
                 LRESULT(0)
             }
@@ -1853,16 +2667,20 @@ unsafe extern "system" fn clock_proc(
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_LBUTTONDOWN => {
-                let interactive = CLOCK_RUNTIME.with(|slot| {
-                    slot.borrow()
-                        .as_ref()
-                        .is_some_and(|rt| !is_click_through(rt.cfg, rt.repositioning))
-                });
-                if !interactive {
-                    return LRESULT(0);
-                }
                 let mut cur = POINT::default();
                 let _ = GetCursorPos(&mut cur);
+                let mut client_pt = cur;
+                let _ = ScreenToClient(hwnd, &mut client_pt);
+                let allow_drag = CLOCK_RUNTIME.with(|slot| {
+                    slot.borrow().as_ref().is_some_and(|rt| {
+                        !rt.behind_attached
+                            && (!rt.cfg.locked || rt.repositioning)
+                            && in_drag_handle(client_pt.x, client_pt.y, rt.width, rt.height)
+                    })
+                });
+                if !allow_drag {
+                    return LRESULT(0);
+                }
                 let mut wr = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut wr);
                 CLOCK_RUNTIME.with(|slot| {
@@ -1914,7 +2732,6 @@ unsafe extern "system" fn clock_proc(
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                // Clicks never collapse or hide the widget; only explicit Done/Esc exits repositioning.
                 let (moved, owner, action_msg) = CLOCK_RUNTIME.with(|slot| {
                     slot.borrow_mut().as_mut().map_or((false, 0, 0), |rt| {
                         let m = rt.dragging && rt.drag_moved;
@@ -1946,7 +2763,8 @@ unsafe extern "system" fn clock_proc(
                 let delta = ((wparam.0 >> 16) as i16) as i32;
                 let (allowed, owner, action_msg) = CLOCK_RUNTIME.with(|slot| {
                     slot.borrow_mut().as_mut().map_or((false, 0, 0), |rt| {
-                        let ok = !is_click_through(rt.cfg, rt.repositioning);
+                        // Lock position disables accidental drag & scroll-resizing; repositioning unlocks both.
+                        let ok = !rt.behind_attached && (!rt.cfg.locked || rt.repositioning);
                         if ok {
                             rt.pending_wheel_delta += delta;
                             let steps = rt.pending_wheel_delta / 120;
@@ -1995,6 +2813,609 @@ unsafe extern "system" fn clock_proc(
                     }
                 }
                 LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+// --- Screen-wide Eyedropper Color Picker (Pick colour from anywhere on screen) ---
+
+#[derive(Default)]
+struct ColorPickState {
+    picker_hwnd: isize,
+    loupe_hwnd: isize,
+    owner: isize,
+    action_msg: u32,
+    original_color: u32,
+    last_color: u32,
+    sample_dc: isize,
+    sample_bmp: isize,
+    sample_bits: usize,
+    closing: bool,
+}
+
+const SAMPLE_SIDE: i32 = 9;
+const LOUPE_W: i32 = 152;
+const LOUPE_H: i32 = 62;
+
+unsafe extern "system" fn loupe_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: delegates loupe messages directly to default Win32 handler.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+pub fn begin_color_pick(owner: HWND, action_msg: u32, current_color: u32) {
+    cancel_color_pick();
+    let black_brush = unsafe { GetStockObject(BLACK_BRUSH) };
+    if ensure_class(PICKER_CLASS, Some(picker_proc), black_brush, IDC_CROSS).is_err()
+        || ensure_class(LOUPE_CLASS, Some(loupe_proc), HGDIOBJ::default(), IDC_CROSS).is_err()
+    {
+        return;
+    }
+    ensure_quicksand_loaded();
+    let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else {
+        return;
+    };
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
+        )
+    };
+    // SAFETY: lightweight LWA_ALPHA=1 overlay consumes 0 KB backing bitmap while intercepting clicks across all monitors.
+    unsafe {
+        let Ok(picker) = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            PICKER_CLASS,
+            w!("WallpaperLive Color Picker"),
+            WS_POPUP,
+            vx,
+            vy,
+            vw,
+            vh,
+            None,
+            None,
+            instance,
+            None,
+        ) else {
+            return;
+        };
+        let _ = SetLayeredWindowAttributes(picker, COLORREF(0), 1, LWA_ALPHA);
+
+        let Ok(loupe) = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            LOUPE_CLASS,
+            w!("WallpaperLive Color Loupe"),
+            WS_POPUP,
+            0,
+            0,
+            LOUPE_W,
+            LOUPE_H,
+            None,
+            None,
+            instance,
+            None,
+        ) else {
+            let _ = DestroyWindow(picker);
+            return;
+        };
+
+        let sample_dc = CreateCompatibleDC(None);
+        let mut s_bits = std::ptr::null_mut();
+        let sample_bmp = if !sample_dc.0.is_null() {
+            CreateDIBSection(
+                sample_dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: SAMPLE_SIDE,
+                        biHeight: -SAMPLE_SIDE,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut s_bits,
+                None,
+                0,
+            )
+            .ok()
+        } else {
+            None
+        };
+        let Some(sb) = sample_bmp else {
+            if !sample_dc.0.is_null() {
+                let _ = DeleteDC(sample_dc);
+            }
+            let _ = DestroyWindow(loupe);
+            let _ = DestroyWindow(picker);
+            return;
+        };
+        if s_bits.is_null() {
+            let _ = DeleteObject(sb);
+            let _ = DeleteDC(sample_dc);
+            let _ = DestroyWindow(loupe);
+            let _ = DestroyWindow(picker);
+            return;
+        }
+        let _ = SelectObject(sample_dc, HGDIOBJ(sb.0));
+
+        COLOR_PICK_SESSION.with(|slot| {
+            *slot.borrow_mut() = Some(ColorPickState {
+                picker_hwnd: picker.0 as isize,
+                loupe_hwnd: loupe.0 as isize,
+                owner: owner.0 as isize,
+                action_msg,
+                original_color: current_color & 0x00FF_FFFF,
+                last_color: current_color & 0x00FF_FFFF,
+                sample_dc: sample_dc.0 as isize,
+                sample_bmp: sb.0 as isize,
+                sample_bits: s_bits as usize,
+                closing: false,
+            });
+        });
+
+        let _ = ShowWindow(picker, SW_SHOWNA);
+        let _ = SetWindowPos(
+            picker,
+            HWND_TOPMOST,
+            vx,
+            vy,
+            vw,
+            vh,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
+        let _ = SetForegroundWindow(picker);
+        let _ = SetFocus(picker);
+        let _ = SetCapture(picker);
+
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        update_picker_loupe(pt);
+    }
+}
+
+pub fn cancel_color_pick() {
+    let old = COLOR_PICK_SESSION.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if let Some(st) = borrow.as_mut() {
+            if st.closing {
+                return None;
+            }
+            st.closing = true;
+        }
+        borrow.take()
+    });
+    let Some(st) = old else {
+        return;
+    };
+    unsafe {
+        if st.picker_hwnd != 0 {
+            let p = HWND(st.picker_hwnd as *mut c_void);
+            if GetCapture() == p {
+                let _ = ReleaseCapture();
+            }
+            if IsWindow(p).as_bool() {
+                let _ = DestroyWindow(p);
+            }
+        }
+        if st.loupe_hwnd != 0 {
+            let l = HWND(st.loupe_hwnd as *mut c_void);
+            if IsWindow(l).as_bool() {
+                let _ = DestroyWindow(l);
+            }
+        }
+        if st.sample_bmp != 0 {
+            let _ = DeleteObject(HGDIOBJ(st.sample_bmp as *mut c_void));
+        }
+        if st.sample_dc != 0 {
+            let _ = DeleteDC(HDC(st.sample_dc as *mut c_void));
+        }
+    }
+}
+
+fn preview_clock_color_live(color: u32) {
+    let clock_raw = CLOCK_RUNTIME.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        borrow.as_mut().map(|rt| {
+            rt.cfg.color = color & 0x00FF_FFFF;
+            rt.hwnd
+        })
+    });
+    if let Some(raw) = clock_raw
+        && raw != 0
+    {
+        render_and_place(HWND(raw as *mut c_void));
+    }
+}
+
+fn finish_color_pick(commit: bool) {
+    let info = COLOR_PICK_SESSION.with(|slot| {
+        slot.borrow().as_ref().map(|st| {
+            (
+                st.picker_hwnd,
+                st.loupe_hwnd,
+                st.owner,
+                st.action_msg,
+                st.original_color,
+                st.last_color,
+            )
+        })
+    });
+    let Some((picker_raw, loupe_raw, owner_raw, action_msg, original_color, mut picked_color)) =
+        info
+    else {
+        return;
+    };
+
+    if commit {
+        // Hide capture overlay + loupe first so final 1x1 pixel read is 100% untinted by alpha=1 veil.
+        unsafe {
+            if loupe_raw != 0 {
+                let _ = ShowWindow(HWND(loupe_raw as *mut c_void), SW_HIDE);
+            }
+            if picker_raw != 0 {
+                let p = HWND(picker_raw as *mut c_void);
+                if GetCapture() == p {
+                    let _ = ReleaseCapture();
+                }
+                let _ = ShowWindow(p, SW_HIDE);
+            }
+            let _ = DwmFlush();
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            if let Some(exact) = sample_exact_screen_pixel(pt) {
+                picked_color = exact;
+            }
+        }
+    }
+
+    cancel_color_pick();
+
+    if commit {
+        preview_clock_color_live(picked_color);
+        CLOCK_PICKED_COLOR.with(|c| c.set(Some(picked_color)));
+        if owner_raw != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(owner_raw as *mut c_void),
+                    action_msg,
+                    WPARAM(CLOCK_CTX_PICK_COLOR),
+                    LPARAM(0),
+                );
+            }
+        }
+    } else {
+        preview_clock_color_live(original_color);
+        if owner_raw != 0 {
+            unsafe {
+                let _ = SetForegroundWindow(HWND(owner_raw as *mut c_void));
+            }
+        }
+    }
+}
+
+unsafe fn sample_exact_screen_pixel(pt: POINT) -> Option<u32> {
+    let mut result = None;
+    COLOR_PICK_SESSION.with(|slot| {
+        if let Some(st) = slot.borrow().as_ref()
+            && st.sample_dc != 0
+            && st.sample_bits != 0
+        {
+            // SAFETY: reads 1x1 pixel at virtual screen coordinates into owned 9x9 scratch DIB.
+            unsafe {
+                let sdc = GetDC(None);
+                if !sdc.0.is_null() {
+                    let _ = BitBlt(
+                        HDC(st.sample_dc as *mut c_void),
+                        0,
+                        0,
+                        1,
+                        1,
+                        sdc,
+                        pt.x,
+                        pt.y,
+                        SRCCOPY,
+                    );
+                    let _ = GdiFlush();
+                    let _ = ReleaseDC(None, sdc);
+                    let px = *(st.sample_bits as *const u32);
+                    result = Some(px & 0x00FF_FFFF);
+                }
+            }
+        }
+    });
+    result
+}
+
+unsafe fn update_picker_loupe(pt: POINT) {
+    let meta = COLOR_PICK_SESSION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|st| (st.loupe_hwnd, st.sample_dc, st.sample_bits))
+    });
+    let Some((loupe_raw, sdc_raw, sbits_raw)) = meta else {
+        return;
+    };
+    if loupe_raw == 0 || sdc_raw == 0 || sbits_raw == 0 {
+        return;
+    }
+
+    let mut samples = [0u32; (SAMPLE_SIDE * SAMPLE_SIDE) as usize];
+    // SAFETY: reads 9x9 virtual screen pixels around cursor and updates compact LOUPE_W x LOUPE_H layered preview.
+    unsafe {
+        let sdc = GetDC(None);
+        if sdc.0.is_null() {
+            return;
+        }
+        let sample_dc = HDC(sdc_raw as *mut c_void);
+        let half = SAMPLE_SIDE / 2;
+        let _ = BitBlt(
+            sample_dc,
+            0,
+            0,
+            SAMPLE_SIDE,
+            SAMPLE_SIDE,
+            sdc,
+            pt.x - half,
+            pt.y - half,
+            SRCCOPY,
+        );
+        let _ = GdiFlush();
+        let _ = ReleaseDC(None, sdc);
+
+        let raw = std::slice::from_raw_parts(sbits_raw as *const u32, samples.len());
+        for (i, &px) in raw.iter().enumerate() {
+            // Undo tiny 1/255 alpha=1 black veil so live preview matches exact final pixel color.
+            let r = (((px >> 16) & 255) * 255 + 127) / 254;
+            let g = (((px >> 8) & 255) * 255 + 127) / 254;
+            let b = ((px & 255) * 255 + 127) / 254;
+            samples[i] = (r.min(255) << 16) | (g.min(255) << 8) | b.min(255);
+        }
+    }
+
+    let center_col = samples[samples.len() / 2];
+    COLOR_PICK_SESSION.with(|slot| {
+        if let Some(st) = slot.borrow_mut().as_mut() {
+            st.last_color = center_col;
+        }
+    });
+    preview_clock_color_live(center_col);
+
+    // Build compact dark glass loupe DIB with 9x9 zoom grid + color swatch + hex code.
+    unsafe {
+        let mem_dc = CreateCompatibleDC(None);
+        if mem_dc.0.is_null() {
+            return;
+        }
+        let mut bits = std::ptr::null_mut();
+        let Ok(bmp) = CreateDIBSection(
+            mem_dc,
+            &BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: LOUPE_W,
+                    biHeight: -LOUPE_H,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        ) else {
+            let _ = DeleteDC(mem_dc);
+            return;
+        };
+        if !bits.is_null() {
+            let prev = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+            let buf =
+                std::slice::from_raw_parts_mut(bits as *mut u32, (LOUPE_W * LOUPE_H) as usize);
+            // Dark rounded pill background (#181818 @ 235 alpha).
+            for y in 0..LOUPE_H {
+                for x in 0..LOUPE_W {
+                    let border = x == 0 || y == 0 || x == LOUPE_W - 1 || y == LOUPE_H - 1;
+                    buf[(y * LOUPE_W + x) as usize] =
+                        if border { 0xFF42_4242 } else { 0xEB18_1818 };
+                }
+            }
+            // Left 9x9 zoomed pixel square (8, 8) at 5x5 per sample -> 45x45.
+            let cell = 5i32;
+            let zx0 = 8i32;
+            let zy0 = 8i32;
+            for sy in 0..SAMPLE_SIDE {
+                for sx in 0..SAMPLE_SIDE {
+                    let col = samples[(sy * SAMPLE_SIDE + sx) as usize];
+                    let px_col = 0xFF00_0000 | col;
+                    for dy in 0..cell {
+                        for dx in 0..cell {
+                            let gx = zx0 + sx * cell + dx;
+                            let gy = zy0 + sy * cell + dy;
+                            let grid_edge = dx == 0 || dy == 0;
+                            let final_px = if sx == 4
+                                && sy == 4
+                                && (dx == 0 || dy == 0 || dx == cell - 1 || dy == cell - 1)
+                            {
+                                0xFFFF_FFFF
+                            } else if grid_edge {
+                                0xFF28_2828
+                            } else {
+                                px_col
+                            };
+                            buf[(gy * LOUPE_W + gx) as usize] = final_px;
+                        }
+                    }
+                }
+            }
+            // Color swatch circle/square next to zoom grid (x=62..80, y=12..30).
+            for y in 12..30 {
+                for x in 62..80 {
+                    let edge = x == 62 || x == 79 || y == 12 || y == 29;
+                    buf[(y * LOUPE_W + x) as usize] = if edge {
+                        0xFFAA_AAAA
+                    } else {
+                        0xFF00_0000 | center_col
+                    };
+                }
+            }
+
+            let hex = format!("#{:06X}", center_col);
+            let mut canvas = GlyphCanvas {
+                buf,
+                width: LOUPE_W,
+                height: LOUPE_H,
+            };
+            draw_quicksand_line(
+                &mut canvas,
+                &hex,
+                RECT {
+                    left: 84,
+                    top: 10,
+                    right: LOUPE_W - 6,
+                    bottom: 32,
+                },
+                14,
+                0,
+                0x00FF_FFFF,
+            );
+            draw_quicksand_line(
+                &mut canvas,
+                "Click pick / Esc cancel",
+                RECT {
+                    left: 60,
+                    top: 34,
+                    right: LOUPE_W - 6,
+                    bottom: 54,
+                },
+                11,
+                0,
+                0x00B8_B8B8,
+            );
+
+            // Offset loupe away from cursor while staying inside current monitor work area.
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let mon_r = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                mi.rcMonitor
+            } else {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                }
+            };
+            let lx = if pt.x + 20 + LOUPE_W <= mon_r.right {
+                pt.x + 20
+            } else {
+                pt.x - LOUPE_W - 16
+            };
+            let ly = if pt.y + 20 + LOUPE_H <= mon_r.bottom {
+                pt.y + 20
+            } else {
+                pt.y - LOUPE_H - 16
+            };
+
+            let loupe = HWND(loupe_raw as *mut c_void);
+            let dst = POINT { x: lx, y: ly };
+            let size = SIZE {
+                cx: LOUPE_W,
+                cy: LOUPE_H,
+            };
+            let src = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                loupe,
+                None,
+                Some(&dst),
+                Some(&size),
+                mem_dc,
+                Some(&src),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            let _ = SetWindowPos(
+                loupe,
+                HWND_TOPMOST,
+                lx,
+                ly,
+                LOUPE_W,
+                LOUPE_H,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            SelectObject(mem_dc, prev);
+        }
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem_dc);
+    }
+}
+
+unsafe extern "system" fn picker_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: interacts strictly with thread-local COLOR_PICK_SESSION on UI thread.
+    unsafe {
+        match msg {
+            WM_MOUSEMOVE => {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                update_picker_loupe(pt);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                finish_color_pick(true);
+                LRESULT(0)
+            }
+            WM_RBUTTONUP | WM_RBUTTONDOWN => {
+                finish_color_pick(false);
+                LRESULT(0)
+            }
+            WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => {
+                finish_color_pick(false);
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                let active = COLOR_PICK_SESSION.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .is_some_and(|st| !st.closing && st.picker_hwnd == hwnd.0 as isize)
+                });
+                if active {
+                    finish_color_pick(false);
+                }
+                LRESULT(0)
+            }
+            WM_SETCURSOR => {
+                if let Ok(h) = LoadCursorW(None, IDC_CROSS) {
+                    SetCursor(h);
+                }
+                LRESULT(1)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -2050,13 +3471,16 @@ mod tests {
         let max_alpha = buf.iter().map(|&px| px >> 24).max().unwrap_or(0);
         assert!((120..=135).contains(&max_alpha));
 
-        // Rainmeter SolidColor=0,0,0,1 invariant: interactive surface has alpha>=1 everywhere, click-through stays 0.
-        let mut hit_buf = vec![0u32; 64];
-        apply_hit_alpha_in_place(&mut hit_buf, false);
-        assert!(hit_buf.iter().all(|&px| px == 0));
-        apply_hit_alpha_in_place(&mut hit_buf, true);
-        assert!(hit_buf.iter().all(|&px| px == 0x0100_0000));
-
+        // Lock position is strictly distinct from Behind desktop shortcuts: locking does NOT activate WS_EX_TRANSPARENT.
+        assert!(!is_click_through(
+            ClockConfig {
+                enabled: true,
+                locked: true,
+                behind_icons: false,
+                ..Default::default()
+            },
+            false,
+        ));
         assert!(is_click_through(
             ClockConfig {
                 enabled: true,
@@ -2075,6 +3499,13 @@ mod tests {
             },
             true,
         ));
+
+        // Inner center drag handle rejects outer border touches and accepts dead-center clicks.
+        assert!(in_drag_handle(w / 2, h / 2, w, h));
+        assert!(!in_drag_handle(4, h / 2, w, h));
+        assert!(!in_drag_handle(w - 4, h / 2, w, h));
+        assert!(!in_drag_handle(w / 2, 4, w, h));
+        assert!(!in_drag_handle(w / 2, h - 4, w, h));
 
         assert_eq!(minute_timer_delay_ms(0), 60_050);
         assert_eq!(minute_timer_delay_ms(59), 1_050);

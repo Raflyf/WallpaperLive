@@ -1276,13 +1276,13 @@ impl App {
                 (
                     visuals::CLOCK_LOCK,
                     w!("BUTTON"),
-                    "Lock position",
+                    "Lock position & size",
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
                 ),
                 (
                     visuals::CLOCK_BEHIND_ICONS,
                     w!("BUTTON"),
-                    "Pass clicks to desktop shortcuts",
+                    "Behind desktop shortcuts",
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -1301,6 +1301,12 @@ impl App {
                     visuals::CLOCK_RESET_POS,
                     w!("BUTTON"),
                     "Center position",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_PICK_COLOR,
+                    w!("BUTTON"),
+                    "Pick colour from screen",
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -3580,6 +3586,7 @@ impl App {
         playback.player.pause(paused)?;
         self.requested_pause = paused;
         playback.surface.show();
+        crate::clock_widget::sync_zorder();
         let playing_path = playback.path.clone();
         self.settings.path = Some(playing_path.clone());
         if let Some(monitor) = &self.active_monitor {
@@ -4387,6 +4394,20 @@ impl App {
             visuals::CLOCK_RESET_POS => {
                 self.settings.clock_pos = None;
                 self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_PICK_COLOR => {
+                crate::clock_widget::begin_color_pick(self.hwnd, ACTION, self.settings.clock_color);
+            }
+            visuals::CLOCK_CTX_PICK_COLOR => {
+                if let Some(color) = crate::clock_widget::take_picked_color() {
+                    self.settings.clock_color = color & 0x00FF_FFFF;
+                    self.save_and_sync_clock()?;
+                    if !self.hwnd.0.is_null() && unsafe { IsWindowVisible(self.hwnd).as_bool() } {
+                        unsafe {
+                            let _ = SetForegroundWindow(self.hwnd);
+                        }
+                    }
+                }
             }
             visuals::CLOCK_STYLE_CHANGED => {
                 let st = visuals::clock_ui_state();

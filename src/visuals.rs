@@ -88,6 +88,8 @@ pub const CLOCK_CTX_OPEN_SETTINGS: usize = 167;
 pub const CLOCK_CTX_REMOVE: usize = 168;
 pub const CLOCK_STYLE_CHANGED: usize = 169;
 pub const CLOCK_STYLE_COMMIT: usize = 170;
+pub const CLOCK_PICK_COLOR: usize = 171;
+pub const CLOCK_CTX_PICK_COLOR: usize = 172;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 pub const HEADER_HEIGHT: i32 = 72;
@@ -112,7 +114,7 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
             tab == Tab::Settings
         }
         CLOCK_ENABLE | CLOCK_LOCK | CLOCK_BEHIND_ICONS | CLOCK_24H | CLOCK_REPOSITION
-        | CLOCK_RESET_POS => tab == Tab::Clock,
+        | CLOCK_RESET_POS | CLOCK_PICK_COLOR => tab == Tab::Clock,
         PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
         | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
             tab == Tab::Library
@@ -180,7 +182,7 @@ pub struct Layout {
     pub caption_divider: Rect,
     pub caption_buttons: [(CaptionButton, Rect); 3],
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 51],
+    controls: [(usize, Rect); 52],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -298,6 +300,7 @@ impl Layout {
                 (CLOCK_24H, r(content_x, 392, column_width, 38)),
                 (CLOCK_REPOSITION, r(content_x, 448, column_width, 36)),
                 (CLOCK_RESET_POS, r(content_x, 496, column_width, 36)),
+                (CLOCK_PICK_COLOR, r(resources_x, 496, column_width, 36)),
                 (VERSION, r(resources_x, 212, column_width, 24)),
                 (MEMORY_INFO, r(resources_x, 248, column_width, 40)),
                 (CACHE_INFO, r(resources_x, 300, column_width, 24)),
@@ -480,6 +483,7 @@ fn control_surface(id: usize) -> (u32, u8) {
             | CLOCK_24H
             | CLOCK_REPOSITION
             | CLOCK_RESET_POS
+            | CLOCK_PICK_COLOR
             | PRODUCT_WEBSITE
             | CLEAR_CACHE
             | SUPPORT
@@ -5910,7 +5914,7 @@ unsafe fn paint_scene(
                         DT_SINGLELINE,
                     );
                     label_clipped(
-                        "Mond-style desktop clock with Win+D persistence and click-through shortcuts",
+                        "Mond-style clock — behind desktop shortcuts or interactive on desktop (drag from center)",
                         pixels(layout.settings_subtitle),
                         scale(13),
                         false,
@@ -7323,7 +7327,7 @@ unsafe fn paint_clock_appearance_controls(
         );
         label(
             dc,
-            "Pick anywhere on the wheel; bar sets brightness.",
+            "Use the wheel & bar, or sample anywhere on screen.",
             g.colour_hint,
             s(12),
             false,
@@ -9663,7 +9667,15 @@ mod tests {
         }
 
         let g = clock_appearance_geom(&layout, 96);
-        assert!(g.wheel_r >= 44 && g.val_bar.bottom <= layout.settings_resources_panel.bottom);
+        let pick_area = layout.control(CLOCK_PICK_COLOR).unwrap();
+        assert!(visible_on(Tab::Clock, CLOCK_PICK_COLOR));
+        assert!(
+            g.wheel_r >= 44
+                && g.val_bar.bottom <= pick_area.top
+                && pick_area.bottom <= layout.settings_resources_panel.bottom
+                && pick_area.left >= layout.settings_resources_panel.left
+                && pick_area.right <= layout.settings_resources_panel.right
+        );
     }
 
     #[test]
