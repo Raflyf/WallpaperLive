@@ -4977,6 +4977,7 @@ unsafe extern "system" fn window_proc(
                 flush_drag_move(window);
                 reset_drag_move(window);
                 let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
+                visuals::end_drag_move_backdrop(window);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_DESTROY => {
@@ -5035,10 +5036,14 @@ unsafe extern "system" fn window_proc(
                         && !GetPropW(window, SIZE_MOVE_PROPERTY).0.is_null()
                     {
                         maybe_coalesce_drag_move(window, pos);
+                        if (pos.flags.0 & SWP_NOMOVE.0) == 0 {
+                            let _ = visuals::begin_drag_move_backdrop(window);
+                        }
                     }
                     return DefWindowProcW(window, message, wparam, lparam);
                 }
                 clear_pending_drag_move(window);
+                visuals::cancel_drag_move_backdrop(window);
                 let animate_backdrop = visuals::os_window_animations_enabled();
                 if !iconic && pos.x <= -30000 && pos.y <= -30000 {
                     if animate_backdrop {
@@ -5092,6 +5097,12 @@ unsafe extern "system" fn window_proc(
                         }
                     }
                     pos.flags |= SWP_NOCOPYBITS;
+                }
+                DefWindowProcW(window, message, wparam, lparam)
+            }
+            WM_MOVE => {
+                if !IsIconic(window).as_bool() && visuals::drag_move_backdrop_active(window) {
+                    visuals::update_drag_move_backdrop(window);
                 }
                 DefWindowProcW(window, message, wparam, lparam)
             }
@@ -7534,6 +7545,110 @@ mod tests {
             app.update_status();
             assert!(app.status_dirty.get());
             assert!(app.status_cache.borrow().0.is_empty());
+
+            let _ = DestroyWindow(hwnd);
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
+            if atom != 0 {
+                let _ = UnregisterClassW(class_name, instance);
+            }
+        }
+    }
+
+    #[test]
+    fn drag_move_backdrop_engages_on_move_and_restores_on_snap_or_exit() {
+        struct ResetOsAnim;
+        impl Drop for ResetOsAnim {
+            fn drop(&mut self) {
+                visuals::set_os_animations_for_test(None);
+            }
+        }
+        let _guard = ResetOsAnim;
+        // SAFETY: isolated tool-window HWND created and destroyed within this test thread.
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("module handle");
+            let class_name = w!("WallpaperLive.DragMoveBackdropTest");
+            let atom = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            });
+            assert!(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class_name,
+                w!("WallpaperLive Drag Backdrop Test"),
+                WS_POPUP | WS_CLIPCHILDREN,
+                100,
+                100,
+                240,
+                160,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("drag backdrop test window");
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+
+            let send_pos = |x, y, cx, cy, flags| {
+                let mut pos = WINDOWPOS {
+                    hwnd,
+                    hwndInsertAfter: HWND::default(),
+                    x,
+                    y,
+                    cx,
+                    cy,
+                    flags,
+                };
+                assert_eq!(
+                    SendMessageW(
+                        hwnd,
+                        WM_WINDOWPOSCHANGING,
+                        WPARAM(0),
+                        LPARAM((&mut pos as *mut WINDOWPOS) as isize),
+                    ),
+                    LRESULT(0)
+                );
+            };
+
+            if visuals::enable_backdrop(hwnd) {
+                visuals::set_os_animations_for_test(Some(true));
+                let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
+                send_pos(120, 120, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(visuals::drag_move_backdrop_active(hwnd));
+                assert!(visuals::backdrop_transition_active(hwnd));
+
+                // Aero Snap / resize mid-drag cancels the cached drag-move backdrop cleanly.
+                send_pos(0, 0, 320, 240, SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(!visuals::drag_move_backdrop_active(hwnd));
+                assert!(!visuals::backdrop_transition_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
+
+                // Subsequent drag moves keep drag_move_backdrop_active until WM_EXITSIZEMOVE fades out.
+                let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
+                send_pos(140, 140, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(visuals::drag_move_backdrop_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
+                assert!(!visuals::drag_move_backdrop_active(hwnd));
+                assert!(visuals::backdrop_fading(hwnd));
+                visuals::expire_backdrop_fade_for_test(hwnd);
+                let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(visuals::ANIM_TIMER_ID), LPARAM(0));
+                assert!(!visuals::backdrop_transition_active(hwnd));
+
+                // Even with OS animations disabled, drag-move uses the fast backdrop and finishes at 0ms.
+                visuals::set_os_animations_for_test(Some(false));
+                let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
+                send_pos(160, 160, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(visuals::drag_move_backdrop_active(hwnd));
+                let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
+                assert!(!visuals::drag_move_backdrop_active(hwnd));
+                assert!(!visuals::backdrop_transition_active(hwnd));
+
+                visuals::set_os_animations_for_test(None);
+                visuals::disable_backdrop(hwnd);
+            }
 
             let _ = DestroyWindow(hwnd);
             let mut msg = MSG::default();

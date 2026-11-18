@@ -1485,21 +1485,8 @@ pub fn tick_animations(window: HWND) -> bool {
     if finish_fade {
         finish_backdrop_transition(window);
     } else if fade_tick {
-        // SAFETY: window and child controls are live UI-thread HWNDs; SEARCH is opaque CARD so ValidateRect prevents caret flicker.
         unsafe {
-            let _ = RedrawWindow(
-                window,
-                None,
-                None,
-                RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN,
-            );
-            if let Ok(search) = GetDlgItem(window, SEARCH as i32)
-                && !search.0.is_null()
-                && IsWindowVisible(search).as_bool()
-            {
-                let _ = ValidateRect(search, None);
-            }
-            let _ = RedrawWindow(window, None, None, RDW_UPDATENOW | RDW_ALLCHILDREN);
+            redraw_backdrop_surfaces(window);
         }
     }
     disarm_timer_if_idle(window);
@@ -1544,6 +1531,8 @@ pub fn clear() {
         }
     });
     TRANSITION_BACKDROP.with(|slot| *slot.borrow_mut() = TransitionBackdrop::default());
+    DRAG_UI_CACHE.with(|slot| *slot.borrow_mut() = DragUiCache::default());
+    DRAG_UV_REDRAW.with(|slot| slot.set(false));
     BX_COLS_SCRATCH.with(|slot| *slot.borrow_mut() = Vec::new());
     SYNCED_LAYOUT.with(|slot| slot.set(None));
     invalidate_theme_cache();
@@ -1554,6 +1543,7 @@ pub fn clear() {
 struct TransitionBackdrop {
     active: bool,
     captured_while_visible: bool,
+    drag_move: bool,
     fading: bool,
     fade_start: Option<Instant>,
     fade_duration_ms: u32,
@@ -1572,11 +1562,77 @@ impl TransitionBackdrop {
         let was_fading = self.fading;
         self.active = false;
         self.captured_while_visible = false;
+        self.drag_move = false;
         self.fading = false;
         self.fade_start = None;
         self.fade_duration_ms = 0;
         self.pixels = Vec::new();
         was_fading
+    }
+}
+
+struct CachedUiSurface {
+    width: i32,
+    height: i32,
+    pixels: Vec<u32>,
+}
+
+#[derive(Default)]
+struct DragUiCache {
+    root_hwnd: isize,
+    surfaces: Vec<(isize, CachedUiSurface)>,
+}
+
+impl DragUiCache {
+    fn clear_for(&mut self, root_hwnd: isize, allow_all: bool) {
+        if allow_all || self.root_hwnd == root_hwnd {
+            self.root_hwnd = 0;
+            self.surfaces.clear();
+        }
+    }
+
+    fn store(
+        &mut self,
+        root_hwnd: isize,
+        surface_hwnd: isize,
+        width: i32,
+        height: i32,
+        pixels: Vec<u32>,
+    ) {
+        if self.root_hwnd != root_hwnd {
+            self.root_hwnd = root_hwnd;
+            self.surfaces.clear();
+        }
+        if let Some((_, entry)) = self.surfaces.iter_mut().find(|(id, _)| *id == surface_hwnd) {
+            entry.width = width;
+            entry.height = height;
+            entry.pixels = pixels;
+        } else {
+            self.surfaces.push((
+                surface_hwnd,
+                CachedUiSurface {
+                    width,
+                    height,
+                    pixels,
+                },
+            ));
+        }
+    }
+
+    fn find(
+        &self,
+        root_hwnd: isize,
+        surface_hwnd: isize,
+        width: i32,
+        height: i32,
+    ) -> Option<&[u32]> {
+        if self.root_hwnd != root_hwnd {
+            return None;
+        }
+        self.surfaces.iter().find_map(|(id, entry)| {
+            (*id == surface_hwnd && entry.width == width && entry.height == height)
+                .then_some(entry.pixels.as_slice())
+        })
     }
 }
 
@@ -1733,6 +1789,8 @@ thread_local! {
     static USER_ACRYLIC: Cell<bool> = const { Cell::new(true) };
     static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
     static TRANSITION_BACKDROP: RefCell<TransitionBackdrop> = RefCell::new(TransitionBackdrop::default());
+    static DRAG_UI_CACHE: RefCell<DragUiCache> = RefCell::new(DragUiCache::default());
+    static DRAG_UV_REDRAW: Cell<bool> = const { Cell::new(false) };
     static SYNCED_LAYOUT: Cell<Option<(isize, i32, i32, i32)>> = const { Cell::new(None) };
     static IN_CAPTURE_REGION: Cell<bool> = const { Cell::new(false) };
 }
@@ -1763,6 +1821,8 @@ struct PaintBuffer {
     area: RECT,
     window_hwnd: isize,
     client_origin: Option<POINT>,
+    cache_hwnd: isize,
+    record_drag_ui: bool,
 }
 #[inline(always)]
 fn fill_interior_pixel(
@@ -1846,7 +1906,14 @@ impl PaintBuffer {
             area,
             window_hwnd,
             client_origin,
+            cache_hwnd: 0,
+            record_drag_ui: false,
         })
+    }
+    fn with_drag_cache(mut self, cache_hwnd: isize, record: bool) -> Self {
+        self.cache_hwnd = cache_hwnd;
+        self.record_drag_ui = record && cache_hwnd != 0;
+        self
     }
     unsafe fn opaque(&self) -> bool {
         unsafe { GdiFlush().as_bool() && BufferedPaintSetAlpha(self.handle, None, 255).is_ok() }
@@ -2777,8 +2844,66 @@ impl PaintBuffer {
             });
         });
     }
+    unsafe fn save_drag_ui_snapshot(&self) {
+        if !self.record_drag_ui || self.cache_hwnd == 0 || IN_CAPTURE_REGION.with(Cell::get) {
+            return;
+        }
+        let width = self.area.right - self.area.left;
+        let height = self.area.bottom - self.area.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let root_hwnd = TRANSITION_BACKDROP.with(|slot| {
+            let bd = slot.borrow();
+            (bd.active && bd.drag_move && !bd.fading).then_some(bd.hwnd)
+        });
+        let Some(root_hwnd) = root_hwnd else {
+            return;
+        };
+        if self.window_hwnd != 0 && self.window_hwnd != root_hwnd {
+            return;
+        }
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        // SAFETY: self.handle owns the top-down DIB until EndBufferedPaint.
+        if !unsafe { GdiFlush() }.as_bool()
+            || unsafe { GetBufferedPaintBits(self.handle, &mut bits, &mut stride) }.is_err()
+            || bits.is_null()
+            || stride < width
+        {
+            return;
+        }
+        let Some(src_len) = (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<u32>())
+        else {
+            return;
+        };
+        let Some(dst_len) = (width as usize).checked_mul(height as usize) else {
+            return;
+        };
+        // SAFETY: GetBufferedPaintBits owns stride * height u32 BGRA pixels.
+        let src = unsafe { std::slice::from_raw_parts(bits as *const u32, src_len) };
+        let w = width as usize;
+        let pixels = if stride == width {
+            src[..dst_len].to_vec()
+        } else {
+            let mut out = Vec::with_capacity(dst_len);
+            for y in 0..height as usize {
+                let row = y * stride as usize;
+                out.extend_from_slice(&src[row..row + w]);
+            }
+            out
+        };
+        DRAG_UI_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .store(root_hwnd, self.cache_hwnd, width, height, pixels);
+        });
+    }
     unsafe fn finish(mut self) -> bool {
         unsafe {
+            self.save_drag_ui_snapshot();
             self.blend_transition_backdrop();
             let result = EndBufferedPaint(self.handle, true).is_ok();
             self.handle = 0;
@@ -2989,6 +3114,66 @@ struct RoundedMask {
     sheen_strength: f32,
 }
 
+unsafe fn try_replay_drag_ui(
+    root: HWND,
+    target: HDC,
+    area: RECT,
+    surface_hwnd: isize,
+    client_origin: Option<POINT>,
+) -> bool {
+    if root.0.is_null() || surface_hwnd == 0 || !DRAG_UV_REDRAW.with(Cell::get) {
+        return false;
+    }
+    if !drag_move_backdrop_active(root) || backdrop_fading(root) {
+        return false;
+    }
+    let width = area.right - area.left;
+    let height = area.bottom - area.top;
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+    let replayed = DRAG_UI_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let cached = cache.find(root.0 as isize, surface_hwnd, width, height)?;
+        // SAFETY: target DC owns area for this synchronous paint; bits stays valid until EndBufferedPaint.
+        let buffer =
+            unsafe { PaintBuffer::new_for_window(target, area, root.0 as isize, client_origin) }?;
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        let copied = unsafe {
+            GetBufferedPaintBits(buffer.handle, &mut bits, &mut stride).is_ok()
+                && !bits.is_null()
+                && stride >= width
+        };
+        if !copied {
+            return None;
+        }
+        let dst_len = (stride as usize)
+            .checked_mul(height as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<u32>())?;
+        let w = width as usize;
+        if cached.len() < w.saturating_mul(height as usize) {
+            return None;
+        }
+        // SAFETY: GetBufferedPaintBits owns stride * height u32 BGRA pixels.
+        let dst = unsafe { std::slice::from_raw_parts_mut(bits as *mut u32, dst_len) };
+        if stride == width {
+            dst[..w * height as usize].copy_from_slice(cached);
+        } else {
+            for y in 0..height as usize {
+                let srow = y * w;
+                let drow = y * stride as usize;
+                dst[drow..drow + w].copy_from_slice(&cached[srow..srow + w]);
+            }
+        }
+        Some(buffer)
+    });
+    match replayed {
+        Some(buffer) => unsafe { buffer.finish() },
+        None => false,
+    }
+}
+
 pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
     // SAFETY: the owner-draw DC stays borrowed until this synchronous dispatch returns.
     unsafe {
@@ -3003,7 +3188,23 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
         {
             return;
         }
-        if let Some(buffer) = PaintBuffer::new(item.hDC, item.rcItem) {
+        if !parent.0.is_null()
+            && try_replay_drag_ui(
+                parent,
+                item.hDC,
+                item.rcItem,
+                item.hwndItem.0 as isize,
+                None,
+            )
+        {
+            return;
+        }
+        let record_drag =
+            !parent.0.is_null() && drag_move_backdrop_active(parent) && !backdrop_fading(parent);
+        if let Some(buffer) =
+            PaintBuffer::new_for_window(item.hDC, item.rcItem, parent.0 as isize, None)
+                .map(|b| b.with_drag_cache(item.hwndItem.0 as isize, record_drag))
+        {
             let glass = glass_enabled(parent);
             let theme = if glass {
                 cached_window_theme(parent)
@@ -4302,6 +4503,7 @@ fn reset_transition_backdrop(window: HWND, allow_null: bool) {
     if window.0.is_null() && !allow_null {
         return;
     }
+    DRAG_UI_CACHE.with(|cache| cache.borrow_mut().clear_for(window.0 as isize, allow_null));
     let cleared_fading = TRANSITION_BACKDROP.with(|slot| {
         let mut bd = slot.borrow_mut();
         if (allow_null && window.0.is_null()) || bd.hwnd == window.0 as isize {
@@ -4317,6 +4519,140 @@ fn reset_transition_backdrop(window: HWND, allow_null: bool) {
 
 pub fn clear_backdrop_transition(window: HWND) {
     reset_transition_backdrop(window, false);
+}
+
+unsafe fn redraw_backdrop_surfaces(window: HWND) {
+    // SAFETY: window and child controls are live UI-thread HWNDs; SEARCH is opaque CARD so ValidateRect prevents caret flicker.
+    unsafe {
+        let _ = RedrawWindow(
+            window,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN,
+        );
+        if let Ok(search) = GetDlgItem(window, SEARCH as i32)
+            && !search.0.is_null()
+            && IsWindowVisible(search).as_bool()
+        {
+            let _ = ValidateRect(search, None);
+        }
+        let _ = RedrawWindow(window, None, None, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+}
+
+pub fn drag_move_backdrop_active(window: HWND) -> bool {
+    !window.0.is_null()
+        && TRANSITION_BACKDROP.with(|slot| {
+            let bd = slot.borrow();
+            bd.active && bd.drag_move && bd.hwnd == window.0 as isize
+        })
+}
+
+struct ResetDragUvRedraw;
+impl Drop for ResetDragUvRedraw {
+    fn drop(&mut self) {
+        DRAG_UV_REDRAW.with(|slot| slot.set(false));
+    }
+}
+
+/// Captures a screen-space blurred backdrop once on drag-move start and disables DWM
+/// `ACCENT_ENABLE_ACRYLICBLURBEHIND` so window moves compose as an opaque alpha=255 surface.
+pub fn begin_drag_move_backdrop(window: HWND) -> bool {
+    if window.0.is_null() {
+        return false;
+    }
+    if drag_move_backdrop_active(window) {
+        return true;
+    }
+    // SAFETY: window is a live visible non-iconic HWND on the UI thread.
+    unsafe {
+        if !IsWindow(window).as_bool()
+            || IsIconic(window).as_bool()
+            || !IsWindowVisible(window).as_bool()
+            || !glass_enabled(window)
+            || !user_acrylic_enabled()
+            || !transparency_enabled()
+        {
+            return false;
+        }
+        DRAG_UI_CACHE.with(|cache| cache.borrow_mut().clear_for(window.0 as isize, false));
+        capture_transition_backdrop(window);
+        TRANSITION_BACKDROP.with(|slot| {
+            let mut bd = slot.borrow_mut();
+            bd.active = true;
+            bd.captured_while_visible = true;
+            bd.drag_move = true;
+            bd.fading = false;
+            bd.fade_start = None;
+            bd.fade_duration_ms = 0;
+        });
+        disarm_timer_if_idle(window);
+        // Paint the alpha=255 transition surface (and populate DRAG_UI_CACHE) before turning off DWM Acrylic.
+        redraw_backdrop_surfaces(window);
+        let _ = set_acrylic_composition(window, false);
+        true
+    }
+}
+
+/// Shifts the blurred backdrop viewport via `DRAG_UI_CACHE` when the dragged window moves.
+pub fn update_drag_move_backdrop(window: HWND) {
+    if !drag_move_backdrop_active(window) {
+        return;
+    }
+    // SAFETY: window is a live visible non-iconic HWND on the UI thread.
+    unsafe {
+        if !IsWindow(window).as_bool()
+            || IsIconic(window).as_bool()
+            || !IsWindowVisible(window).as_bool()
+        {
+            return;
+        }
+        let mon = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let changed = TRANSITION_BACKDROP.with(|slot| {
+                let bd = slot.borrow();
+                bd.active
+                    && bd.drag_move
+                    && bd.hwnd == window.0 as isize
+                    && bd.mon_rect != mi.rcMonitor
+            });
+            if changed {
+                capture_transition_backdrop(window);
+            }
+        }
+        DRAG_UV_REDRAW.with(|slot| slot.set(true));
+        let _guard = ResetDragUvRedraw;
+        redraw_backdrop_surfaces(window);
+    }
+}
+
+pub fn end_drag_move_backdrop(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    DRAG_UI_CACHE.with(|cache| cache.borrow_mut().clear_for(window.0 as isize, false));
+    let was_drag = TRANSITION_BACKDROP.with(|slot| {
+        let mut bd = slot.borrow_mut();
+        if bd.hwnd == window.0 as isize && bd.drag_move {
+            bd.drag_move = false;
+            bd.active
+        } else {
+            false
+        }
+    });
+    if was_drag {
+        begin_backdrop_fade(window);
+    }
+}
+
+pub fn cancel_drag_move_backdrop(window: HWND) {
+    if drag_move_backdrop_active(window) {
+        finish_backdrop_transition(window);
+    }
 }
 
 pub fn begin_backdrop_transition(window: HWND) {
@@ -4340,11 +4676,13 @@ pub fn begin_backdrop_transition(window: HWND) {
         if backdrop_transition_active(window) && !backdrop_fading(window) && !iconic_or_hidden {
             return;
         }
+        DRAG_UI_CACHE.with(|cache| cache.borrow_mut().clear_for(window.0 as isize, false));
         capture_transition_backdrop(window);
         TRANSITION_BACKDROP.with(|slot| {
             let mut bd = slot.borrow_mut();
             bd.active = true;
             bd.captured_while_visible = !iconic_or_hidden;
+            bd.drag_move = false;
             bd.fading = false;
             bd.fade_start = None;
             bd.fade_duration_ms = 0;
@@ -4516,7 +4854,11 @@ pub fn sync_child_positions(window: HWND) {
         if synced {
             SYNCED_LAYOUT.with(|slot| slot.set(Some((window.0 as isize, dpi, width, height))));
         }
-        if glass_enabled(window) && user_acrylic_enabled() && transparency_enabled() {
+        if glass_enabled(window)
+            && user_acrylic_enabled()
+            && transparency_enabled()
+            && !drag_move_backdrop_active(window)
+        {
             let _ = set_acrylic_composition(window, true);
         }
     }
@@ -4570,7 +4912,9 @@ pub fn enable_backdrop(window: HWND) -> bool {
             return false;
         }
         if glass_enabled(window) {
-            let _ = set_acrylic_composition(window, true);
+            if !drag_move_backdrop_active(window) {
+                let _ = set_acrylic_composition(window, true);
+            }
             if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
                 sync_search_layering(window, search, IsWindowVisible(search).as_bool());
             }
@@ -4721,8 +5065,17 @@ pub unsafe fn paint_into_rect(window: HWND, target: HDC, clip_rect: Option<RECT>
         } else {
             None
         };
+        let full_client = area == client;
+        if full_client && try_replay_drag_ui(window, target, area, window.0 as isize, client_origin)
+        {
+            return;
+        }
+        let record_drag =
+            full_client && drag_move_backdrop_active(window) && !backdrop_fading(window);
         if let Some(buffer) =
-            PaintBuffer::new_for_window(target, area, window.0 as isize, client_origin)
+            PaintBuffer::new_for_window(target, area, window.0 as isize, client_origin).map(|b| {
+                b.with_drag_cache(if full_client { window.0 as isize } else { 0 }, record_drag)
+            })
         {
             let glass = glass_enabled(window);
             let theme = if glass {
@@ -5311,7 +5664,21 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
             status_selected = sel_start != sel_end;
         }
         let color = control_color(id);
-        if let Some(buffer) = PaintBuffer::new(dc, area) {
+        if !parent.0.is_null()
+            && !status_selected
+            && (static_text || checkbox || status_edit)
+            && try_replay_drag_ui(parent, dc, area, window.0 as isize, None)
+        {
+            return;
+        }
+        let record_drag = !parent.0.is_null()
+            && !status_selected
+            && (static_text || checkbox || status_edit)
+            && drag_move_backdrop_active(parent)
+            && !backdrop_fading(parent);
+        if let Some(buffer) = PaintBuffer::new_for_window(dc, area, parent.0 as isize, None)
+            .map(|b| b.with_drag_cache(window.0 as isize, record_drag))
+        {
             if static_text || checkbox || (status_edit && !status_selected) {
                 let glass = glass_enabled(parent);
                 let (surface_color, surface_alpha) = control_surface(id);
@@ -7693,6 +8060,152 @@ mod tests {
         invalidate_theme_cache();
         let _ = transparency_enabled();
         let _ = os_window_animations_enabled();
+        clear();
+    }
+
+    #[test]
+    fn drag_ui_cache_records_replays_shifted_backdrop_and_cleans_up() {
+        clear();
+        let _guard = ResetOsAnim;
+        set_os_animations_for_test(Some(true));
+        // SAFETY: isolated tool WS_POPUP window and offscreen DIB live strictly on this thread.
+        unsafe {
+            let win = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                120,
+                80,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("drag cache test window");
+            let _ = ShowWindow(win, SW_SHOWNA);
+            let _ = SetWindowPos(win, None, 20, 0, 120, 80, SWP_NOACTIVATE | SWP_NOZORDER);
+            let mut origin_left = POINT::default();
+            assert!(ClientToScreen(win, &mut origin_left).as_bool());
+
+            let bw = 480i32;
+            let bh = 270i32;
+            let mut pixels = vec![0xFF10_2030u32; (bw * bh) as usize];
+            for y in 0..bh {
+                let row = (y * bw) as usize;
+                pixels[row + 240..row + bw as usize].fill(0xFF90_A0B0);
+            }
+            TRANSITION_BACKDROP.with(|slot| {
+                let mut bd = slot.borrow_mut();
+                bd.active = true;
+                bd.captured_while_visible = true;
+                bd.drag_move = true;
+                bd.hwnd = win.0 as isize;
+                bd.mon_rect = rect(
+                    origin_left.x,
+                    origin_left.y,
+                    origin_left.x + 480,
+                    origin_left.y + 270,
+                );
+                bd.win_rect = rect(
+                    origin_left.x,
+                    origin_left.y,
+                    origin_left.x + 120,
+                    origin_left.y + 80,
+                );
+                bd.width = bw;
+                bd.height = bh;
+                bd.pixels = pixels;
+            });
+
+            let w = 120i32;
+            let h = 80i32;
+            let total = (w * h) as usize;
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(
+                dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .expect("drag cache DIB");
+            let prev = SelectObject(dc, bmp);
+            let full = rect(0, 0, w, h);
+
+            // Initial frame records premultiplied opaque pixel (alpha=255) into DRAG_UI_CACHE
+            // before blend_transition_backdrop overlays translucent regions.
+            std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
+            let buf = PaintBuffer::new_for_window(dc, full, win.0 as isize, Some(origin_left))
+                .expect("record buffer")
+                .with_drag_cache(win.0 as isize, true);
+            fill(buf.dc, rect(0, 0, 10, 10), 0x445566);
+            assert!(buf.opaque());
+            // Paint only top-left corner opaque; leave rest at alpha=0 so backdrop shows through.
+            {
+                let mut buf_bits = std::ptr::null_mut();
+                let mut stride = 0;
+                assert!(GetBufferedPaintBits(buf.handle, &mut buf_bits, &mut stride).is_ok());
+                let slice = std::slice::from_raw_parts_mut(buf_bits, (stride * h) as usize);
+                for y in 10..h {
+                    for x in 0..w {
+                        slice[(y * stride + x) as usize] = RGBQUAD::default();
+                    }
+                }
+            }
+            assert!(buf.finish());
+            assert!(DRAG_UI_CACHE.with(|c| {
+                c.borrow()
+                    .find(win.0 as isize, win.0 as isize, w, h)
+                    .is_some()
+            }));
+
+            // Move window onto right half of monitor, then replay cached UI without re-drawing.
+            let _ = SetWindowPos(
+                win,
+                None,
+                origin_left.x + 260,
+                origin_left.y,
+                120,
+                80,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+            let mut origin_right = POINT::default();
+            assert!(ClientToScreen(win, &mut origin_right).as_bool());
+            std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
+            DRAG_UV_REDRAW.with(|slot| slot.set(true));
+            let replayed = try_replay_drag_ui(win, dc, full, win.0 as isize, Some(origin_right));
+            DRAG_UV_REDRAW.with(|slot| slot.set(false));
+            assert!(replayed);
+            let _ = GdiFlush();
+            let out = std::slice::from_raw_parts(bits as *const u32, total);
+            assert_eq!(out[(2 * w + 2) as usize], 0xFF44_5566);
+            assert_eq!(out[(20 * w + 20) as usize], 0xFF90_A0B0);
+
+            end_drag_move_backdrop(win);
+            assert!(!drag_move_backdrop_active(win));
+            assert!(DRAG_UI_CACHE.with(|c| c.borrow().surfaces.is_empty()));
+
+            SelectObject(dc, prev);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(dc);
+            let _ = DestroyWindow(win);
+        }
         clear();
     }
 }
