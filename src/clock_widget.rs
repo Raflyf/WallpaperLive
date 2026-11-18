@@ -35,8 +35,9 @@ use windows::{
                 DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE, FW_BOLD,
                 GdiFlush, GetDC, GetMonitorInfoW, GetStockObject, HDC, HGDIOBJ,
                 MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromPoint,
-                MonitorFromWindow, OUT_DEFAULT_PRECIS, ReleaseDC, SRCCOPY, ScreenToClient,
-                SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, TRANSPARENT,
+                MonitorFromRect, MonitorFromWindow, OUT_DEFAULT_PRECIS, ReleaseDC, SRCCOPY,
+                ScreenToClient, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor,
+                TRANSPARENT,
             },
         },
         System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
@@ -557,6 +558,9 @@ struct ClockRuntime {
 struct ClockInput {
     hwnd: HWND,
     hook: HWINEVENTHOOK,
+    last_w: i32,
+    last_h: i32,
+    last_holes: Vec<[i32; 4]>,
 }
 impl Drop for ClockInput {
     fn drop(&mut self) {
@@ -637,7 +641,7 @@ unsafe extern "system" fn clock_input_event(
     _: HWINEVENTHOOK,
     event: u32,
     event_hwnd: HWND,
-    _: i32,
+    id_object: i32,
     _: i32,
     _: u32,
     _: u32,
@@ -651,6 +655,13 @@ unsafe extern "system" fn clock_input_event(
             | EVENT_OBJECT_REORDER
             | EVENT_OBJECT_LOCATIONCHANGE
     ) {
+        return;
+    }
+    // Skip high-frequency cursor movement location events (OBJID_CURSOR = -9) so mouse hover stays idle.
+    if event == EVENT_OBJECT_LOCATIONCHANGE
+        && id_object != OBJID_CLIENT.0
+        && id_object != OBJID_WINDOW.0
+    {
         return;
     }
     let state = CLOCK_RUNTIME.with(|s| {
@@ -697,11 +708,37 @@ fn sync_clock_input() {
     let layer = layer.unwrap();
     // SAFETY: unowned WS_POPUP input handle sits above desktop/below apps so Explorer never buries or blocks it.
     unsafe {
+        let mut area = RECT::default();
+        if GetWindowRect(HWND(raw as *mut c_void), &mut area).is_err() {
+            return;
+        }
         let view = FindWindowExW(layer.icons, None, w!("SysListView32"), PCWSTR::null())
             .unwrap_or_default();
         let exclusions = desktop_shortcut_rects(view);
-        let hwnd = if let Some(input) = input {
-            input
+        let handle = drag_handle_rect(w, h);
+        let mut clipped_holes = Vec::new();
+        for icon in exclusions {
+            let left = (icon.left - area.left).max(handle.left);
+            let top = (icon.top - area.top).max(handle.top);
+            let right = (icon.right - area.left).min(handle.right);
+            let bottom = (icon.bottom - area.top).min(handle.bottom);
+            if left < right && top < bottom {
+                clipped_holes.push([left, top, right, bottom]);
+            }
+        }
+        clipped_holes.sort_unstable();
+        clipped_holes.dedup();
+
+        let (hwnd, needs_rgn) = if let Some(input) = input {
+            let same_rgn = CLOCK_RUNTIME.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .and_then(|r| r.input.as_ref())
+                    .is_some_and(|i| {
+                        i.last_w == w && i.last_h == h && i.last_holes == clipped_holes
+                    })
+            });
+            (input, !same_rgn)
         } else {
             if ensure_class(
                 CLOCK_INPUT_CLASS,
@@ -750,40 +787,46 @@ fn sync_clock_input() {
             );
             CLOCK_RUNTIME.with(|s| {
                 if let Some(rt) = s.borrow_mut().as_mut() {
-                    rt.input = Some(ClockInput { hwnd, hook });
+                    rt.input = Some(ClockInput {
+                        hwnd,
+                        hook,
+                        last_w: 0,
+                        last_h: 0,
+                        last_holes: Vec::new(),
+                    });
                 }
             });
-            hwnd
+            (hwnd, true)
         };
-        let mut area = RECT::default();
-        if GetWindowRect(HWND(raw as *mut c_void), &mut area).is_err() {
-            return;
-        }
-        let handle = drag_handle_rect(w, h);
-        let region = windows::Win32::Graphics::Gdi::CreateRectRgnIndirect(&handle);
-        if region.0.is_null() {
-            return;
-        }
-        for icon in exclusions {
-            let hole = windows::Win32::Graphics::Gdi::CreateRectRgn(
-                icon.left - area.left,
-                icon.top - area.top,
-                icon.right - area.left,
-                icon.bottom - area.top,
-            );
-            if !hole.0.is_null() {
-                windows::Win32::Graphics::Gdi::CombineRgn(
-                    region,
-                    region,
-                    hole,
-                    windows::Win32::Graphics::Gdi::RGN_DIFF,
-                );
-                let _ = DeleteObject(HGDIOBJ(hole.0));
+
+        if needs_rgn {
+            let region = windows::Win32::Graphics::Gdi::CreateRectRgnIndirect(&handle);
+            if region.0.is_null() {
+                return;
             }
-        }
-        if windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, region, false) == 0 {
-            let _ = DeleteObject(HGDIOBJ(region.0));
-            return;
+            for &[left, top, right, bottom] in &clipped_holes {
+                let hole = windows::Win32::Graphics::Gdi::CreateRectRgn(left, top, right, bottom);
+                if !hole.0.is_null() {
+                    windows::Win32::Graphics::Gdi::CombineRgn(
+                        region,
+                        region,
+                        hole,
+                        windows::Win32::Graphics::Gdi::RGN_DIFF,
+                    );
+                    let _ = DeleteObject(HGDIOBJ(hole.0));
+                }
+            }
+            if windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, region, false) == 0 {
+                let _ = DeleteObject(HGDIOBJ(region.0));
+                return;
+            }
+            CLOCK_RUNTIME.with(|s| {
+                if let Some(inp) = s.borrow_mut().as_mut().and_then(|r| r.input.as_mut()) {
+                    inp.last_w = w;
+                    inp.last_h = h;
+                    inp.last_holes = clipped_holes;
+                }
+            });
         }
         place_popup_on_desktop(hwnd, area.left, area.top, w, h, true, false);
     }
@@ -831,6 +874,12 @@ unsafe extern "system" fn clock_input_proc(
             WM_NCHITTEST => LRESULT(HTCLIENT as isize),
             WM_LBUTTONDOWN => {
                 let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
+                CLOCK_RUNTIME.with(|s| {
+                    if let Some(inp) = s.borrow_mut().as_mut().and_then(|r| r.input.as_mut()) {
+                        inp.last_w = 0;
+                        inp.last_holes.clear();
+                    }
+                });
                 let result = SendMessageW(clock, msg, wp, lp);
                 if CLOCK_RUNTIME.with(|s| s.borrow().as_ref().is_some_and(|r| r.dragging)) {
                     let _ = SetCapture(hwnd);
@@ -900,11 +949,12 @@ struct ClockTextScratch {
 impl ClockTextScratch {
     fn free(&mut self) {
         unsafe {
-            if self.bmp != 0 {
-                let _ = DeleteObject(HGDIOBJ(self.bmp as *mut c_void));
-            }
+            // Delete DC before the selected bitmap so GDI frees the HBITMAP kernel object cleanly.
             if self.dc != 0 {
                 let _ = DeleteDC(HDC(self.dc as *mut c_void));
+            }
+            if self.bmp != 0 {
+                let _ = DeleteObject(HGDIOBJ(self.bmp as *mut c_void));
             }
         }
         *self = Self::default();
@@ -962,6 +1012,94 @@ impl ClockTextScratch {
     }
 }
 
+#[derive(Default)]
+struct ClockFontCache {
+    entries: Vec<(i32, isize)>,
+}
+
+impl ClockFontCache {
+    fn get_or_create(&mut self, height_px: i32) -> isize {
+        let key = height_px.max(10);
+        if let Some(&(_, handle)) = self.entries.iter().find(|&&(px, _)| px == key) {
+            return handle;
+        }
+        // SAFETY: creates a bold antialiased Quicksand GDI font strictly owned by UI thread cache.
+        let font = unsafe {
+            CreateFontW(
+                -key,
+                0,
+                0,
+                0,
+                FW_BOLD.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                ANTIALIASED_QUALITY.0 as u32,
+                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                w!("Quicksand"),
+            )
+        };
+        if font.0.is_null() {
+            return 0;
+        }
+        let raw = font.0 as isize;
+        if self.entries.len() >= 6 {
+            let (_, evicted) = self.entries.remove(0);
+            if evicted != 0 {
+                // SAFETY: evicted HFONT is never selected outside synchronous DrawTextW calls.
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(evicted as *mut c_void));
+                }
+            }
+        }
+        self.entries.push((key, raw));
+        raw
+    }
+
+    fn free(&mut self) {
+        for (_, raw) in self.entries.drain(..) {
+            if raw != 0 {
+                // SAFETY: freed only during widget teardown when no DrawTextW is active.
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(raw as *mut c_void));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AnuratiCacheKey {
+    text: String,
+    width: i32,
+    height: i32,
+    top_bits: u32,
+    cap_bits: u32,
+    cx_bits: u32,
+}
+
+#[derive(Default)]
+struct AnuratiWordCache {
+    key: Option<AnuratiCacheKey>,
+    band_y0: i32,
+    band_y1: i32,
+    sh_buf: Vec<u8>,
+    fg_buf: Vec<u8>,
+    edges: Vec<(f32, f32, f32, f32)>,
+    crossings: Vec<f32>,
+    cov_grid: Vec<u8>,
+    hits: Vec<u8>,
+}
+
+impl AnuratiWordCache {
+    fn free(&mut self) {
+        *self = Self::default();
+    }
+}
+
 thread_local! {
     static CLOCK_RUNTIME: RefCell<Option<ClockRuntime>> = const { RefCell::new(None) };
     static CLOCK_SAVED_POS: RefCell<Option<(i32, i32)>> = const { RefCell::new(None) };
@@ -973,6 +1111,27 @@ thread_local! {
         bits: 0,
         w: 0,
         h: 0,
+    }) };
+    static CLOCK_CANVAS_SCRATCH: RefCell<ClockTextScratch> = const { RefCell::new(ClockTextScratch {
+        dc: 0,
+        bmp: 0,
+        bits: 0,
+        w: 0,
+        h: 0,
+    }) };
+    static CLOCK_FONT_CACHE: RefCell<ClockFontCache> = const { RefCell::new(ClockFontCache {
+        entries: Vec::new(),
+    }) };
+    static ANURATI_WORD_CACHE: RefCell<AnuratiWordCache> = const { RefCell::new(AnuratiWordCache {
+        key: None,
+        band_y0: 0,
+        band_y1: 0,
+        sh_buf: Vec::new(),
+        fg_buf: Vec::new(),
+        edges: Vec::new(),
+        crossings: Vec::new(),
+        cov_grid: Vec::new(),
+        hits: Vec::new(),
     }) };
     static ALLOW_INTERNAL_HIDE: Cell<bool> = const { Cell::new(false) };
     static IN_ZORDER_SYNC: Cell<bool> = const { Cell::new(false) };
@@ -1384,6 +1543,9 @@ pub fn hide_all() {
         destroy_clock_hwnd(rt.hwnd, rt.hooks);
     }
     CLOCK_TEXT_SCRATCH.with(|s| s.borrow_mut().free());
+    CLOCK_CANVAS_SCRATCH.with(|s| s.borrow_mut().free());
+    CLOCK_FONT_CACHE.with(|s| s.borrow_mut().free());
+    ANURATI_WORD_CACHE.with(|s| s.borrow_mut().free());
 }
 
 pub fn begin_reposition(owner: HWND, action_msg: u32, cfg: ClockConfig) {
@@ -2077,9 +2239,21 @@ pub fn widget_pixel_size(day_str: &str, size_pct: u32, dpi: i32) -> (i32, i32) {
     (width.clamp(240, 2400), height.clamp(120, 900))
 }
 
-fn target_monitor_info(hwnd: HWND, owner: HWND, pos: Option<(i32, i32)>) -> (RECT, i32) {
+fn target_monitor_info(
+    hwnd: HWND,
+    owner: HWND,
+    pos: Option<(i32, i32)>,
+    approx_size: (i32, i32),
+) -> (RECT, i32) {
     let mon = if let Some((x, y)) = pos {
-        unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) }
+        let (rw, rh) = approx_size;
+        let rc = RECT {
+            left: x,
+            top: y,
+            right: x.saturating_add(rw.max(1)),
+            bottom: y.saturating_add(rh.max(1)),
+        };
+        unsafe { MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST) }
     } else if !owner.0.is_null() && unsafe { IsWindow(owner).as_bool() } {
         unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) }
     } else {
@@ -2229,6 +2403,16 @@ pub struct GlyphCanvas<'a> {
     pub height: i32,
 }
 
+#[inline]
+fn blend_alpha_channel(dst: &mut u8, src_a: u8) {
+    if src_a == 0 {
+        return;
+    }
+    let s = u32::from(src_a);
+    let d = u32::from(*dst);
+    *dst = (s + (d * (255 - s) + 127) / 255).min(255) as u8;
+}
+
 pub fn render_anurati_word(
     canvas: &mut GlyphCanvas<'_>,
     text: &str,
@@ -2246,124 +2430,215 @@ pub fn render_anurati_word(
     if total_units <= 0.0 {
         return;
     }
-    let em_scale = cap_height_px / ANURATI_CAP_HEIGHT_UNITS;
-    let mut pen_x = center_x - total_units * em_scale * 0.5;
     let r = (color >> 16) & 255;
     let g = (color >> 8) & 255;
     let b = color & 255;
-    let sh_dx = (1.5 * (cap_height_px / 50.0)).round().clamp(1.0, 3.0) as i32;
-    let sh_dy = (2.0 * (cap_height_px / 50.0)).round().clamp(1.0, 4.0) as i32;
 
-    let mut edges = Vec::with_capacity(64);
-    let mut crossings = Vec::with_capacity(16);
-    let mut cov_grid = Vec::new();
-    let mut hits = Vec::new();
+    ANURATI_WORD_CACHE.with(|slot| {
+        let mut cache = slot.borrow_mut();
+        let hit = cache.key.as_ref().is_some_and(|k| {
+            k.width == canvas.width
+                && k.height == buf_h
+                && k.top_bits == top_y.to_bits()
+                && k.cap_bits == cap_height_px.to_bits()
+                && k.cx_bits == center_x.to_bits()
+                && k.text == text
+        });
+        if !hit {
+            let em_scale = cap_height_px / ANURATI_CAP_HEIGHT_UNITS;
+            let sh_dx = (1.5 * (cap_height_px / 50.0)).round().clamp(1.0, 3.0) as i32;
+            let sh_dy = (2.0 * (cap_height_px / 50.0)).round().clamp(1.0, 4.0) as i32;
 
-    for ch in text.chars() {
-        let Some(glyph) = anurati_glyph(ch) else {
-            continue;
-        };
-        collect_glyph_edges(glyph.ops, pen_x, top_y, em_scale, &mut edges);
-        pen_x += (glyph.advance + ANURATI_TRACKING_UNITS) * em_scale;
-        if edges.is_empty() {
-            continue;
-        }
-
-        let mut min_x = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut min_y = f32::MAX;
-        let mut max_y = f32::MIN;
-        for &(ax, ay, bx, by) in &edges {
-            min_x = min_x.min(ax).min(bx);
-            max_x = max_x.max(ax).max(bx);
-            min_y = min_y.min(ay).min(by);
-            max_y = max_y.max(ay).max(by);
-        }
-
-        let x0 = (min_x.floor() as i32 - 1).max(0);
-        let x1 = (max_x.ceil() as i32 + 1).min(stride_px as i32);
-        let y0 = (min_y.floor() as i32 - 1).max(0);
-        let y1 = (max_y.ceil() as i32 + 1).min(buf_h);
-        if x0 >= x1 || y0 >= y1 {
-            continue;
-        }
-        let bw = (x1 - x0) as usize;
-        let bh = (y1 - y0) as usize;
-        cov_grid.clear();
-        cov_grid.resize(bw * bh, 0);
-        hits.clear();
-        hits.resize(bw, 0u8);
-
-        for row_idx in 0..bh {
-            let py = y0 + row_idx as i32;
-            hits.fill(0);
-            for sub_y in 0..4 {
-                let sy = py as f32 + (sub_y as f32 + 0.5) * 0.25;
-                crossings.clear();
-                for &(ax, ay, bx, by) in &edges {
-                    let (lo, hi) = if ay < by { (ay, by) } else { (by, ay) };
-                    if lo <= sy && sy < hi {
-                        let ix = ax + (sy - ay) * (bx - ax) / (by - ay);
-                        crossings.push(ix);
-                    }
+            // Measure exact rendered vertical band so cache buffers hold only active rows.
+            let mut pen_x = center_x - total_units * em_scale * 0.5;
+            let mut word_y0 = buf_h;
+            let mut word_y1 = 0i32;
+            for ch in text.chars() {
+                let Some(glyph) = anurati_glyph(ch) else {
+                    continue;
+                };
+                collect_glyph_edges(glyph.ops, pen_x, top_y, em_scale, &mut cache.edges);
+                pen_x += (glyph.advance + ANURATI_TRACKING_UNITS) * em_scale;
+                if cache.edges.is_empty() {
+                    continue;
                 }
-                crossings.sort_unstable_by(f32::total_cmp);
-                for &[xa, xb] in crossings.as_chunks::<2>().0 {
-                    let cx_start = ((xa - 0.125).floor() as i32).max(x0);
-                    let cx_end = ((xb + 0.125).ceil() as i32).min(x1);
-                    for px in cx_start..cx_end {
-                        let col = (px - x0) as usize;
-                        let mut h_count = 0u8;
-                        for sub_x in 0..4 {
-                            let sx = px as f32 + (sub_x as f32 + 0.5) * 0.25;
-                            if sx >= xa && sx < xb {
-                                h_count += 1;
+                let mut min_y = f32::MAX;
+                let mut max_y = f32::MIN;
+                for &(_, ay, _, by) in &cache.edges {
+                    min_y = min_y.min(ay).min(by);
+                    max_y = max_y.max(ay).max(by);
+                }
+                word_y0 = word_y0.min((min_y.floor() as i32 - 1).max(0));
+                word_y1 = word_y1.max((max_y.ceil() as i32 + 1).min(buf_h));
+            }
+            if word_y0 >= word_y1 {
+                cache.key = Some(AnuratiCacheKey {
+                    text: text.to_string(),
+                    width: canvas.width,
+                    height: buf_h,
+                    top_bits: top_y.to_bits(),
+                    cap_bits: cap_height_px.to_bits(),
+                    cx_bits: center_x.to_bits(),
+                });
+                cache.band_y0 = 0;
+                cache.band_y1 = 0;
+                cache.sh_buf.clear();
+                cache.fg_buf.clear();
+                return;
+            }
+
+            let band_y0 = word_y0.clamp(0, buf_h);
+            let band_y1 = (word_y1 + sh_dy).clamp(band_y0, buf_h);
+            let band_rows = (band_y1 - band_y0) as usize;
+            let band_len = band_rows * stride_px;
+            cache.band_y0 = band_y0;
+            cache.band_y1 = band_y1;
+            cache.sh_buf.resize(band_len, 0);
+            cache.sh_buf.fill(0);
+            cache.fg_buf.resize(band_len, 0);
+            cache.fg_buf.fill(0);
+
+            let c = &mut *cache;
+            pen_x = center_x - total_units * em_scale * 0.5;
+            for ch in text.chars() {
+                let Some(glyph) = anurati_glyph(ch) else {
+                    continue;
+                };
+                collect_glyph_edges(glyph.ops, pen_x, top_y, em_scale, &mut c.edges);
+                pen_x += (glyph.advance + ANURATI_TRACKING_UNITS) * em_scale;
+                if c.edges.is_empty() {
+                    continue;
+                }
+
+                let mut min_x = f32::MAX;
+                let mut max_x = f32::MIN;
+                let mut min_y = f32::MAX;
+                let mut max_y = f32::MIN;
+                for &(ax, ay, bx, by) in &c.edges {
+                    min_x = min_x.min(ax).min(bx);
+                    max_x = max_x.max(ax).max(bx);
+                    min_y = min_y.min(ay).min(by);
+                    max_y = max_y.max(ay).max(by);
+                }
+
+                let x0 = (min_x.floor() as i32 - 1).max(0);
+                let x1 = (max_x.ceil() as i32 + 1).min(stride_px as i32);
+                let y0 = (min_y.floor() as i32 - 1).max(0);
+                let y1 = (max_y.ceil() as i32 + 1).min(buf_h);
+                if x0 >= x1 || y0 >= y1 {
+                    continue;
+                }
+                let bw = (x1 - x0) as usize;
+                let bh = (y1 - y0) as usize;
+                c.cov_grid.clear();
+                c.cov_grid.resize(bw * bh, 0);
+                c.hits.clear();
+                c.hits.resize(bw, 0u8);
+
+                for row_idx in 0..bh {
+                    let py = y0 + row_idx as i32;
+                    c.hits.fill(0);
+                    for sub_y in 0..4 {
+                        let sy = py as f32 + (sub_y as f32 + 0.5) * 0.25;
+                        c.crossings.clear();
+                        for &(ax, ay, bx, by) in &c.edges {
+                            let (lo, hi) = if ay < by { (ay, by) } else { (by, ay) };
+                            if lo <= sy && sy < hi {
+                                let ix = ax + (sy - ay) * (bx - ax) / (by - ay);
+                                c.crossings.push(ix);
                             }
                         }
-                        hits[col] = hits[col].saturating_add(h_count);
+                        c.crossings.sort_unstable_by(f32::total_cmp);
+                        for &[xa, xb] in c.crossings.as_chunks::<2>().0 {
+                            let cx_start = ((xa - 0.125).floor() as i32).max(x0);
+                            let cx_end = ((xb + 0.125).ceil() as i32).min(x1);
+                            for px in cx_start..cx_end {
+                                let col = (px - x0) as usize;
+                                let mut h_count = 0u8;
+                                for sub_x in 0..4 {
+                                    let sx = px as f32 + (sub_x as f32 + 0.5) * 0.25;
+                                    if sx >= xa && sx < xb {
+                                        h_count += 1;
+                                    }
+                                }
+                                c.hits[col] = c.hits[col].saturating_add(h_count);
+                            }
+                        }
+                    }
+                    let out_row = &mut c.cov_grid[row_idx * bw..(row_idx + 1) * bw];
+                    for (out_px, &hit) in out_row.iter_mut().zip(&c.hits) {
+                        if hit > 0 {
+                            *out_px = ((u16::from(hit) * 255 + 8) / 16).min(255) as u8;
+                        }
+                    }
+                }
+
+                for row_idx in 0..bh {
+                    let py = y0 + row_idx as i32 + sh_dy;
+                    if py < band_y0 || py >= band_y1 {
+                        continue;
+                    }
+                    let dst_row = (py - band_y0) as usize * stride_px;
+                    let src_row = &c.cov_grid[row_idx * bw..(row_idx + 1) * bw];
+                    for (col, &cov) in src_row.iter().enumerate().take(bw) {
+                        if cov == 0 {
+                            continue;
+                        }
+                        let px = x0 + col as i32 + sh_dx;
+                        if px >= 0 && (px as usize) < stride_px {
+                            let sh_a = ((u16::from(cov) * 76) / 255) as u8;
+                            blend_alpha_channel(&mut c.sh_buf[dst_row + px as usize], sh_a);
+                        }
+                    }
+                }
+                for row_idx in 0..bh {
+                    let py = y0 + row_idx as i32;
+                    if py < band_y0 || py >= band_y1 {
+                        continue;
+                    }
+                    let dst_row = (py - band_y0) as usize * stride_px;
+                    let src_row = &c.cov_grid[row_idx * bw..(row_idx + 1) * bw];
+                    for (col, &cov) in src_row.iter().enumerate().take(bw) {
+                        if cov == 0 {
+                            continue;
+                        }
+                        let px = x0 + col as i32;
+                        if px >= 0 && (px as usize) < stride_px {
+                            blend_alpha_channel(&mut c.fg_buf[dst_row + px as usize], cov);
+                        }
                     }
                 }
             }
-            let out_row = &mut cov_grid[row_idx * bw..(row_idx + 1) * bw];
-            for col in 0..bw {
-                if hits[col] > 0 {
-                    out_row[col] = ((u16::from(hits[col]) * 255 + 8) / 16).min(255) as u8;
-                }
-            }
+
+            c.key = Some(AnuratiCacheKey {
+                text: text.to_string(),
+                width: canvas.width,
+                height: buf_h,
+                top_bits: top_y.to_bits(),
+                cap_bits: cap_height_px.to_bits(),
+                cx_bits: center_x.to_bits(),
+            });
         }
 
-        // First composite soft drop shadow, then foreground so no glyph casts shadow onto itself.
-        for row_idx in 0..bh {
-            let py = y0 + row_idx as i32 + sh_dy;
-            if py < 0 || py >= buf_h {
-                continue;
-            }
+        let band_y0 = cache.band_y0;
+        let band_y1 = cache.band_y1;
+        for py in band_y0..band_y1 {
+            let src_row = (py - band_y0) as usize * stride_px;
             let dst_row = py as usize * stride_px;
-            let src_row = &cov_grid[row_idx * bw..(row_idx + 1) * bw];
-            for (col, &cov) in src_row.iter().enumerate().take(bw) {
-                if cov == 0 {
-                    continue;
+            let sh_slice = &cache.sh_buf[src_row..src_row + stride_px];
+            let fg_slice = &cache.fg_buf[src_row..src_row + stride_px];
+            for px in 0..stride_px {
+                let sa = sh_slice[px];
+                if sa != 0 {
+                    premul_blend_pixel(&mut canvas.buf[dst_row + px], 0, 0, 0, sa);
                 }
-                let px = x0 + col as i32 + sh_dx;
-                if px >= 0 && (px as usize) < stride_px {
-                    let sh_a = ((u16::from(cov) * 76) / 255) as u8;
-                    premul_blend_pixel(&mut canvas.buf[dst_row + px as usize], 0, 0, 0, sh_a);
+                let fa = fg_slice[px];
+                if fa != 0 {
+                    premul_blend_pixel(&mut canvas.buf[dst_row + px], r, g, b, fa);
                 }
             }
         }
-        for row_idx in 0..bh {
-            let py = y0 + row_idx as i32;
-            let dst_row = py as usize * stride_px;
-            let src_row = &cov_grid[row_idx * bw..(row_idx + 1) * bw];
-            for (col, &cov) in src_row.iter().enumerate().take(bw) {
-                if cov == 0 {
-                    continue;
-                }
-                let px = x0 + col as i32;
-                premul_blend_pixel(&mut canvas.buf[dst_row + px as usize], r, g, b, cov);
-            }
-        }
-    }
+    });
 }
 
 fn draw_quicksand_line(
@@ -2386,6 +2661,8 @@ fn draw_quicksand_line(
         return;
     }
 
+    let font_raw = CLOCK_FONT_CACHE.with(|fc| fc.borrow_mut().get_or_create(font_px));
+
     CLOCK_TEXT_SCRATCH.with(|slot| {
         let mut scratch = slot.borrow_mut();
         let Some((dc, bits_ptr)) = scratch.ensure(rw, rh) else {
@@ -2395,23 +2672,8 @@ fn draw_quicksand_line(
         // SAFETY: scratch DIB has rw * rh 32-bit pixels owned by this thread.
         unsafe {
             std::slice::from_raw_parts_mut(bits_ptr, total).fill(0);
-            let font = CreateFontW(
-                -font_px.max(10),
-                0,
-                0,
-                0,
-                FW_BOLD.0 as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET.0 as u32,
-                OUT_DEFAULT_PRECIS.0 as u32,
-                CLIP_DEFAULT_PRECIS.0 as u32,
-                ANTIALIASED_QUALITY.0 as u32,
-                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-                w!("Quicksand"),
-            );
-            let prev_font = (!font.0.is_null()).then(|| SelectObject(dc, HGDIOBJ(font.0)));
+            let prev_font =
+                (font_raw != 0).then(|| SelectObject(dc, HGDIOBJ(font_raw as *mut c_void)));
             let prev_extra = SetTextCharacterExtra(dc, char_extra.max(0));
             let _ = SetBkMode(dc, TRANSPARENT);
             let _ = SetTextColor(dc, COLORREF(0x00FF_FFFF));
@@ -2432,9 +2694,6 @@ fn draw_quicksand_line(
             SetTextCharacterExtra(dc, prev_extra);
             if let Some(prev) = prev_font {
                 let _ = SelectObject(dc, prev);
-            }
-            if !font.0.is_null() {
-                let _ = DeleteObject(HGDIOBJ(font.0));
             }
         }
 
@@ -2574,6 +2833,8 @@ fn render_and_place(hwnd: HWND) {
                 r.repositioning,
                 r.last_bounds,
                 r.dcomp.is_some(),
+                r.width,
+                r.height,
             )
         })
     });
@@ -2585,12 +2846,13 @@ fn render_and_place(hwnd: HWND) {
         repositioning,
         last_bounds,
         has_dcomp,
+        prev_w,
+        prev_h,
     )) = snapshot
     else {
         return;
     };
     let owner = HWND(owner_raw as *mut c_void);
-    let (work, dpi) = target_monitor_info(hwnd, owner, cfg.pos);
     let now = unsafe { local_time() };
     let (day_str, date_str, time_str) = format_clock_lines(
         now.wYear,
@@ -2601,42 +2863,21 @@ fn render_and_place(hwnd: HWND) {
         now.wMinute,
         cfg.use_24h,
     );
+    let (est_w, est_h) = widget_pixel_size(&day_str, cfg.size_pct, 96);
+    let (work, dpi) =
+        target_monitor_info(hwnd, owner, cfg.pos, (prev_w.max(est_w), prev_h.max(est_h)));
     let (w, h) = widget_pixel_size(&day_str, cfg.size_pct, dpi);
     let (sx, sy) = resolve_screen_position(cfg.pos, work, w, h);
 
-    // SAFETY: owns offscreen memory DC and 32-bit DIBSection strictly for this synchronous frame update.
-    unsafe {
-        let mem_dc = CreateCompatibleDC(None);
-        if mem_dc.0.is_null() {
-            return;
-        }
-        let mut bits = std::ptr::null_mut();
-        let Ok(bmp) = CreateDIBSection(
-            mem_dc,
-            &BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w,
-                    biHeight: -h,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            DIB_RGB_COLORS,
-            &mut bits,
-            None,
-            0,
-        ) else {
-            let _ = DeleteDC(mem_dc);
+    // SAFETY: reuses thread-local offscreen DC and 32-bit DIBSection strictly for this synchronous frame update.
+    CLOCK_CANVAS_SCRATCH.with(|canvas_slot| {
+        let mut scratch = canvas_slot.borrow_mut();
+        let Some((mem_dc, bits)) = scratch.ensure(w, h) else {
             return;
         };
-        if !bits.is_null() {
-            let prev_bmp = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+        unsafe {
             let total = (w as usize).saturating_mul(h as usize);
-            let buf = std::slice::from_raw_parts_mut(bits as *mut u32, total);
+            let buf = std::slice::from_raw_parts_mut(bits, total);
             buf.fill(0);
 
             let scale = (cfg.size_pct.clamp(50, 200) as f32 / 100.0) * (dpi as f32 / 96.0);
@@ -2758,7 +2999,6 @@ fn render_and_place(hwnd: HWND) {
                 );
             }
 
-            SelectObject(mem_dc, prev_bmp);
             CLOCK_RUNTIME.with(|slot| {
                 if let Some(state) = slot.borrow_mut().as_mut() {
                     state.width = w;
@@ -2781,9 +3021,7 @@ fn render_and_place(hwnd: HWND) {
                 None,
             );
         }
-        let _ = DeleteObject(HGDIOBJ(bmp.0));
-        let _ = DeleteDC(mem_dc);
-    }
+    });
     sync_clock_input();
 }
 
@@ -3013,6 +3251,9 @@ unsafe extern "system" fn clock_proc(
                     unhook_events(rt.hooks);
                 }
                 CLOCK_TEXT_SCRATCH.with(|s| s.borrow_mut().free());
+                CLOCK_CANVAS_SCRATCH.with(|s| s.borrow_mut().free());
+                CLOCK_FONT_CACHE.with(|s| s.borrow_mut().free());
+                ANURATI_WORD_CACHE.with(|s| s.borrow_mut().free());
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_LBUTTONDOWN => {
@@ -3195,6 +3436,9 @@ struct ColorPickState {
     sample_dc: isize,
     sample_bmp: isize,
     sample_bits: usize,
+    loupe_dc: isize,
+    loupe_bmp: isize,
+    loupe_bits: usize,
     closing: bool,
 }
 
@@ -3313,6 +3557,53 @@ pub fn begin_color_pick(owner: HWND, action_msg: u32, current_color: u32) {
         }
         let _ = SelectObject(sample_dc, HGDIOBJ(sb.0));
 
+        let loupe_dc = CreateCompatibleDC(None);
+        let mut l_bits = std::ptr::null_mut();
+        let loupe_bmp = if !loupe_dc.0.is_null() {
+            CreateDIBSection(
+                loupe_dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: LOUPE_W,
+                        biHeight: -LOUPE_H,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut l_bits,
+                None,
+                0,
+            )
+            .ok()
+        } else {
+            None
+        };
+        let Some(lb) = loupe_bmp else {
+            if !loupe_dc.0.is_null() {
+                let _ = DeleteDC(loupe_dc);
+            }
+            let _ = DeleteDC(sample_dc);
+            let _ = DeleteObject(HGDIOBJ(sb.0));
+            let _ = DestroyWindow(loupe);
+            let _ = DestroyWindow(picker);
+            return;
+        };
+        if l_bits.is_null() {
+            let _ = DeleteObject(lb);
+            let _ = DeleteDC(loupe_dc);
+            let _ = DeleteDC(sample_dc);
+            let _ = DeleteObject(HGDIOBJ(sb.0));
+            let _ = DestroyWindow(loupe);
+            let _ = DestroyWindow(picker);
+            return;
+        }
+        let _ = SelectObject(loupe_dc, HGDIOBJ(lb.0));
+
         COLOR_PICK_SESSION.with(|slot| {
             *slot.borrow_mut() = Some(ColorPickState {
                 picker_hwnd: picker.0 as isize,
@@ -3324,6 +3615,9 @@ pub fn begin_color_pick(owner: HWND, action_msg: u32, current_color: u32) {
                 sample_dc: sample_dc.0 as isize,
                 sample_bmp: sb.0 as isize,
                 sample_bits: s_bits as usize,
+                loupe_dc: loupe_dc.0 as isize,
+                loupe_bmp: lb.0 as isize,
+                loupe_bits: l_bits as usize,
                 closing: false,
             });
         });
@@ -3378,11 +3672,17 @@ pub fn cancel_color_pick() {
                 let _ = DestroyWindow(l);
             }
         }
-        if st.sample_bmp != 0 {
-            let _ = DeleteObject(HGDIOBJ(st.sample_bmp as *mut c_void));
+        if st.loupe_dc != 0 {
+            let _ = DeleteDC(HDC(st.loupe_dc as *mut c_void));
+        }
+        if st.loupe_bmp != 0 {
+            let _ = DeleteObject(HGDIOBJ(st.loupe_bmp as *mut c_void));
         }
         if st.sample_dc != 0 {
             let _ = DeleteDC(HDC(st.sample_dc as *mut c_void));
+        }
+        if st.sample_bmp != 0 {
+            let _ = DeleteObject(HGDIOBJ(st.sample_bmp as *mut c_void));
         }
     }
 }
@@ -3503,19 +3803,25 @@ unsafe fn sample_exact_screen_pixel(pt: POINT) -> Option<u32> {
 
 unsafe fn update_picker_loupe(pt: POINT) {
     let meta = COLOR_PICK_SESSION.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|st| (st.loupe_hwnd, st.sample_dc, st.sample_bits))
+        slot.borrow().as_ref().map(|st| {
+            (
+                st.loupe_hwnd,
+                st.sample_dc,
+                st.sample_bits,
+                st.loupe_dc,
+                st.loupe_bits,
+            )
+        })
     });
-    let Some((loupe_raw, sdc_raw, sbits_raw)) = meta else {
+    let Some((loupe_raw, sdc_raw, sbits_raw, ldc_raw, lbits_raw)) = meta else {
         return;
     };
-    if loupe_raw == 0 || sdc_raw == 0 || sbits_raw == 0 {
+    if loupe_raw == 0 || sdc_raw == 0 || sbits_raw == 0 || ldc_raw == 0 || lbits_raw == 0 {
         return;
     }
 
     let mut samples = [0u32; (SAMPLE_SIDE * SAMPLE_SIDE) as usize];
-    // SAFETY: reads 9x9 virtual screen pixels around cursor and updates compact LOUPE_W x LOUPE_H layered preview.
+    // SAFETY: reads 9x9 virtual screen pixels around cursor and updates reusable LOUPE_W x LOUPE_H layered preview.
     unsafe {
         let sdc = GetDC(None);
         if sdc.0.is_null() {
@@ -3555,184 +3861,151 @@ unsafe fn update_picker_loupe(pt: POINT) {
     });
     preview_clock_color_live(center_col);
 
-    // Build compact dark glass loupe DIB with 9x9 zoom grid + color swatch + hex code.
+    // Paint compact dark glass loupe into persistent DIB with 9x9 zoom grid + color swatch + hex code.
     unsafe {
-        let mem_dc = CreateCompatibleDC(None);
-        if mem_dc.0.is_null() {
-            return;
-        }
-        let mut bits = std::ptr::null_mut();
-        let Ok(bmp) = CreateDIBSection(
-            mem_dc,
-            &BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: LOUPE_W,
-                    biHeight: -LOUPE_H,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            DIB_RGB_COLORS,
-            &mut bits,
-            None,
-            0,
-        ) else {
-            let _ = DeleteDC(mem_dc);
-            return;
-        };
-        if !bits.is_null() {
-            let prev = SelectObject(mem_dc, HGDIOBJ(bmp.0));
-            let buf =
-                std::slice::from_raw_parts_mut(bits as *mut u32, (LOUPE_W * LOUPE_H) as usize);
-            // Dark rounded pill background (#181818 @ 235 alpha).
-            for y in 0..LOUPE_H {
-                for x in 0..LOUPE_W {
-                    let border = x == 0 || y == 0 || x == LOUPE_W - 1 || y == LOUPE_H - 1;
-                    buf[(y * LOUPE_W + x) as usize] =
-                        if border { 0xFF42_4242 } else { 0xEB18_1818 };
-                }
+        let mem_dc = HDC(ldc_raw as *mut c_void);
+        let buf =
+            std::slice::from_raw_parts_mut(lbits_raw as *mut u32, (LOUPE_W * LOUPE_H) as usize);
+        // Dark rounded pill background (#181818 @ 235 alpha).
+        for y in 0..LOUPE_H {
+            for x in 0..LOUPE_W {
+                let border = x == 0 || y == 0 || x == LOUPE_W - 1 || y == LOUPE_H - 1;
+                buf[(y * LOUPE_W + x) as usize] = if border { 0xFF42_4242 } else { 0xEB18_1818 };
             }
-            // Left 9x9 zoomed pixel square (8, 8) at 5x5 per sample -> 45x45.
-            let cell = 5i32;
-            let zx0 = 8i32;
-            let zy0 = 8i32;
-            for sy in 0..SAMPLE_SIDE {
-                for sx in 0..SAMPLE_SIDE {
-                    let col = samples[(sy * SAMPLE_SIDE + sx) as usize];
-                    let px_col = 0xFF00_0000 | col;
-                    for dy in 0..cell {
-                        for dx in 0..cell {
-                            let gx = zx0 + sx * cell + dx;
-                            let gy = zy0 + sy * cell + dy;
-                            let grid_edge = dx == 0 || dy == 0;
-                            let final_px = if sx == 4
-                                && sy == 4
-                                && (dx == 0 || dy == 0 || dx == cell - 1 || dy == cell - 1)
-                            {
-                                0xFFFF_FFFF
-                            } else if grid_edge {
-                                0xFF28_2828
-                            } else {
-                                px_col
-                            };
-                            buf[(gy * LOUPE_W + gx) as usize] = final_px;
-                        }
+        }
+        // Left 9x9 zoomed pixel square (8, 8) at 5x5 per sample -> 45x45.
+        let cell = 5i32;
+        let zx0 = 8i32;
+        let zy0 = 8i32;
+        for sy in 0..SAMPLE_SIDE {
+            for sx in 0..SAMPLE_SIDE {
+                let col = samples[(sy * SAMPLE_SIDE + sx) as usize];
+                let px_col = 0xFF00_0000 | col;
+                for dy in 0..cell {
+                    for dx in 0..cell {
+                        let gx = zx0 + sx * cell + dx;
+                        let gy = zy0 + sy * cell + dy;
+                        let grid_edge = dx == 0 || dy == 0;
+                        let final_px = if sx == 4
+                            && sy == 4
+                            && (dx == 0 || dy == 0 || dx == cell - 1 || dy == cell - 1)
+                        {
+                            0xFFFF_FFFF
+                        } else if grid_edge {
+                            0xFF28_2828
+                        } else {
+                            px_col
+                        };
+                        buf[(gy * LOUPE_W + gx) as usize] = final_px;
                     }
                 }
             }
-            // Color swatch circle/square next to zoom grid (x=62..80, y=12..30).
-            for y in 12..30 {
-                for x in 62..80 {
-                    let edge = x == 62 || x == 79 || y == 12 || y == 29;
-                    buf[(y * LOUPE_W + x) as usize] = if edge {
-                        0xFFAA_AAAA
-                    } else {
-                        0xFF00_0000 | center_col
-                    };
-                }
-            }
-
-            let hex = format!("#{:06X}", center_col);
-            let mut canvas = GlyphCanvas {
-                buf,
-                width: LOUPE_W,
-                height: LOUPE_H,
-            };
-            draw_quicksand_line(
-                &mut canvas,
-                &hex,
-                RECT {
-                    left: 84,
-                    top: 10,
-                    right: LOUPE_W - 6,
-                    bottom: 32,
-                },
-                14,
-                0,
-                0x00FF_FFFF,
-            );
-            draw_quicksand_line(
-                &mut canvas,
-                "Click pick / Esc cancel",
-                RECT {
-                    left: 60,
-                    top: 34,
-                    right: LOUPE_W - 6,
-                    bottom: 54,
-                },
-                11,
-                0,
-                0x00B8_B8B8,
-            );
-
-            // Offset loupe away from cursor while staying inside current monitor work area.
-            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            let mut mi = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            let mon_r = if GetMonitorInfoW(mon, &mut mi).as_bool() {
-                mi.rcMonitor
-            } else {
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: 1920,
-                    bottom: 1080,
-                }
-            };
-            let lx = if pt.x + 20 + LOUPE_W <= mon_r.right {
-                pt.x + 20
-            } else {
-                pt.x - LOUPE_W - 16
-            };
-            let ly = if pt.y + 20 + LOUPE_H <= mon_r.bottom {
-                pt.y + 20
-            } else {
-                pt.y - LOUPE_H - 16
-            };
-
-            let loupe = HWND(loupe_raw as *mut c_void);
-            let dst = POINT { x: lx, y: ly };
-            let size = SIZE {
-                cx: LOUPE_W,
-                cy: LOUPE_H,
-            };
-            let src = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let _ = UpdateLayeredWindow(
-                loupe,
-                None,
-                Some(&dst),
-                Some(&size),
-                mem_dc,
-                Some(&src),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-            let _ = SetWindowPos(
-                loupe,
-                HWND_TOPMOST,
-                lx,
-                ly,
-                LOUPE_W,
-                LOUPE_H,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            SelectObject(mem_dc, prev);
         }
-        let _ = DeleteObject(HGDIOBJ(bmp.0));
-        let _ = DeleteDC(mem_dc);
+        // Color swatch circle/square next to zoom grid (x=62..80, y=12..30).
+        for y in 12..30 {
+            for x in 62..80 {
+                let edge = x == 62 || x == 79 || y == 12 || y == 29;
+                buf[(y * LOUPE_W + x) as usize] = if edge {
+                    0xFFAA_AAAA
+                } else {
+                    0xFF00_0000 | center_col
+                };
+            }
+        }
+
+        let hex = format!("#{:06X}", center_col);
+        let mut canvas = GlyphCanvas {
+            buf,
+            width: LOUPE_W,
+            height: LOUPE_H,
+        };
+        draw_quicksand_line(
+            &mut canvas,
+            &hex,
+            RECT {
+                left: 84,
+                top: 10,
+                right: LOUPE_W - 6,
+                bottom: 32,
+            },
+            14,
+            0,
+            0x00FF_FFFF,
+        );
+        draw_quicksand_line(
+            &mut canvas,
+            "Click pick / Esc cancel",
+            RECT {
+                left: 60,
+                top: 34,
+                right: LOUPE_W - 6,
+                bottom: 54,
+            },
+            11,
+            0,
+            0x00B8_B8B8,
+        );
+
+        // Offset loupe away from cursor while staying inside current monitor work area.
+        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon_r = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcMonitor
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            }
+        };
+        let lx = if pt.x + 20 + LOUPE_W <= mon_r.right {
+            pt.x + 20
+        } else {
+            pt.x - LOUPE_W - 16
+        };
+        let ly = if pt.y + 20 + LOUPE_H <= mon_r.bottom {
+            pt.y + 20
+        } else {
+            pt.y - LOUPE_H - 16
+        };
+
+        let loupe = HWND(loupe_raw as *mut c_void);
+        let dst = POINT { x: lx, y: ly };
+        let size = SIZE {
+            cx: LOUPE_W,
+            cy: LOUPE_H,
+        };
+        let src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let _ = UpdateLayeredWindow(
+            loupe,
+            None,
+            Some(&dst),
+            Some(&size),
+            mem_dc,
+            Some(&src),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        let _ = SetWindowPos(
+            loupe,
+            HWND_TOPMOST,
+            lx,
+            ly,
+            LOUPE_W,
+            LOUPE_H,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 }
 
@@ -4131,6 +4404,18 @@ mod tests {
                 "input child must leave shortcut icon and label clickable"
             );
             let _ = DeleteObject(HGDIOBJ(region.0));
+            // Repeated sync with unchanged holes skips rebuilding HRGN yet preserves the icon hole.
+            sync_clock_input();
+            let region2 = windows::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0);
+            assert_ne!(
+                windows::Win32::Graphics::Gdi::GetWindowRgn(input, region2).0,
+                0
+            );
+            assert!(
+                !windows::Win32::Graphics::Gdi::PtInRegion(region2, center.x - x, center.y - y)
+                    .as_bool()
+            );
+            let _ = DeleteObject(HGDIOBJ(region2.0));
             hide_all();
             assert!(!IsWindow(input).as_bool());
             let _ = DestroyWindow(list);
@@ -4209,6 +4494,67 @@ mod tests {
             );
         }
         assert!(buf.iter().any(|&px| (px >> 24) == 255));
+        // Warm Anurati cache produces bit-identical output across repeated draws and fresh re-rasters.
+        let mut buf_cached = vec![0u32; (w * h) as usize];
+        {
+            let mut canvas = GlyphCanvas {
+                buf: &mut buf_cached,
+                width: w,
+                height: h,
+            };
+            render_anurati_word(
+                &mut canvas,
+                "WEDNESDAY",
+                16.0,
+                50.0,
+                w as f32 * 0.5,
+                0x00FF_FFFF,
+            );
+        }
+        assert_eq!(
+            buf, buf_cached,
+            "cached Anurati frame must match cold raster"
+        );
+
+        let mut orange_warm = vec![0u32; (w * h) as usize];
+        {
+            let mut canvas = GlyphCanvas {
+                buf: &mut orange_warm,
+                width: w,
+                height: h,
+            };
+            render_anurati_word(
+                &mut canvas,
+                "WEDNESDAY",
+                16.0,
+                50.0,
+                w as f32 * 0.5,
+                0x00D9_541E,
+            );
+        }
+        ANURATI_WORD_CACHE.with(|c| c.borrow_mut().free());
+        let mut orange_cold = vec![0u32; (w * h) as usize];
+        {
+            let mut canvas = GlyphCanvas {
+                buf: &mut orange_cold,
+                width: w,
+                height: h,
+            };
+            render_anurati_word(
+                &mut canvas,
+                "WEDNESDAY",
+                16.0,
+                50.0,
+                w as f32 * 0.5,
+                0x00D9_541E,
+            );
+        }
+        assert_eq!(
+            orange_warm, orange_cold,
+            "color switch hitting warm Anurati cache must match cold rasterization"
+        );
+        ANURATI_WORD_CACHE.with(|c| c.borrow_mut().free());
+
         apply_opacity_in_place(&mut buf, 50);
         let max_alpha = buf.iter().map(|&px| px >> 24).max().unwrap_or(0);
         assert!((120..=135).contains(&max_alpha));
@@ -4252,5 +4598,29 @@ mod tests {
         assert_eq!(minute_timer_delay_ms(0), 60_050);
         assert_eq!(minute_timer_delay_ms(59), 1_050);
         assert_eq!(minute_timer_delay_ms(65), 1_050);
+
+        // Multi-monitor negative/secondary work areas keep positions within that monitor cleanly.
+        let left_monitor = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1040,
+        };
+        assert_eq!(
+            resolve_screen_position(Some((-1400, 120)), left_monitor, 400, 180),
+            (-1400, 120)
+        );
+        assert_eq!(
+            resolve_screen_position(Some((-2100, -50)), left_monitor, 400, 180),
+            (-1920, 0)
+        );
+        assert_eq!(
+            resolve_screen_position(Some((200, 950)), left_monitor, 400, 180),
+            (-400, 860)
+        );
+        assert_eq!(
+            resolve_screen_position(None, left_monitor, 400, 180),
+            (-1160, 170)
+        );
     }
 }

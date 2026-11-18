@@ -61,7 +61,7 @@ const STATUS: usize = 113;
 const THUMBNAIL: u32 = WM_APP + 9;
 const PREPARED: u32 = WM_APP + 10;
 const UPDATE_READY: u32 = WM_APP + 11;
-const UPDATE_RELEASE: usize = 126;
+const UPDATE_RELEASE: usize = visuals::CHECK_UPDATES;
 const CONTEXT_MENU: u32 = WM_APP + 12;
 const UPDATE_DOWNLOAD: u32 = WM_APP + 13;
 const CTX_SET: usize = 201;
@@ -1377,6 +1377,12 @@ impl App {
                     SS_ENDELLIPSIS.0,
                 ),
                 (
+                    visuals::CHECK_UPDATES,
+                    w!("BUTTON"),
+                    "Check for updates",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
                     visuals::MEMORY_INFO,
                     w!("STATIC"),
                     "Memory: measuring...",
@@ -2601,12 +2607,26 @@ impl App {
         }
         Ok(())
     }
+    fn set_check_updates_label(&self, label: &str) {
+        let ctrl = self.control(visuals::CHECK_UPDATES);
+        if !ctrl.0.is_null() {
+            self.text(visuals::CHECK_UPDATES, label);
+            // SAFETY: redraws only the owned Check for updates button immediately after label change.
+            unsafe {
+                let _ = InvalidateRect(ctrl, None, false);
+            }
+        }
+    }
     fn check_updates(&mut self, manual: bool) -> Result<(), String> {
         self.update_manual |= manual;
+        if self.update_manual {
+            self.set_check_updates_label("Checking...");
+        }
         if self.update_thread.is_some() {
             return Ok(());
         }
         if unsafe { SetTimer(self.hwnd, 2, 100, None) } == 0 {
+            self.set_check_updates_label("Check for updates");
             return Err("Could not start the update check".into());
         }
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2653,6 +2673,7 @@ impl App {
             let _ = KillTimer(self.hwnd, 2);
         }
         let manual = std::mem::take(&mut self.update_manual);
+        self.set_check_updates_label("Check for updates");
         if let Ok(Some(tag)) = &result {
             self.update_tag = Some(tag.clone());
             self.update_popup_dismissed = false;
@@ -6277,6 +6298,15 @@ mod tests {
             assert_eq!(window_text(app.control(visuals::SAWERIA)), "Saweria");
             assert_ne!(
                 GetWindowLongW(app.control(visuals::SAWERIA), GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0
+            );
+            assert_eq!(
+                window_text(app.control(visuals::CHECK_UPDATES)),
+                "Check for updates"
+            );
+            assert_ne!(
+                GetWindowLongW(app.control(visuals::CHECK_UPDATES), GWL_STYLE) as u32
+                    & WS_VISIBLE.0,
                 0
             );
             app.action(visuals::FIND_WALLPAPERS, BN_CLICKED)?;

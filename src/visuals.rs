@@ -49,6 +49,7 @@ pub const ADD_FOLDER: usize = 122;
 pub const FOLDER_FILTER: usize = 123;
 pub const FPS: usize = 124;
 pub const SELECT_ALL: usize = 125;
+pub const CHECK_UPDATES: usize = 126;
 pub const VERSION: usize = 127;
 pub const CACHE_INFO: usize = 128;
 pub const CLEAR_CACHE: usize = 129;
@@ -109,10 +110,9 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         101 | ADD_FOLDER => matches!(tab, Tab::Library | Tab::Sources),
         SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
         id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
-        107 | 108 | 121 | ACRYLIC | AUTO_UPDATES | VERSION | MEMORY_INFO | CACHE_INFO
-        | CLEAR_CACHE | PRODUCT_WEBSITE | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT | SAWERIA => {
-            tab == Tab::Settings
-        }
+        107 | 108 | 121 | ACRYLIC | AUTO_UPDATES | CHECK_UPDATES | VERSION | MEMORY_INFO
+        | CACHE_INFO | CLEAR_CACHE | PRODUCT_WEBSITE | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT
+        | SAWERIA => tab == Tab::Settings,
         CLOCK_ENABLE | CLOCK_LOCK | CLOCK_BEHIND_ICONS | CLOCK_24H | CLOCK_REPOSITION
         | CLOCK_RESET_POS | CLOCK_PICK_COLOR => tab == Tab::Clock,
         PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
@@ -182,7 +182,7 @@ pub struct Layout {
     pub caption_divider: Rect,
     pub caption_buttons: [(CaptionButton, Rect); 3],
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 52],
+    controls: [(usize, Rect); 53],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -301,7 +301,11 @@ impl Layout {
                 (CLOCK_REPOSITION, r(content_x, 448, column_width, 36)),
                 (CLOCK_RESET_POS, r(content_x, 496, column_width, 36)),
                 (CLOCK_PICK_COLOR, r(resources_x, 496, column_width, 36)),
-                (VERSION, r(resources_x, 212, column_width, 24)),
+                (VERSION, r(resources_x, 214, column_width - 188, 24)),
+                (
+                    CHECK_UPDATES,
+                    r(resources_x + column_width - 176, 210, 176, 32),
+                ),
                 (MEMORY_INFO, r(resources_x, 248, column_width, 40)),
                 (CACHE_INFO, r(resources_x, 300, column_width, 24)),
                 (CLEAR_CACHE, r(resources_x, 336, column_width, 36)),
@@ -486,6 +490,7 @@ fn control_surface(id: usize) -> (u32, u8) {
             | CLOCK_PICK_COLOR
             | PRODUCT_WEBSITE
             | CLEAR_CACHE
+            | CHECK_UPDATES
             | SUPPORT
             | SAWERIA
             | VERSION
@@ -7693,6 +7698,7 @@ mod tests {
         assert_eq!(control_surface(PAGE), (INK, PANEL_ALPHA));
         assert_eq!(control_surface(113), (FOOTER, PANEL_ALPHA));
         assert_eq!(control_surface(PRODUCT_WEBSITE), (CARD, CARD_ALPHA));
+        assert_eq!(control_surface(CHECK_UPDATES), (CARD, CARD_ALPHA));
         assert_eq!(control_surface(VERSION), (CARD, CARD_ALPHA));
 
         // SAFETY: test-owned memory DC and DIB never attach to any desktop window.
@@ -8027,6 +8033,11 @@ mod tests {
             }
             assert!(area(SOURCES_NOTE).bottom < layout.footer.top);
             assert!(area(SETTINGS_INFO).bottom < area(SUPPORT).top);
+            assert!(visible_on(Tab::Settings, CHECK_UPDATES));
+            assert!(!visible_on(Tab::Library, CHECK_UPDATES));
+            assert!(area(CHECK_UPDATES).left > area(VERSION).right);
+            assert!(area(CHECK_UPDATES).bottom < area(MEMORY_INFO).top);
+            assert_eq!(area(CHECK_UPDATES).right, area(CLEAR_CACHE).right);
             assert_eq!(area(105).bottom - area(105).top, 32);
             assert_eq!(layout.control(TILE_BASE), Some(layout.tile_rects[0]));
             assert!(layout.control(TILE_BASE + 9).is_none());
