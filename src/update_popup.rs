@@ -1,6 +1,6 @@
 use crate::visuals::{
-    self, UPDATE_DISABLE, UPDATE_DISMISS, UPDATE_NOW, UPDATE_WHATS_NEW, UpdatePopupHit,
-    UpdatePopupLayout,
+    self, DECODER_DISMISS, DECODER_NOW, UPDATE_DISABLE, UPDATE_DISMISS, UPDATE_NOW,
+    UPDATE_WHATS_NEW, UpdatePopupHit, UpdatePopupLayout,
 };
 use std::{cell::Cell, ffi::c_void, mem::size_of};
 use windows::{
@@ -31,13 +31,21 @@ use windows::{
 const POPUP_CLASS: PCWSTR = w!("WallpaperLive.UpdatePopup");
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PopupKind {
+    AppUpdate,
+    DecoderSetup,
+}
+
 struct PopupState {
+    kind: PopupKind,
     owner: HWND,
     action_msg: u32,
     tag: String,
     title: String,
     subtitle: String,
     update_label: String,
+    secondary_label: String,
     downloading: bool,
     hover: Option<UpdatePopupHit>,
     pressed: Option<UpdatePopupHit>,
@@ -52,52 +60,105 @@ impl PopupState {
         let ver = tag.strip_prefix('v').unwrap_or(tag);
         let current = env!("CARGO_PKG_VERSION");
         Self {
+            kind: PopupKind::AppUpdate,
             owner,
             action_msg,
             tag: tag.to_owned(),
             title: format!("WallpaperLive {ver} is out"),
             subtitle: format!("You are on {current}. Read what changed, or update now."),
             update_label: "Update".into(),
+            secondary_label: "What's new".into(),
             downloading: false,
             hover: None,
             pressed: None,
             tracking_leave: false,
             dpi,
             glass: false,
-            layout: UpdatePopupLayout::measure(dpi, false),
+            layout: UpdatePopupLayout::measure_with_footer(dpi, false, true),
         }
     }
 
+    fn new_decoder(owner: HWND, action_msg: u32, dpi: i32) -> Self {
+        Self {
+            kind: PopupKind::DecoderSetup,
+            owner,
+            action_msg,
+            tag: String::new(),
+            title: "Native decoder needed".into(),
+            subtitle: "Download libmpv-2.dll (~31.8 MB, SHA-256 verified) to play video?".into(),
+            update_label: "Download".into(),
+            secondary_label: "Not now".into(),
+            downloading: false,
+            hover: None,
+            pressed: None,
+            tracking_leave: false,
+            dpi,
+            glass: false,
+            layout: UpdatePopupLayout::measure_with_footer(dpi, false, false),
+        }
+    }
+
+    fn measure(&self) -> UpdatePopupLayout {
+        UpdatePopupLayout::measure_with_footer(
+            self.dpi,
+            self.downloading,
+            self.kind == PopupKind::AppUpdate,
+        )
+    }
+
     fn set_ready(&mut self) {
-        let current = env!("CARGO_PKG_VERSION");
-        self.subtitle = format!("You are on {current}. Read what changed, or update now.");
-        self.update_label = "Update".into();
+        match self.kind {
+            PopupKind::AppUpdate => {
+                let current = env!("CARGO_PKG_VERSION");
+                self.subtitle = format!("You are on {current}. Read what changed, or update now.");
+                self.update_label = "Update".into();
+            }
+            PopupKind::DecoderSetup => {
+                self.subtitle =
+                    "Download libmpv-2.dll (~31.8 MB, SHA-256 verified) to play video?".into();
+                self.update_label = "Download".into();
+            }
+        }
         self.downloading = false;
-        self.layout = UpdatePopupLayout::measure(self.dpi, false);
+        self.layout = self.measure();
     }
 
     fn set_downloading(&mut self, percent: Option<u8>) {
         self.downloading = true;
         self.update_label = "Downloading...".into();
-        self.subtitle = match percent {
-            Some(pct) => format!("Downloading update installer ({pct}%)..."),
-            None => "Downloading update installer...".into(),
+        self.subtitle = match (self.kind, percent) {
+            (PopupKind::AppUpdate, Some(pct)) => {
+                format!("Downloading update installer ({pct}%)...")
+            }
+            (PopupKind::AppUpdate, None) => "Downloading update installer...".into(),
+            (PopupKind::DecoderSetup, Some(pct)) => {
+                format!("Downloading native decoder ({pct}%)...")
+            }
+            (PopupKind::DecoderSetup, None) => "Downloading native decoder...".into(),
         };
-        self.layout = UpdatePopupLayout::measure(self.dpi, true);
+        self.layout = self.measure();
     }
 
     fn set_verifying(&mut self) {
         self.downloading = true;
-        self.update_label = "Verifying...".into();
-        self.subtitle = "Verifying installer SHA-256 checksum...".into();
-        self.layout = UpdatePopupLayout::measure(self.dpi, true);
+        match self.kind {
+            PopupKind::AppUpdate => {
+                self.update_label = "Verifying...".into();
+                self.subtitle = "Verifying installer SHA-256 checksum...".into();
+            }
+            PopupKind::DecoderSetup => {
+                self.update_label = "Installing...".into();
+                self.subtitle = "Verifying SHA-256 and extracting decoder...".into();
+            }
+        }
+        self.layout = self.measure();
     }
 
     fn set_error(&mut self, error: &str) {
         self.downloading = false;
         self.update_label = "Retry".into();
         self.subtitle = error.to_owned();
-        self.layout = UpdatePopupLayout::measure(self.dpi, false);
+        self.layout = self.measure();
     }
 }
 
@@ -209,14 +270,15 @@ pub fn show(owner: HWND, action_msg: u32, tag: &str) {
     if let Some(hwnd) = current_popup() {
         // SAFETY: popup HWND was created on this UI thread with a boxed PopupState.
         if let Some(state) = unsafe { state_mut(hwnd) } {
-            let same_tag = state.tag == tag && state.owner == owner;
+            let same_tag =
+                state.kind == PopupKind::AppUpdate && state.tag == tag && state.owner == owner;
             if !same_tag {
                 *state = PopupState::new(owner, action_msg, tag, dpi);
             } else if !state.downloading {
                 state.set_ready();
             }
             state.dpi = dpi;
-            state.layout = UpdatePopupLayout::measure(dpi, state.downloading);
+            state.layout = state.measure();
             state.glass = unsafe {
                 configure_popup_frame(hwnd, state.layout.width, state.layout.height, dpi)
             };
@@ -231,14 +293,48 @@ pub fn show(owner: HWND, action_msg: u32, tag: &str) {
         return;
     }
 
+    open_popup(owner, PopupState::new(owner, action_msg, tag, dpi));
+}
+
+pub fn show_decoder(owner: HWND, action_msg: u32) {
+    if owner.0.is_null() || unsafe { !IsWindow(owner).as_bool() } {
+        return;
+    }
+    let dpi = unsafe { GetDpiForWindow(owner) }.max(96) as i32;
+    if let Some(hwnd) = current_popup() {
+        if let Some(state) = unsafe { state_mut(hwnd) } {
+            if state.kind != PopupKind::DecoderSetup || state.owner != owner {
+                *state = PopupState::new_decoder(owner, action_msg, dpi);
+            } else if !state.downloading {
+                state.set_ready();
+            }
+            state.dpi = dpi;
+            state.layout = state.measure();
+            state.glass = unsafe {
+                configure_popup_frame(hwnd, state.layout.width, state.layout.height, dpi)
+            };
+        }
+        sync(owner);
+        if unsafe { IsWindowVisible(owner).as_bool() && !IsIconic(owner).as_bool() } {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+            }
+        }
+        return;
+    }
+
+    open_popup(owner, PopupState::new_decoder(owner, action_msg, dpi));
+}
+
+fn open_popup(owner: HWND, mut state: PopupState) {
     if ensure_class().is_err() {
         return;
     }
     let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else {
         return;
     };
-    let mut state = Box::new(PopupState::new(owner, action_msg, tag, dpi));
-    let (x, y) = anchor_rect(owner, state.layout.width, state.layout.height, dpi);
+    let (x, y) = anchor_rect(owner, state.layout.width, state.layout.height, state.dpi);
     let Ok(hwnd) = (unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -258,9 +354,9 @@ pub fn show(owner: HWND, action_msg: u32, tag: &str) {
         return;
     };
     state.glass =
-        unsafe { configure_popup_frame(hwnd, state.layout.width, state.layout.height, dpi) };
+        unsafe { configure_popup_frame(hwnd, state.layout.width, state.layout.height, state.dpi) };
     unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state.into()) as isize);
     }
     POPUP_HWND.with(|slot| slot.set(hwnd.0 as isize));
     if unsafe { IsWindowVisible(owner).as_bool() && !IsIconic(owner).as_bool() } {
@@ -275,6 +371,7 @@ pub fn set_progress(owner: HWND, percent: Option<u8>) {
     if let Some(hwnd) = current_popup()
         && let Some(state) = unsafe { state_mut(hwnd) }
         && state.owner == owner
+        && state.kind == PopupKind::AppUpdate
     {
         state.set_downloading(percent);
         unsafe {
@@ -287,6 +384,7 @@ pub fn set_verifying(owner: HWND) {
     if let Some(hwnd) = current_popup()
         && let Some(state) = unsafe { state_mut(hwnd) }
         && state.owner == owner
+        && state.kind == PopupKind::AppUpdate
     {
         state.set_verifying();
         unsafe {
@@ -299,10 +397,65 @@ pub fn set_error(owner: HWND, error: &str) {
     if let Some(hwnd) = current_popup()
         && let Some(state) = unsafe { state_mut(hwnd) }
         && state.owner == owner
+        && state.kind == PopupKind::AppUpdate
     {
         state.set_error(error);
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+}
+
+pub fn set_decoder_progress(owner: HWND, percent: Option<u8>) {
+    if let Some(hwnd) = current_popup()
+        && let Some(state) = unsafe { state_mut(hwnd) }
+        && state.owner == owner
+        && state.kind == PopupKind::DecoderSetup
+    {
+        state.set_downloading(percent);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+}
+
+pub fn set_decoder_verifying(owner: HWND) {
+    if let Some(hwnd) = current_popup()
+        && let Some(state) = unsafe { state_mut(hwnd) }
+        && state.owner == owner
+        && state.kind == PopupKind::DecoderSetup
+    {
+        state.set_verifying();
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+}
+
+pub fn set_decoder_error(owner: HWND, error: &str) {
+    if let Some(hwnd) = current_popup()
+        && let Some(state) = unsafe { state_mut(hwnd) }
+        && state.owner == owner
+        && state.kind == PopupKind::DecoderSetup
+    {
+        state.set_error(error);
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+}
+
+pub fn dismiss_decoder(owner: HWND) {
+    let Some(hwnd) = current_popup() else {
+        return;
+    };
+    let matches = unsafe { state_mut(hwnd) }.is_some_and(|s| {
+        s.kind == PopupKind::DecoderSetup && (owner.0.is_null() || s.owner == owner)
+    });
+    if matches {
+        POPUP_HWND.with(|slot| slot.set(0));
+        unsafe {
+            let _ = DestroyWindow(hwnd);
         }
     }
 }
@@ -329,7 +482,7 @@ pub fn sync(owner: HWND) {
     let dpi = unsafe { GetDpiForWindow(owner) }.max(96) as i32;
     if dpi != state.dpi {
         state.dpi = dpi;
-        state.layout = UpdatePopupLayout::measure(dpi, state.downloading);
+        state.layout = state.measure();
         state.glass =
             unsafe { configure_popup_frame(hwnd, state.layout.width, state.layout.height, dpi) };
     }
@@ -410,6 +563,10 @@ unsafe extern "system" fn popup_proc(
                         title: &state.title,
                         subtitle: &state.subtitle,
                         update_label: &state.update_label,
+                        secondary_label: &state.secondary_label,
+                        secondary_external: state.kind == PopupKind::AppUpdate,
+                        footer_label: (state.kind == PopupKind::AppUpdate)
+                            .then_some("Don't check for updates"),
                         downloading: state.downloading,
                         hover: state.hover,
                         pressed: state.pressed,
@@ -489,13 +646,21 @@ unsafe extern "system" fn popup_proc(
                 if let Some(target) = pressed
                     && hit == Some(target)
                 {
-                    let action_id = match target {
-                        UpdatePopupHit::Close => UPDATE_DISMISS,
-                        UpdatePopupHit::Update => UPDATE_NOW,
-                        UpdatePopupHit::WhatsNew => UPDATE_WHATS_NEW,
-                        UpdatePopupHit::Disable => UPDATE_DISABLE,
+                    let action_id = match (state.kind, target) {
+                        (PopupKind::AppUpdate, UpdatePopupHit::Close) => Some(UPDATE_DISMISS),
+                        (PopupKind::AppUpdate, UpdatePopupHit::Update) => Some(UPDATE_NOW),
+                        (PopupKind::AppUpdate, UpdatePopupHit::WhatsNew) => Some(UPDATE_WHATS_NEW),
+                        (PopupKind::AppUpdate, UpdatePopupHit::Disable) => Some(UPDATE_DISABLE),
+                        (PopupKind::DecoderSetup, UpdatePopupHit::Close)
+                        | (PopupKind::DecoderSetup, UpdatePopupHit::WhatsNew) => {
+                            Some(DECODER_DISMISS)
+                        }
+                        (PopupKind::DecoderSetup, UpdatePopupHit::Update) => Some(DECODER_NOW),
+                        (PopupKind::DecoderSetup, UpdatePopupHit::Disable) => None,
                     };
-                    if !state.downloading || target != UpdatePopupHit::Update {
+                    if let Some(action_id) = action_id
+                        && (!state.downloading || target != UpdatePopupHit::Update)
+                    {
                         let _ = PostMessageW(
                             state.owner,
                             state.action_msg,
@@ -507,12 +672,11 @@ unsafe extern "system" fn popup_proc(
                 LRESULT(0)
             }
             WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => {
-                let _ = PostMessageW(
-                    state.owner,
-                    state.action_msg,
-                    WPARAM(UPDATE_DISMISS),
-                    LPARAM(0),
-                );
+                let action_id = match state.kind {
+                    PopupKind::AppUpdate => UPDATE_DISMISS,
+                    PopupKind::DecoderSetup => DECODER_DISMISS,
+                };
+                let _ = PostMessageW(state.owner, state.action_msg, WPARAM(action_id), LPARAM(0));
                 LRESULT(0)
             }
             WM_NCDESTROY => {

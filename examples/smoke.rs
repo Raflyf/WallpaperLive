@@ -74,11 +74,12 @@ fn main() -> Result<(), String> {
             return Err("Desktop attachment is disabled in tests; use --window".into());
         };
         let host = surface.as_ref().map(|s| s.hwnd).unwrap_or(window);
-        let player = mpv::Mpv::open_at(
+        let player = mpv::Mpv::open_at_with_quality(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/libmpv-2.dll"),
             host,
             window,
             core::Fit::Fill,
+            core::Quality::Optimize,
         )?;
         player.load(&media)?;
         if SetTimer(window, 1, 100, None) == 0 {

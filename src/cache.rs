@@ -1,5 +1,5 @@
 use crate::{
-    core::{FPS_OPTIONS, validate_media, validate_path_syntax},
+    core::{FPS_OPTIONS, Quality, validate_media, validate_path_syntax},
     mpv::{self, MediaInfo},
 };
 use std::{
@@ -46,6 +46,7 @@ pub fn prepare(
     directory: &Path,
     display: (u32, u32),
     fps: u32,
+    quality: Quality,
     cancelled: &AtomicBool,
 ) -> Result<Prepared, String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -60,6 +61,7 @@ pub fn prepare(
             .arg(display.0.to_string())
             .arg(display.1.to_string())
             .arg(fps.to_string())
+            .arg(quality.key())
             .creation_flags(0x08004000)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -163,7 +165,7 @@ fn parse_response(text: &str) -> Result<Prepared, String> {
     })
 }
 pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
-    if args.len() != 6 {
+    if !(6..=7).contains(&args.len()) {
         return Err("Invalid preparation arguments".into());
     }
     let number = |i: usize| {
@@ -172,12 +174,20 @@ pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
             .and_then(|s| s.parse::<u32>().ok())
             .ok_or("Invalid preparation dimensions".to_owned())
     };
-    let prepared = prepare_local(
+    let quality = if let Some(raw) = args.get(6) {
+        raw.to_str()
+            .and_then(Quality::from_key)
+            .ok_or("Invalid preparation quality".to_owned())?
+    } else {
+        Quality::Optimize
+    };
+    let prepared = prepare_local_with_quality(
         Path::new(&args[0]),
         Path::new(&args[1]),
         Path::new(&args[2]),
         (number(3)?, number(4)?),
         number(5)?,
+        quality,
         &AtomicBool::new(false),
     )?;
     let path = prepared
@@ -192,6 +202,24 @@ pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
         .lock()
         .write_all(text.as_bytes())
         .map_err(|e| e.to_string())
+}
+
+fn target_size_for_quality(
+    width: u32,
+    height: u32,
+    display: (u32, u32),
+    quality: Quality,
+) -> Result<(u32, u32), String> {
+    let capped_display = if quality == Quality::Low {
+        if display.0 >= display.1 {
+            (display.0.min(1280), display.1.min(720))
+        } else {
+            (display.0.min(720), display.1.min(1280))
+        }
+    } else {
+        display
+    };
+    target_size(width, height, capped_display)
 }
 
 fn target_size(width: u32, height: u32, display: (u32, u32)) -> Result<(u32, u32), String> {
@@ -293,12 +321,33 @@ fn unchanged(path: &Path, size: u64, modified: SystemTime) -> Result<(), String>
     }
     Ok(())
 }
+#[cfg(test)]
 pub fn prepare_local(
     dll: &Path,
     source: &Path,
     directory: &Path,
     display: (u32, u32),
     fps: u32,
+    cancelled: &AtomicBool,
+) -> Result<Prepared, String> {
+    prepare_local_with_quality(
+        dll,
+        source,
+        directory,
+        display,
+        fps,
+        Quality::Optimize,
+        cancelled,
+    )
+}
+
+pub fn prepare_local_with_quality(
+    dll: &Path,
+    source: &Path,
+    directory: &Path,
+    display: (u32, u32),
+    fps: u32,
+    quality: Quality,
     cancelled: &AtomicBool,
 ) -> Result<Prepared, String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -311,7 +360,17 @@ pub fn prepare_local(
     validate_path_syntax(directory)?;
     fs::create_dir_all(directory).map_err(|e| format!("Could not create video cache: {e}"))?;
     let info = mpv::probe_media(dll, &source)?;
-    let target = target_size(info.width, info.height, display)?;
+    if quality == Quality::Native {
+        return Ok(Prepared {
+            path: source,
+            width: info.width,
+            height: info.height,
+            fps: info.fps,
+            cached: false,
+            note: "Native quality (original media)".into(),
+        });
+    }
+    let target = target_size_for_quality(info.width, info.height, display, quality)?;
     let mut prepared = Prepared {
         path: source.clone(),
         width: info.width,
@@ -353,7 +412,12 @@ pub fn prepare_local(
     let modified = metadata.modified().map_err(|e| e.to_string())?;
     let hash = sha256(&source, cancelled)?;
     unchanged(&source, metadata.len(), modified)?;
-    let destination = directory.join(format!("wl-v2-{hash}-{}x{}-{fps}.mp4", target.0, target.1));
+    let destination = directory.join(format!(
+        "wl-v2-{hash}-{}x{}-{fps}-{}.mp4",
+        target.0,
+        target.1,
+        quality.key()
+    ));
     if destination.is_file() {
         if !(1..=MAX_OUTPUT).contains(&fs::metadata(&destination).map_err(|e| e.to_string())?.len())
         {
@@ -400,7 +464,9 @@ pub fn prepare_local(
     if partial.exists() || destination.exists() {
         return Err("Cache destination already exists; existing bytes were kept".into());
     }
-    mpv::encode(dll, &source, &partial, target.0, target.1, fps, cancelled)?;
+    mpv::encode_with_quality(
+        dll, &source, &partial, target.0, target.1, fps, quality, cancelled,
+    )?;
     if fs::metadata(&partial).map_err(|e| e.to_string())?.len() > MAX_OUTPUT {
         return Err("Prepared video exceeds 512 MiB; partial cache is not used".into());
     }
@@ -638,5 +704,21 @@ mod tests {
         assert!(file2.exists());
         assert!(other.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn low_quality_caps_cache_dimensions_to_720p_without_distorting_aspect() {
+        assert_eq!(
+            target_size_for_quality(3840, 2160, (2560, 1440), Quality::High).unwrap(),
+            (2560, 1440)
+        );
+        assert_eq!(
+            target_size_for_quality(3840, 2160, (2560, 1440), Quality::Low).unwrap(),
+            (1280, 720)
+        );
+        assert_eq!(
+            target_size_for_quality(2160, 3840, (1080, 1920), Quality::Low).unwrap(),
+            (720, 1280)
+        );
     }
 }

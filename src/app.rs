@@ -1530,6 +1530,12 @@ impl App {
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::QUALITY,
+                    w!("BUTTON"),
+                    "Quality: Optimize",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
                     visuals::CLOCK_HEX_EDIT,
                     w!("EDIT"),
                     "#5D86A8",
@@ -1680,6 +1686,7 @@ impl App {
                 WPARAM(self.settings.auto_update_check as usize),
                 LPARAM(0),
             );
+            self.text(visuals::QUALITY, self.settings.quality.label());
             self.sync_clock_controls();
             if let Ok(enabled) = startup_enabled() {
                 SendMessageW(
@@ -2111,6 +2118,7 @@ impl App {
             visuals::FPS,
             &format!("Frame rate: {} FPS", self.settings.fps),
         );
+        self.text(visuals::QUALITY, self.settings.quality.label());
         self.text(
             visuals::FOLDER_FILTER,
             &self
@@ -2996,6 +3004,7 @@ impl App {
         self.error = None;
         self.decoder_download_status = Some("Downloading native decoder... 0%".into());
         self.update_status();
+        crate::update_popup::set_decoder_progress(self.hwnd, Some(0));
 
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cancelled.clone();
@@ -3040,27 +3049,11 @@ impl App {
             let _ = decoder_path()?;
             return Ok(true);
         }
+        self.pending_decoder_apply = Some(source.to_path_buf());
         if self.decoder_download_thread.is_some() {
-            self.pending_decoder_apply = Some(source.to_path_buf());
             return Ok(false);
         }
-        let prompt = wide(
-            "Native video decoder (libmpv-2.dll, ~31.8 MB download from GitHub, SHA-256 verified) is not installed yet.\n\nDownload and install it now?",
-        );
-        // SAFETY: modal user-consent prompt owned by the panel window.
-        let choice = unsafe {
-            MessageBoxW(
-                self.hwnd,
-                PCWSTR(prompt.as_ptr()),
-                w!("Native decoder required"),
-                MB_YESNO | MB_ICONQUESTION,
-            )
-        };
-        if choice != IDYES {
-            let _ = decoder_path()?;
-            return Ok(true);
-        }
-        self.start_decoder_download(source.to_path_buf())?;
+        crate::update_popup::show_decoder(self.hwnd, ACTION);
         Ok(false)
     }
     fn decoder_download_event(&mut self) -> Result<bool, String> {
@@ -3072,15 +3065,18 @@ impl App {
                 crate::update::DownloadEvent::Progress(Some(pct)) => {
                     self.decoder_download_status =
                         Some(format!("Downloading native decoder... {pct}%"));
+                    crate::update_popup::set_decoder_progress(self.hwnd, Some(pct));
                     status_changed = true;
                 }
                 crate::update::DownloadEvent::Progress(None) => {
                     self.decoder_download_status = Some("Downloading native decoder...".into());
+                    crate::update_popup::set_decoder_progress(self.hwnd, None);
                     status_changed = true;
                 }
                 crate::update::DownloadEvent::Verifying => {
                     self.decoder_download_status =
                         Some("Verifying and extracting native decoder...".into());
+                    crate::update_popup::set_decoder_verifying(self.hwnd);
                     status_changed = true;
                 }
                 crate::update::DownloadEvent::Ready(path) => {
@@ -3107,11 +3103,12 @@ impl App {
             finished_err = Some("Decoder downloader stopped unexpectedly".into());
         }
         if let Some(err) = finished_err {
-            self.pending_decoder_apply = None;
+            crate::update_popup::set_decoder_error(self.hwnd, &err);
             return Err(err);
         }
         if ready_path.is_some() {
             self.error = None;
+            crate::update_popup::dismiss_decoder(self.hwnd);
             if let Some(pending) = self.pending_decoder_apply.take() {
                 return self.start_path(&pending).map(|_| false);
             }
@@ -3402,11 +3399,17 @@ impl App {
             height: 0,
             fps: 0.0,
             cached: false,
-            note: "Original media".into(),
+            note: if self.settings.quality == crate::core::Quality::Native {
+                "Native quality (original media)".into()
+            } else {
+                "Original media".into()
+            },
         };
         self.load_prepared(path.clone(), prepared, self.resume_position)?;
-        self.preparation = Some((path, display, crate::cache::CACHE_FPS));
-        self.launch_preparation()?;
+        if self.settings.quality != crate::core::Quality::Native {
+            self.preparation = Some((path, display, crate::cache::CACHE_FPS));
+            self.launch_preparation()?;
+        }
         self.update_status();
         Ok(())
     }
@@ -3446,9 +3449,11 @@ impl App {
         let flag = cancelled.clone();
         let tx = self.preparation_tx.clone();
         let id = self.preparation_id;
+        let quality = self.settings.quality;
         let hwnd = self.hwnd.0 as usize;
         let worker = std::thread::spawn(move || {
-            let result = crate::cache::prepare(&dll, &path, &directory, display, fps, &flag);
+            let result =
+                crate::cache::prepare(&dll, &path, &directory, display, fps, quality, &flag);
             if tx.send((id, result)).is_ok() {
                 // SAFETY: worker only posts completion; App owns and joins its lifetime on exit.
                 unsafe {
@@ -3519,8 +3524,13 @@ impl App {
             let surface = Surface::create(rect)?;
             #[cfg(test)]
             let surface = Surface::isolated(self.hwnd, rect)?;
-            let player =
-                Mpv::open_at(&decoder_path()?, surface.hwnd, self.hwnd, self.settings.fit)?;
+            let player = Mpv::open_at_with_quality(
+                &decoder_path()?,
+                surface.hwnd,
+                self.hwnd,
+                self.settings.fit,
+                self.settings.quality,
+            )?;
             player.pause(true)?;
             player.set_audio(audio_enabled)?;
             request = player.load(&prepared.path)?;
@@ -4335,6 +4345,59 @@ impl App {
         self.update_status();
         Ok(())
     }
+    fn change_quality(&mut self, quality: crate::core::Quality) -> Result<(), String> {
+        if self.settings.quality == quality {
+            return Ok(());
+        }
+        let old = self.settings.quality;
+        self.settings.quality = quality;
+        if let Err(error) = self.save() {
+            self.settings.quality = old;
+            return Err(error);
+        }
+        self.text(visuals::QUALITY, quality.label());
+        if !self.multi_dispatch && !self.displays.is_empty() {
+            for index in 0..self.displays.len() {
+                let active_source = self
+                    .settings
+                    .wallpapers
+                    .iter()
+                    .find(|(m, _)| m.eq_ignore_ascii_case(&self.displays[index].monitor))
+                    .map(|(_, p)| p.clone())
+                    .filter(|_| {
+                        let d = &self.displays[index];
+                        d.playback.is_some()
+                            || d.preparation.is_some()
+                            || d.dormant.is_some()
+                            || d.recovery.is_some()
+                    });
+                if let Some(path) = active_source {
+                    self.with_display(index, |app| {
+                        app.cancel_preparation();
+                        app.recovery = None;
+                        app.dormant = None;
+                        app.release_playback();
+                        app.start_path(&path)
+                    })?;
+                }
+            }
+            self.sync_audio()?;
+            self.arm_monitor()?;
+        } else if (self.playback.is_some()
+            || self.preparation.is_some()
+            || self.dormant.is_some()
+            || self.recovery.is_some())
+            && let Some(path) = self.settings.path.clone()
+        {
+            self.cancel_preparation();
+            self.recovery = None;
+            self.dormant = None;
+            self.release_playback();
+            self.start_path(&path)?;
+        }
+        self.update_status();
+        Ok(())
+    }
     fn action(&mut self, id: usize, notification: u32) -> Result<bool, String> {
         if id == visuals::SEARCH && notification == EN_CHANGE {
             let search = window_text(self.control(visuals::SEARCH));
@@ -4703,6 +4766,21 @@ impl App {
                     self.save()?;
                 }
             }
+            visuals::QUALITY => {
+                let labels: Vec<_> = crate::core::QUALITY_OPTIONS
+                    .iter()
+                    .map(|q| q.option_label().to_owned())
+                    .collect();
+                let selected = crate::core::QUALITY_OPTIONS
+                    .iter()
+                    .position(|q| *q == self.settings.quality)
+                    .unwrap_or(2);
+                if let Some(index) = self.selector(visuals::QUALITY, &labels, selected)?
+                    && let Some(quality) = crate::core::QUALITY_OPTIONS.get(index)
+                {
+                    self.change_quality(*quality)?;
+                }
+            }
             visuals::UPDATE_NOW => {
                 self.start_update_download()?;
             }
@@ -4726,6 +4804,20 @@ impl App {
             visuals::UPDATE_DISMISS => {
                 self.update_popup_dismissed = true;
                 crate::update_popup::dismiss(self.hwnd);
+            }
+            visuals::DECODER_NOW => {
+                if let Some(pending) = self.pending_decoder_apply.clone() {
+                    self.start_decoder_download(pending)?;
+                }
+            }
+            visuals::DECODER_DISMISS => {
+                self.pending_decoder_apply = None;
+                self.decoder_download_status = None;
+                if let Some((cancelled, _)) = &self.decoder_download_thread {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                crate::update_popup::dismiss_decoder(self.hwnd);
+                self.update_status();
             }
             visuals::CLOCK_ENABLE => {
                 let ctrl = self.control(visuals::CLOCK_ENABLE);
@@ -7616,11 +7708,12 @@ mod tests {
         .map_err(|e| e.to_string())?;
         let surface = Surface::isolated(app.hwnd, app.screen().rect)?;
         let surface_hwnd = surface.hwnd;
-        let player = Mpv::open_at(
+        let player = Mpv::open_at_with_quality(
             &root.join("runtime/libmpv-2.dll"),
             surface_hwnd,
             app.hwnd,
             Fit::Fill,
+            crate::core::Quality::Optimize,
         )?;
         app.playback = Some(Playback {
             player,
@@ -9313,6 +9406,28 @@ mod tests {
         let err = app.decoder_download_event().unwrap_err();
         assert_eq!(err, "network down");
         assert!(app.decoder_download_status.is_none());
+        assert!(app.pending_decoder_apply.is_some());
+
+        assert!(!app.action(visuals::DECODER_DISMISS, 0).unwrap());
         assert!(app.pending_decoder_apply.is_none());
+    }
+
+    #[test]
+    fn change_quality_updates_setting_and_persists() {
+        let mut app = fixture();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!("quality-change-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        app.config = dir.join("settings.ini");
+        app.change_quality(crate::core::Quality::Native).unwrap();
+        assert_eq!(app.settings.quality, crate::core::Quality::Native);
+        let decoded =
+            crate::core::Settings::decode(&fs::read_to_string(&app.config).unwrap()).unwrap();
+        assert_eq!(decoded.quality, crate::core::Quality::Native);
+        app.change_quality(crate::core::Quality::High).unwrap();
+        assert_eq!(app.settings.quality, crate::core::Quality::High);
+        let _ = fs::remove_file(&app.config);
+        let _ = fs::remove_dir(&dir);
     }
 }

@@ -93,6 +93,9 @@ pub const CLOCK_CTX_PICK_COLOR: usize = 172;
 pub const TRANSPARENT_BAR: usize = 173;
 pub const CLOCK_HEX_EDIT: usize = 174;
 pub const CLOCK_HEX_CONFIRM: usize = 175;
+pub const DECODER_NOW: usize = 176;
+pub const DECODER_DISMISS: usize = 177;
+pub const QUALITY: usize = 178;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 pub const HEADER_HEIGHT: i32 = 72;
@@ -113,8 +116,8 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
         id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
         107 | 108 | 121 | ACRYLIC | AUTO_UPDATES | CHECK_UPDATES | VERSION | CACHE_INFO
-        | CLEAR_CACHE | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE | SETTINGS_INFO
-        | SUPPORT | SAWERIA => tab == Tab::Settings,
+        | CLEAR_CACHE | QUALITY | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE
+        | SETTINGS_INFO | SUPPORT | SAWERIA => tab == Tab::Settings,
         CLOCK_ENABLE | CLOCK_LOCK | CLOCK_BEHIND_ICONS | CLOCK_24H | CLOCK_REPOSITION
         | CLOCK_RESET_POS | CLOCK_PICK_COLOR | CLOCK_HEX_EDIT | CLOCK_HEX_CONFIRM => {
             tab == Tab::Clock
@@ -186,7 +189,7 @@ pub struct Layout {
     pub caption_divider: Rect,
     pub caption_buttons: [(CaptionButton, Rect); 3],
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 55],
+    controls: [(usize, Rect); 56],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -356,7 +359,8 @@ impl Layout {
                 (SITE_BASE + 3, r(source_x, 352, source_width, 44)),
                 (SOURCES_NOTE, r(source_x, 412, source_width, 112)),
                 (SETTINGS_NOTE, settings_note),
-                (SETTINGS_INFO, r(resources_x, 344, column_width, 48)),
+                (SETTINGS_INFO, r(resources_x, 336, column_width, 40)),
+                (QUALITY, r(resources_x, 386, column_width, 34)),
             ],
         }
     }
@@ -517,6 +521,7 @@ fn control_surface(id: usize) -> (u32, u8) {
             | PRODUCT_WEBSITE
             | TRANSPARENT_BAR
             | CLEAR_CACHE
+            | QUALITY
             | CHECK_UPDATES
             | SUPPORT
             | SAWERIA
@@ -4029,7 +4034,7 @@ unsafe fn draw_item_into(
                 return false;
             }
         }
-        let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT);
+        let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT | QUALITY);
         let label_color = if disabled {
             DISABLED_TEXT
         } else if primary && pressed {
@@ -6915,13 +6920,14 @@ pub struct UpdatePopupLayout {
     pub update_btn: RECT,
     pub whats_new_btn: RECT,
     pub disable_link: RECT,
+    pub footer_visible: bool,
 }
 
 impl UpdatePopupLayout {
-    pub fn measure(dpi: i32, downloading: bool) -> Self {
+    pub fn measure_with_footer(dpi: i32, downloading: bool, footer_visible: bool) -> Self {
         let s = |n: i32| n * dpi.max(96) / 96;
         let width = s(368);
-        let height = s(154);
+        let height = if footer_visible { s(154) } else { s(126) };
         let update_w = if downloading { s(134) } else { s(88) };
         let btn_top = s(76);
         let btn_h = s(32);
@@ -6938,7 +6944,12 @@ impl UpdatePopupLayout {
             close: rect(width - s(40), s(14), width - s(12), s(42)),
             update_btn,
             whats_new_btn,
-            disable_link: rect(s(46), s(118), s(212), s(142)),
+            disable_link: if footer_visible {
+                rect(s(46), s(118), s(212), s(142))
+            } else {
+                rect(0, 0, 0, 0)
+            },
+            footer_visible,
         }
     }
 
@@ -6950,7 +6961,7 @@ impl UpdatePopupLayout {
             Some(UpdatePopupHit::Update)
         } else if contains(self.whats_new_btn) {
             Some(UpdatePopupHit::WhatsNew)
-        } else if contains(self.disable_link) {
+        } else if self.footer_visible && contains(self.disable_link) {
             Some(UpdatePopupHit::Disable)
         } else {
             None
@@ -6963,6 +6974,9 @@ pub(crate) struct UpdatePopupPaint<'a> {
     pub title: &'a str,
     pub subtitle: &'a str,
     pub update_label: &'a str,
+    pub secondary_label: &'a str,
+    pub secondary_external: bool,
+    pub footer_label: Option<&'a str>,
     pub downloading: bool,
     pub hover: Option<UpdatePopupHit>,
     pub pressed: Option<UpdatePopupHit>,
@@ -6979,6 +6993,9 @@ pub(crate) unsafe fn paint_update_popup_into(
     let title = paint.title;
     let subtitle = paint.subtitle;
     let update_label = paint.update_label;
+    let secondary_label = paint.secondary_label;
+    let secondary_external = paint.secondary_external;
+    let footer_label = paint.footer_label;
     let downloading = paint.downloading;
     let hover = paint.hover;
     let pressed = paint.pressed;
@@ -7208,55 +7225,62 @@ pub(crate) unsafe fn paint_update_popup_into(
                     sheen_strength: 0.03,
                 },
             );
-            let wn_text = rect(
-                layout.whats_new_btn.left + s(12),
-                layout.whats_new_btn.top,
-                layout.whats_new_btn.right - s(26),
-                layout.whats_new_btn.bottom,
-            );
+            let wn_text = if secondary_external {
+                rect(
+                    layout.whats_new_btn.left + s(12),
+                    layout.whats_new_btn.top,
+                    layout.whats_new_btn.right - s(26),
+                    layout.whats_new_btn.bottom,
+                )
+            } else {
+                layout.whats_new_btn
+            };
             label(
                 buffer.dc,
-                "What's new",
+                secondary_label,
                 wn_text,
                 s(13),
                 true,
                 TEXT,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
-            // External-link square + diagonal arrow icon.
-            let ix = layout.whats_new_btn.right - s(22);
-            let iy = (layout.whats_new_btn.top + layout.whats_new_btn.bottom) / 2 - s(5);
-            let box_sz = s(10).max(8);
-            let ext_pen = CreatePen(PS_SOLID, stroke, rgb(MUTED));
-            let old_ext = SelectObject(buffer.dc, ext_pen);
-            let _ = MoveToEx(buffer.dc, ix + box_sz / 2, iy, None);
-            let _ = LineTo(buffer.dc, ix, iy);
-            let _ = LineTo(buffer.dc, ix, iy + box_sz);
-            let _ = LineTo(buffer.dc, ix + box_sz, iy + box_sz);
-            let _ = LineTo(buffer.dc, ix + box_sz, iy + box_sz / 2);
-            let _ = MoveToEx(buffer.dc, ix + box_sz / 2, iy + box_sz / 2, None);
-            let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy - s(1));
-            let _ = MoveToEx(buffer.dc, ix + box_sz - s(3), iy - s(1), None);
-            let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy - s(1));
-            let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy + s(3));
-            SelectObject(buffer.dc, old_ext);
-            let _ = DeleteObject(ext_pen);
-            let _ = buffer.tint_background(
-                rect(ix - 2, iy - 3, ix + box_sz + s(4), iy + box_sz + 3),
-                255,
-            );
+            if secondary_external {
+                // External-link square + diagonal arrow icon.
+                let ix = layout.whats_new_btn.right - s(22);
+                let iy = (layout.whats_new_btn.top + layout.whats_new_btn.bottom) / 2 - s(5);
+                let box_sz = s(10).max(8);
+                let ext_pen = CreatePen(PS_SOLID, stroke, rgb(MUTED));
+                let old_ext = SelectObject(buffer.dc, ext_pen);
+                let _ = MoveToEx(buffer.dc, ix + box_sz / 2, iy, None);
+                let _ = LineTo(buffer.dc, ix, iy);
+                let _ = LineTo(buffer.dc, ix, iy + box_sz);
+                let _ = LineTo(buffer.dc, ix + box_sz, iy + box_sz);
+                let _ = LineTo(buffer.dc, ix + box_sz, iy + box_sz / 2);
+                let _ = MoveToEx(buffer.dc, ix + box_sz / 2, iy + box_sz / 2, None);
+                let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy - s(1));
+                let _ = MoveToEx(buffer.dc, ix + box_sz - s(3), iy - s(1), None);
+                let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy - s(1));
+                let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy + s(3));
+                SelectObject(buffer.dc, old_ext);
+                let _ = DeleteObject(ext_pen);
+                let _ = buffer.tint_background(
+                    rect(ix - 2, iy - 3, ix + box_sz + s(4), iy + box_sz + 3),
+                    255,
+                );
+            }
 
-            // Bottom subtle action link ("Don't check for updates").
-            let d_hot = hover == Some(UpdatePopupHit::Disable);
-            label(
-                buffer.dc,
-                "Don't check for updates",
-                layout.disable_link,
-                s(12),
-                false,
-                if d_hot { TEXT } else { MUTED },
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
+            if let Some(footer_text) = footer_label.filter(|_| layout.footer_visible) {
+                let d_hot = hover == Some(UpdatePopupHit::Disable);
+                label(
+                    buffer.dc,
+                    footer_text,
+                    layout.disable_link,
+                    s(12),
+                    false,
+                    if d_hot { TEXT } else { MUTED },
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
             theme.0 != 0 || buffer.opaque()
         })();
         drop(_text_guard);
@@ -8354,7 +8378,13 @@ mod tests {
                 assert!(area(id).bottom < area(SOURCES_NOTE).top);
             }
             assert!(area(SOURCES_NOTE).bottom < layout.footer.top);
-            assert!(area(SETTINGS_INFO).bottom < area(SUPPORT).top);
+            assert!(area(SETTINGS_INFO).bottom < area(QUALITY).top);
+            assert!(area(QUALITY).bottom < area(SUPPORT).top);
+            assert!(visible_on(Tab::Settings, QUALITY));
+            assert!(!visible_on(Tab::Library, QUALITY));
+            assert!(!visible_on(Tab::Clock, QUALITY));
+            assert_eq!(area(QUALITY).left, area(CLEAR_CACHE).left);
+            assert_eq!(area(QUALITY).right, area(CLEAR_CACHE).right);
             assert!(visible_on(Tab::Settings, CHECK_UPDATES));
             assert!(!visible_on(Tab::Library, CHECK_UPDATES));
             assert!(area(CHECK_UPDATES).left > area(VERSION).right);
@@ -9895,7 +9925,7 @@ mod tests {
     fn update_popup_layout_and_buffered_paint_render_cleanly() {
         clear();
         for dpi in [96, 144] {
-            let layout = UpdatePopupLayout::measure(dpi, false);
+            let layout = UpdatePopupLayout::measure_with_footer(dpi, false, true);
             assert!(layout.width >= 368 && layout.height >= 154);
             assert!(layout.update_btn.right < layout.whats_new_btn.left);
             assert_eq!(
@@ -9915,11 +9945,18 @@ mod tests {
                 Some(UpdatePopupHit::Disable)
             );
             assert_eq!(layout.hit_test(2, 2), None);
+
+            let decoder_layout = UpdatePopupLayout::measure_with_footer(dpi, false, false);
+            assert!(decoder_layout.height < layout.height);
+            assert_eq!(
+                decoder_layout.hit_test(layout.disable_link.left + 4, layout.disable_link.top + 4),
+                None
+            );
         }
 
         // SAFETY: offscreen DIB created and destroyed solely within this test.
         unsafe {
-            let layout = UpdatePopupLayout::measure(96, false);
+            let layout = UpdatePopupLayout::measure_with_footer(96, false, true);
             let area = rect(0, 0, layout.width, layout.height);
             let dc = CreateCompatibleDC(None);
             let mut bits = std::ptr::null_mut();
@@ -9952,6 +9989,9 @@ mod tests {
                     title: "WallpaperLive 0.2.2 is out",
                     subtitle: "You are on 0.2.1. Read what changed, or update now.",
                     update_label: "Update",
+                    secondary_label: "What's new",
+                    secondary_external: true,
+                    footer_label: Some("Don't check for updates"),
                     downloading: false,
                     hover: Some(UpdatePopupHit::WhatsNew),
                     pressed: None,

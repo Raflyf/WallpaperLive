@@ -1,4 +1,4 @@
-use crate::core::Fit;
+use crate::core::{Fit, Quality};
 #[path = "gpu.rs"]
 mod gpu;
 use std::{
@@ -448,6 +448,80 @@ fn worker_error(player: &Mpv, event: &RawEvent) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct RenderProfile {
+    scale: &'static str,
+    cscale: &'static str,
+    dscale: &'static str,
+    fbo_format: &'static str,
+    dither_depth: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct EncodeProfile {
+    filter_flags: &'static str,
+    ovcopts: &'static str,
+}
+
+fn render_profile(quality: Quality) -> RenderProfile {
+    match quality {
+        Quality::Native | Quality::High => RenderProfile {
+            scale: "spline36",
+            cscale: "spline36",
+            dscale: "spline36",
+            fbo_format: "rgba16f",
+            dither_depth: "auto",
+        },
+        Quality::Optimize => RenderProfile {
+            scale: "catmull_rom",
+            cscale: "bilinear",
+            dscale: "catmull_rom",
+            fbo_format: "rgba16f",
+            dither_depth: "auto",
+        },
+        Quality::Medium => RenderProfile {
+            scale: "bilinear",
+            cscale: "bilinear",
+            dscale: "bilinear",
+            fbo_format: "rgba8",
+            dither_depth: "auto",
+        },
+        Quality::Low => RenderProfile {
+            scale: "bilinear",
+            cscale: "bilinear",
+            dscale: "bilinear",
+            fbo_format: "rgba8",
+            dither_depth: "no",
+        },
+    }
+}
+
+fn encode_profile(quality: Quality) -> EncodeProfile {
+    match quality {
+        Quality::Native => EncodeProfile {
+            filter_flags: "lanczos",
+            ovcopts: "preset=medium,crf=15,threads=2,rc-lookahead=25,refs=3",
+        },
+        Quality::High => EncodeProfile {
+            filter_flags: "lanczos",
+            ovcopts: "preset=medium,crf=17,threads=2,rc-lookahead=25,refs=3",
+        },
+        Quality::Optimize => EncodeProfile {
+            filter_flags: "bicubic",
+            ovcopts: "preset=fast,crf=19,threads=2,rc-lookahead=16,refs=2",
+        },
+        Quality::Medium => EncodeProfile {
+            filter_flags: "bicubic",
+            ovcopts: "preset=veryfast,crf=22,threads=2,rc-lookahead=10,refs=1",
+        },
+        Quality::Low => EncodeProfile {
+            filter_flags: "bilinear",
+            ovcopts: "preset=veryfast,crf=26,threads=2,rc-lookahead=8,refs=1",
+        },
+    }
+}
+
+#[cfg(test)]
 pub fn encode(
     dll: &Path,
     source: &Path,
@@ -455,6 +529,29 @@ pub fn encode(
     width: u32,
     height: u32,
     fps: u32,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    encode_with_quality(
+        dll,
+        source,
+        output,
+        width,
+        height,
+        fps,
+        Quality::Optimize,
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encode_with_quality(
+    dll: &Path,
+    source: &Path,
+    output: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    quality: Quality,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -495,17 +592,16 @@ pub fn encode(
         270 => "transpose=cclock,",
         _ => "",
     };
+    let encode_cfg = encode_profile(quality);
     let filter = format!(
-        "lavfi=graph=[{rotate}scale=w={width}:h={height}:flags=bicubic,setsar=1,fps={rate:.6}:round=near,format=yuv420p]:o=[threads=2]"
+        "lavfi=graph=[{rotate}scale=w={width}:h={height}:flags={},setsar=1,fps={rate:.6}:round=near,format=yuv420p]:o=[threads=2]",
+        encode_cfg.filter_flags
     );
     for (name, value) in [
         ("of", "mp4"),
         ("ovc", "libx264"),
         // FFmpeg names this AVOption "refs"; "ref" is only valid inside x264-params.
-        (
-            "ovcopts",
-            "preset=veryfast,crf=23,threads=2,rc-lookahead=10,refs=1",
-        ),
+        ("ovcopts", encode_cfg.ovcopts),
         ("oac", "aac"),
         ("oacopts", "b=128000,threads=2"),
         ("aid", "auto"),
@@ -647,20 +743,27 @@ impl Mpv {
             .check(unsafe { (player.api.logs)(handle, c"error".as_ptr()) })?;
         Ok(player)
     }
-    pub fn open_at(dll: &Path, host: HWND, notify: HWND, fit: Fit) -> Result<Self, String> {
+    pub fn open_at_with_quality(
+        dll: &Path,
+        host: HWND,
+        notify: HWND,
+        fit: Fit,
+        quality: Quality,
+    ) -> Result<Self, String> {
         if let Some(adapter) = gpu::preferred_adapter() {
-            match Self::open_with_adapter(dll, host, notify, fit, Some(&adapter)) {
+            match Self::open_with_adapter(dll, host, notify, fit, quality, Some(&adapter)) {
                 Ok(player) => return Ok(player),
-                Err(_) => return Self::open_with_adapter(dll, host, notify, fit, None),
+                Err(_) => return Self::open_with_adapter(dll, host, notify, fit, quality, None),
             }
         }
-        Self::open_with_adapter(dll, host, notify, fit, None)
+        Self::open_with_adapter(dll, host, notify, fit, quality, None)
     }
     fn open_with_adapter(
         dll: &Path,
         host: HWND,
         notify: HWND,
         fit: Fit,
+        quality: Quality,
         adapter: Option<&str>,
     ) -> Result<Self, String> {
         let api = Api::load(dll)?;
@@ -670,6 +773,7 @@ impl Mpv {
             return Err("Could not create decoder".into());
         }
         let player = Self::from_handle(handle, api);
+        let render = render_profile(quality);
         for (name, value) in [
             ("config", "no"),
             ("load-scripts", "no"),
@@ -705,11 +809,11 @@ impl Mpv {
             // ponytail: cap GPU decode surface pool and skip frame-exact resume seeks on low-VRAM laptops.
             ("hwdec-extra-frames", "3"),
             ("hr-seek", "no"),
-            ("scale", "bilinear"),
-            ("cscale", "bilinear"),
-            ("dscale", "bilinear"),
-            ("fbo-format", "rgba8"),
-            ("dither-depth", "no"),
+            ("scale", render.scale),
+            ("cscale", render.cscale),
+            ("dscale", render.dscale),
+            ("fbo-format", render.fbo_format),
+            ("dither-depth", render.dither_depth),
             ("framedrop", "vo"),
             ("d3d11-flip", "no"),
             ("border", "no"),
@@ -1370,11 +1474,12 @@ mod tests {
     }
     #[test]
     fn missing_decoder_has_actionable_error() {
-        let error = Mpv::open_at(
+        let error = Mpv::open_at_with_quality(
             Path::new(r"C:\missing-decoder-931251\libmpv-2.dll"),
             HWND::default(),
             HWND::default(),
             Fit::Fill,
+            Quality::Optimize,
         )
         .err()
         .unwrap();

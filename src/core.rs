@@ -3,6 +3,67 @@ use std::path::{Path, PathBuf};
 pub const FPS_OPTIONS: [u32; 4] = [24, 30, 45, 60];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Quality {
+    Native,
+    High,
+    #[default]
+    Optimize,
+    Medium,
+    Low,
+}
+
+pub const QUALITY_OPTIONS: [Quality; 5] = [
+    Quality::Native,
+    Quality::High,
+    Quality::Optimize,
+    Quality::Medium,
+    Quality::Low,
+];
+
+impl Quality {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::High => "high",
+            Self::Optimize => "optimize",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "native" => Some(Self::Native),
+            "high" => Some(Self::High),
+            "optimize" => Some(Self::Optimize),
+            "medium" => Some(Self::Medium),
+            "low" => Some(Self::Low),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Native => "Quality: Native",
+            Self::High => "Quality: High",
+            Self::Optimize => "Quality: Optimize",
+            Self::Medium => "Quality: Medium",
+            Self::Low => "Quality: Low",
+        }
+    }
+
+    pub fn option_label(self) -> &'static str {
+        match self {
+            Self::Native => "Native (Original, sharpest)",
+            Self::High => "High (Near-lossless)",
+            Self::Optimize => "Optimize (Balanced, clean)",
+            Self::Medium => "Medium (Lighter GPU)",
+            Self::Low => "Low (Battery / 720p)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Fit {
     #[default]
     Fill,
@@ -19,6 +80,7 @@ pub struct Settings {
     pub audio_enabled: bool,
     pub pause_fullscreen: bool,
     pub fps: u32,
+    pub quality: Quality,
     pub acrylic_blur: bool,
     pub auto_update_check: bool,
     pub clock_enabled: bool,
@@ -42,6 +104,7 @@ impl Default for Settings {
             audio_enabled: false,
             pause_fullscreen: true,
             fps: 30,
+            quality: Quality::Optimize,
             acrylic_blur: false,
             auto_update_check: true,
             clock_enabled: false,
@@ -111,6 +174,9 @@ impl Settings {
         if self.acrylic_blur {
             content.push_str("acrylic=true\n");
         }
+        if self.quality != Quality::Optimize {
+            content.push_str(&format!("quality={}\n", self.quality.key()));
+        }
         if !self.auto_update_check {
             content.push_str("updates=false\n");
         }
@@ -152,6 +218,7 @@ impl Settings {
         }
         let mut lines: Vec<_> = text.lines().collect();
         let mut acrylic = None;
+        let mut quality = None;
         let mut auto_update_check = None;
         let mut clock_enabled = None;
         let mut clock_locked = None;
@@ -173,6 +240,11 @@ impl Settings {
                 {
                     lines.pop();
                     acrylic = Some(parse_bool(v, "Invalid acrylic blur setting")?);
+                } else if let Some(v) = last.strip_prefix("quality=")
+                    && quality.is_none()
+                {
+                    lines.pop();
+                    quality = Some(Quality::from_key(v).ok_or("Invalid quality preset setting")?);
                 } else if let Some(v) = last.strip_prefix("updates=")
                     && auto_update_check.is_none()
                 {
@@ -343,6 +415,7 @@ impl Settings {
             audio_enabled,
             pause_fullscreen,
             fps,
+            quality: quality.unwrap_or(Quality::Optimize),
             acrylic_blur: acrylic.unwrap_or(false),
             auto_update_check: auto_update_check.unwrap_or(true),
             clock_enabled: clock_enabled.unwrap_or(false),
@@ -519,6 +592,7 @@ mod tests {
             audio_enabled: true,
             pause_fullscreen: false,
             fps: 45,
+            quality: Quality::High,
             acrylic_blur: true,
             auto_update_check: false,
             clock_enabled: true,
@@ -802,5 +876,20 @@ mod tests {
         assert!(
             validate_media(Path::new(r"C:\definitely-missing-wallpaper-3f491927.mp4")).is_err()
         );
+    }
+
+    #[test]
+    fn quality_preferences_encode_decode_and_reject_invalid() {
+        assert_eq!(Settings::default().quality, Quality::Optimize);
+        for quality in QUALITY_OPTIONS {
+            let settings = Settings {
+                quality,
+                ..Settings::default()
+            };
+            let decoded = Settings::decode(&settings.encode().unwrap()).unwrap();
+            assert_eq!(decoded.quality, quality);
+        }
+        let invalid = format!("{}quality=ultra\n", Settings::default().encode().unwrap());
+        assert!(Settings::decode(&invalid).is_err());
     }
 }
