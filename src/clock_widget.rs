@@ -578,35 +578,44 @@ impl Drop for ClockInput {
 const CLOCK_INPUT_CLASS: PCWSTR = w!("WallpaperLive.ClockInput");
 const CLOCK_INPUT_REFRESH: u32 = WM_APP + 81;
 
-fn desktop_shortcut_rects(view: HWND) -> Option<Vec<RECT>> {
+fn desktop_shortcut_rects(view: HWND) -> Vec<RECT> {
     use windows::Win32::{System::Com::*, UI::Accessibility::*};
-    // SAFETY: MSAA marshals Explorer's accessible child bounds; no remote LVHITTESTINFO pointers.
+    if view.0.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: MSAA marshals Explorer's accessible child bounds; skip any individual item errors.
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
-        let result = (|| {
+        let rects = (|| {
             let mut raw = std::ptr::null_mut();
-            AccessibleObjectFromWindow(view, OBJID_CLIENT.0 as u32, &IAccessible::IID, &mut raw)
-                .ok()?;
-            if raw.is_null() {
-                return None;
+            if AccessibleObjectFromWindow(view, OBJID_CLIENT.0 as u32, &IAccessible::IID, &mut raw)
+                .is_err()
+                || raw.is_null()
+            {
+                return Vec::new();
             }
             let acc = IAccessible::from_raw(raw);
-            let count = acc.accChildCount().ok()?;
+            let Ok(count) = acc.accChildCount() else {
+                return Vec::new();
+            };
             if !(0..=4096).contains(&count) {
-                return None;
+                return Vec::new();
             }
             let mut rects = Vec::with_capacity(count as usize);
             for child in 1..=count {
                 let (mut x, mut y, mut w, mut h) = (0, 0, 0, 0);
-                acc.accLocation(
-                    &mut x,
-                    &mut y,
-                    &mut w,
-                    &mut h,
-                    &windows::core::VARIANT::from(child),
-                )
-                .ok()?;
-                if w > 0 && h > 0 {
+                if acc
+                    .accLocation(
+                        &mut x,
+                        &mut y,
+                        &mut w,
+                        &mut h,
+                        &windows::core::VARIANT::from(child),
+                    )
+                    .is_ok()
+                    && w > 0
+                    && h > 0
+                {
                     rects.push(RECT {
                         left: x,
                         top: y,
@@ -615,12 +624,12 @@ fn desktop_shortcut_rects(view: HWND) -> Option<Vec<RECT>> {
                     });
                 }
             }
-            Some(rects)
+            rects
         })();
         if initialized {
             CoUninitialize();
         }
-        result
+        rects
     }
 }
 
@@ -647,13 +656,13 @@ unsafe extern "system" fn clock_input_event(
     let state = CLOCK_RUNTIME.with(|s| {
         s.borrow()
             .as_ref()
+            .filter(|r| !r.dragging)
             .and_then(|r| Some((r.input.as_ref()?.hwnd, r.cached_layer?.icons)))
     });
     if let Some((input, icons)) = state {
         unsafe {
             if event_hwnd == icons || IsChild(icons, event_hwnd).as_bool() {
-                let _ = ShowWindow(input, SW_HIDE);
-                let _ = SetTimer(input, CLOCK_INPUT_REFRESH as usize, 60, None);
+                let _ = SetTimer(input, CLOCK_INPUT_REFRESH as usize, 80, None);
             }
         }
     }
@@ -686,17 +695,11 @@ fn sync_clock_input() {
         return;
     }
     let layer = layer.unwrap();
-    // SAFETY: the input-only child stays inside Explorer's icon layer, never topmost above apps.
+    // SAFETY: unowned WS_POPUP input handle sits above desktop/below apps so Explorer never buries or blocks it.
     unsafe {
-        let Ok(view) = FindWindowExW(layer.icons, None, w!("SysListView32"), PCWSTR::null()) else {
-            return;
-        };
-        let Some(exclusions) = desktop_shortcut_rects(view) else {
-            if let Some(input) = input {
-                let _ = ShowWindow(input, SW_HIDE);
-            }
-            return;
-        };
+        let view = FindWindowExW(layer.icons, None, w!("SysListView32"), PCWSTR::null())
+            .unwrap_or_default();
+        let exclusions = desktop_shortcut_rects(view);
         let hwnd = if let Some(input) = input {
             input
         } else {
@@ -714,15 +717,15 @@ fn sync_clock_input() {
                 return;
             };
             let Ok(hwnd) = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_NOACTIVATE,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 CLOCK_INPUT_CLASS,
                 w!("WallpaperLive clock drag handle"),
-                WS_CHILD,
+                WS_POPUP,
                 0,
                 0,
                 w,
                 h,
-                layer.icons,
+                HWND::default(),
                 None,
                 instance,
                 None,
@@ -756,11 +759,6 @@ fn sync_clock_input() {
         if GetWindowRect(HWND(raw as *mut c_void), &mut area).is_err() {
             return;
         }
-        let mut origin = [POINT {
-            x: area.left,
-            y: area.top,
-        }];
-        MapWindowPoints(None, layer.icons, &mut origin);
         let handle = drag_handle_rect(w, h);
         let region = windows::Win32::Graphics::Gdi::CreateRectRgnIndirect(&handle);
         if region.0.is_null() {
@@ -787,15 +785,7 @@ fn sync_clock_input() {
             let _ = DeleteObject(HGDIOBJ(region.0));
             return;
         }
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOP,
-            origin[0].x,
-            origin[0].y,
-            w,
-            h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
+        place_popup_on_desktop(hwnd, area.left, area.top, w, h, true, false);
     }
 }
 
@@ -812,12 +802,40 @@ unsafe extern "system" fn clock_input_proc(
         }
         match msg {
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            WM_QUERYOPEN => LRESULT(1),
+            WM_SYSCOMMAND => {
+                let cmd = (wp.0 & 0xFFF0) as u32;
+                if cmd == SC_MINIMIZE || cmd == SC_MAXIMIZE {
+                    return LRESULT(0);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_WINDOWPOSCHANGING => {
+                if lp.0 != 0 {
+                    let pos = &mut *(lp.0 as *mut WINDOWPOS);
+                    if !ALLOW_INTERNAL_HIDE.with(Cell::get) {
+                        pos.flags.0 &= !SWP_HIDEWINDOW.0;
+                    }
+                    if !IN_ZORDER_SYNC.with(Cell::get) {
+                        if (pos.flags.0 & SWP_NOMOVE.0 == 0) && (pos.x <= -30000 || pos.y <= -30000)
+                        {
+                            pos.flags |= SWP_NOMOVE | SWP_NOSIZE;
+                        }
+                        if pos.flags.0 & SWP_NOZORDER.0 == 0 {
+                            pos.flags |= SWP_NOZORDER;
+                        }
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_NCHITTEST => LRESULT(HTCLIENT as isize),
             WM_LBUTTONDOWN => {
+                let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
                 let result = SendMessageW(clock, msg, wp, lp);
                 if CLOCK_RUNTIME.with(|s| s.borrow().as_ref().is_some_and(|r| r.dragging)) {
-                    let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
                     let _ = SetCapture(hwnd);
+                } else {
+                    sync_clock_input();
                 }
                 result
             }
@@ -827,19 +845,12 @@ unsafe extern "system" fn clock_input_proc(
                     && CLOCK_RUNTIME.with(|s| s.borrow().as_ref().is_some_and(|r| r.dragging))
                 {
                     let mut rect = RECT::default();
-                    if GetWindowRect(clock, &mut rect).is_ok()
-                        && let Ok(parent) = GetParent(hwnd)
-                    {
-                        let mut pt = [POINT {
-                            x: rect.left,
-                            y: rect.top,
-                        }];
-                        MapWindowPoints(None, parent, &mut pt);
+                    if GetWindowRect(clock, &mut rect).is_ok() {
                         let _ = SetWindowPos(
                             hwnd,
                             None,
-                            pt[0].x,
-                            pt[0].y,
+                            rect.left,
+                            rect.top,
                             0,
                             0,
                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
@@ -1056,12 +1067,20 @@ unsafe extern "system" fn win_event_proc(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    let (clock_raw, behind) = CLOCK_RUNTIME.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map_or((0, false), |r| (r.hwnd, r.behind_attached))
+    let (clock_raw, behind, input_raw) = CLOCK_RUNTIME.with(|s| {
+        s.borrow().as_ref().map_or((0, false, 0), |r| {
+            (
+                r.hwnd,
+                r.behind_attached,
+                r.input.as_ref().map_or(0, |i| i.hwnd.0 as isize),
+            )
+        })
     });
-    if clock_raw == 0 || behind || event_hwnd.0 as isize == clock_raw {
+    if clock_raw == 0
+        || (behind && input_raw == 0)
+        || event_hwnd.0 as isize == clock_raw
+        || event_hwnd.0 as isize == input_raw
+    {
         return;
     }
     ensure_desktop_visible();
@@ -1266,10 +1285,11 @@ pub fn ensure_desktop_visible() {
                 rt.behind_attached,
                 rt.cached_layer,
                 rt.repositioning,
+                rt.input.as_ref().map(|i| i.hwnd),
             ))
         })
     });
-    let Some((raw, behind_attached, cached_layer, repositioning)) = state else {
+    let Some((raw, behind_attached, cached_layer, repositioning, input_hwnd)) = state else {
         return;
     };
     let hwnd = HWND(raw as *mut c_void);
@@ -1297,6 +1317,12 @@ pub fn ensure_desktop_visible() {
                 );
             }
             IN_ZORDER_SYNC.with(|g| g.set(false));
+        }
+        if let Some(input) = input_hwnd
+            && unsafe { IsWindow(input).as_bool() }
+        {
+            restore_if_iconic(input);
+            place_popup_on_desktop(input, 0, 0, 0, 0, false, false);
         }
     } else {
         place_popup_on_desktop(hwnd, 0, 0, 0, 0, false, repositioning);
@@ -1549,11 +1575,7 @@ fn sync_inner(owner: HWND, action_msg: u32, cfg: ClockConfig, repositioning: boo
             pop
         };
 
-        let hooks = if attached_behind {
-            [0, 0]
-        } else {
-            install_events()
-        };
+        let hooks = install_events();
         let now = unsafe { local_time() };
         unsafe {
             let _ = SetTimer(
@@ -3019,7 +3041,9 @@ unsafe extern "system" fn clock_proc(
                         rt.drag_offset_y = cur.y - wr.top;
                     }
                 });
-                let _ = SetCapture(hwnd);
+                if !CLOCK_RUNTIME.with(|s| s.borrow().as_ref().is_some_and(|r| r.behind_attached)) {
+                    let _ = SetCapture(hwnd);
+                }
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
@@ -3944,18 +3968,16 @@ mod tests {
                 });
             });
             render_and_place(fixture.clock);
-            let input = FindWindowExW(
-                fixture.panel,
-                None,
-                w!("WallpaperLive.ClockInput"),
-                PCWSTR::null(),
-            );
+            let input = CLOCK_RUNTIME.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .and_then(|r| r.input.as_ref().map(|i| i.hwnd))
+            });
             assert!(
-                input.is_ok(),
-                "behind-icons clock needs a native input child above the icon view"
+                input.is_some(),
+                "behind-icons clock needs an input handle above the desktop"
             );
             let input = input.unwrap();
-            assert_eq!(GetParent(input).unwrap(), fixture.panel);
             assert_eq!(
                 GetWindowLongPtrW(input, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
                 0
@@ -4049,7 +4071,7 @@ mod tests {
             CLOCK_RUNTIME.with(|s| s.borrow_mut().as_mut().unwrap().cfg.locked = false);
             sync_clock_input();
             let input =
-                FindWindowExW(fixture.panel, None, CLOCK_INPUT_CLASS, PCWSTR::null()).unwrap();
+                CLOCK_RUNTIME.with(|s| s.borrow().as_ref().unwrap().input.as_ref().unwrap().hwnd);
             use windows::Win32::UI::Controls::{
                 LVIF_TEXT, LVITEMW, LVM_INSERTITEMW, LVM_SETITEMPOSITION,
             };
@@ -4075,7 +4097,7 @@ mod tests {
                 WPARAM(0),
                 LPARAM(100 | (100 << 16)),
             );
-            let icons = desktop_shortcut_rects(list).expect("native icon view bounds");
+            let icons = desktop_shortcut_rects(list);
             assert_eq!(icons.len(), 1);
             let center = POINT {
                 x: (icons[0].left + icons[0].right) / 2,
