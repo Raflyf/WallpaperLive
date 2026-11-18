@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 [CmdletBinding()]
 param([string]$OutputDirectory, [string]$AppExe)
 
@@ -99,22 +99,22 @@ if ($LASTEXITCODE -ne 0) { throw "WiX light linking failed (exit $LASTEXITCODE).
 
 if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "Compiler produced no installer: $output" }
 
-$msiInstaller = New-Object -ComObject WindowsInstaller.Installer
-$db = $msiInstaller.OpenDatabase($output, 0)
+function Invoke-Com($target, [string]$member, [string]$kind, $arguments) {
+    return $target.GetType().InvokeMember($member, [Reflection.BindingFlags]$kind, $null, $target, $arguments)
+}
+$msiInstaller = [Activator]::CreateInstance([Type]::GetTypeFromProgID('WindowsInstaller.Installer'))
+$db = Invoke-Com $msiInstaller 'OpenDatabase' 'InvokeMethod' @($output, 0)
 function Get-MsiProperty([string]$prop) {
-    $view = $db.OpenView("SELECT Value FROM Property WHERE Property='$prop'")
-    $view.Execute()
-    $rec = $view.Fetch()
-    $val = if ($rec) { $rec.StringData(1) } else { '' }
-    $view.Close()
+    $view = Invoke-Com $db 'OpenView' 'InvokeMethod' @("SELECT Value FROM Property WHERE Property='$prop'")
+    [void](Invoke-Com $view 'Execute' 'InvokeMethod' $null)
+    $rec = Invoke-Com $view 'Fetch' 'InvokeMethod' $null
+    $val = if ($rec) { [string](Invoke-Com $rec 'StringData' 'GetProperty' @(1)) } else { '' }
+    [void](Invoke-Com $view 'Close' 'InvokeMethod' $null)
     return $val
 }
 $msiVersion = (Get-MsiProperty 'ProductVersion').Trim()
 $msiName = (Get-MsiProperty 'ProductName').Trim()
 $msiManufacturer = (Get-MsiProperty 'Manufacturer').Trim()
-[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($db)
-[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($msiInstaller)
-
 if ($msiVersion -ne $version -or $msiName -ne 'WallpaperLive' -or $msiManufacturer -ne 'Raflyf') {
     throw "Installer MSI metadata mismatch: Name=$msiName, Manufacturer=$msiManufacturer, Version=$msiVersion, expected=$version."
 }
