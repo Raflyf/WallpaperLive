@@ -99,22 +99,49 @@ if ($LASTEXITCODE -ne 0) { throw "WiX light linking failed (exit $LASTEXITCODE).
 
 if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "Compiler produced no installer: $output" }
 
-function Invoke-Com($target, [string]$member, [string]$kind, $arguments) {
-    return $target.GetType().InvokeMember($member, [Reflection.BindingFlags]$kind, $null, $target, $arguments)
+if (-not ([Management.Automation.PSTypeName]'WallpaperLiveMsiReader').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class WallpaperLiveMsiReader {
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+    static extern uint MsiOpenDatabase(string szDatabasePath, IntPtr szPersist, out IntPtr phDatabase);
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+    static extern uint MsiDatabaseOpenView(IntPtr hDatabase, string szQuery, out IntPtr phView);
+    [DllImport("msi.dll")]
+    static extern uint MsiViewExecute(IntPtr hView, IntPtr hRecord);
+    [DllImport("msi.dll")]
+    static extern uint MsiViewFetch(IntPtr hView, out IntPtr phRecord);
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+    static extern uint MsiRecordGetString(IntPtr hRecord, uint iField, StringBuilder szValueBuf, ref uint pcchValueBuf);
+    [DllImport("msi.dll")]
+    static extern uint MsiCloseHandle(IntPtr hAny);
+
+    public static string GetProperty(string msiPath, string name) {
+        IntPtr db = IntPtr.Zero, view = IntPtr.Zero, rec = IntPtr.Zero;
+        try {
+            if (MsiOpenDatabase(msiPath, IntPtr.Zero, out db) != 0) throw new Exception("MsiOpenDatabase failed.");
+            if (MsiDatabaseOpenView(db, "SELECT `Value` FROM `Property` WHERE `Property` = '" + name + "'", out view) != 0) throw new Exception("MsiDatabaseOpenView failed.");
+            if (MsiViewExecute(view, IntPtr.Zero) != 0) throw new Exception("MsiViewExecute failed.");
+            if (MsiViewFetch(view, out rec) != 0 || rec == IntPtr.Zero) return "";
+            uint len = 512;
+            var sb = new StringBuilder((int)len);
+            if (MsiRecordGetString(rec, 1, sb, ref len) != 0) return "";
+            return sb.ToString();
+        } finally {
+            if (rec != IntPtr.Zero) MsiCloseHandle(rec);
+            if (view != IntPtr.Zero) MsiCloseHandle(view);
+            if (db != IntPtr.Zero) MsiCloseHandle(db);
+        }
+    }
 }
-$msiInstaller = [Activator]::CreateInstance([Type]::GetTypeFromProgID('WindowsInstaller.Installer'))
-$db = Invoke-Com $msiInstaller 'OpenDatabase' 'InvokeMethod' @($output, 0)
-function Get-MsiProperty([string]$prop) {
-    $view = Invoke-Com $db 'OpenView' 'InvokeMethod' @("SELECT Value FROM Property WHERE Property='$prop'")
-    [void](Invoke-Com $view 'Execute' 'InvokeMethod' $null)
-    $rec = Invoke-Com $view 'Fetch' 'InvokeMethod' $null
-    $val = if ($rec) { [string](Invoke-Com $rec 'StringData' 'GetProperty' @(1)) } else { '' }
-    [void](Invoke-Com $view 'Close' 'InvokeMethod' $null)
-    return $val
+'@
 }
-$msiVersion = (Get-MsiProperty 'ProductVersion').Trim()
-$msiName = (Get-MsiProperty 'ProductName').Trim()
-$msiManufacturer = (Get-MsiProperty 'Manufacturer').Trim()
+$msiVersion = ([WallpaperLiveMsiReader]::GetProperty($output, 'ProductVersion')).Trim()
+$msiName = ([WallpaperLiveMsiReader]::GetProperty($output, 'ProductName')).Trim()
+$msiManufacturer = ([WallpaperLiveMsiReader]::GetProperty($output, 'Manufacturer')).Trim()
 if ($msiVersion -ne $version -or $msiName -ne 'WallpaperLive' -or $msiManufacturer -ne 'Raflyf') {
     throw "Installer MSI metadata mismatch: Name=$msiName, Manufacturer=$msiManufacturer, Version=$msiVersion, expected=$version."
 }
