@@ -92,6 +92,7 @@ pub const CLOCK_PICK_COLOR: usize = 171;
 pub const CLOCK_CTX_PICK_COLOR: usize = 172;
 pub const TRANSPARENT_BAR: usize = 173;
 pub const CLOCK_HEX_EDIT: usize = 174;
+pub const CLOCK_HEX_CONFIRM: usize = 175;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 pub const HEADER_HEIGHT: i32 = 72;
@@ -115,7 +116,9 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         | CLEAR_CACHE | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE | SETTINGS_INFO
         | SUPPORT | SAWERIA => tab == Tab::Settings,
         CLOCK_ENABLE | CLOCK_LOCK | CLOCK_BEHIND_ICONS | CLOCK_24H | CLOCK_REPOSITION
-        | CLOCK_RESET_POS | CLOCK_PICK_COLOR | CLOCK_HEX_EDIT => tab == Tab::Clock,
+        | CLOCK_RESET_POS | CLOCK_PICK_COLOR | CLOCK_HEX_EDIT | CLOCK_HEX_CONFIRM => {
+            tab == Tab::Clock
+        }
         PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
         | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
             tab == Tab::Library
@@ -183,7 +186,7 @@ pub struct Layout {
     pub caption_divider: Rect,
     pub caption_buttons: [(CaptionButton, Rect); 3],
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 54],
+    controls: [(usize, Rect); 55],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -319,6 +322,10 @@ impl Layout {
                 (
                     CLOCK_HEX_EDIT,
                     r(resources_x + 6, clock_val_top - 1, 84, 20),
+                ),
+                (
+                    CLOCK_HEX_CONFIRM,
+                    r(resources_x + 102, clock_val_top - 4, 68, 26),
                 ),
                 (VERSION, r(resources_x, 214, column_width - 188, 24)),
                 (
@@ -506,6 +513,7 @@ fn control_surface(id: usize) -> (u32, u8) {
             | CLOCK_REPOSITION
             | CLOCK_RESET_POS
             | CLOCK_PICK_COLOR
+            | CLOCK_HEX_CONFIRM
             | PRODUCT_WEBSITE
             | TRANSPARENT_BAR
             | CLEAR_CACHE
@@ -889,6 +897,16 @@ fn tab_axis(tab: Tab) -> f32 {
         Tab::Settings => 1.0,
         Tab::Clock => 2.0,
     }
+}
+
+pub fn tab_slide_direction(from: Tab, to: Tab) -> i32 {
+    let rank = |tab: Tab| match tab {
+        Tab::Library => 0,
+        Tab::Sources => 1,
+        Tab::Settings => 2,
+        Tab::Clock => 3,
+    };
+    if rank(to) >= rank(from) { -1 } else { 1 }
 }
 
 fn tab_slide_pos(tab: Tab) -> f32 {
@@ -1974,8 +1992,6 @@ thread_local! {
     static OS_SETTINGS_CACHE: Cell<(Option<bool>, Option<bool>)> = const { Cell::new((None, None)) };
     static BX_COLS_SCRATCH: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     static USER_ACRYLIC: Cell<bool> = const { Cell::new(false) };
-    static TB_DISMISSED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
-    static TB_SUPPRESS_CLICK: Cell<bool> = const { Cell::new(false) };
     static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
     static TRANSITION_BACKDROP: RefCell<TransitionBackdrop> = RefCell::new(TransitionBackdrop::default());
     static DRAG_UI_CACHE: RefCell<DragUiCache> = RefCell::new(DragUiCache::default());
@@ -2023,27 +2039,6 @@ pub fn invalidate_os_settings_cache() {
 
 pub fn set_user_acrylic(enabled: bool) {
     USER_ACRYLIC.with(|slot| slot.set(enabled));
-}
-pub fn note_transparentbar_dismissed() {
-    TB_DISMISSED_AT.with(|s| s.set(Some(Instant::now())));
-}
-pub fn clear_transparentbar_dismissed() {
-    TB_DISMISSED_AT.with(|s| s.set(None));
-    TB_SUPPRESS_CLICK.with(|s| s.set(false));
-}
-pub fn take_transparentbar_suppressed() -> bool {
-    TB_SUPPRESS_CLICK.with(|s| s.replace(false))
-}
-pub fn handle_transparentbar_lbuttondown(ctrl_id: usize) {
-    if ctrl_id == TRANSPARENT_BAR {
-        let dismissed_recently = TB_DISMISSED_AT.with(|s| {
-            s.take()
-                .is_some_and(|t| t.elapsed() <= std::time::Duration::from_millis(400))
-        });
-        TB_SUPPRESS_CLICK.with(|s| s.set(dismissed_recently));
-    } else {
-        clear_transparentbar_dismissed();
-    }
 }
 
 pub fn user_acrylic_enabled() -> bool {
@@ -6394,9 +6389,6 @@ unsafe extern "system" fn control_proc(
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
-                if message == WM_LBUTTONDOWN {
-                    handle_transparentbar_lbuttondown(ctrl_id);
-                }
                 if let Ok(parent) = GetParent(window)
                     && !parent.0.is_null()
                 {
@@ -6537,7 +6529,10 @@ pub(crate) unsafe fn paint_dropdown_into(
     target: HDC,
     area: RECT,
     items: &[&str],
-    checked_index: Option<usize>,
+    checked: &[bool],
+    separator_before: &[bool],
+    has_check_gutter: bool,
+    highlight_checked: bool,
     hover_index: Option<usize>,
     item_h: i32,
     scroll_top: usize,
@@ -6580,11 +6575,7 @@ pub(crate) unsafe fn paint_dropdown_into(
             }
             let pad_y = s(6);
             let pad_x = s(6);
-            let gutter = if checked_index.is_some() {
-                s(26)
-            } else {
-                s(12)
-            };
+            let gutter = if has_check_gutter { s(26) } else { s(12) };
             let slide_y = ((1.0 - ease_out_cubic(reveal_t)) * (-s(6) as f32)).round() as i32;
             let clip = CreateRectRgn(
                 area.left + 1,
@@ -6603,10 +6594,38 @@ pub(crate) unsafe fn paint_dropdown_into(
                 if top >= area.bottom - pad_y {
                     break;
                 }
-                let row = rect(area.left + pad_x, top, area.right - pad_x, top + item_h);
-                if row.right <= row.left || row.bottom <= row.top {
+                let raw_row = rect(area.left + pad_x, top, area.right - pad_x, top + item_h);
+                if raw_row.right <= raw_row.left || raw_row.bottom <= raw_row.top {
                     continue;
                 }
+                let has_sep =
+                    idx > scroll_top && separator_before.get(idx).copied().unwrap_or(false);
+                if has_sep {
+                    let sep = rect(
+                        area.left + s(10),
+                        raw_row.top,
+                        area.right - s(10),
+                        raw_row.top + s(1).max(1),
+                    );
+                    fill(buffer.dc, sep, if glass { GLASS_RIM } else { LINE });
+                    if glass {
+                        let _ = buffer.tint_background(sep, DIVIDER_ALPHA);
+                    }
+                }
+                let row = if has_sep {
+                    rect(
+                        raw_row.left,
+                        raw_row.top + s(2),
+                        raw_row.right,
+                        raw_row.bottom,
+                    )
+                } else {
+                    raw_row
+                };
+                if row.bottom <= row.top {
+                    continue;
+                }
+                let item_checked = checked.get(idx).copied().unwrap_or(false);
                 if Some(idx) == hover_index {
                     fill(buffer.dc, row, CARD_LIT);
                     let _ = buffer.clear_alpha(row);
@@ -6625,7 +6644,7 @@ pub(crate) unsafe fn paint_dropdown_into(
                         sheen_strength: 0.06,
                     };
                     let _ = buffer.apply_rounded_rect_mask(row, &hover_mask);
-                } else if Some(idx) == checked_index {
+                } else if highlight_checked && item_checked {
                     fill(buffer.dc, row, ACTIVE_SURFACE);
                     let _ = buffer.clear_alpha(row);
                     let active_mask = RoundedMask {
@@ -6644,7 +6663,7 @@ pub(crate) unsafe fn paint_dropdown_into(
                     };
                     let _ = buffer.apply_rounded_rect_mask(row, &active_mask);
                 }
-                if Some(idx) == checked_index {
+                if item_checked {
                     let cy = (row.top + row.bottom) / 2;
                     let cx = row.left + gutter / 2;
                     let u = (gutter / 6).max(3);
@@ -6665,7 +6684,7 @@ pub(crate) unsafe fn paint_dropdown_into(
                     text,
                     text_r,
                     s(14),
-                    Some(idx) == checked_index,
+                    highlight_checked && item_checked,
                     TEXT,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
                 );
@@ -8246,7 +8265,10 @@ mod tests {
                 mdc,
                 rect(0, 0, 220, 80),
                 &items,
-                Some(0),
+                &[true, false],
+                &[false, true],
+                true,
+                true,
                 Some(1),
                 32,
                 0,
@@ -9787,13 +9809,20 @@ mod tests {
         let g = clock_appearance_geom(&layout, 96);
         let pick_area = layout.control(CLOCK_PICK_COLOR).unwrap();
         let hex_area = layout.control(CLOCK_HEX_EDIT).unwrap();
+        let confirm_area = layout.control(CLOCK_HEX_CONFIRM).unwrap();
         assert!(visible_on(Tab::Clock, CLOCK_PICK_COLOR));
         assert!(visible_on(Tab::Clock, CLOCK_HEX_EDIT));
+        assert!(visible_on(Tab::Clock, CLOCK_HEX_CONFIRM));
         assert!(
             hex_area.left >= g.hex_pill.left
                 && hex_area.right <= g.hex_pill.right
                 && hex_area.top >= g.hex_pill.top
                 && hex_area.bottom <= g.hex_pill.bottom
+        );
+        assert!(
+            confirm_area.left > g.hex_pill.right
+                && confirm_area.right < g.val_bar.left
+                && confirm_area.bottom <= pick_area.top
         );
         assert!(
             g.wheel_r >= 44
@@ -10054,20 +10083,15 @@ mod tests {
     }
 
     #[test]
-    fn transparentbar_toggle_suppresses_dismiss_click_only() {
-        clear_transparentbar_dismissed();
-        handle_transparentbar_lbuttondown(TRANSPARENT_BAR);
-        assert!(!take_transparentbar_suppressed());
-
-        note_transparentbar_dismissed();
-        handle_transparentbar_lbuttondown(TRANSPARENT_BAR);
-        assert!(take_transparentbar_suppressed());
-        assert!(!take_transparentbar_suppressed());
-
-        note_transparentbar_dismissed();
-        handle_transparentbar_lbuttondown(CLEAR_CACHE);
-        handle_transparentbar_lbuttondown(TRANSPARENT_BAR);
-        assert!(!take_transparentbar_suppressed());
-        clear_transparentbar_dismissed();
+    fn tab_slide_direction_stays_spatially_consistent_across_all_tabs() {
+        assert_eq!(tab_slide_direction(Tab::Library, Tab::Settings), -1);
+        assert_eq!(tab_slide_direction(Tab::Settings, Tab::Clock), -1);
+        assert_eq!(tab_slide_direction(Tab::Library, Tab::Clock), -1);
+        assert_eq!(tab_slide_direction(Tab::Clock, Tab::Settings), 1);
+        assert_eq!(tab_slide_direction(Tab::Settings, Tab::Library), 1);
+        assert_eq!(tab_slide_direction(Tab::Clock, Tab::Library), 1);
+        assert_eq!(tab_slide_direction(Tab::Library, Tab::Sources), -1);
+        assert_eq!(tab_slide_direction(Tab::Sources, Tab::Library), 1);
+        assert_eq!(tab_slide_direction(Tab::Sources, Tab::Settings), -1);
     }
 }

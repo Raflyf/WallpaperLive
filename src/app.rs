@@ -103,10 +103,17 @@ thread_local! {
         std::cell::RefCell::new(DragMoveState::default());
     static CLOCK_DRAG: std::cell::Cell<Option<visuals::ClockDragTarget>> =
         const { std::cell::Cell::new(None) };
-    static TB_FOCUS: std::cell::Cell<(bool, Option<Instant>)> =
-        const { std::cell::Cell::new((false, None)) };
     static HEX_EDIT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+const TB_CMD_STARTUP: usize = 1;
+const TB_CMD_ABOUT: usize = 2;
+const TB_CMD_EXIT: usize = 3;
+const TB_CMD_CONNECTOR: usize = 4;
+const TB_CMD_UPDATE: usize = 5;
+const TB_CMD_PATTERN: usize = 6;
+const TB_CMD_REDUCE_MOTION: usize = 7;
+const TB_CMD_SUPPORT: usize = 8;
 
 fn parse_hex_color(raw: &str) -> Option<u32> {
     let trimmed = raw.trim();
@@ -119,24 +126,102 @@ fn parse_hex_color(raw: &str) -> Option<u32> {
         .map(|value| value & 0x00FF_FFFF)
 }
 
-unsafe fn foreground_belongs_to_transparentbar() -> bool {
-    let fg = unsafe { GetForegroundWindow() };
-    if fg.0.is_null() {
-        return false;
-    }
-    let Ok(tb) = (unsafe { FindWindowW(w!("TransparentBar.Window"), None) }) else {
-        return false;
+fn find_transparentbar_window() -> Option<HWND> {
+    // SAFETY: read-only class lookup across current session desktop.
+    unsafe { FindWindowW(w!("TransparentBar.Window"), None) }
+        .ok()
+        .filter(|h| !h.0.is_null())
+}
+
+fn read_hkcu_dword(subkey: PCWSTR, name: PCWSTR, fallback: bool) -> bool {
+    let mut data = [0u32; 1];
+    let mut bytes = std::mem::size_of_val(&data) as u32;
+    // SAFETY: read-only HKCU DWORD query on static subkey/value names.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey,
+            name,
+            RRF_RT_REG_DWORD,
+            None,
+            Some(data.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
     };
-    if tb.0.is_null() {
-        return false;
+    if status == ERROR_FILE_NOT_FOUND || status.is_err() {
+        return fallback;
     }
-    let mut fg_pid = 0u32;
-    let mut tb_pid = 0u32;
-    unsafe {
-        GetWindowThreadProcessId(fg, Some(&mut fg_pid));
-        GetWindowThreadProcessId(tb, Some(&mut tb_pid));
-    }
-    fg_pid != 0 && fg_pid == tb_pid
+    data[0] != 0
+}
+
+fn build_transparentbar_entries(
+    connector: bool,
+    startup: bool,
+    pattern: bool,
+    reduce_motion: bool,
+) -> [crate::tray::MenuEntry<'static>; 8] {
+    [
+        crate::tray::MenuEntry {
+            id: TB_CMD_CONNECTOR,
+            label: "Taskbar connector",
+            checked: connector,
+            separator_before: false,
+        },
+        crate::tray::MenuEntry {
+            id: TB_CMD_STARTUP,
+            label: "Run at sign-in",
+            checked: startup,
+            separator_before: false,
+        },
+        crate::tray::MenuEntry {
+            id: TB_CMD_PATTERN,
+            label: "Connector pattern",
+            checked: pattern,
+            separator_before: false,
+        },
+        crate::tray::MenuEntry {
+            id: TB_CMD_REDUCE_MOTION,
+            label: "Reduce connector animation",
+            checked: reduce_motion,
+            separator_before: false,
+        },
+        crate::tray::MenuEntry {
+            id: TB_CMD_UPDATE,
+            label: "Check for updates",
+            checked: false,
+            separator_before: true,
+        },
+        crate::tray::MenuEntry {
+            id: TB_CMD_ABOUT,
+            label: "About / license",
+            checked: false,
+            separator_before: false,
+        },
+        crate::tray::MenuEntry {
+            id: TB_CMD_SUPPORT,
+            label: "Buy me a coffee",
+            checked: false,
+            separator_before: false,
+        },
+        crate::tray::MenuEntry {
+            id: TB_CMD_EXIT,
+            label: "Exit TransparentBar",
+            checked: false,
+            separator_before: false,
+        },
+    ]
+}
+
+fn transparentbar_menu_entries() -> [crate::tray::MenuEntry<'static>; 8] {
+    let connector = read_hkcu_dword(w!(r"Software\TransparentBar"), w!("TaskbarConnector"), true);
+    let startup = read_hkcu_string(
+        w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        w!("TransparentBar"),
+    )
+    .is_some();
+    let pattern = read_hkcu_dword(w!(r"Software\TransparentBar"), w!("TaskbarPattern"), true);
+    let reduce_motion = read_hkcu_dword(w!(r"Software\TransparentBar"), w!("ReduceMotion"), false);
+    build_transparentbar_entries(connector, startup, pattern, reduce_motion)
 }
 
 fn enter_drag_move(window: HWND) {
@@ -1440,6 +1525,12 @@ impl App {
                     w!("EDIT"),
                     "#5D86A8",
                     ES_CENTER as u32 | ES_AUTOHSCROLL as u32 | ES_UPPERCASE as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_HEX_CONFIRM,
+                    w!("BUTTON"),
+                    "Confirm",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
                     EXIT,
@@ -2955,10 +3046,11 @@ impl App {
         Ok(())
     }
     fn open_or_get_transparentbar(&self) -> Result<(), String> {
-        if visuals::take_transparentbar_suppressed() {
-            return Ok(());
-        }
-        if let Some(exe) = find_transparentbar_exe() {
+        let Some(exe) = find_transparentbar_exe() else {
+            return self.open_website(TRANSPARENT_BAR_URL);
+        };
+        let mut tb_hwnd = find_transparentbar_window();
+        if tb_hwnd.is_none() {
             let mut cmd = std::process::Command::new(&exe);
             if let Some(dir) = exe.parent()
                 && !dir.as_os_str().is_empty()
@@ -2967,11 +3059,38 @@ impl App {
             }
             cmd.spawn()
                 .map_err(|e| format!("Could not launch TransparentBar: {e}"))?;
-            TB_FOCUS.with(|s| s.set((false, Some(Instant::now()))));
-            Ok(())
-        } else {
-            self.open_website(TRANSPARENT_BAR_URL)
         }
+        let mut anchor = RECT::default();
+        // SAFETY: read-only screen bounds of owned button child.
+        unsafe {
+            GetWindowRect(self.control(visuals::TRANSPARENT_BAR), &mut anchor)
+                .map_err(native_error)?;
+        }
+        let entries = transparentbar_menu_entries();
+        let chosen = crate::tray::menu_at(self.hwnd, anchor, &entries)?;
+        if chosen == 0 {
+            return Ok(());
+        }
+        if chosen == TB_CMD_SUPPORT {
+            return self.open_website(SUPPORT_URL);
+        }
+        if tb_hwnd.is_none() {
+            for _ in 0..20 {
+                tb_hwnd = find_transparentbar_window();
+                if tb_hwnd.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        let Some(hwnd) = tb_hwnd else {
+            return Err("TransparentBar is still starting. Click again in a moment.".into());
+        };
+        // SAFETY: TransparentBar.Window handles WM_COMMAND ids directly on its UI loop.
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(chosen), LPARAM(0));
+        }
+        Ok(())
     }
     fn find_wallpapers(&mut self) -> Result<(), String> {
         self.switch_tab(visuals::Tab::Sources)
@@ -4281,8 +4400,6 @@ impl App {
                     }
                     unsafe {
                         let _ = KillTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID);
-                        TB_FOCUS.with(|s| s.set((false, None)));
-                        visuals::clear_transparentbar_dismissed();
                         visuals::clear_backdrop_transition(self.hwnd);
                         visuals::invalidate_backdrop_cache();
                         let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -4501,6 +4618,19 @@ impl App {
             visuals::CLOCK_PICK_COLOR => {
                 crate::clock_widget::begin_color_pick(self.hwnd, ACTION, self.settings.clock_color);
             }
+            visuals::CLOCK_HEX_CONFIRM => {
+                let raw = window_text(self.control(visuals::CLOCK_HEX_EDIT));
+                if let Some(color) = parse_hex_color(&raw) {
+                    self.settings.clock_color = color;
+                }
+                self.save_and_sync_clock()?;
+                if !self.hwnd.0.is_null() {
+                    // SAFETY: move keyboard focus out of the hex edit box after confirming.
+                    unsafe {
+                        let _ = SetFocus(self.hwnd);
+                    }
+                }
+            }
             visuals::CLOCK_CTX_PICK_COLOR => {
                 if let Some(color) = crate::clock_widget::take_picked_color() {
                     self.settings.clock_color = color & 0x00FF_FFFF;
@@ -4656,8 +4786,6 @@ impl App {
         let repaint_now = old_layer.is_none();
 
         if previous != tab {
-            TB_FOCUS.with(|s| s.set((false, None)));
-            visuals::clear_transparentbar_dismissed();
             if previous == visuals::Tab::Clock && crate::clock_widget::is_repositioning() {
                 crate::clock_widget::end_reposition(self.hwnd, ACTION, self.clock_config());
                 self.sync_clock_controls();
@@ -4733,11 +4861,7 @@ impl App {
                 let _ = SetFocus(holder);
             }
             if let Some(new) = visuals::capture_region_controls(self.hwnd, c, &new_controls) {
-                let dir = if previous == visuals::Tab::Library {
-                    -1
-                } else {
-                    1
-                };
+                let dir = visuals::tab_slide_direction(previous, tab);
                 visuals::begin_transition_with_hide(
                     self.hwnd,
                     c,
@@ -5513,28 +5637,6 @@ unsafe extern "system" fn window_proc(
                 }
             }
             WM_ACTIVATE => {
-                let code = (wparam.0 & 0xFFFF) as u32;
-                if code == WA_INACTIVE {
-                    let launched_recent = TB_FOCUS
-                        .with(|s| s.get().1.is_some_and(|t| t.elapsed().as_millis() < 1500));
-                    if launched_recent || foreground_belongs_to_transparentbar() {
-                        TB_FOCUS.with(|s| {
-                            let (_, at) = s.get();
-                            s.set((true, at));
-                        });
-                    }
-                } else {
-                    let had_tb = TB_FOCUS.with(|s| {
-                        let (had, _) = s.get();
-                        s.set((false, None));
-                        had
-                    });
-                    if had_tb && code == WA_CLICKACTIVE {
-                        visuals::note_transparentbar_dismissed();
-                    } else if code == WA_ACTIVE {
-                        visuals::clear_transparentbar_dismissed();
-                    }
-                }
                 if let Some(area) = visuals::caption_cluster_rect(window) {
                     let _ = InvalidateRect(window, Some(&area), false);
                 }
@@ -5618,6 +5720,16 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
+                let focused = GetFocus();
+                if !focused.0.is_null()
+                    && focused != window
+                    && matches!(
+                        GetDlgCtrlID(focused) as usize,
+                        visuals::CLOCK_HEX_EDIT | visuals::SEARCH
+                    )
+                {
+                    let _ = SetFocus(window);
+                }
                 let x = (lparam.0 & 0xffff) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
                 if let Some(target) = visuals::clock_control_hit(window, x, y) {
@@ -5631,12 +5743,10 @@ unsafe extern "system" fn window_proc(
                     }
                     LRESULT(0)
                 } else if let Some(btn) = visuals::caption_button_hit(window, x, y) {
-                    visuals::clear_transparentbar_dismissed();
                     let _ = SetCapture(window);
                     visuals::set_caption_down(window, Some(btn));
                     LRESULT(0)
                 } else {
-                    visuals::clear_transparentbar_dismissed();
                     DefWindowProcW(window, message, wparam, lparam)
                 }
             }
@@ -8965,10 +9075,33 @@ mod tests {
             assert_eq!(app.settings.clock_color, 0x0012_AB34);
             assert_eq!(window_text(hex), "#12AB34");
 
+            let confirm_hex = w!("abcdef");
+            let _ = SetWindowTextW(hex, PCWSTR(confirm_hex.as_ptr()));
+            assert!(!app.action(visuals::CLOCK_HEX_CONFIRM, BN_CLICKED).unwrap());
+            assert_eq!(app.settings.clock_color, 0x00AB_CDEF);
+            assert_eq!(window_text(hex), "#ABCDEF");
+
             let _ = DestroyWindow(host);
         }
 
         let _ = fs::remove_file(&app.config);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn transparentbar_menu_entries_map_ids_checkmarks_and_separator() {
+        let entries = build_transparentbar_entries(true, false, true, true);
+        assert_eq!(entries.len(), 8);
+        assert_eq!(entries[0].id, TB_CMD_CONNECTOR);
+        assert!(entries[0].checked);
+        assert_eq!(entries[1].id, TB_CMD_STARTUP);
+        assert!(!entries[1].checked);
+        assert_eq!(entries[2].id, TB_CMD_PATTERN);
+        assert!(entries[2].checked);
+        assert_eq!(entries[3].id, TB_CMD_REDUCE_MOTION);
+        assert!(entries[3].checked);
+        assert_eq!(entries[4].id, TB_CMD_UPDATE);
+        assert!(entries[4].separator_before);
+        assert_eq!(entries[7].id, TB_CMD_EXIT);
     }
 }

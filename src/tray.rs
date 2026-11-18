@@ -323,6 +323,15 @@ pub fn popup_at(
     )
 }
 
+/// Native menu entry for anchored rounded Acrylic dropdowns.
+#[derive(Clone, Copy)]
+pub struct MenuEntry<'a> {
+    pub id: usize,
+    pub label: &'a str,
+    pub checked: bool,
+    pub separator_before: bool,
+}
+
 /// Shows an anchored, rounded Acrylic glassmorphic dropdown below (or above) `anchor`.
 /// Falls back to the system menu when Windows High Contrast mode is active.
 pub fn dropdown_at(
@@ -346,7 +355,41 @@ pub fn dropdown_at(
             true,
         );
     }
-    dropdown::show(owner, anchor, items, selected_id)
+    let entries: Vec<MenuEntry<'_>> = items
+        .iter()
+        .map(|&(id, label)| MenuEntry {
+            id,
+            label,
+            checked: selected_id == Some(id),
+            separator_before: false,
+        })
+        .collect();
+    dropdown::show_entries(owner, anchor, &entries, selected_id.is_some(), true)
+}
+
+/// Shows an anchored Acrylic toggle/action menu with independent checkmarks and optional dividers.
+pub fn menu_at(
+    owner: HWND,
+    anchor: windows::Win32::Foundation::RECT,
+    entries: &[MenuEntry<'_>],
+) -> Result<usize, String> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    if system_palette(true).is_none() {
+        let pairs: Vec<(usize, &str)> = entries.iter().map(|e| (e.id, e.label)).collect();
+        return track_menu(
+            owner,
+            POINT {
+                x: anchor.left,
+                y: anchor.bottom,
+            },
+            &pairs,
+            None,
+            true,
+        );
+    }
+    dropdown::show_entries(owner, anchor, entries, true, false)
 }
 
 mod dropdown {
@@ -450,6 +493,10 @@ mod dropdown {
 
     struct State<'a> {
         items: &'a [&'a str],
+        checked: &'a [bool],
+        separator_before: &'a [bool],
+        has_check_gutter: bool,
+        highlight_checked: bool,
         checked_index: Option<usize>,
         hover_index: Option<usize>,
         pressed_inside: bool,
@@ -603,7 +650,10 @@ mod dropdown {
                 hdc,
                 client,
                 state.items,
-                state.checked_index,
+                state.checked,
+                state.separator_before,
+                state.has_check_gutter,
+                state.highlight_checked,
                 state.hover_index,
                 state.item_h,
                 state.scroll_top,
@@ -746,15 +796,22 @@ mod dropdown {
         name
     }
 
-    pub(crate) fn show(
+    pub(crate) fn show_entries(
         owner: HWND,
         anchor: RECT,
-        items: &[(usize, &str)],
-        selected_id: Option<usize>,
+        entries: &[super::MenuEntry<'_>],
+        has_check_gutter: bool,
+        highlight_checked: bool,
     ) -> Result<usize, String> {
-        let labels: Vec<&str> = items.iter().map(|(_, label)| *label).collect();
-        let checked_index =
-            selected_id.and_then(|id| items.iter().position(|(item_id, _)| *item_id == id));
+        let labels: Vec<&str> = entries.iter().map(|entry| entry.label).collect();
+        let checked: Vec<bool> = entries.iter().map(|entry| entry.checked).collect();
+        let separator_before: Vec<bool> =
+            entries.iter().map(|entry| entry.separator_before).collect();
+        let checked_index = if highlight_checked {
+            checked.iter().position(|&c| c)
+        } else {
+            None
+        };
 
         // SAFETY: Win32 popup lifecycle bounded to this function; State outlives popup window.
         unsafe {
@@ -798,6 +855,10 @@ mod dropdown {
             let animate = crate::visuals::animations_enabled(owner);
             let mut state = State {
                 items: &labels,
+                checked: &checked,
+                separator_before: &separator_before,
+                has_check_gutter,
+                highlight_checked,
                 checked_index,
                 hover_index: checked_index,
                 pressed_inside: false,
@@ -937,8 +998,8 @@ mod dropdown {
             let _ = DestroyWindow(popup);
             Ok(state
                 .chosen_index
-                .and_then(|idx| items.get(idx))
-                .map(|(id, _)| *id)
+                .and_then(|idx| entries.get(idx))
+                .map(|entry| entry.id)
                 .unwrap_or(0))
         }
     }
@@ -984,8 +1045,14 @@ mod dropdown {
             use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
             let labels = ["All folders", r"D:\wallpapers\live"];
+            let checked = [false, true];
+            let separators = [false, false];
             let mut state = State {
                 items: &labels,
+                checked: &checked,
+                separator_before: &separators,
+                has_check_gutter: true,
+                highlight_checked: true,
                 checked_index: Some(1),
                 hover_index: Some(1),
                 pressed_inside: false,
