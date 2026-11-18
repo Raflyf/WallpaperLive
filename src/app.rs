@@ -1276,13 +1276,13 @@ impl App {
                 (
                     visuals::CLOCK_LOCK,
                     w!("BUTTON"),
-                    "Lock position & click-through",
+                    "Lock position",
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
                 ),
                 (
                     visuals::CLOCK_BEHIND_ICONS,
                     w!("BUTTON"),
-                    "Keep below desktop shortcuts",
+                    "Pass clicks to desktop shortcuts",
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -4165,6 +4165,10 @@ impl App {
             EXIT => return Ok(true),
             HIDE => {
                 if self.tray_present {
+                    if crate::clock_widget::is_repositioning() {
+                        crate::clock_widget::end_reposition(self.hwnd, ACTION, self.clock_config());
+                        self.sync_clock_controls();
+                    }
                     unsafe {
                         let _ = KillTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID);
                         visuals::clear_backdrop_transition(self.hwnd);
@@ -4172,6 +4176,7 @@ impl App {
                         let _ = ShowWindow(self.hwnd, SW_HIDE);
                         crate::update_popup::sync(self.hwnd);
                     }
+                    crate::clock_widget::ensure_desktop_visible();
                     self.cancel_thumbnails();
                     visuals::retain_thumbnails(&[]);
                     // ponytail: trim panel memory while running in tray; active display keeps running.
@@ -4372,7 +4377,12 @@ impl App {
                     self.settings.clock_enabled = true;
                     self.save_and_sync_clock()?;
                 }
-                crate::clock_widget::begin_reposition(self.hwnd, ACTION, self.clock_config());
+                if crate::clock_widget::is_repositioning() {
+                    crate::clock_widget::end_reposition(self.hwnd, ACTION, self.clock_config());
+                } else {
+                    crate::clock_widget::begin_reposition(self.hwnd, ACTION, self.clock_config());
+                }
+                self.sync_clock_controls();
             }
             visuals::CLOCK_RESET_POS => {
                 self.settings.clock_pos = None;
@@ -4464,6 +4474,18 @@ impl App {
                 }
             }
         }
+        let repo_ctrl = self.control(visuals::CLOCK_REPOSITION);
+        if !repo_ctrl.0.is_null() {
+            let text = if crate::clock_widget::is_repositioning() {
+                w!("Done positioning")
+            } else {
+                w!("Reposition on desktop")
+            };
+            unsafe {
+                let _ = SetWindowTextW(repo_ctrl, text);
+                let _ = InvalidateRect(repo_ctrl, None, false);
+            }
+        }
         if self.tab == visuals::Tab::Clock
             && !self.hwnd.0.is_null()
             && unsafe { IsWindow(self.hwnd).as_bool() }
@@ -4500,6 +4522,10 @@ impl App {
         let repaint_now = old_layer.is_none();
 
         if previous != tab {
+            if previous == visuals::Tab::Clock && crate::clock_widget::is_repositioning() {
+                crate::clock_widget::end_reposition(self.hwnd, ACTION, self.clock_config());
+                self.sync_clock_controls();
+            }
             visuals::start_tab_pill_anim(self.hwnd, previous, tab);
         }
         self.tab = tab;
@@ -5560,6 +5586,15 @@ unsafe extern "system" fn window_proc(
                 }
                 if wparam.0 == SIZE_MINIMIZED as usize {
                     let _ = SetPropW(window, ICONIC_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+                    if crate::clock_widget::is_repositioning() {
+                        let _ = PostMessageW(
+                            window,
+                            ACTION,
+                            WPARAM(visuals::CLOCK_REPOSITION),
+                            LPARAM(0),
+                        );
+                    }
+                    crate::clock_widget::ensure_desktop_visible();
                     crate::update_popup::sync(window);
                     return LRESULT(0);
                 }

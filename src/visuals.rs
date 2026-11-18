@@ -1584,6 +1584,7 @@ pub fn clear() {
     DRAG_UV_REDRAW.with(|slot| slot.set(false));
     BX_COLS_SCRATCH.with(|slot| *slot.borrow_mut() = Vec::new());
     CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
+    TEXT_SCRATCH.with(|slot| *slot.borrow_mut() = TextScratch::default());
     SYNCED_LAYOUT.with(|slot| slot.set(None));
     invalidate_theme_cache();
     invalidate_os_settings_cache();
@@ -1833,10 +1834,102 @@ impl Drop for CachedTheme {
     }
 }
 
+#[derive(Default)]
+struct TextScratch {
+    dc: HDC,
+    bmp: HBITMAP,
+    prev: HGDIOBJ,
+    bits: *mut u32,
+    w: i32,
+    h: i32,
+}
+impl TextScratch {
+    fn reset(&mut self) {
+        if !self.dc.0.is_null() {
+            unsafe {
+                if !self.prev.0.is_null() {
+                    let _ = SelectObject(self.dc, self.prev);
+                }
+                if !self.bmp.0.is_null() {
+                    let _ = DeleteObject(self.bmp);
+                }
+                let _ = DeleteDC(self.dc);
+            }
+        }
+        self.dc = HDC::default();
+        self.bmp = HBITMAP::default();
+        self.prev = HGDIOBJ::default();
+        self.bits = std::ptr::null_mut();
+        self.w = 0;
+        self.h = 0;
+    }
+
+    unsafe fn ensure(&mut self, min_w: i32, min_h: i32) -> bool {
+        let min_w = min_w.max(1);
+        let min_h = min_h.max(1);
+        if !self.dc.0.is_null() && !self.bits.is_null() && self.w >= min_w && self.h >= min_h {
+            return true;
+        }
+        self.reset();
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.0.is_null() {
+                return false;
+            }
+            let cap_w = min_w.max(256);
+            let cap_h = min_h.max(64);
+            let mut bits = std::ptr::null_mut();
+            let Ok(bmp) = CreateDIBSection(
+                dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: cap_w,
+                        biHeight: -cap_h,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            ) else {
+                let _ = DeleteDC(dc);
+                return false;
+            };
+            if bits.is_null() {
+                let _ = DeleteObject(bmp);
+                let _ = DeleteDC(dc);
+                return false;
+            }
+            let prev = SelectObject(dc, bmp);
+            self.dc = dc;
+            self.bmp = bmp;
+            self.prev = prev;
+            self.bits = bits as *mut u32;
+            self.w = cap_w;
+            self.h = cap_h;
+            true
+        }
+    }
+}
+impl Drop for TextScratch {
+    fn drop(&mut self) {
+        self.reset();
+    }
+}
+
 thread_local! {
     static PAINT_RUNTIME: PaintRuntime = PaintRuntime::new();
     static GLASS_BUFFER: Cell<isize> = const { Cell::new(0) };
+    static GLASS_AREA: Cell<RECT> = const { Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }) };
+    static GLASS_TEXT: Cell<bool> = const { Cell::new(false) };
     static TEXT_THEME: Cell<HTHEME> = const { Cell::new(HTHEME(0)) };
+    static TEXT_SCRATCH: RefCell<TextScratch> = RefCell::new(TextScratch::default());
     static THEME_CACHE: RefCell<CachedTheme> = RefCell::new(CachedTheme::default());
     static OS_SETTINGS_CACHE: Cell<(Option<bool>, Option<bool>)> = const { Cell::new((None, None)) };
     static BX_COLS_SCRATCH: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
@@ -1847,6 +1940,31 @@ thread_local! {
     static DRAG_UV_REDRAW: Cell<bool> = const { Cell::new(false) };
     static SYNCED_LAYOUT: Cell<Option<(isize, i32, i32, i32)>> = const { Cell::new(None) };
     static IN_CAPTURE_REGION: Cell<bool> = const { Cell::new(false) };
+}
+
+struct TextTargetGuard {
+    old_theme: HTHEME,
+    old_buffer: isize,
+    old_area: RECT,
+    old_glass: bool,
+}
+impl TextTargetGuard {
+    fn push(theme: HTHEME, buffer: isize, area: RECT, glass_text: bool) -> Self {
+        Self {
+            old_theme: TEXT_THEME.with(|slot| slot.replace(theme)),
+            old_buffer: GLASS_BUFFER.with(|slot| slot.replace(buffer)),
+            old_area: GLASS_AREA.with(|slot| slot.replace(area)),
+            old_glass: GLASS_TEXT.with(|slot| slot.replace(glass_text)),
+        }
+    }
+}
+impl Drop for TextTargetGuard {
+    fn drop(&mut self) {
+        TEXT_THEME.with(|slot| slot.set(self.old_theme));
+        GLASS_BUFFER.with(|slot| slot.set(self.old_buffer));
+        GLASS_AREA.with(|slot| slot.set(self.old_area));
+        GLASS_TEXT.with(|slot| slot.set(self.old_glass));
+    }
 }
 
 unsafe fn cached_window_theme(window: HWND) -> HTHEME {
@@ -3012,6 +3130,161 @@ unsafe fn raised_rounded(dc: HDC, r: RECT, color: u32, border: u32, highlight: u
         }
     }
 }
+struct GlassLabelReq<'a> {
+    buffer: isize,
+    area: RECT,
+    font: HFONT,
+    theme: HTHEME,
+    text_buf: &'a mut [u16],
+    dst_rect: RECT,
+    color: u32,
+    flags: DRAW_TEXT_FORMAT,
+}
+unsafe fn draw_glass_label(req: GlassLabelReq<'_>) -> bool {
+    let GlassLabelReq {
+        buffer,
+        area: buf_area,
+        font,
+        theme,
+        text_buf,
+        dst_rect: r,
+        color,
+        flags,
+    } = req;
+    let Some(clip) = intersect_rects(r, buf_area) else {
+        return true;
+    };
+    let rw = clip.right - clip.left;
+    let rh = clip.bottom - clip.top;
+    let buf_w = buf_area.right - buf_area.left;
+    let buf_h = buf_area.bottom - buf_area.top;
+    if rw <= 0 || rh <= 0 || buf_w <= 0 || buf_h <= 0 {
+        return true;
+    }
+
+    // SAFETY: reads/writes owned TEXT_SCRATCH DIB and buffer's synchronous GetBufferedPaintBits slice.
+    unsafe {
+        let mut bits = std::ptr::null_mut();
+        let mut stride = 0;
+        if !GdiFlush().as_bool()
+            || GetBufferedPaintBits(buffer, &mut bits, &mut stride).is_err()
+            || bits.is_null()
+            || stride < buf_w
+        {
+            return false;
+        }
+        let Some(dst_len) = (stride as usize)
+            .checked_mul(buf_h as usize)
+            .filter(|len| *len <= isize::MAX as usize / std::mem::size_of::<RGBQUAD>())
+        else {
+            return false;
+        };
+        let dst = std::slice::from_raw_parts_mut(bits, dst_len);
+
+        TEXT_SCRATCH.with(|slot| {
+            let mut scratch = slot.borrow_mut();
+            if !scratch.ensure(rw, rh) {
+                return false;
+            }
+            let sw = scratch.w as usize;
+            let total_rows = (rh as usize).saturating_mul(sw);
+            let src_bits = std::slice::from_raw_parts_mut(scratch.bits, total_rows);
+            src_bits.fill(0);
+
+            let saved = SaveDC(scratch.dc);
+            let _ = IntersectClipRect(scratch.dc, 0, 0, rw, rh);
+            let old_font = SelectObject(scratch.dc, font);
+            let mut local_r = RECT {
+                left: r.left - clip.left,
+                top: r.top - clip.top,
+                right: r.right - clip.left,
+                bottom: r.bottom - clip.top,
+            };
+
+            let themed_ok = theme.0 != 0
+                && DrawThemeTextEx(
+                    theme,
+                    scratch.dc,
+                    0,
+                    0,
+                    text_buf,
+                    flags | DT_NOPREFIX,
+                    &mut local_r,
+                    Some(&DTTOPTS {
+                        dwSize: std::mem::size_of::<DTTOPTS>() as u32,
+                        dwFlags: DTT_COMPOSITED | DTT_TEXTCOLOR,
+                        crText: COLORREF(0x00FF_FFFF),
+                        ..Default::default()
+                    }),
+                )
+                .is_ok();
+
+            if !themed_ok {
+                src_bits.fill(0);
+                let mut retry_r = RECT {
+                    left: r.left - clip.left,
+                    top: r.top - clip.top,
+                    right: r.right - clip.left,
+                    bottom: r.bottom - clip.top,
+                };
+                SetTextColor(scratch.dc, COLORREF(0x00FF_FFFF));
+                SetBkMode(scratch.dc, TRANSPARENT);
+                DrawTextW(scratch.dc, text_buf, &mut retry_r, flags | DT_NOPREFIX);
+            }
+            let _ = GdiFlush();
+            SelectObject(scratch.dc, old_font);
+            if saved != 0 {
+                let _ = RestoreDC(scratch.dc, saved);
+            }
+
+            let fr = (color >> 16) & 255;
+            let fg = (color >> 8) & 255;
+            let fb = color & 255;
+            let ox = (clip.left - buf_area.left) as usize;
+            let oy = (clip.top - buf_area.top) as usize;
+            for y in 0..rh as usize {
+                let src_row = &src_bits[y * sw..y * sw + rw as usize];
+                let dst_off = (oy + y) * stride as usize + ox;
+                let dst_row = &mut dst[dst_off..dst_off + rw as usize];
+                for (&spx, pixel) in src_row.iter().zip(dst_row.iter_mut()) {
+                    let rgb = spx & 0x00FF_FFFF;
+                    if rgb == 0 {
+                        continue;
+                    }
+                    let cov = if themed_ok {
+                        ((spx >> 24) & 255)
+                            .max(((spx >> 16) & 255).max((spx >> 8) & 255).max(spx & 255))
+                    } else {
+                        let sr = (spx >> 16) & 255;
+                        let sg = (spx >> 8) & 255;
+                        let sb = spx & 255;
+                        ((sr * 77 + sg * 150 + sb * 29 + 128) >> 8).min(255)
+                    };
+                    if cov == 0 {
+                        continue;
+                    }
+                    let inv = 255 - cov;
+                    let out_a = (cov + div255_round(u32::from(pixel.rgbReserved) * inv)).min(255);
+                    pixel.rgbRed = ((div255_round(fr * cov)
+                        + div255_round(u32::from(pixel.rgbRed) * inv))
+                        as u8)
+                        .min(out_a as u8);
+                    pixel.rgbGreen = ((div255_round(fg * cov)
+                        + div255_round(u32::from(pixel.rgbGreen) * inv))
+                        as u8)
+                        .min(out_a as u8);
+                    pixel.rgbBlue = ((div255_round(fb * cov)
+                        + div255_round(u32::from(pixel.rgbBlue) * inv))
+                        as u8)
+                        .min(out_a as u8);
+                    pixel.rgbReserved = out_a as u8;
+                }
+            }
+            true
+        })
+    }
+}
+
 unsafe fn label(
     dc: HDC,
     text: &str,
@@ -3027,9 +3300,6 @@ unsafe fn label(
     // SAFETY: drawing borrows temporary UTF-16 buffer and thread-cached font until return.
     unsafe {
         let font = cached_font(size, bold);
-        let old = SelectObject(dc, font);
-        SetTextColor(dc, rgb(color));
-        SetBkMode(dc, TRANSPARENT);
         let mut stack = [0u16; 256];
         let mut heap = Vec::new();
         let text_buf: &mut [u16] = {
@@ -3051,33 +3321,28 @@ unsafe fn label(
                 &mut stack[..len]
             }
         };
-        let mut r = r;
-        let theme = TEXT_THEME.with(Cell::get);
-        let painted = theme.0 != 0
-            && DrawThemeTextEx(
+        let buffer = GLASS_BUFFER.with(Cell::get);
+        if buffer != 0 && GLASS_TEXT.with(Cell::get) {
+            let theme = TEXT_THEME.with(Cell::get);
+            let buf_area = GLASS_AREA.with(Cell::get);
+            if draw_glass_label(GlassLabelReq {
+                buffer,
+                area: buf_area,
+                font,
                 theme,
-                dc,
-                0,
-                0,
                 text_buf,
-                flags | DT_NOPREFIX,
-                &mut r,
-                Some(&DTTOPTS {
-                    dwSize: std::mem::size_of::<DTTOPTS>() as u32,
-                    dwFlags: DTT_COMPOSITED | DTT_TEXTCOLOR,
-                    crText: rgb(color),
-                    ..Default::default()
-                }),
-            )
-            .is_ok();
-        if !painted {
-            DrawTextW(dc, text_buf, &mut r, flags | DT_NOPREFIX);
-            let buffer = GLASS_BUFFER.with(Cell::get);
-            if buffer != 0 {
-                let _ = GdiFlush();
-                let _ = BufferedPaintSetAlpha(buffer, Some(&r), 255);
+                dst_rect: r,
+                color,
+                flags,
+            }) {
+                return;
             }
         }
+        let old = SelectObject(dc, font);
+        SetTextColor(dc, rgb(color));
+        SetBkMode(dc, TRANSPARENT);
+        let mut local = r;
+        DrawTextW(dc, text_buf, &mut local, flags | DT_NOPREFIX);
         SelectObject(dc, old);
     }
 }
@@ -3266,15 +3531,15 @@ pub unsafe fn draw_item(item: &DRAWITEMSTRUCT) {
             } else {
                 HTHEME(0)
             };
-            let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
-            let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+            let glass_active = glass && theme.0 != 0;
+            let _text_guard =
+                TextTargetGuard::push(theme, buffer.handle, buffer.area, glass_active);
             let buffered = DRAWITEMSTRUCT {
                 hDC: buffer.dc,
                 ..*item
             };
-            let ok = draw_item_into(&buffered, glass, Some(&buffer));
-            TEXT_THEME.with(|slot| slot.set(old_theme));
-            GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+            let ok = draw_item_into(&buffered, glass_active, Some(&buffer));
+            drop(_text_guard);
             if ok && buffer.finish() {
                 return;
             }
@@ -5154,18 +5419,12 @@ pub unsafe fn paint_into_rect(window: HWND, target: HDC, clip_rect: Option<RECT>
             } else {
                 HTHEME::default()
             };
-            let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
-            let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
-            let rendered = paint_scene(
-                window,
-                buffer.dc,
-                Some(&buffer),
-                glass && theme.0 != 0,
-                area,
-            );
-            TEXT_THEME.with(|slot| slot.set(old_theme));
-            GLASS_BUFFER.with(|slot| slot.set(old_buffer));
-            let ready = rendered && ((glass && theme.0 != 0) || buffer.opaque());
+            let glass_active = glass && theme.0 != 0;
+            let _text_guard =
+                TextTargetGuard::push(theme, buffer.handle, buffer.area, glass_active);
+            let rendered = paint_scene(window, buffer.dc, Some(&buffer), glass_active, area);
+            drop(_text_guard);
+            let ready = rendered && (glass_active || buffer.opaque());
             if ready && buffer.finish() {
                 if glass && theme.0 == 0 {
                     disable_backdrop(window);
@@ -5651,7 +5910,7 @@ unsafe fn paint_scene(
                         DT_SINGLELINE,
                     );
                     label_clipped(
-                        "Spaced letters directly on your wallpaper, with desktop shortcut protection",
+                        "Mond-style desktop clock with Win+D persistence and click-through shortcuts",
                         pixels(layout.settings_subtitle),
                         scale(13),
                         false,
@@ -5863,8 +6122,8 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                         true
                     }
                 };
-                let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
-                let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+                let _text_guard =
+                    TextTargetGuard::push(theme, buffer.handle, buffer.area, theme.0 != 0);
                 if checkbox {
                     let track_h = (s(22).max(16) / 2) * 2;
                     let track_w = s(40).max(28);
@@ -5945,8 +6204,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                         }
                     }
                 }
-                TEXT_THEME.with(|slot| slot.set(old_theme));
-                GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+                drop(_text_guard);
                 if theme.0 != 0 {
                     if alpha_ok && buffer.finish() {
                         return;
@@ -6189,8 +6447,7 @@ pub(crate) unsafe fn paint_dropdown_into(
         } else {
             HTHEME(0)
         };
-        let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
-        let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+        let _text_guard = TextTargetGuard::push(theme, buffer.handle, buffer.area, glass);
         let ok = (|| -> bool {
             fill(buffer.dc, area, CARD);
             let outer_mask = RoundedMask {
@@ -6305,8 +6562,7 @@ pub(crate) unsafe fn paint_dropdown_into(
             let _ = RestoreDC(buffer.dc, saved);
             true
         })();
-        TEXT_THEME.with(|slot| slot.set(old_theme));
-        GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+        drop(_text_guard);
         ok && buffer.finish()
     }
 }
@@ -6410,8 +6666,7 @@ pub(crate) unsafe fn paint_update_popup_into(
         } else {
             HTHEME(0)
         };
-        let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
-        let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+        let _text_guard = TextTargetGuard::push(theme, buffer.handle, buffer.area, glass);
         let ok = (|| -> bool {
             let card_alpha = if glass { 196 } else { 255 };
             fill(buffer.dc, area, CARD);
@@ -6672,8 +6927,7 @@ pub(crate) unsafe fn paint_update_popup_into(
             );
             theme.0 != 0 || buffer.opaque()
         })();
-        TEXT_THEME.with(|slot| slot.set(old_theme));
-        GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+        drop(_text_guard);
         ok && buffer.finish()
     }
 }
@@ -9410,5 +9664,104 @@ mod tests {
 
         let g = clock_appearance_geom(&layout, 96);
         assert!(g.wheel_r >= 44 && g.val_bar.bottom <= layout.settings_resources_panel.bottom);
+    }
+
+    #[test]
+    fn glass_label_compositing_preserves_transparent_background() {
+        clear();
+        // SAFETY: self-contained offscreen DIB & PaintBuffer created and freed in this test.
+        unsafe {
+            let w = 220;
+            let h = 64;
+            let area = rect(0, 0, w, h);
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(
+                dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .expect("label test DIB");
+            let prev = SelectObject(dc, bmp);
+
+            let buffer = PaintBuffer::new(dc, area).expect("buffered paint");
+            let left_r = rect(0, 0, 110, h);
+            let right_r = rect(110, 0, w, h);
+            fill(buffer.dc, left_r, BODY);
+            fill(buffer.dc, right_r, CARD);
+            assert!(buffer.tint_background(left_r, PANEL_ALPHA));
+            assert!(buffer.tint_background(right_r, CARD_ALPHA));
+
+            {
+                let _guard = TextTargetGuard::push(HTHEME(0), buffer.handle, buffer.area, true);
+                label(
+                    buffer.dc,
+                    "Hi",
+                    rect(12, 10, 100, 50),
+                    20,
+                    true,
+                    TEXT,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
+                label(
+                    buffer.dc,
+                    "Card",
+                    rect(120, 10, 208, 50),
+                    20,
+                    true,
+                    TEXT,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+
+            let mut bp_bits = std::ptr::null_mut();
+            let mut stride = 0;
+            assert!(GdiFlush().as_bool());
+            assert!(GetBufferedPaintBits(buffer.handle, &mut bp_bits, &mut stride).is_ok());
+            let out = std::slice::from_raw_parts(
+                bp_bits as *const RGBQUAD,
+                (stride as usize) * (h as usize),
+            );
+            // Non-glyph background pixels inside the label boxes must keep PANEL_ALPHA / CARD_ALPHA (never 255 black!).
+            let left_bg = &out[48 * stride as usize + 95];
+            assert_eq!(left_bg.rgbReserved, PANEL_ALPHA);
+            let right_bg = &out[48 * stride as usize + 202];
+            assert_eq!(right_bg.rgbReserved, CARD_ALPHA);
+            // At least some glyph pixels must have been composited cleanly and stay premultiplied.
+            let has_glyph = (12..48).any(|y| {
+                (12..90).any(|x| {
+                    let px = &out[y * stride as usize + x];
+                    px.rgbReserved > 0 && px.rgbRed <= px.rgbReserved
+                })
+            });
+            assert!(has_glyph, "glass label must draw antialiased glyph pixels");
+            assert!(
+                out.iter().all(|p| {
+                    p.rgbRed <= p.rgbReserved
+                        && p.rgbGreen <= p.rgbReserved
+                        && p.rgbBlue <= p.rgbReserved
+                }),
+                "all pixels after glass label compositing must stay premultiplied"
+            );
+            drop(buffer);
+            SelectObject(dc, prev);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(dc);
+        }
+        clear();
     }
 }
