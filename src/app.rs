@@ -5342,6 +5342,10 @@ fn set_startup(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+pub fn cleanup_uninstall() {
+    let _ = set_startup(false);
+}
+
 fn trim_working_set() {
     // SAFETY: pseudo-handle for current process; best-effort working-set trim of cold/freed pages.
     unsafe {

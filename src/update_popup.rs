@@ -215,16 +215,13 @@ fn ensure_class() -> Result<(), String> {
 
 fn anchor_rect(owner: HWND, width: i32, height: i32, dpi: i32) -> (i32, i32) {
     let s = |n: i32| n * dpi.max(96) / 96;
-    let mut client = RECT::default();
     let mut origin = POINT::default();
-    let ok = unsafe {
-        GetClientRect(owner, &mut client).is_ok() && ClientToScreen(owner, &mut origin).as_bool()
-    };
+    let ok = unsafe { ClientToScreen(owner, &mut origin).as_bool() };
     if !ok {
         return (100, 100);
     }
-    let mut x = origin.x + s(20);
-    let mut y = origin.y + (client.bottom - s(76) - height - s(14)).max(s(8));
+    let mut x = origin.x + s(24);
+    let mut y = origin.y + s(84);
 
     let mon = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO {

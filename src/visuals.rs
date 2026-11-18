@@ -7017,7 +7017,7 @@ pub(crate) unsafe fn paint_update_popup_into(
         };
         let _text_guard = TextTargetGuard::push(theme, buffer.handle, buffer.area, glass);
         let ok = (|| -> bool {
-            let card_alpha = if glass { 196 } else { 255 };
+            let card_alpha = if glass { DROPDOWN_ALPHA } else { 255 };
             fill(buffer.dc, area, CARD);
             let outer_mask = RoundedMask {
                 ellipse: s(12),

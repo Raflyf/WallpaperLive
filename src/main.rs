@@ -41,6 +41,10 @@ fn main() {
             }
         }
     }
+    if args.first().is_some_and(|arg| arg == "--cleanup-uninstall") {
+        app::cleanup_uninstall();
+        std::process::exit(0);
+    }
     if let Err(error) = app::run() {
         let message: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();
         // SAFETY: NUL-terminated temporary string lives until native message box returns.

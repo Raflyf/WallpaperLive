@@ -37,8 +37,9 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Fixed
 
-- **Acrylic glass control painting:** Fixed opaque black/dark background boxes behind static glass labels (`a9a7044`), static clear-cache labels (`0ae7603`), and highlighted text selections inside the bottom `STATUS` box (`paint_control_into`, `collect_status_selection_spans`).
+- **Acrylic glass control painting & popups:** Fixed opaque black/dark background boxes behind static glass labels (`a9a7044`), static clear-cache labels (`0ae7603`), and highlighted text selections inside the bottom `STATUS` box (`paint_control_into`, `collect_status_selection_spans`); updated floating update/decoder popups to use translucent `DROPDOWN_ALPHA` Acrylic tint anchored cleanly at the top-left below the header (`anchor_rect`).
 - **Tab animations & stability:** Aligned slide transition directions across Library, Settings, and Day Clock (`visuals::tab_slide_direction`) and guarded null HWNDs during headless tab switches (`3cbe4e2`).
+- **Complete MSI uninstall cleanup:** Added `WixRemoveFoldersEx` cleanup for the install folder (`runtime\libmpv-2.dll`, `updates\`) and `%LocalAppData%\WallpaperLive` (`settings.ini`, `video-cache\`), plus `--cleanup-uninstall` removal of the `Run\WallpaperLive` startup entry and HKCU install registry keys on full uninstall while preserving user state during upgrades.
 - **Desktop clock layering & multi-monitor edge cases:** Fixed multi-monitor placement, screen picker behavior, unowned popup drag handling, resilient MSAA icon rect detection, separation between drag input and visual layering, and lowering the popup clock when returning to WallpaperLive after Show desktop.
 
 ### Verification and limits

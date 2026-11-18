@@ -30,6 +30,27 @@
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <Property Id="WixShellExecTarget" Value="[#WallpaperLiveExe]" />
+    <Property Id="INSTALLFOLDER_CLEANUP" Secure="yes">
+      <RegistrySearch
+          Id="FindInstallPath"
+          Root="HKCU"
+          Key="Software\Raflyf\WallpaperLive\Install"
+          Name="InstallPath"
+          Type="raw"
+          Win64="yes" />
+    </Property>
+    <Property Id="APPDATA_CLEANUP" Secure="yes">
+      <RegistrySearch
+          Id="FindDataPath"
+          Root="HKCU"
+          Key="Software\Raflyf\WallpaperLive\Install"
+          Name="DataPath"
+          Type="raw"
+          Win64="yes" />
+    </Property>
+
+    <SetProperty Id="INSTALLFOLDER_CLEANUP" Value="" Before="WixRemoveFoldersEx" Sequence="execute">UPGRADINGPRODUCTCODE</SetProperty>
+    <SetProperty Id="APPDATA_CLEANUP" Value="" Before="WixRemoveFoldersEx" Sequence="execute">UPGRADINGPRODUCTCODE</SetProperty>
 
     <util:CloseApplication
         Id="CloseWallpaperLive"
@@ -45,6 +66,16 @@
         BinaryKey="WixCA"
         DllEntry="WixShellExec"
         Impersonate="yes" />
+    <CustomAction
+        Id="CleanupStartupRun"
+        FileKey="WallpaperLiveExe"
+        ExeCommand="--cleanup-uninstall"
+        Execute="deferred"
+        Impersonate="yes"
+        Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="CleanupStartupRun" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
 
     <UI>
       <UIRef Id="WixUI_InstallDir" />
@@ -75,6 +106,15 @@
             Type="string"
             Value="[INSTALLFOLDER]"
             KeyPath="yes" />
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\Raflyf\WallpaperLive\Install"
+            Name="DataPath"
+            Type="string"
+            Value="[LocalAppDataFolder]WallpaperLive" />
+        <RegistryKey Root="HKCU" Key="Software\Raflyf\WallpaperLive" Action="createKeyAndRemoveKeyOnUninstall" />
+        <util:RemoveFolderEx Id="CleanupInstallFolder" On="uninstall" Property="INSTALLFOLDER_CLEANUP" />
+        <util:RemoveFolderEx Id="CleanupAppDataFolder" On="uninstall" Property="APPDATA_CLEANUP" />
         <File Id="WallpaperLiveExe" Source="$(var.AppExe)" />
         <File Id="ReadmeMd" Source="$(var.RepoRoot)\README.md" />
         <File Id="LicenseTxt" Source="$(var.RepoRoot)\LICENSE" />
