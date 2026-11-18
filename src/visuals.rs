@@ -53,7 +53,6 @@ pub const CHECK_UPDATES: usize = 126;
 pub const VERSION: usize = 127;
 pub const CACHE_INFO: usize = 128;
 pub const CLEAR_CACHE: usize = 129;
-pub const MEMORY_INFO: usize = 130;
 pub const TAB_LIBRARY: usize = 114;
 pub const TAB_SETTINGS: usize = 132;
 pub const SEARCH: usize = 133;
@@ -92,6 +91,7 @@ pub const CLOCK_STYLE_COMMIT: usize = 170;
 pub const CLOCK_PICK_COLOR: usize = 171;
 pub const CLOCK_CTX_PICK_COLOR: usize = 172;
 pub const TRANSPARENT_BAR: usize = 173;
+pub const CLOCK_HEX_EDIT: usize = 174;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 pub const HEADER_HEIGHT: i32 = 72;
@@ -111,11 +111,11 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         101 | ADD_FOLDER => matches!(tab, Tab::Library | Tab::Sources),
         SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
         id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
-        107 | 108 | 121 | ACRYLIC | AUTO_UPDATES | CHECK_UPDATES | VERSION | MEMORY_INFO
-        | CACHE_INFO | CLEAR_CACHE | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE
-        | SETTINGS_INFO | SUPPORT | SAWERIA => tab == Tab::Settings,
+        107 | 108 | 121 | ACRYLIC | AUTO_UPDATES | CHECK_UPDATES | VERSION | CACHE_INFO
+        | CLEAR_CACHE | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE | SETTINGS_INFO
+        | SUPPORT | SAWERIA => tab == Tab::Settings,
         CLOCK_ENABLE | CLOCK_LOCK | CLOCK_BEHIND_ICONS | CLOCK_24H | CLOCK_REPOSITION
-        | CLOCK_RESET_POS | CLOCK_PICK_COLOR => tab == Tab::Clock,
+        | CLOCK_RESET_POS | CLOCK_PICK_COLOR | CLOCK_HEX_EDIT => tab == Tab::Clock,
         PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
         | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
             tab == Tab::Library
@@ -241,6 +241,10 @@ impl Layout {
         ];
         let sources_divider =
             (sources_panel.bottom > 408).then(|| r(source_x, 404, source_width, 1));
+        let clock_panel_bottom = footer.top - 16;
+        let clock_avail_h = (clock_panel_bottom - 320).max(170);
+        let clock_wheel_r = ((clock_avail_h - 48) / 2).clamp(44, 62);
+        let clock_val_top = 326 + clock_wheel_r * 2 + 14;
         Self {
             client: r(0, 0, width, height),
             header: r(0, 0, width, HEADER_HEIGHT),
@@ -312,14 +316,17 @@ impl Layout {
                 (CLOCK_REPOSITION, r(content_x, 448, column_width, 36)),
                 (CLOCK_RESET_POS, r(content_x, 496, column_width, 36)),
                 (CLOCK_PICK_COLOR, r(resources_x, 496, column_width, 36)),
+                (
+                    CLOCK_HEX_EDIT,
+                    r(resources_x + 6, clock_val_top - 1, 84, 20),
+                ),
                 (VERSION, r(resources_x, 214, column_width - 188, 24)),
                 (
                     CHECK_UPDATES,
                     r(resources_x + column_width - 176, 210, 176, 32),
                 ),
-                (MEMORY_INFO, r(resources_x, 248, column_width, 40)),
-                (CACHE_INFO, r(resources_x, 300, column_width, 24)),
-                (CLEAR_CACHE, r(resources_x, 336, column_width, 36)),
+                (CACHE_INFO, r(resources_x, 256, column_width, 24)),
+                (CLEAR_CACHE, r(resources_x, 292, column_width, 36)),
                 (FPS, r(side_x, fit.bottom + 12, side_width, 34)),
                 (SELECT_ALL, r(split - 128, 164, 104, 32)),
                 (PREVIOUS, r(pager.left, pager.top, 88, 36)),
@@ -342,7 +349,7 @@ impl Layout {
                 (SITE_BASE + 3, r(source_x, 352, source_width, 44)),
                 (SOURCES_NOTE, r(source_x, 412, source_width, 112)),
                 (SETTINGS_NOTE, settings_note),
-                (SETTINGS_INFO, r(resources_x, 384, column_width, 48)),
+                (SETTINGS_INFO, r(resources_x, 344, column_width, 48)),
             ],
         }
     }
@@ -506,7 +513,6 @@ fn control_surface(id: usize) -> (u32, u8) {
             | SUPPORT
             | SAWERIA
             | VERSION
-            | MEMORY_INFO
             | CACHE_INFO
             | SETTINGS_NOTE
             | SETTINGS_INFO
@@ -979,7 +985,7 @@ unsafe fn set_child_visible_no_redraw(child: HWND, visible: bool) {
     };
     unsafe {
         if !visible || IsWindow(child).as_bool() {
-            if GetDlgCtrlID(child) as usize == SEARCH {
+            if matches!(GetDlgCtrlID(child) as usize, SEARCH | CLOCK_HEX_EDIT) {
                 sync_search_layering(GetParent(child).unwrap_or_default(), child, visible);
             }
             let _ = SetWindowPos(
@@ -1056,7 +1062,7 @@ unsafe fn paint_children_with_visibility(
             {
                 continue;
             }
-            if id == SEARCH {
+            if id == SEARCH || id == CLOCK_HEX_EDIT {
                 let cw = child_rect.right - child_rect.left;
                 let ch = child_rect.bottom - child_rect.top;
                 if cw <= 0 || ch <= 0 {
@@ -1087,7 +1093,8 @@ unsafe fn paint_children_with_visibility(
                         let prev_bmp = SelectObject(temp_dc, temp_bmp);
                         if !temp_bits.is_null() {
                             let total = (cw * ch) as usize;
-                            std::slice::from_raw_parts_mut(temp_bits as *mut u32, total).fill(CARD);
+                            std::slice::from_raw_parts_mut(temp_bits as *mut u32, total)
+                                .fill(control_color(id));
                             SendMessageW(
                                 child,
                                 WM_PRINT,
@@ -1966,7 +1973,9 @@ thread_local! {
     static THEME_CACHE: RefCell<CachedTheme> = RefCell::new(CachedTheme::default());
     static OS_SETTINGS_CACHE: Cell<(Option<bool>, Option<bool>)> = const { Cell::new((None, None)) };
     static BX_COLS_SCRATCH: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    static USER_ACRYLIC: Cell<bool> = const { Cell::new(true) };
+    static USER_ACRYLIC: Cell<bool> = const { Cell::new(false) };
+    static TB_DISMISSED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+    static TB_SUPPRESS_CLICK: Cell<bool> = const { Cell::new(false) };
     static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
     static TRANSITION_BACKDROP: RefCell<TransitionBackdrop> = RefCell::new(TransitionBackdrop::default());
     static DRAG_UI_CACHE: RefCell<DragUiCache> = RefCell::new(DragUiCache::default());
@@ -2014,6 +2023,27 @@ pub fn invalidate_os_settings_cache() {
 
 pub fn set_user_acrylic(enabled: bool) {
     USER_ACRYLIC.with(|slot| slot.set(enabled));
+}
+pub fn note_transparentbar_dismissed() {
+    TB_DISMISSED_AT.with(|s| s.set(Some(Instant::now())));
+}
+pub fn clear_transparentbar_dismissed() {
+    TB_DISMISSED_AT.with(|s| s.set(None));
+    TB_SUPPRESS_CLICK.with(|s| s.set(false));
+}
+pub fn take_transparentbar_suppressed() -> bool {
+    TB_SUPPRESS_CLICK.with(|s| s.replace(false))
+}
+pub fn handle_transparentbar_lbuttondown(ctrl_id: usize) {
+    if ctrl_id == TRANSPARENT_BAR {
+        let dismissed_recently = TB_DISMISSED_AT.with(|s| {
+            s.take()
+                .is_some_and(|t| t.elapsed() <= std::time::Duration::from_millis(400))
+        });
+        TB_SUPPRESS_CLICK.with(|s| s.set(dismissed_recently));
+    } else {
+        clear_transparentbar_dismissed();
+    }
 }
 
 pub fn user_acrylic_enabled() -> bool {
@@ -4164,6 +4194,16 @@ unsafe fn set_acrylic_composition(window: HWND, enable: bool) -> bool {
     }
 }
 
+unsafe fn sync_edit_layerings(window: HWND) {
+    for id in [SEARCH, CLOCK_HEX_EDIT] {
+        if let Ok(edit) = unsafe { GetDlgItem(window, id as i32) } {
+            unsafe {
+                sync_search_layering(window, edit, IsWindowVisible(edit).as_bool());
+            }
+        }
+    }
+}
+
 unsafe fn sync_search_layering(parent: HWND, search: HWND, visible: bool) {
     if search.0.is_null() {
         return;
@@ -5285,9 +5325,7 @@ pub fn enable_backdrop(window: HWND) -> bool {
             if !drag_move_backdrop_active(window) {
                 let _ = set_acrylic_composition(window, true);
             }
-            if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
-                sync_search_layering(window, search, IsWindowVisible(search).as_bool());
-            }
+            sync_edit_layerings(window);
             return true;
         }
         let backdrop_ok = apply_hybrid_acrylic(window);
@@ -5302,9 +5340,7 @@ pub fn enable_backdrop(window: HWND) -> bool {
             disable_backdrop(window);
             return false;
         }
-        if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
-            sync_search_layering(window, search, IsWindowVisible(search).as_bool());
-        }
+        sync_edit_layerings(window);
         true
     }
 }
@@ -5338,9 +5374,7 @@ pub fn disable_backdrop(window: HWND) {
             std::mem::size_of_val(&allow_transitions) as u32,
         );
         let _ = DwmExtendFrameIntoClientArea(window, &MARGINS::default());
-        if let Ok(search) = GetDlgItem(window, SEARCH as i32) {
-            sync_search_layering(window, search, IsWindowVisible(search).as_bool());
-        }
+        sync_edit_layerings(window);
         if was_enabled {
             let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
         }
@@ -5944,7 +5978,7 @@ unsafe fn paint_scene(
                         DT_SINGLELINE,
                     );
                     label_clipped(
-                        "Mond-style clock — behind desktop shortcuts or interactive on desktop (drag from center)",
+                        "Mond-style clock: behind desktop shortcuts or interactive on desktop (drag from center)",
                         pixels(layout.settings_subtitle),
                         scale(13),
                         false,
@@ -6003,7 +6037,8 @@ pub fn prepare_control(window: HWND) -> Result<(), String> {
         let mut class = [0u16; 32];
         let count = GetClassNameW(window, &mut class).max(0) as usize;
         let class_name = String::from_utf16_lossy(&class[..count]);
-        if class_name == "Edit" && GetDlgCtrlID(window) as usize == SEARCH {
+        if class_name == "Edit" && matches!(GetDlgCtrlID(window) as usize, SEARCH | CLOCK_HEX_EDIT)
+        {
             // Native editing, selection and caret repaint outside WM_PAINT; composite this child with frosted alpha only while visible under glass.
             let parent = GetParent(window).unwrap_or_default();
             sync_search_layering(parent, window, IsWindowVisible(window).as_bool());
@@ -6035,9 +6070,17 @@ fn control_color(id: usize) -> u32 {
         FOOTER
     } else if id == SEARCH {
         CARD
+    } else if id == CLOCK_HEX_EDIT {
+        INK
     } else {
         control_surface(id).0
     }
+}
+
+unsafe fn is_static_window(window: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let count = unsafe { GetClassNameW(window, &mut class) }.max(0) as usize;
+    String::from_utf16_lossy(&class[..count]) == "Static"
 }
 
 unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
@@ -6306,9 +6349,32 @@ unsafe extern "system" fn control_proc(
         VK_DOWN, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
     };
     const WM_MOUSELEAVE: u32 = 0x02A3;
+    const WM_ENABLE: u32 = 0x000A;
     unsafe {
         let owner_draw = data != 0;
+        let ctrl_id = GetDlgCtrlID(window) as usize;
         match message {
+            WM_SETTEXT | WM_ENABLE
+                if !owner_draw && (ctrl_id == 113 || is_static_window(window)) =>
+            {
+                // Static's default handler paints directly on GetDC during WM_SETTEXT/WM_ENABLE,
+                // bypassing PaintBuffer and leaving an opaque box over Acrylic glass.
+                // Clear WS_VISIBLE briefly while DefSubclassProc updates state, then repaint via WM_PAINT.
+                let style = GetWindowLongW(window, GWL_STYLE) as u32;
+                if style & WS_VISIBLE.0 != 0 {
+                    SetWindowLongW(window, GWL_STYLE, (style & !WS_VISIBLE.0) as i32);
+                    let res = DefSubclassProc(window, message, wparam, lparam);
+                    SetWindowLongW(window, GWL_STYLE, style as i32);
+                    let parent = GetParent(window).unwrap_or_default();
+                    if !parent.0.is_null() && IsWindowVisible(parent).as_bool() {
+                        let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                    } else {
+                        let _ = InvalidateRect(window, None, false);
+                    }
+                    return res;
+                }
+                DefSubclassProc(window, message, wparam, lparam)
+            }
             WM_PAINT if !owner_draw => {
                 let mut ps = PAINTSTRUCT::default();
                 let dc = BeginPaint(window, &mut ps);
@@ -6328,6 +6394,9 @@ unsafe extern "system" fn control_proc(
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                if message == WM_LBUTTONDOWN {
+                    handle_transparentbar_lbuttondown(ctrl_id);
+                }
                 if let Ok(parent) = GetParent(window)
                     && !parent.0.is_null()
                 {
@@ -6339,7 +6408,7 @@ unsafe extern "system" fn control_proc(
                     );
                 }
                 let res = DefSubclassProc(window, message, wparam, lparam);
-                if GetDlgCtrlID(window) as usize == 113 {
+                if ctrl_id == 113 {
                     let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                 }
                 res
@@ -6434,8 +6503,16 @@ unsafe extern "system" fn control_proc(
                         LPARAM(0),
                     );
                 }
+                if key == VK_RETURN.0
+                    && ctrl_id == CLOCK_HEX_EDIT
+                    && let Ok(parent) = GetParent(window)
+                    && !parent.0.is_null()
+                {
+                    let _ = SetFocus(parent);
+                    return LRESULT(0);
+                }
                 let res = DefSubclassProc(window, message, wparam, lparam);
-                if GetDlgCtrlID(window) as usize == 113 {
+                if ctrl_id == 113 {
                     let _ = RedrawWindow(window, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                 }
                 res
@@ -7379,17 +7456,8 @@ unsafe fn paint_clock_appearance_controls(
             }
         }
 
-        // Hex colour badge.
+        // Hex colour badge backing pill (editable CLOCK_HEX_EDIT sits inside).
         rounded(dc, g.hex_pill, INK, LINE, s(8));
-        label(
-            dc,
-            &format!("#{:06X}", st.color & 0x00FF_FFFF),
-            g.hex_pill,
-            s(12),
-            true,
-            TEXT,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
         if let Some(buf) = buffer {
             let _ = buf.tint_background(g.hex_pill, 255);
         }
@@ -7559,7 +7627,7 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
     // SAFETY: native control requests a persistent UI-owned brush, deleted only after windows close.
     unsafe {
         let id = GetDlgCtrlID(window) as usize;
-        if matches!(id, 113 | SEARCH) {
+        if matches!(id, 113 | SEARCH | CLOCK_HEX_EDIT) {
             SetBkMode(dc, OPAQUE);
         } else {
             SetBkMode(dc, TRANSPARENT);
@@ -7570,7 +7638,7 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
                 TEXT_ON_DARK
             } else if matches!(
                 id,
-                VERSION | MEMORY_INFO | CACHE_INFO | SOURCES_NOTE | SETTINGS_NOTE | SETTINGS_INFO
+                VERSION | CACHE_INFO | SOURCES_NOTE | SETTINGS_NOTE | SETTINGS_INFO
             ) {
                 MUTED
             } else {
@@ -8056,7 +8124,6 @@ mod tests {
             assert_eq!(area(107).left, area(121).left);
             assert_eq!(area(107).left, area(ACRYLIC).left);
             assert!(area(ACRYLIC).top > area(108).bottom);
-            assert_eq!(area(MEMORY_INFO).left, area(CACHE_INFO).left);
             assert!(area(FPS).bottom + 12 <= area(AUDIO).top);
             assert_eq!(area(SOURCES_BACK).top, layout.sources_title.top);
             for id in SITE_BASE..SITE_BASE + 4 {
@@ -8070,7 +8137,7 @@ mod tests {
             assert!(visible_on(Tab::Settings, CHECK_UPDATES));
             assert!(!visible_on(Tab::Library, CHECK_UPDATES));
             assert!(area(CHECK_UPDATES).left > area(VERSION).right);
-            assert!(area(CHECK_UPDATES).bottom < area(MEMORY_INFO).top);
+            assert!(area(CHECK_UPDATES).bottom < area(CACHE_INFO).top);
             assert_eq!(area(CHECK_UPDATES).right, area(CLEAR_CACHE).right);
             assert_eq!(area(105).bottom - area(105).top, 32);
             assert_eq!(layout.control(TILE_BASE), Some(layout.tile_rects[0]));
@@ -9719,7 +9786,15 @@ mod tests {
 
         let g = clock_appearance_geom(&layout, 96);
         let pick_area = layout.control(CLOCK_PICK_COLOR).unwrap();
+        let hex_area = layout.control(CLOCK_HEX_EDIT).unwrap();
         assert!(visible_on(Tab::Clock, CLOCK_PICK_COLOR));
+        assert!(visible_on(Tab::Clock, CLOCK_HEX_EDIT));
+        assert!(
+            hex_area.left >= g.hex_pill.left
+                && hex_area.right <= g.hex_pill.right
+                && hex_area.top >= g.hex_pill.top
+                && hex_area.bottom <= g.hex_pill.bottom
+        );
         assert!(
             g.wheel_r >= 44
                 && g.val_bar.bottom <= pick_area.top
@@ -9858,5 +9933,141 @@ mod tests {
             let _ = DeleteDC(dc);
         }
         clear();
+    }
+
+    #[test]
+    fn static_text_update_preserves_glass_card_alpha_and_hex_edit_uses_ink() {
+        unsafe extern "system" fn ctlcolor_subclass(
+            window: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+            _id: usize,
+            _data: usize,
+        ) -> LRESULT {
+            if matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC)
+                && let Some(handled) = unsafe {
+                    control_colors(message, HDC(wparam.0 as *mut _), HWND(lparam.0 as *mut _))
+                }
+            {
+                return handled;
+            }
+            unsafe { DefSubclassProc(window, message, wparam, lparam) }
+        }
+
+        clear();
+        // SAFETY: test-owned hidden POPUP parent + child controls created and destroyed synchronously.
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                280,
+                120,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("test parent");
+            assert!(SetWindowSubclass(parent, Some(ctlcolor_subclass), 992, 0).as_bool());
+            let _ = SetPropW(
+                parent,
+                GLASS_PROPERTY,
+                windows::Win32::Foundation::HANDLE(parent.0),
+            );
+            let cache_lbl = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Video cache: 49 MB of 2048 MB"),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WINDOW_STYLE(windows::Win32::System::SystemServices::SS_ENDELLIPSIS.0),
+                12,
+                12,
+                220,
+                24,
+                parent,
+                HMENU(CACHE_INFO as *mut _),
+                None,
+                None,
+            )
+            .expect("test cache static");
+            prepare_control(cache_lbl).expect("prepare cache static");
+
+            let updated = w!("Video cache: 0 MB of 2048 MB");
+            let _ = SetWindowTextW(cache_lbl, windows::core::PCWSTR(updated.as_ptr()));
+            assert_eq!(window_text(cache_lbl), "Video cache: 0 MB of 2048 MB");
+            assert_ne!(
+                GetWindowLongW(cache_lbl, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0
+            );
+
+            let layer =
+                capture_region_controls(parent, rect(0, 0, 280, 120), &[(CACHE_INFO, cache_lbl)])
+                    .expect("captured static layer");
+            let bg = layer.pixels[(32 * 280 + 225) as usize];
+            assert_eq!((bg >> 24) & 255, u32::from(CARD_ALPHA));
+
+            let hex_edit = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!("#5D86A8"),
+                WS_CHILD | WINDOW_STYLE(ES_CENTER as u32 | ES_AUTOHSCROLL as u32),
+                12,
+                52,
+                84,
+                20,
+                parent,
+                HMENU(CLOCK_HEX_EDIT as *mut _),
+                None,
+                None,
+            )
+            .expect("test hex edit");
+            prepare_control(hex_edit).expect("prepare hex edit");
+            assert_eq!(control_color(CLOCK_HEX_EDIT), INK);
+
+            let dc = CreateCompatibleDC(None);
+            let _ = SetBkMode(dc, TRANSPARENT);
+            assert!(control_colors(WM_CTLCOLOREDIT, dc, hex_edit).is_some());
+            assert_eq!(GetBkColor(dc), rgb(INK));
+            let _ = DeleteDC(dc);
+
+            set_child_visible_no_redraw(hex_edit, true);
+            assert_ne!(
+                GetWindowLongPtrW(hex_edit, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
+                0
+            );
+            set_child_visible_no_redraw(hex_edit, false);
+            assert_eq!(
+                GetWindowLongPtrW(hex_edit, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize,
+                0
+            );
+
+            let _ = RemoveWindowSubclass(parent, Some(ctlcolor_subclass), 992);
+            let _ = DestroyWindow(parent);
+        }
+        clear();
+    }
+
+    #[test]
+    fn transparentbar_toggle_suppresses_dismiss_click_only() {
+        clear_transparentbar_dismissed();
+        handle_transparentbar_lbuttondown(TRANSPARENT_BAR);
+        assert!(!take_transparentbar_suppressed());
+
+        note_transparentbar_dismissed();
+        handle_transparentbar_lbuttondown(TRANSPARENT_BAR);
+        assert!(take_transparentbar_suppressed());
+        assert!(!take_transparentbar_suppressed());
+
+        note_transparentbar_dismissed();
+        handle_transparentbar_lbuttondown(CLEAR_CACHE);
+        handle_transparentbar_lbuttondown(TRANSPARENT_BAR);
+        assert!(!take_transparentbar_suppressed());
+        clear_transparentbar_dismissed();
     }
 }

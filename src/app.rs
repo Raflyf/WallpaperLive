@@ -16,8 +16,8 @@ use windows::{
         Graphics::Gdi::*,
         Storage::FileSystem::*,
         System::{
-            Com::*, LibraryLoader::GetModuleHandleW, Power::*, ProcessStatus::*, Registry::*,
-            RemoteDesktop::*, SystemServices::*, Threading::*,
+            Com::*, LibraryLoader::GetModuleHandleW, Power::*, Registry::*, RemoteDesktop::*,
+            SystemServices::*, Threading::*,
         },
         UI::{
             Controls::{
@@ -103,6 +103,40 @@ thread_local! {
         std::cell::RefCell::new(DragMoveState::default());
     static CLOCK_DRAG: std::cell::Cell<Option<visuals::ClockDragTarget>> =
         const { std::cell::Cell::new(None) };
+    static TB_FOCUS: std::cell::Cell<(bool, Option<Instant>)> =
+        const { std::cell::Cell::new((false, None)) };
+    static HEX_EDIT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn parse_hex_color(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16)
+        .ok()
+        .map(|value| value & 0x00FF_FFFF)
+}
+
+unsafe fn foreground_belongs_to_transparentbar() -> bool {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return false;
+    }
+    let Ok(tb) = (unsafe { FindWindowW(w!("TransparentBar.Window"), None) }) else {
+        return false;
+    };
+    if tb.0.is_null() {
+        return false;
+    }
+    let mut fg_pid = 0u32;
+    let mut tb_pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+        GetWindowThreadProcessId(tb, Some(&mut tb_pid));
+    }
+    fg_pid != 0 && fg_pid == tb_pid
 }
 
 fn enter_drag_move(window: HWND) {
@@ -1181,7 +1215,7 @@ impl App {
                 (
                     visuals::SETTINGS_INFO,
                     w!("STATIC"),
-                    "Memory readings may differ from Task Manager. Clear unused cache keeps imported media and active wallpapers.",
+                    "Clear unused cache keeps imported media and active wallpapers.",
                     SS_LEFT.0 | SS_NOPREFIX.0,
                 ),
                 (
@@ -1390,12 +1424,6 @@ impl App {
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
-                    visuals::MEMORY_INFO,
-                    w!("STATIC"),
-                    "Memory: measuring...",
-                    SS_LEFT.0 | SS_NOPREFIX.0,
-                ),
-                (
                     visuals::CACHE_INFO,
                     w!("STATIC"),
                     "Video cache: measuring...",
@@ -1406,6 +1434,12 @@ impl App {
                     w!("BUTTON"),
                     "Clear unused cache",
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_HEX_EDIT,
+                    w!("EDIT"),
+                    "#5D86A8",
+                    ES_CENTER as u32 | ES_AUTOHSCROLL as u32 | ES_UPPERCASE as u32 | WS_TABSTOP.0,
                 ),
                 (
                     EXIT,
@@ -1479,6 +1513,12 @@ impl App {
                 self.control(visuals::SEARCH),
                 windows::Win32::UI::Controls::EM_SETLIMITTEXT,
                 WPARAM(256),
+                LPARAM(0),
+            );
+            SendMessageW(
+                self.control(visuals::CLOCK_HEX_EDIT),
+                windows::Win32::UI::Controls::EM_SETLIMITTEXT,
+                WPARAM(16),
                 LPARAM(0),
             );
             for i in 0..9 {
@@ -1629,24 +1669,8 @@ impl App {
         paths.dedup();
         paths
     }
-    // Read-only diagnostics: one process query and one directory listing per Settings visit.
+    // Read-only diagnostics: one directory listing per Settings visit.
     fn refresh_diagnostics(&self) {
-        let mut counters = PROCESS_MEMORY_COUNTERS {
-            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: current-process pseudo handle and correctly sized output struct.
-        let memory =
-            unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) }
-                .map(|_| {
-                    format!(
-                        "Memory: {:.0} MB in use\r\nPeak: {:.0} MB",
-                        counters.WorkingSetSize as f64 / 1048576.0,
-                        counters.PeakWorkingSetSize as f64 / 1048576.0
-                    )
-                })
-                .unwrap_or_else(|_| "Memory: unavailable".into());
-        self.text(visuals::MEMORY_INFO, &memory);
         let cache = self
             .cache_directory()
             .map(|d| crate::cache::cache_size(&d))
@@ -2928,6 +2952,9 @@ impl App {
         Ok(())
     }
     fn open_or_get_transparentbar(&self) -> Result<(), String> {
+        if visuals::take_transparentbar_suppressed() {
+            return Ok(());
+        }
         if let Some(exe) = find_transparentbar_exe() {
             let mut cmd = std::process::Command::new(&exe);
             if let Some(dir) = exe.parent()
@@ -2937,6 +2964,7 @@ impl App {
             }
             cmd.spawn()
                 .map_err(|e| format!("Could not launch TransparentBar: {e}"))?;
+            TB_FOCUS.with(|s| s.set((false, Some(Instant::now()))));
             Ok(())
         } else {
             self.open_website(TRANSPARENT_BAR_URL)
@@ -4041,6 +4069,27 @@ impl App {
             }
             return Ok(false);
         }
+        if id == visuals::CLOCK_HEX_EDIT {
+            if notification == EN_CHANGE {
+                let raw = window_text(self.control(visuals::CLOCK_HEX_EDIT));
+                if let Some(color) = parse_hex_color(&raw)
+                    && color != (self.settings.clock_color & 0x00FF_FFFF)
+                {
+                    self.settings.clock_color = color;
+                    HEX_EDIT_SYNC.with(|s| s.set(true));
+                    let res = self.save_and_sync_clock();
+                    HEX_EDIT_SYNC.with(|s| s.set(false));
+                    res?;
+                }
+            } else if notification == EN_KILLFOCUS {
+                let raw = window_text(self.control(visuals::CLOCK_HEX_EDIT));
+                if let Some(color) = parse_hex_color(&raw) {
+                    self.settings.clock_color = color;
+                }
+                self.save_and_sync_clock()?;
+            }
+            return Ok(false);
+        }
         if notification != BN_CLICKED {
             return Ok(false);
         }
@@ -4229,6 +4278,8 @@ impl App {
                     }
                     unsafe {
                         let _ = KillTimer(self.hwnd, RESTORE_BACKDROP_TIMER_ID);
+                        TB_FOCUS.with(|s| s.set((false, None)));
+                        visuals::clear_transparentbar_dismissed();
                         visuals::clear_backdrop_transition(self.hwnd);
                         visuals::invalidate_backdrop_cache();
                         let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -4541,6 +4592,16 @@ impl App {
             if !ctrl.0.is_null() {
                 unsafe {
                     SendMessageW(ctrl, BM_SETCHECK, WPARAM(checked as usize), LPARAM(0));
+                }
+            }
+        }
+        let hex_ctrl = self.control(visuals::CLOCK_HEX_EDIT);
+        if !hex_ctrl.0.is_null() && !HEX_EDIT_SYNC.with(std::cell::Cell::get) {
+            let formatted = format!("#{:06X}", self.settings.clock_color & 0x00FF_FFFF);
+            if window_text(hex_ctrl) != formatted {
+                let wide_hex = wide(&formatted);
+                unsafe {
+                    let _ = SetWindowTextW(hex_ctrl, PCWSTR(wide_hex.as_ptr()));
                 }
             }
         }
@@ -5445,6 +5506,28 @@ unsafe extern "system" fn window_proc(
                 }
             }
             WM_ACTIVATE => {
+                let code = (wparam.0 & 0xFFFF) as u32;
+                if code == WA_INACTIVE {
+                    let launched_recent = TB_FOCUS
+                        .with(|s| s.get().1.is_some_and(|t| t.elapsed().as_millis() < 1500));
+                    if launched_recent || foreground_belongs_to_transparentbar() {
+                        TB_FOCUS.with(|s| {
+                            let (_, at) = s.get();
+                            s.set((true, at));
+                        });
+                    }
+                } else {
+                    let had_tb = TB_FOCUS.with(|s| {
+                        let (had, _) = s.get();
+                        s.set((false, None));
+                        had
+                    });
+                    if had_tb && code == WA_CLICKACTIVE {
+                        visuals::note_transparentbar_dismissed();
+                    } else if code == WA_ACTIVE {
+                        visuals::clear_transparentbar_dismissed();
+                    }
+                }
                 if let Some(area) = visuals::caption_cluster_rect(window) {
                     let _ = InvalidateRect(window, Some(&area), false);
                 }
@@ -5541,10 +5624,12 @@ unsafe extern "system" fn window_proc(
                     }
                     LRESULT(0)
                 } else if let Some(btn) = visuals::caption_button_hit(window, x, y) {
+                    visuals::clear_transparentbar_dismissed();
                     let _ = SetCapture(window);
                     visuals::set_caption_down(window, Some(btn));
                     LRESULT(0)
                 } else {
+                    visuals::clear_transparentbar_dismissed();
                     DefWindowProcW(window, message, wparam, lparam)
                 }
             }
@@ -8796,6 +8881,85 @@ mod tests {
         assert_eq!(decoded.clock_size, 155);
         assert_eq!(decoded.clock_opacity, 70);
         assert_eq!(decoded.clock_color, 0xD9541E);
+
+        let _ = fs::remove_file(&app.config);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_hash_bare_and_rejects_incomplete() {
+        assert_eq!(parse_hex_color("#5D86A8"), Some(0x005D_86A8));
+        assert_eq!(parse_hex_color("5d86a8"), Some(0x005D_86A8));
+        assert_eq!(parse_hex_color("  #ff00aa \r\n"), Some(0x00FF_00AA));
+        assert_eq!(parse_hex_color("#000000"), Some(0x0000_0000));
+        assert_eq!(parse_hex_color("#5D86A"), None);
+        assert_eq!(parse_hex_color("5D86A89"), None);
+        assert_eq!(parse_hex_color("#GGGGGG"), None);
+        assert_eq!(parse_hex_color(""), None);
+    }
+
+    #[test]
+    fn clock_hex_edit_en_change_updates_color_and_killfocus_normalizes() {
+        let mut app = fixture();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!("clock-hex-edit-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        app.config = dir.join("settings.ini");
+
+        // SAFETY: self-contained child EDIT control owned by test and destroyed before exit.
+        unsafe {
+            let host = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                160,
+                60,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("host");
+            let hex = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!("#5D86A8"),
+                WS_CHILD
+                    | WINDOW_STYLE(ES_CENTER as u32 | ES_AUTOHSCROLL as u32 | ES_UPPERCASE as u32),
+                8,
+                8,
+                84,
+                20,
+                host,
+                HMENU(visuals::CLOCK_HEX_EDIT as *mut _),
+                None,
+                None,
+            )
+            .expect("hex edit");
+            app.controls.push((visuals::CLOCK_HEX_EDIT, hex));
+
+            let pasted = w!("12ab34");
+            let _ = SetWindowTextW(hex, PCWSTR(pasted.as_ptr()));
+            assert!(!app.action(visuals::CLOCK_HEX_EDIT, EN_CHANGE).unwrap());
+            assert_eq!(app.settings.clock_color, 0x0012_AB34);
+            // Live EN_CHANGE preserves raw text while typing until blur/Enter.
+            assert_eq!(window_text(hex).to_ascii_uppercase(), "12AB34");
+
+            assert!(!app.action(visuals::CLOCK_HEX_EDIT, EN_KILLFOCUS).unwrap());
+            assert_eq!(window_text(hex), "#12AB34");
+
+            let bad = w!("#ZZZ");
+            let _ = SetWindowTextW(hex, PCWSTR(bad.as_ptr()));
+            assert!(!app.action(visuals::CLOCK_HEX_EDIT, EN_KILLFOCUS).unwrap());
+            assert_eq!(app.settings.clock_color, 0x0012_AB34);
+            assert_eq!(window_text(hex), "#12AB34");
+
+            let _ = DestroyWindow(host);
+        }
 
         let _ = fs::remove_file(&app.config);
         let _ = fs::remove_dir(&dir);

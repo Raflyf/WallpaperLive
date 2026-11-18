@@ -42,7 +42,7 @@ impl Default for Settings {
             audio_enabled: false,
             pause_fullscreen: true,
             fps: 30,
-            acrylic_blur: true,
+            acrylic_blur: false,
             auto_update_check: true,
             clock_enabled: false,
             clock_locked: false,
@@ -108,8 +108,8 @@ impl Settings {
                 path.display()
             ));
         }
-        if !self.acrylic_blur {
-            content.push_str("acrylic=false\n");
+        if self.acrylic_blur {
+            content.push_str("acrylic=true\n");
         }
         if !self.auto_update_check {
             content.push_str("updates=false\n");
@@ -343,7 +343,7 @@ impl Settings {
             audio_enabled,
             pause_fullscreen,
             fps,
-            acrylic_blur: acrylic.unwrap_or(true),
+            acrylic_blur: acrylic.unwrap_or(false),
             auto_update_check: auto_update_check.unwrap_or(true),
             clock_enabled: clock_enabled.unwrap_or(false),
             clock_locked: clock_locked.unwrap_or(false),
@@ -519,7 +519,7 @@ mod tests {
             audio_enabled: true,
             pause_fullscreen: false,
             fps: 45,
-            acrylic_blur: false,
+            acrylic_blur: true,
             auto_update_check: false,
             clock_enabled: true,
             clock_locked: true,
@@ -532,12 +532,8 @@ mod tests {
         };
         assert_eq!(Settings::decode(&s.encode().unwrap()).unwrap(), s);
         assert!(
-            Settings::decode(
-                &s.encode()
-                    .unwrap()
-                    .replace("acrylic=false", "acrylic=maybe")
-            )
-            .is_err()
+            Settings::decode(&s.encode().unwrap().replace("acrylic=true", "acrylic=maybe"))
+                .is_err()
         );
         assert!(
             Settings::decode(
@@ -548,7 +544,7 @@ mod tests {
             .is_err()
         );
         let empty = Settings::default();
-        assert!(empty.acrylic_blur);
+        assert!(!empty.acrylic_blur);
         assert!(empty.auto_update_check);
         assert_eq!(Settings::decode(&empty.encode().unwrap()).unwrap(), empty);
     }
