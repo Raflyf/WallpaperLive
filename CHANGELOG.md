@@ -19,21 +19,27 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ### Added
 
-- Add a 5-tier **Quality** selector (`Native`, `High`, `Optimize`, `Medium`, `Low`) beside **FPS** in the Library sidebar (`Core::Quality`, `Mpv::open_at_with_quality`, `cache::prepare_local_with_quality`), giving users direct control over native untouched playback vs GPU shader scaling, dithering depth, and cache compression presets.
-- Add consent-based in-app native decoder setup (`download_verified_decoder`) using WinHTTP, SHA-256 verification for both archive and `libmpv-2.dll`, and `System32\tar.exe` extraction, presented inside a matching dark Acrylic popup card (`update_popup::show_decoder`).
-- Add manual hex color editing (`CLOCK_HEX_EDIT`) with a dedicated **Confirm** button (`CLOCK_HEX_CONFIRM`) on the Day Clock appearance controls.
+- **Desktop Day Clock widget:** Rainmeter Mond-inspired desktop day, date, and time widget with Anurati typography, full **Day Clock** settings tab, size and opacity controls, HSV color wheel picker, swatches, editable hex input (`CLOCK_HEX_EDIT`) with dedicated **Confirm** button (`CLOCK_HEX_CONFIRM`), 12h/24h format toggle, lock position/size, right-click context menu, Show desktop topmost behavior, and DirectComposition **Behind desktop shortcuts** layering that keeps shortcut icons and labels clickable.
+- **In-app Acrylic update notifier & downloader:** Dark translucent floating update card (`update_popup.rs`), manual **Check for updates** button in Settings, background update check toggle, SHA-256 checksum verification (`SHA256SUMS.txt`), and support for `.msi` (plus legacy `.exe`) self-update packages.
+- **5-tier `Quality` selector beside `FPS` in Library:** Direct user control over `Native` (original media untouched, bypasses cache re-encode, `spline36`, `rgba16f`, `dither-depth=auto`), `High` (`crf=17, preset=medium, refs=3, lanczos`, `spline36`, `rgba16f`), `Optimize` (`crf=19, preset=fast, refs=2`, `catmull_rom`, `rgba16f`, `dither-depth=auto`), `Medium` (`crf=22, veryfast`, `bilinear`, `rgba8`, `dither-depth=auto`), and `Low` (`720p` cap, `crf=26`, `bilinear`, `rgba8`, `dither-depth=no`), with quality-isolated cache files (`wl-v2-...-{quality}.mp4`).
+- **Consent-based in-app native decoder setup:** Replaces installer-time PowerShell scripts with a matching dark Acrylic in-app confirmation card, WinHTTP download, SHA-256 verification of both archive and extracted `libmpv-2.dll`, and extraction via `System32\tar.exe`.
+- **TransparentBar integration:** Added **Open TransparentBar** in Settings and replaced the external `#32768` popup menu with WallpaperLive's own rounded Acrylic `WallpaperLive.Dropdown` (`tray::menu_at`).
+- **Policies & PE metadata:** Added SignPath code signing and privacy policies in documentation (`README.md`) and embedded PE version/icon metadata into `wallpaperlive.exe`.
 
 ### Changed
 
-- Switch Windows installer packaging from Inno Setup to WiX Toolset v3.14 `.msi` (`installer/WallpaperLive.wxs`) with a modern dark-sidebar `WixUI_InstallDir` setup wizard (`assets/wix-dialog.bmp`, `assets/wix-banner.bmp`) and `.msi` self-update asset support (`src/update.rs`).
-- Replace the external `#32768` TransparentBar menu with WallpaperLive's own rounded Acrylic dropdown (`tray::menu_at`).
+- **WiX Toolset v3.14 `.msi` installer:** Migrated packaging from Inno Setup `.exe` to a per-user Windows Installer package (`wallpaperlivesetup-v0.2.2.msi`) using a modern dark-sidebar `WixUI_InstallDir` wizard (`assets/wix-dialog.bmp`, `assets/wix-banner.bmp`) and replaced `taskkill` with graceful `WM_ENDSESSION` / close-application handling.
+- **Settings & Acrylic refinement:** Lightened Acrylic glass tint opacity, defaulted Acrylic blur to off, removed the static memory readout from Settings, and removed em-dash punctuation from UI copy.
+
+### Performance
+
+- **Drag & memory optimization:** Cached backdrop viewport slide during Acrylic window drags to prevent frame drops (`a3bafdd`), reduced open-panel RAM via bounded thumbnail cache, tab control pruning, and idle working-set trim (`92ce679`), and reused GDI/Anurati font caches (`79cf217`).
 
 ### Fixed
 
-- Preserve translucent Acrylic glass behind the bottom `STATUS` control when text is selected (`paint_control_into`, `collect_status_selection_spans`), eliminating the solid black background artifact during text highlight.
-- Align top-level tab slide transition directions cleanly across Library, Settings, and Day Clock (`visuals::tab_slide_direction`).
-- Allow center-handle dragging and wheel resizing of an unlocked desktop clock while Behind desktop shortcuts is enabled. Keep shortcut icon and label areas clickable, map drag coordinates to the desktop parent, and retain the saved position. Lock position & size remains independent of the visual layer.
-- Include WallpaperLive panel activation in clock foreground handling so a popup clock raised for Show desktop is lowered when returning to the application.
+- **Acrylic glass control painting:** Fixed opaque black/dark background boxes behind static glass labels (`a9a7044`), static clear-cache labels (`0ae7603`), and highlighted text selections inside the bottom `STATUS` box (`paint_control_into`, `collect_status_selection_spans`).
+- **Tab animations & stability:** Aligned slide transition directions across Library, Settings, and Day Clock (`visuals::tab_slide_direction`) and guarded null HWNDs during headless tab switches (`3cbe4e2`).
+- **Desktop clock layering & multi-monitor edge cases:** Fixed multi-monitor placement, screen picker behavior, unowned popup drag handling, resilient MSAA icon rect detection, separation between drag input and visual layering, and lowering the popup clock when returning to WallpaperLive after Show desktop.
 
 ### Verification and limits
 
