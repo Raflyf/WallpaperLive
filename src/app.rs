@@ -1840,6 +1840,9 @@ impl App {
         repaint: bool,
         sync_visibility: bool,
     ) -> Result<(), String> {
+        if self.hwnd.0.is_null() {
+            return Ok(());
+        }
         visuals::cancel_transition(self.hwnd);
         // SAFETY: layout uses logical pixels scaled once; native control HWNDs belong to App.
         unsafe {
@@ -4653,6 +4656,8 @@ impl App {
         let repaint_now = old_layer.is_none();
 
         if previous != tab {
+            TB_FOCUS.with(|s| s.set((false, None)));
+            visuals::clear_transparentbar_dismissed();
             if previous == visuals::Tab::Clock && crate::clock_widget::is_repositioning() {
                 crate::clock_widget::end_reposition(self.hwnd, ACTION, self.clock_config());
                 self.sync_clock_controls();
@@ -4776,11 +4781,13 @@ impl App {
         if !repaint_now {
             self.apply_layout_with_visibility(false, true)?;
         }
-        // SAFETY: move focus off controls hidden by this tab change and force clean repaint.
-        unsafe {
-            let _ = SetFocus(self.control(focus));
-            let _ = InvalidateRect(self.hwnd, None, false);
-            let _ = UpdateWindow(self.hwnd);
+        if !self.hwnd.0.is_null() {
+            // SAFETY: move focus off controls hidden by this tab change and force clean repaint.
+            unsafe {
+                let _ = SetFocus(self.control(focus));
+                let _ = InvalidateRect(self.hwnd, None, false);
+                let _ = UpdateWindow(self.hwnd);
+            }
         }
         Ok(())
     }
