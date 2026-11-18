@@ -116,14 +116,14 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
         id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
         107 | 108 | 121 | ACRYLIC | AUTO_UPDATES | CHECK_UPDATES | VERSION | CACHE_INFO
-        | CLEAR_CACHE | QUALITY | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE
-        | SETTINGS_INFO | SUPPORT | SAWERIA => tab == Tab::Settings,
+        | CLEAR_CACHE | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE | SETTINGS_INFO
+        | SUPPORT | SAWERIA => tab == Tab::Settings,
         CLOCK_ENABLE | CLOCK_LOCK | CLOCK_BEHIND_ICONS | CLOCK_24H | CLOCK_REPOSITION
         | CLOCK_RESET_POS | CLOCK_PICK_COLOR | CLOCK_HEX_EDIT | CLOCK_HEX_CONFIRM => {
             tab == Tab::Clock
         }
-        PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
-        | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
+        PREVIEW | 112 | 105 | 106 | FPS | QUALITY | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH
+        | SORT | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
             tab == Tab::Library
         }
         id if (TILE_BASE..TILE_BASE + 9).contains(&id) => tab == Tab::Library,
@@ -337,7 +337,8 @@ impl Layout {
                 ),
                 (CACHE_INFO, r(resources_x, 256, column_width, 24)),
                 (CLEAR_CACHE, r(resources_x, 292, column_width, 36)),
-                (FPS, r(side_x, fit.bottom + 12, side_width, 34)),
+                (FPS, r(side_x, fit.bottom + 12, 116, 34)),
+                (QUALITY, r(side_x + 128, fit.bottom + 12, 168, 34)),
                 (SELECT_ALL, r(split - 128, 164, 104, 32)),
                 (PREVIOUS, r(pager.left, pager.top, 88, 36)),
                 (NEXT, r(pager.left + 100, pager.top, 88, 36)),
@@ -359,8 +360,7 @@ impl Layout {
                 (SITE_BASE + 3, r(source_x, 352, source_width, 44)),
                 (SOURCES_NOTE, r(source_x, 412, source_width, 112)),
                 (SETTINGS_NOTE, settings_note),
-                (SETTINGS_INFO, r(resources_x, 336, column_width, 40)),
-                (QUALITY, r(resources_x, 386, column_width, 34)),
+                (SETTINGS_INFO, r(resources_x, 344, column_width, 48)),
             ],
         }
     }
@@ -8296,7 +8296,9 @@ mod tests {
                         assert!(!overlap(scale(*tile), scale(*other)));
                     }
                 }
-                for id in [PREVIEW, 112, 105, 106, FPS, AUDIO, REMOVE, 102, 103, 104] {
+                for id in [
+                    PREVIEW, 112, 105, 106, FPS, QUALITY, AUDIO, REMOVE, 102, 103, 104,
+                ] {
                     assert!(scale(layout.sidebar).covers(scale(layout.control(id).unwrap())));
                 }
                 for id in [PREVIOUS, NEXT, PAGE] {
@@ -8378,13 +8380,15 @@ mod tests {
                 assert!(area(id).bottom < area(SOURCES_NOTE).top);
             }
             assert!(area(SOURCES_NOTE).bottom < layout.footer.top);
-            assert!(area(SETTINGS_INFO).bottom < area(QUALITY).top);
-            assert!(area(QUALITY).bottom < area(SUPPORT).top);
-            assert!(visible_on(Tab::Settings, QUALITY));
-            assert!(!visible_on(Tab::Library, QUALITY));
+            assert!(area(SETTINGS_INFO).bottom < area(SUPPORT).top);
+            assert!(visible_on(Tab::Library, QUALITY));
+            assert!(!visible_on(Tab::Settings, QUALITY));
             assert!(!visible_on(Tab::Clock, QUALITY));
-            assert_eq!(area(QUALITY).left, area(CLEAR_CACHE).left);
-            assert_eq!(area(QUALITY).right, area(CLEAR_CACHE).right);
+            assert_eq!(area(QUALITY).top, area(FPS).top);
+            assert_eq!(area(QUALITY).bottom, area(FPS).bottom);
+            assert!(area(QUALITY).left > area(FPS).right);
+            assert_eq!(area(QUALITY).right, area(REMOVE).right);
+            assert!(area(QUALITY).bottom + 12 <= area(REMOVE).top);
             assert!(visible_on(Tab::Settings, CHECK_UPDATES));
             assert!(!visible_on(Tab::Library, CHECK_UPDATES));
             assert!(area(CHECK_UPDATES).left > area(VERSION).right);

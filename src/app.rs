@@ -1490,7 +1490,7 @@ impl App {
                 (
                     visuals::FPS,
                     w!("BUTTON"),
-                    "Frame rate: 30 FPS",
+                    "FPS: 30",
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -2114,10 +2114,7 @@ impl App {
         self.marked.retain(|p| self.library.contains(p));
         visuals::marked(&self.marked);
         self.text(visuals::REMOVE, &format!("Remove ({})", self.marked.len()));
-        self.text(
-            visuals::FPS,
-            &format!("Frame rate: {} FPS", self.settings.fps),
-        );
+        self.text(visuals::FPS, &format!("FPS: {}", self.settings.fps));
         self.text(visuals::QUALITY, self.settings.quality.label());
         self.text(
             visuals::FOLDER_FILTER,
@@ -4325,7 +4322,7 @@ impl App {
             self.settings.fps = old;
             return Err(error);
         }
-        self.text(visuals::FPS, &format!("Frame rate: {fps} FPS"));
+        self.text(visuals::FPS, &format!("FPS: {fps}"));
         for display in &self.displays {
             if display.loaded
                 && let Some(playback) = &display.playback
