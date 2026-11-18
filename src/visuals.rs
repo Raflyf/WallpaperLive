@@ -9718,6 +9718,29 @@ mod tests {
             assert!(buffer.tint_background(left_r, PANEL_ALPHA));
             assert!(buffer.tint_background(right_r, CARD_ALPHA));
 
+            let mut pre_bits = std::ptr::null_mut();
+            let mut pre_stride = 0;
+            assert!(GdiFlush().as_bool());
+            assert!(GetBufferedPaintBits(buffer.handle, &mut pre_bits, &mut pre_stride).is_ok());
+            let pre = std::slice::from_raw_parts(
+                pre_bits as *const RGBQUAD,
+                (pre_stride as usize) * (h as usize),
+            );
+            if let Some(i) = pre.iter().position(|p| {
+                p.rgbRed > p.rgbReserved || p.rgbGreen > p.rgbReserved || p.rgbBlue > p.rgbReserved
+            }) {
+                let p = pre[i];
+                panic!(
+                    "pre-label violation at ({}, {}) stride={pre_stride}: r={} g={} b={} a={}",
+                    i % pre_stride as usize,
+                    i / pre_stride as usize,
+                    p.rgbRed,
+                    p.rgbGreen,
+                    p.rgbBlue,
+                    p.rgbReserved
+                );
+            }
+
             {
                 let _guard = TextTargetGuard::push(HTHEME(0), buffer.handle, buffer.area, true);
                 label(
@@ -9761,14 +9784,20 @@ mod tests {
                 })
             });
             assert!(has_glyph, "glass label must draw antialiased glyph pixels");
-            assert!(
-                out.iter().all(|p| {
-                    p.rgbRed <= p.rgbReserved
-                        && p.rgbGreen <= p.rgbReserved
-                        && p.rgbBlue <= p.rgbReserved
-                }),
-                "all pixels after glass label compositing must stay premultiplied"
-            );
+            if let Some(i) = out.iter().position(|p| {
+                p.rgbRed > p.rgbReserved || p.rgbGreen > p.rgbReserved || p.rgbBlue > p.rgbReserved
+            }) {
+                let p = out[i];
+                panic!(
+                    "all pixels after glass label compositing must stay premultiplied: ({}, {}) stride={stride} r={} g={} b={} a={}",
+                    i % stride as usize,
+                    i / stride as usize,
+                    p.rgbRed,
+                    p.rgbGreen,
+                    p.rgbBlue,
+                    p.rgbReserved
+                );
+            }
             drop(buffer);
             SelectObject(dc, prev);
             let _ = DeleteObject(bmp);
