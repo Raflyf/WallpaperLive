@@ -6670,10 +6670,7 @@ pub(crate) unsafe fn paint_update_popup_into(
                 if d_hot { TEXT } else { MUTED },
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
-            if theme.0 == 0 && !buffer.opaque() {
-                return false;
-            }
-            true
+            theme.0 != 0 || buffer.opaque()
         })();
         TEXT_THEME.with(|slot| slot.set(old_theme));
         GLASS_BUFFER.with(|slot| slot.set(old_buffer));
