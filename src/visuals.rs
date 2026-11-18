@@ -67,6 +67,27 @@ pub const SETTINGS_INFO: usize = 146;
 pub const SUPPORT: usize = 147;
 pub const SAWERIA: usize = 148;
 pub const ACRYLIC: usize = 149;
+pub const AUTO_UPDATES: usize = 150;
+pub const UPDATE_NOW: usize = 151;
+pub const UPDATE_WHATS_NEW: usize = 152;
+pub const UPDATE_DISABLE: usize = 153;
+pub const UPDATE_DISMISS: usize = 154;
+pub const TAB_CLOCK: usize = 155;
+pub const CLOCK_ENABLE: usize = 156;
+pub const CLOCK_LOCK: usize = 157;
+pub const CLOCK_BEHIND_ICONS: usize = 158;
+pub const CLOCK_24H: usize = 159;
+pub const CLOCK_REPOSITION: usize = 160;
+pub const CLOCK_RESET_POS: usize = 161;
+pub const CLOCK_CTX_POS_SAVED: usize = 162;
+pub const CLOCK_CTX_SIZE_DELTA: usize = 163;
+pub const CLOCK_CTX_24H: usize = 164;
+pub const CLOCK_CTX_LOCK: usize = 165;
+pub const CLOCK_CTX_BEHIND_ICONS: usize = 166;
+pub const CLOCK_CTX_OPEN_SETTINGS: usize = 167;
+pub const CLOCK_CTX_REMOVE: usize = 168;
+pub const CLOCK_STYLE_CHANGED: usize = 169;
+pub const CLOCK_STYLE_COMMIT: usize = 170;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 pub const HEADER_HEIGHT: i32 = 72;
@@ -76,19 +97,22 @@ pub enum Tab {
     #[default]
     Library,
     Settings,
+    Clock,
     Sources,
 }
 
 pub fn visible_on(tab: Tab, id: usize) -> bool {
     match id {
-        TAB_LIBRARY | TAB_SETTINGS | 110 | 113 => true,
-        101 | ADD_FOLDER => tab != Tab::Settings,
+        TAB_LIBRARY | TAB_SETTINGS | TAB_CLOCK | 110 | 113 => true,
+        101 | ADD_FOLDER => matches!(tab, Tab::Library | Tab::Sources),
         SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
         id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
-        107 | 108 | 121 | ACRYLIC | VERSION | MEMORY_INFO | CACHE_INFO | CLEAR_CACHE
-        | PRODUCT_WEBSITE | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT | SAWERIA => {
+        107 | 108 | 121 | ACRYLIC | AUTO_UPDATES | VERSION | MEMORY_INFO | CACHE_INFO
+        | CLEAR_CACHE | PRODUCT_WEBSITE | SETTINGS_NOTE | SETTINGS_INFO | SUPPORT | SAWERIA => {
             tab == Tab::Settings
         }
+        CLOCK_ENABLE | CLOCK_LOCK | CLOCK_BEHIND_ICONS | CLOCK_24H | CLOCK_REPOSITION
+        | CLOCK_RESET_POS => tab == Tab::Clock,
         PREVIEW | 112 | 105 | 106 | FPS | AUDIO | REMOVE | 102 | 103 | 104 | SEARCH | SORT
         | FOLDER_FILTER | SELECT_ALL | FIND_WALLPAPERS | PREVIOUS | NEXT | PAGE => {
             tab == Tab::Library
@@ -101,7 +125,7 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
 pub fn is_body_control(id: usize) -> bool {
     !matches!(
         id,
-        TAB_LIBRARY | TAB_SETTINGS | 101 | ADD_FOLDER | 110 | 113
+        TAB_LIBRARY | TAB_SETTINGS | TAB_CLOCK | 101 | ADD_FOLDER | 110 | 113
     )
 }
 
@@ -156,7 +180,7 @@ pub struct Layout {
     pub caption_divider: Rect,
     pub caption_buttons: [(CaptionButton, Rect); 3],
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 43],
+    controls: [(usize, Rect); 51],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -246,6 +270,7 @@ impl Layout {
                 (ADD_FOLDER, r(width - 280, 18, 122, 36)),
                 (TAB_LIBRARY, r(176, 18, 96, 36)),
                 (TAB_SETTINGS, r(280, 18, 96, 36)),
+                (TAB_CLOCK, r(384, 18, 96, 36)),
                 (SEARCH, r(24, 164, split - 336, 32)),
                 (SORT, r(split - 300, 164, 160, 32)),
                 (FOLDER_FILTER, r(24, 204, split - 48, 32)),
@@ -266,6 +291,13 @@ impl Layout {
                 (121, r(content_x, 304, column_width, 38)),
                 (108, r(content_x, 348, column_width, 38)),
                 (ACRYLIC, r(content_x, 392, column_width, 38)),
+                (AUTO_UPDATES, r(content_x, 496, column_width, 38)),
+                (CLOCK_ENABLE, r(content_x, 260, column_width, 38)),
+                (CLOCK_LOCK, r(content_x, 304, column_width, 38)),
+                (CLOCK_BEHIND_ICONS, r(content_x, 348, column_width, 38)),
+                (CLOCK_24H, r(content_x, 392, column_width, 38)),
+                (CLOCK_REPOSITION, r(content_x, 448, column_width, 36)),
+                (CLOCK_RESET_POS, r(content_x, 496, column_width, 36)),
                 (VERSION, r(resources_x, 212, column_width, 24)),
                 (MEMORY_INFO, r(resources_x, 248, column_width, 40)),
                 (CACHE_INFO, r(resources_x, 300, column_width, 24)),
@@ -441,6 +473,13 @@ fn control_surface(id: usize) -> (u32, u8) {
             | 108
             | 121
             | ACRYLIC
+            | AUTO_UPDATES
+            | CLOCK_ENABLE
+            | CLOCK_LOCK
+            | CLOCK_BEHIND_ICONS
+            | CLOCK_24H
+            | CLOCK_REPOSITION
+            | CLOCK_RESET_POS
             | PRODUCT_WEBSITE
             | CLEAR_CACHE
             | SUPPORT
@@ -815,17 +854,23 @@ fn disarm_timer_if_idle(window: HWND) {
     }
 }
 
-fn tab_settings_weight(tab: Tab) -> f32 {
+fn tab_axis(tab: Tab) -> f32 {
+    match tab {
+        Tab::Library | Tab::Sources => 0.0,
+        Tab::Settings => 1.0,
+        Tab::Clock => 2.0,
+    }
+}
+
+fn tab_slide_pos(tab: Tab) -> f32 {
     ANIM.with(|a| {
         let state = a.borrow();
         if let Some(slide) = &state.tab_slide {
             let raw = slide.start.elapsed().as_secs_f32() * 1000.0 / TAB_ANIM_MS as f32;
             let t = ease_out_cubic(raw);
             slide.from_settings + (slide.to_settings - slide.from_settings) * t
-        } else if tab == Tab::Settings {
-            1.0
         } else {
-            0.0
+            tab_axis(tab)
         }
     })
 }
@@ -884,17 +929,16 @@ fn toggle_progress(id: usize, checked: bool, parent: HWND) -> f32 {
 }
 
 pub fn start_tab_pill_anim(window: HWND, from_tab: Tab, to_tab: Tab) {
-    let from_is_settings = from_tab == Tab::Settings;
-    let to_is_settings = to_tab == Tab::Settings;
-    if from_is_settings == to_is_settings || !animations_enabled(window) {
+    let to_pos = tab_axis(to_tab);
+    if (tab_axis(from_tab) - to_pos).abs() < f32::EPSILON || !animations_enabled(window) {
         ANIM.with(|a| a.borrow_mut().tab_slide = None);
         return;
     }
-    let current = tab_settings_weight(from_tab);
+    let current = tab_slide_pos(from_tab);
     ANIM.with(|a| {
         a.borrow_mut().tab_slide = Some(TabSlideAnim {
             from_settings: current,
-            to_settings: if to_is_settings { 1.0 } else { 0.0 },
+            to_settings: to_pos,
             start: Instant::now(),
         });
     });
@@ -1437,26 +1481,28 @@ pub fn tick_animations(window: HWND) -> bool {
             let elapsed_ms = bd
                 .fade_start
                 .map(|start| now.duration_since(start).as_secs_f32() * 1000.0)
-                .unwrap_or(bd.fade_duration_ms as f32);
+                .unwrap_or(bd.fade_warmup_ms as f32 + bd.fade_duration_ms as f32);
+            let fade_elapsed = elapsed_ms - bd.fade_warmup_ms as f32;
             if hidden
                 || !os_window_animations_enabled()
                 || !glass_enabled(window)
                 || !user_acrylic_enabled()
                 || !transparency_enabled()
-                || elapsed_ms >= bd.fade_duration_ms as f32
+                || fade_elapsed >= bd.fade_duration_ms as f32
             {
                 bd.fading = false;
                 bd.fade_start = None;
+                bd.fade_warmup_ms = 0;
                 bd.fade_duration_ms = 0;
                 finish_fade = true;
-            } else {
+            } else if fade_elapsed >= 0.0 {
                 fade_tick = true;
             }
         }
     });
     unsafe {
         if invalidate_tabs {
-            for tab_id in [TAB_LIBRARY, TAB_SETTINGS] {
+            for tab_id in [TAB_LIBRARY, TAB_SETTINGS, TAB_CLOCK] {
                 if let Ok(h) = GetDlgItem(window, tab_id as i32)
                     && !h.0.is_null()
                 {
@@ -1494,6 +1540,9 @@ pub fn tick_animations(window: HWND) -> bool {
 }
 
 pub fn set_tab(tab: Tab) {
+    if tab != Tab::Clock {
+        CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
+    }
     SKIN.with(|s| s.borrow_mut().tab = tab);
 }
 pub fn clear() {
@@ -1534,6 +1583,7 @@ pub fn clear() {
     DRAG_UI_CACHE.with(|slot| *slot.borrow_mut() = DragUiCache::default());
     DRAG_UV_REDRAW.with(|slot| slot.set(false));
     BX_COLS_SCRATCH.with(|slot| *slot.borrow_mut() = Vec::new());
+    CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
     SYNCED_LAYOUT.with(|slot| slot.set(None));
     invalidate_theme_cache();
     invalidate_os_settings_cache();
@@ -1544,8 +1594,10 @@ struct TransitionBackdrop {
     active: bool,
     captured_while_visible: bool,
     drag_move: bool,
+    acrylic_suspended: bool,
     fading: bool,
     fade_start: Option<Instant>,
+    fade_warmup_ms: u32,
     fade_duration_ms: u32,
     hwnd: isize,
     win_rect: RECT,
@@ -1563,8 +1615,10 @@ impl TransitionBackdrop {
         self.active = false;
         self.captured_while_visible = false;
         self.drag_move = false;
+        self.acrylic_suspended = false;
         self.fading = false;
         self.fade_start = None;
+        self.fade_warmup_ms = 0;
         self.fade_duration_ms = 0;
         self.pixels = Vec::new();
         was_fading
@@ -1587,7 +1641,7 @@ impl DragUiCache {
     fn clear_for(&mut self, root_hwnd: isize, allow_all: bool) {
         if allow_all || self.root_hwnd == root_hwnd {
             self.root_hwnd = 0;
-            self.surfaces.clear();
+            self.surfaces = Vec::new();
         }
     }
 
@@ -2727,7 +2781,8 @@ impl PaintBuffer {
                 .fade_start
                 .map(|start| start.elapsed().as_secs_f32() * 1000.0)
                 .unwrap_or(0.0);
-            let weight = backdrop_fade_weight(bd.fading, elapsed_ms, bd.fade_duration_ms);
+            let fade_elapsed = (elapsed_ms - bd.fade_warmup_ms as f32).max(0.0);
+            let weight = backdrop_fade_weight(bd.fading, fade_elapsed, bd.fade_duration_ms);
             if weight == 0 {
                 return;
             }
@@ -3277,16 +3332,22 @@ unsafe fn draw_item_into(
         let focus_visible = item.itemState.0 & ODS_FOCUS.0 != 0
             && item.itemState.0 & ODS_DISABLED.0 == 0
             && !hide_focus;
-        let is_tab = matches!(id, TAB_LIBRARY | TAB_SETTINGS);
+        let is_tab = matches!(id, TAB_LIBRARY | TAB_SETTINGS | TAB_CLOCK);
         let current_tab = SKIN.with(|s| s.borrow().tab);
         let active_tab = is_tab
-            && ((current_tab != Tab::Settings && id == TAB_LIBRARY)
-                || (current_tab == Tab::Settings && id == TAB_SETTINGS));
+            && ((matches!(current_tab, Tab::Library | Tab::Sources) && id == TAB_LIBRARY)
+                || (current_tab == Tab::Settings && id == TAB_SETTINGS)
+                || (current_tab == Tab::Clock && id == TAB_CLOCK));
         let tab_weight = if !is_tab {
             0.0
         } else {
-            let sw = tab_settings_weight(current_tab);
-            if id == TAB_SETTINGS { sw } else { 1.0 - sw }
+            let pos = tab_slide_pos(current_tab);
+            let target = match id {
+                TAB_SETTINGS => 1.0,
+                TAB_CLOCK => 2.0,
+                _ => 0.0,
+            };
+            (1.0 - (pos - target).abs()).clamp(0.0, 1.0)
         };
         let hot = is_hot(item.hwndItem);
         let focus_color = if !focus_visible {
@@ -4447,6 +4508,7 @@ pub fn invalidate_backdrop_cache() {
         bd.raw_mon_rect = RECT::default();
         bd.wallpaper_key = None;
     });
+    CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4582,8 +4644,10 @@ pub fn begin_drag_move_backdrop(window: HWND) -> bool {
             bd.active = true;
             bd.captured_while_visible = true;
             bd.drag_move = true;
+            bd.acrylic_suspended = true;
             bd.fading = false;
             bd.fade_start = None;
+            bd.fade_warmup_ms = 0;
             bd.fade_duration_ms = 0;
         });
         disarm_timer_if_idle(window);
@@ -4730,22 +4794,26 @@ pub fn begin_backdrop_fade(window: HWND) {
     let started = TRANSITION_BACKDROP.with(|slot| {
         let mut bd = slot.borrow_mut();
         if !bd.active || bd.hwnd != window.0 as isize || bd.pixels.is_empty() {
-            return false;
+            return None;
         }
+        let was_suspended = std::mem::take(&mut bd.acrylic_suspended);
         if !bd.fading {
             bd.fading = true;
             bd.fade_start = Some(Instant::now());
+            bd.fade_warmup_ms = if was_suspended { 40 } else { 0 };
             bd.fade_duration_ms = BACKDROP_FADE_MS;
         }
-        true
+        Some(was_suspended)
     });
-    if !started {
+    let Some(was_suspended) = started else {
         return;
-    }
-    // Re-enable live hardware Acrylic behind the dissolving transition snapshot before the first fade tick.
-    // SAFETY: window is a live non-iconic HWND on the UI thread.
-    unsafe {
-        let _ = set_acrylic_composition(window, true);
+    };
+    if was_suspended {
+        // Re-enable live hardware Acrylic once behind the opaque warmup hold before fade-out begins.
+        // SAFETY: window is a live non-iconic HWND on the UI thread.
+        unsafe {
+            let _ = set_acrylic_composition(window, true);
+        }
     }
     arm_anim_timer(window);
 }
@@ -4767,11 +4835,15 @@ pub fn end_minimize_backdrop_transition(window: HWND) {
 }
 
 pub fn finish_backdrop_transition(window: HWND) {
+    let was_suspended = TRANSITION_BACKDROP.with(|slot| {
+        let bd = slot.borrow();
+        (window.0.is_null() || bd.hwnd == window.0 as isize) && bd.acrylic_suspended
+    });
     reset_transition_backdrop(window, true);
     if window.0.is_null() {
         return;
     }
-    // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND once restore animation finishes.
+    // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND if still suspended, then redraws without erase flicker.
     unsafe {
         if !IsWindow(window).as_bool()
             || IsIconic(window).as_bool()
@@ -4779,15 +4851,14 @@ pub fn finish_backdrop_transition(window: HWND) {
         {
             return;
         }
-        if glass_enabled(window) && user_acrylic_enabled() && transparency_enabled() {
+        if was_suspended
+            && glass_enabled(window)
+            && user_acrylic_enabled()
+            && transparency_enabled()
+        {
             let _ = set_acrylic_composition(window, true);
         }
-        let _ = RedrawWindow(
-            window,
-            None,
-            None,
-            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
-        );
+        redraw_backdrop_surfaces(window);
     }
 }
 
@@ -5242,7 +5313,7 @@ unsafe fn paint_scene(
                         fill_clipped(div, divider_color);
                     }
                 }
-                Tab::Settings => {
+                Tab::Settings | Tab::Clock => {
                     let prefs_px = pixels(layout.settings_preferences_panel);
                     if should_paint_box(prefs_px) {
                         raised_rounded(dc, prefs_px, CARD, LINE, HIGHLIGHT, scale(12));
@@ -5254,7 +5325,9 @@ unsafe fn paint_scene(
                     if let Some(div) = prefs_divider {
                         fill_clipped(div, divider_color);
                     }
-                    if let Some(div) = resources_divider {
+                    if tab == Tab::Settings
+                        && let Some(div) = resources_divider
+                    {
                         fill_clipped(div, divider_color);
                     }
                 }
@@ -5341,11 +5414,11 @@ unsafe fn paint_scene(
                                 && tint_clipped(side_divider, DIVIDER_ALPHA)
                                 && tint_clipped(pixels(layout.sidebar), CARD_ALPHA)
                         }
-                        Tab::Settings => {
+                        Tab::Settings | Tab::Clock => {
                             let p_div_ok =
                                 prefs_divider.is_none_or(|d| tint_clipped(d, DIVIDER_ALPHA));
-                            let r_div_ok =
-                                resources_divider.is_none_or(|d| tint_clipped(d, DIVIDER_ALPHA));
+                            let r_div_ok = tab != Tab::Settings
+                                || resources_divider.is_none_or(|d| tint_clipped(d, DIVIDER_ALPHA));
                             let prefs_px = pixels(layout.settings_preferences_panel);
                             let res_px = pixels(layout.settings_resources_panel);
                             p_div_ok
@@ -5568,6 +5641,44 @@ unsafe fn paint_scene(
                         DT_SINGLELINE,
                     );
                 }
+                Tab::Clock => {
+                    label_clipped(
+                        "Day clock",
+                        pixels(layout.settings_title),
+                        scale(25),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE,
+                    );
+                    label_clipped(
+                        "Spaced letters directly on your wallpaper, with desktop shortcut protection",
+                        pixels(layout.settings_subtitle),
+                        scale(13),
+                        false,
+                        MUTED,
+                        DT_SINGLELINE,
+                    );
+                    label_clipped(
+                        "Desktop widget",
+                        pixels(layout.preferences_title),
+                        scale(16),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE,
+                    );
+                    label_clipped(
+                        "Size, opacity & colour",
+                        pixels(layout.resources_title),
+                        scale(16),
+                        true,
+                        TEXT,
+                        DT_SINGLELINE,
+                    );
+                    let res_px = pixels(layout.settings_resources_panel);
+                    if rects_intersect(res_px, dirty) {
+                        paint_clock_appearance_controls(dc, buffer, &layout, dpi, glass_active);
+                    }
+                }
                 Tab::Sources => {
                     label_clipped(
                         "Where to find wallpapers",
@@ -5650,7 +5761,17 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
         let mut class = [0u16; 32];
         let count = GetClassNameW(window, &mut class).max(0) as usize;
         let static_text = String::from_utf16_lossy(&class[..count]) == "Static";
-        let checkbox = matches!(id, 107 | 108 | 121 | ACRYLIC);
+        let checkbox = matches!(
+            id,
+            107 | 108
+                | 121
+                | ACRYLIC
+                | AUTO_UPDATES
+                | CLOCK_ENABLE
+                | CLOCK_LOCK
+                | CLOCK_BEHIND_ICONS
+                | CLOCK_24H
+        );
         let status_edit = id == 113;
         let mut status_selected = false;
         if status_edit {
@@ -5943,7 +6064,18 @@ unsafe extern "system" fn control_proc(
             }
             WM_MOUSEMOVE => {
                 let ctrl_id = GetDlgCtrlID(window) as usize;
-                let interactive = owner_draw || matches!(ctrl_id, 107 | 108 | 121 | ACRYLIC);
+                let interactive = owner_draw
+                    || matches!(
+                        ctrl_id,
+                        107 | 108
+                            | 121
+                            | ACRYLIC
+                            | AUTO_UPDATES
+                            | CLOCK_ENABLE
+                            | CLOCK_LOCK
+                            | CLOCK_BEHIND_ICONS
+                            | CLOCK_24H
+                    );
                 if interactive {
                     let prev_hot = ANIM.with(|a| {
                         let mut state = a.borrow_mut();
@@ -6176,6 +6308,959 @@ pub(crate) unsafe fn paint_dropdown_into(
         TEXT_THEME.with(|slot| slot.set(old_theme));
         GLASS_BUFFER.with(|slot| slot.set(old_buffer));
         ok && buffer.finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdatePopupHit {
+    Close,
+    Update,
+    WhatsNew,
+    Disable,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UpdatePopupLayout {
+    pub width: i32,
+    pub height: i32,
+    pub close: RECT,
+    pub update_btn: RECT,
+    pub whats_new_btn: RECT,
+    pub disable_link: RECT,
+}
+
+impl UpdatePopupLayout {
+    pub fn measure(dpi: i32, downloading: bool) -> Self {
+        let s = |n: i32| n * dpi.max(96) / 96;
+        let width = s(368);
+        let height = s(154);
+        let update_w = if downloading { s(134) } else { s(88) };
+        let btn_top = s(76);
+        let btn_h = s(32);
+        let update_btn = rect(s(46), btn_top, s(46) + update_w, btn_top + btn_h);
+        let whats_new_btn = rect(
+            update_btn.right + s(10),
+            btn_top,
+            update_btn.right + s(10) + s(116),
+            btn_top + btn_h,
+        );
+        Self {
+            width,
+            height,
+            close: rect(width - s(40), s(14), width - s(12), s(42)),
+            update_btn,
+            whats_new_btn,
+            disable_link: rect(s(46), s(118), s(212), s(142)),
+        }
+    }
+
+    pub fn hit_test(&self, x: i32, y: i32) -> Option<UpdatePopupHit> {
+        let contains = |r: RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+        if contains(self.close) {
+            Some(UpdatePopupHit::Close)
+        } else if contains(self.update_btn) {
+            Some(UpdatePopupHit::Update)
+        } else if contains(self.whats_new_btn) {
+            Some(UpdatePopupHit::WhatsNew)
+        } else if contains(self.disable_link) {
+            Some(UpdatePopupHit::Disable)
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) struct UpdatePopupPaint<'a> {
+    pub layout: &'a UpdatePopupLayout,
+    pub title: &'a str,
+    pub subtitle: &'a str,
+    pub update_label: &'a str,
+    pub downloading: bool,
+    pub hover: Option<UpdatePopupHit>,
+    pub pressed: Option<UpdatePopupHit>,
+    pub dpi: i32,
+    pub glass: bool,
+}
+
+pub(crate) unsafe fn paint_update_popup_into(
+    target: HDC,
+    area: RECT,
+    paint: &UpdatePopupPaint<'_>,
+) -> bool {
+    let layout = paint.layout;
+    let title = paint.title;
+    let subtitle = paint.subtitle;
+    let update_label = paint.update_label;
+    let downloading = paint.downloading;
+    let hover = paint.hover;
+    let pressed = paint.pressed;
+    let dpi = paint.dpi;
+    let glass = paint.glass;
+    if area.right <= area.left || area.bottom <= area.top {
+        return false;
+    }
+    let s = |n: i32| n * dpi.max(96) / 96;
+    // SAFETY: target HDC owns area for the synchronous buffered paint session.
+    unsafe {
+        let Some(buffer) = PaintBuffer::new(target, area) else {
+            return false;
+        };
+        let theme = if glass {
+            cached_window_theme(HWND::default())
+        } else {
+            HTHEME(0)
+        };
+        let old_theme = TEXT_THEME.with(|slot| slot.replace(theme));
+        let old_buffer = GLASS_BUFFER.with(|slot| slot.replace(buffer.handle));
+        let ok = (|| -> bool {
+            let card_alpha = if glass { 196 } else { 255 };
+            fill(buffer.dc, area, CARD);
+            let outer_mask = RoundedMask {
+                ellipse: s(12),
+                border: LINE,
+                border_width: 1.0,
+                border_alpha: if glass { BORDER_ALPHA } else { 255 },
+                fill_alpha: card_alpha,
+                focus: 0,
+                focus_inset: 0.0,
+                host_color: INK,
+                host_alpha: if glass { 0 } else { 255 },
+                top_rim: GLASS_RIM,
+                bottom_rim: INK,
+                sheen_strength: 0.03,
+            };
+            if !buffer.apply_rounded_rect_mask(area, &outer_mask) {
+                return false;
+            }
+
+            // Refresh icon on top-left (two opposed semicircular arcs + arrow tips).
+            let cx = s(27);
+            let cy = s(28);
+            let rad = s(7).max(5);
+            let stroke = (s(2) / 2).max(1);
+            let icon_pen = CreatePen(PS_SOLID, stroke, rgb(TEXT));
+            let old_pen = SelectObject(buffer.dc, icon_pen);
+            let _ = Arc(
+                buffer.dc,
+                cx - rad,
+                cy - rad,
+                cx + rad + 1,
+                cy + rad + 1,
+                cx + rad,
+                cy - rad / 2,
+                cx - rad,
+                cy,
+            );
+            let _ = MoveToEx(buffer.dc, cx + rad, cy - rad / 2 - s(3), None);
+            let _ = LineTo(buffer.dc, cx + rad, cy - rad / 2 + s(1));
+            let _ = LineTo(buffer.dc, cx + rad - s(4), cy - rad / 2 + s(1));
+            let _ = Arc(
+                buffer.dc,
+                cx - rad,
+                cy - rad,
+                cx + rad + 1,
+                cy + rad + 1,
+                cx - rad,
+                cy + rad / 2,
+                cx + rad,
+                cy,
+            );
+            let _ = MoveToEx(buffer.dc, cx - rad, cy + rad / 2 + s(3), None);
+            let _ = LineTo(buffer.dc, cx - rad, cy + rad / 2 - s(1));
+            let _ = LineTo(buffer.dc, cx - rad + s(4), cy + rad / 2 - s(1));
+            SelectObject(buffer.dc, old_pen);
+            let _ = DeleteObject(icon_pen);
+            let _ = buffer.tint_background(
+                rect(
+                    cx - rad - s(3),
+                    cy - rad - s(3),
+                    cx + rad + s(4),
+                    cy + rad + s(4),
+                ),
+                255,
+            );
+
+            // Close (x) button top-right.
+            if hover == Some(UpdatePopupHit::Close) || pressed == Some(UpdatePopupHit::Close) {
+                let cr = layout.close;
+                fill(buffer.dc, cr, CARD_LIT);
+                let _ = buffer.clear_alpha(cr);
+                let _ = buffer.apply_rounded_rect_mask(
+                    cr,
+                    &RoundedMask {
+                        ellipse: s(8),
+                        border: HIGHLIGHT,
+                        border_width: 1.0,
+                        border_alpha: if glass { 196 } else { 255 },
+                        fill_alpha: if pressed == Some(UpdatePopupHit::Close) {
+                            200
+                        } else {
+                            164
+                        },
+                        focus: 0,
+                        focus_inset: 0.0,
+                        host_color: CARD,
+                        host_alpha: card_alpha,
+                        top_rim: CREAM,
+                        bottom_rim: INK,
+                        sheen_strength: 0.04,
+                    },
+                );
+            }
+            let ccx = (layout.close.left + layout.close.right) / 2;
+            let ccy = (layout.close.top + layout.close.bottom) / 2;
+            let x_r = s(4).max(3);
+            let x_color = if hover == Some(UpdatePopupHit::Close) {
+                TEXT
+            } else {
+                MUTED
+            };
+            let x_pen = CreatePen(PS_SOLID, stroke, rgb(x_color));
+            let old_x = SelectObject(buffer.dc, x_pen);
+            let _ = MoveToEx(buffer.dc, ccx - x_r, ccy - x_r, None);
+            let _ = LineTo(buffer.dc, ccx + x_r + 1, ccy + x_r + 1);
+            let _ = MoveToEx(buffer.dc, ccx + x_r, ccy - x_r, None);
+            let _ = LineTo(buffer.dc, ccx - x_r - 1, ccy + x_r + 1);
+            SelectObject(buffer.dc, old_x);
+            let _ = DeleteObject(x_pen);
+            let _ = buffer.tint_background(layout.close, 255);
+
+            // Title & subtitle.
+            label(
+                buffer.dc,
+                title,
+                rect(s(46), s(16), layout.close.left - s(8), s(40)),
+                s(15),
+                true,
+                TEXT,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            label(
+                buffer.dc,
+                subtitle,
+                rect(s(46), s(42), layout.width - s(16), s(66)),
+                s(13),
+                false,
+                MUTED,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+
+            // Primary pill button ("Update" / "Downloading...").
+            let u_hot = hover == Some(UpdatePopupHit::Update) && !downloading;
+            let u_down = pressed == Some(UpdatePopupHit::Update) && !downloading;
+            let u_fill = if downloading {
+                DISABLED_FILL
+            } else if u_down {
+                ACCENT_DARK
+            } else if u_hot {
+                ACCENT_HOVER
+            } else {
+                ACCENT
+            };
+            fill(buffer.dc, layout.update_btn, u_fill);
+            let _ = buffer.clear_alpha(layout.update_btn);
+            let _ = buffer.apply_rounded_rect_mask(
+                layout.update_btn,
+                &RoundedMask {
+                    ellipse: s(32),
+                    border: if downloading {
+                        DISABLED_BORDER
+                    } else {
+                        ACCENT_DARK
+                    },
+                    border_width: 1.0,
+                    border_alpha: 255,
+                    fill_alpha: if downloading { 220 } else { ACTIVE_ALPHA },
+                    focus: 0,
+                    focus_inset: 0.0,
+                    host_color: CARD,
+                    host_alpha: card_alpha,
+                    top_rim: if downloading { 0 } else { ACCENT_SOFT },
+                    bottom_rim: INK,
+                    sheen_strength: if downloading { 0.0 } else { 0.06 },
+                },
+            );
+            label(
+                buffer.dc,
+                update_label,
+                layout.update_btn,
+                s(13),
+                true,
+                if downloading { MUTED } else { TEXT_ON_ACCENT },
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+
+            // Secondary outlined pill ("What's new" + external link glyph).
+            let w_hot = hover == Some(UpdatePopupHit::WhatsNew);
+            let w_down = pressed == Some(UpdatePopupHit::WhatsNew);
+            let w_fill = if w_down || w_hot { CARD_LIT } else { CARD };
+            fill(buffer.dc, layout.whats_new_btn, w_fill);
+            let _ = buffer.clear_alpha(layout.whats_new_btn);
+            let _ = buffer.apply_rounded_rect_mask(
+                layout.whats_new_btn,
+                &RoundedMask {
+                    ellipse: s(32),
+                    border: if w_hot { HIGHLIGHT } else { LINE },
+                    border_width: 1.0,
+                    border_alpha: if glass { BORDER_ALPHA } else { 255 },
+                    fill_alpha: if w_down {
+                        220
+                    } else if w_hot {
+                        if glass { 188 } else { 255 }
+                    } else if glass {
+                        120
+                    } else {
+                        255
+                    },
+                    focus: 0,
+                    focus_inset: 0.0,
+                    host_color: CARD,
+                    host_alpha: card_alpha,
+                    top_rim: GLASS_RIM,
+                    bottom_rim: INK,
+                    sheen_strength: 0.03,
+                },
+            );
+            let wn_text = rect(
+                layout.whats_new_btn.left + s(12),
+                layout.whats_new_btn.top,
+                layout.whats_new_btn.right - s(26),
+                layout.whats_new_btn.bottom,
+            );
+            label(
+                buffer.dc,
+                "What's new",
+                wn_text,
+                s(13),
+                true,
+                TEXT,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            // External-link square + diagonal arrow icon.
+            let ix = layout.whats_new_btn.right - s(22);
+            let iy = (layout.whats_new_btn.top + layout.whats_new_btn.bottom) / 2 - s(5);
+            let box_sz = s(10).max(8);
+            let ext_pen = CreatePen(PS_SOLID, stroke, rgb(MUTED));
+            let old_ext = SelectObject(buffer.dc, ext_pen);
+            let _ = MoveToEx(buffer.dc, ix + box_sz / 2, iy, None);
+            let _ = LineTo(buffer.dc, ix, iy);
+            let _ = LineTo(buffer.dc, ix, iy + box_sz);
+            let _ = LineTo(buffer.dc, ix + box_sz, iy + box_sz);
+            let _ = LineTo(buffer.dc, ix + box_sz, iy + box_sz / 2);
+            let _ = MoveToEx(buffer.dc, ix + box_sz / 2, iy + box_sz / 2, None);
+            let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy - s(1));
+            let _ = MoveToEx(buffer.dc, ix + box_sz - s(3), iy - s(1), None);
+            let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy - s(1));
+            let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy + s(3));
+            SelectObject(buffer.dc, old_ext);
+            let _ = DeleteObject(ext_pen);
+            let _ = buffer.tint_background(
+                rect(ix - 2, iy - 3, ix + box_sz + s(4), iy + box_sz + 3),
+                255,
+            );
+
+            // Bottom subtle action link ("Don't check for updates").
+            let d_hot = hover == Some(UpdatePopupHit::Disable);
+            label(
+                buffer.dc,
+                "Don't check for updates",
+                layout.disable_link,
+                s(12),
+                false,
+                if d_hot { TEXT } else { MUTED },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            if theme.0 == 0 && !buffer.opaque() {
+                return false;
+            }
+            true
+        })();
+        TEXT_THEME.with(|slot| slot.set(old_theme));
+        GLASS_BUFFER.with(|slot| slot.set(old_buffer));
+        ok && buffer.finish()
+    }
+}
+
+pub const CLOCK_SWATCHES: [u32; 4] = [0x00FF_FFFF, CREAM, ORANGE, INK];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockUiState {
+    pub size_pct: u32,
+    pub opacity_pct: u32,
+    pub hue: f32,
+    pub sat: f32,
+    pub val: f32,
+    pub color: u32,
+}
+
+impl Default for ClockUiState {
+    fn default() -> Self {
+        Self {
+            size_pct: 100,
+            opacity_pct: 100,
+            hue: 0.0,
+            sat: 0.0,
+            val: 1.0,
+            color: 0x00FF_FFFF,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockDragTarget {
+    SizeSlider,
+    OpacitySlider,
+    ColorWheel,
+    BrightnessBar,
+    Swatch(usize),
+}
+
+thread_local! {
+    static CLOCK_UI: Cell<ClockUiState> = Cell::new(ClockUiState::default());
+}
+
+pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> u32 {
+    let h = h.rem_euclid(1.0) * 6.0;
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    let i = h.floor() as i32;
+    let f = h - i as f32;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    let (r, g, b) = match i.rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    let to_u8 = |c: f32| (c * 255.0).round().clamp(0.0, 255.0) as u32;
+    (to_u8(r) << 16) | (to_u8(g) << 8) | to_u8(b)
+}
+
+pub fn rgb_to_hsv(color: u32) -> (f32, f32, f32) {
+    let r = ((color >> 16) & 255) as f32 / 255.0;
+    let g = ((color >> 8) & 255) as f32 / 255.0;
+    let b = (color & 255) as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let v = max;
+    let s = if max > 0.0 { delta / max } else { 0.0 };
+    let h = if delta <= f32::EPSILON {
+        0.0
+    } else if (max - r).abs() <= f32::EPSILON {
+        ((g - b) / delta).rem_euclid(6.0) / 6.0
+    } else if (max - g).abs() <= f32::EPSILON {
+        (((b - r) / delta) + 2.0) / 6.0
+    } else {
+        (((r - g) / delta) + 4.0) / 6.0
+    };
+    (h, s, v)
+}
+
+pub fn clock_ui_state() -> ClockUiState {
+    CLOCK_UI.with(Cell::get)
+}
+
+pub fn sync_clock_ui(size_pct: u32, opacity_pct: u32, color: u32) {
+    let color = color & 0x00FF_FFFF;
+    let (hue, sat, val) = rgb_to_hsv(color);
+    CLOCK_UI.with(|slot| {
+        let prev = slot.get();
+        // Preserve hue/sat when user drags brightness to black so wheel thumb stays put.
+        let (hue, sat) = if val <= 0.001 && prev.color == color {
+            (prev.hue, prev.sat)
+        } else {
+            (hue, sat)
+        };
+        slot.set(ClockUiState {
+            size_pct: size_pct.clamp(50, 200),
+            opacity_pct: opacity_pct.clamp(20, 100),
+            hue,
+            sat,
+            val,
+            color,
+        });
+    });
+}
+
+struct ClockAppearanceGeom {
+    size_track: RECT,
+    size_hit: RECT,
+    size_label: RECT,
+    size_value: RECT,
+    opacity_track: RECT,
+    opacity_hit: RECT,
+    opacity_label: RECT,
+    opacity_value: RECT,
+    divider: RECT,
+    colour_title: RECT,
+    colour_hint: RECT,
+    swatches: [RECT; 4],
+    hex_pill: RECT,
+    wheel_cx: i32,
+    wheel_cy: i32,
+    wheel_r: i32,
+    val_bar: RECT,
+    val_hit: RECT,
+}
+
+fn clock_appearance_geom(layout: &Layout, dpi: i32) -> ClockAppearanceGeom {
+    let s = |n: i32| n * dpi.max(96) / 96;
+    let rx = s(layout.resources_title.left);
+    let rw = s(layout.resources_title.right - layout.resources_title.left);
+    let track_l = rx + s(76);
+    let track_r = (rx + rw - s(54)).max(track_l + s(40));
+    let sz_cy = s(240);
+    let op_cy = s(282);
+    let track_h = s(4).max(4);
+    let panel_b = s(layout.settings_resources_panel.bottom);
+    let avail_h = (panel_b - s(320)).max(s(170));
+    let wheel_r = ((avail_h - s(48)) / 2).clamp(s(44), s(62));
+    let wheel_cx = (rx + rw - wheel_r - s(16)).max(rx + s(190));
+    let wheel_cy = s(326) + wheel_r;
+    let val_top = wheel_cy + wheel_r + s(14);
+    let bar_w = (wheel_r * 2 + s(16)).min(rw / 2);
+    let val_left = wheel_cx - bar_w / 2;
+    let mut swatches = [RECT::default(); 4];
+    for (i, slot) in swatches.iter_mut().enumerate() {
+        let sx = rx + i as i32 * s(32);
+        *slot = rect(sx, s(420), sx + s(24), s(444));
+    }
+    ClockAppearanceGeom {
+        size_track: rect(track_l, sz_cy - track_h / 2, track_r, sz_cy + track_h / 2),
+        size_hit: rect(track_l - s(8), sz_cy - s(14), track_r + s(8), sz_cy + s(14)),
+        size_label: rect(rx, sz_cy - s(12), track_l - s(8), sz_cy + s(12)),
+        size_value: rect(track_r + s(8), sz_cy - s(12), rx + rw, sz_cy + s(12)),
+        opacity_track: rect(track_l, op_cy - track_h / 2, track_r, op_cy + track_h / 2),
+        opacity_hit: rect(track_l - s(8), op_cy - s(14), track_r + s(8), op_cy + s(14)),
+        opacity_label: rect(rx, op_cy - s(12), track_l - s(8), op_cy + s(12)),
+        opacity_value: rect(track_r + s(8), op_cy - s(12), rx + rw, op_cy + s(12)),
+        divider: rect(rx, s(308), rx + rw, s(308) + s(1).max(1)),
+        colour_title: rect(
+            rx,
+            s(324),
+            (wheel_cx - wheel_r - s(16)).max(rx + s(80)),
+            s(348),
+        ),
+        colour_hint: rect(
+            rx,
+            s(352),
+            (wheel_cx - wheel_r - s(16)).max(rx + s(80)),
+            s(410),
+        ),
+        swatches,
+        hex_pill: rect(rx, val_top - s(4), rx + s(96), val_top + s(22)),
+        wheel_cx,
+        wheel_cy,
+        wheel_r,
+        val_bar: rect(val_left, val_top, val_left + bar_w, val_top + s(14)),
+        val_hit: rect(
+            val_left - s(8),
+            val_top - s(8),
+            val_left + bar_w + s(8),
+            val_top + s(22),
+        ),
+    }
+}
+
+pub fn clock_control_hit(window: HWND, x: i32, y: i32) -> Option<ClockDragTarget> {
+    if SKIN.with(|s| s.borrow().tab) != Tab::Clock || window.0.is_null() {
+        return None;
+    }
+    let mut client = RECT::default();
+    if unsafe { GetClientRect(window, &mut client) }.is_err() {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
+    let layout = Layout::new(client.right * 96 / dpi, client.bottom * 96 / dpi);
+    let g = clock_appearance_geom(&layout, dpi);
+    let in_rect = |r: RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+    if in_rect(g.size_hit) {
+        return Some(ClockDragTarget::SizeSlider);
+    }
+    if in_rect(g.opacity_hit) {
+        return Some(ClockDragTarget::OpacitySlider);
+    }
+    let dx = (x - g.wheel_cx) as f32;
+    let dy = (y - g.wheel_cy) as f32;
+    if dx * dx + dy * dy <= ((g.wheel_r + 6) * (g.wheel_r + 6)) as f32 {
+        return Some(ClockDragTarget::ColorWheel);
+    }
+    if in_rect(g.val_hit) {
+        return Some(ClockDragTarget::BrightnessBar);
+    }
+    for (i, &sw) in g.swatches.iter().enumerate() {
+        if in_rect(sw) {
+            return Some(ClockDragTarget::Swatch(i));
+        }
+    }
+    None
+}
+
+pub fn apply_clock_pointer(window: HWND, target: ClockDragTarget, x: i32, y: i32) -> ClockUiState {
+    let mut client = RECT::default();
+    let _ = unsafe { GetClientRect(window, &mut client) };
+    let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
+    let layout = Layout::new(client.right * 96 / dpi, client.bottom * 96 / dpi);
+    let g = clock_appearance_geom(&layout, dpi);
+
+    let next = CLOCK_UI.with(|slot| {
+        let mut st = slot.get();
+        match target {
+            ClockDragTarget::SizeSlider => {
+                let span = (g.size_track.right - g.size_track.left).max(1) as f32;
+                let t = ((x - g.size_track.left) as f32 / span).clamp(0.0, 1.0);
+                st.size_pct = (50.0 + t * 150.0).round() as u32;
+            }
+            ClockDragTarget::OpacitySlider => {
+                let span = (g.opacity_track.right - g.opacity_track.left).max(1) as f32;
+                let t = ((x - g.opacity_track.left) as f32 / span).clamp(0.0, 1.0);
+                st.opacity_pct = (20.0 + t * 80.0).round() as u32;
+            }
+            ClockDragTarget::ColorWheel => {
+                let dx = (x - g.wheel_cx) as f32;
+                let dy = (y - g.wheel_cy) as f32;
+                let r = g.wheel_r.max(1) as f32;
+                let dist = (dx * dx + dy * dy).sqrt();
+                st.sat = (dist / r).clamp(0.0, 1.0);
+                if st.sat > 0.02 {
+                    st.hue = (dy.atan2(dx) / (2.0 * std::f32::consts::PI)).rem_euclid(1.0);
+                }
+                if st.val < 0.15 {
+                    st.val = 1.0;
+                }
+                st.color = hsv_to_rgb(st.hue, st.sat, st.val);
+            }
+            ClockDragTarget::BrightnessBar => {
+                let span = (g.val_bar.right - g.val_bar.left).max(1) as f32;
+                st.val = ((x - g.val_bar.left) as f32 / span).clamp(0.0, 1.0);
+                st.color = hsv_to_rgb(st.hue, st.sat, st.val);
+            }
+            ClockDragTarget::Swatch(idx) => {
+                if let Some(&col) = CLOCK_SWATCHES.get(idx) {
+                    let (h, s, v) = rgb_to_hsv(col);
+                    st.hue = h;
+                    st.sat = s;
+                    st.val = v;
+                    st.color = col;
+                }
+            }
+        }
+        slot.set(st);
+        st
+    });
+
+    if !window.0.is_null() {
+        let s = |n: i32| n * dpi / 96;
+        let p = layout.settings_resources_panel;
+        let rep = rect(s(p.left), s(p.top), s(p.right), s(p.bottom));
+        unsafe {
+            let _ = RedrawWindow(
+                window,
+                Some(&rep),
+                None,
+                RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW,
+            );
+        }
+    }
+    next
+}
+
+struct CachedClockWheel {
+    wheel_r: i32,
+    val_q: u8,
+    pad: i32,
+    side: i32,
+    pixels: Vec<u32>,
+}
+
+thread_local! {
+    static CLOCK_WHEEL_CACHE: RefCell<Option<CachedClockWheel>> = const { RefCell::new(None) };
+}
+
+unsafe fn paint_clock_appearance_controls(
+    dc: HDC,
+    buffer: Option<&PaintBuffer>,
+    layout: &Layout,
+    dpi: i32,
+    glass_active: bool,
+) {
+    let s = |n: i32| n * dpi.max(96) / 96;
+    let st = CLOCK_UI.with(Cell::get);
+    let g = clock_appearance_geom(layout, dpi);
+
+    // SAFETY: dc & PaintBuffer are valid synchronously inside paint_scene.
+    unsafe {
+        fill(dc, g.divider, if glass_active { GLASS_RIM } else { LINE });
+        if let Some(buf) = buffer
+            && glass_active
+        {
+            let _ = buf.tint_background(g.divider, DIVIDER_ALPHA);
+        }
+
+        // Helper for drawing a clean slider bar + circular handle + text labels.
+        let draw_slider =
+            |label_r: RECT, val_r: RECT, track: RECT, frac: f32, text: &str, val_str: &str| {
+                label(
+                    dc,
+                    text,
+                    label_r,
+                    s(13),
+                    false,
+                    MUTED,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
+                label(
+                    dc,
+                    val_str,
+                    val_r,
+                    s(13),
+                    true,
+                    TEXT,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+                );
+                fill(dc, track, LINE);
+                let filled_w =
+                    ((track.right - track.left) as f32 * frac.clamp(0.0, 1.0)).round() as i32;
+                let fill_r = rect(
+                    track.left,
+                    track.top,
+                    (track.left + filled_w).max(track.left),
+                    track.bottom,
+                );
+                fill(dc, fill_r, ACCENT);
+                let kr = s(7).max(6);
+                let kx = track.left + filled_w;
+                let ky = (track.top + track.bottom) / 2;
+                let knob_r = rect(kx - kr, ky - kr, kx + kr, ky + kr);
+                rounded(dc, knob_r, TEXT, INK, kr * 2);
+                if let Some(buf) = buffer {
+                    let _ = buf.tint_background(track, 255);
+                    let _ = buf.tint_background(knob_r, 255);
+                }
+            };
+
+        draw_slider(
+            g.size_label,
+            g.size_value,
+            g.size_track,
+            (st.size_pct as f32 - 50.0) / 150.0,
+            "Size",
+            &format!("{}%", st.size_pct),
+        );
+        draw_slider(
+            g.opacity_label,
+            g.opacity_value,
+            g.opacity_track,
+            (st.opacity_pct as f32 - 20.0) / 80.0,
+            "Opacity",
+            &format!("{}%", st.opacity_pct),
+        );
+
+        label(
+            dc,
+            "Colour",
+            g.colour_title,
+            s(14),
+            true,
+            TEXT,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+        label(
+            dc,
+            "Pick anywhere on the wheel; bar sets brightness.",
+            g.colour_hint,
+            s(12),
+            false,
+            MUTED,
+            DT_LEFT | DT_WORDBREAK,
+        );
+
+        // Quick swatch circles.
+        for &sw in &g.swatches {
+            // Mapped below by index.
+            let _ = sw;
+        }
+        for (i, &sw) in g.swatches.iter().enumerate() {
+            let col = CLOCK_SWATCHES[i];
+            let active = (st.color & 0x00FF_FFFF) == (col & 0x00FF_FFFF);
+            rounded(dc, sw, col, if active { ACCENT } else { LINE }, s(12));
+            if let Some(buf) = buffer {
+                let _ = buf.tint_background(sw, 255);
+            }
+        }
+
+        // Hex colour badge.
+        rounded(dc, g.hex_pill, INK, LINE, s(8));
+        label(
+            dc,
+            &format!("#{:06X}", st.color & 0x00FF_FFFF),
+            g.hex_pill,
+            s(12),
+            true,
+            TEXT,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        if let Some(buf) = buffer {
+            let _ = buf.tint_background(g.hex_pill, 255);
+        }
+
+        // Pixel-rendered HSV wheel & linear brightness bar into PaintBuffer DIB bits.
+        if let Some(buf) = buffer {
+            let mut bits = std::ptr::null_mut();
+            let mut stride = 0;
+            if GdiFlush().as_bool()
+                && GetBufferedPaintBits(buf.handle, &mut bits, &mut stride).is_ok()
+                && !bits.is_null()
+            {
+                let buf_w = buf.area.right - buf.area.left;
+                let buf_h = buf.area.bottom - buf.area.top;
+                if let Some(len) = (stride as usize).checked_mul(buf_h as usize) {
+                    let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, len);
+                    let wheel_r = g.wheel_r.max(1);
+                    let r = wheel_r as f32;
+                    let pad = wheel_r + 2;
+                    let side = pad * 2 + 1;
+                    let val_effective = st.val.max(0.18);
+                    let val_q = (val_effective * 255.0).round().clamp(0.0, 255.0) as u8;
+                    CLOCK_WHEEL_CACHE.with(|slot| {
+                        let mut cache = slot.borrow_mut();
+                        let rebuild = cache.as_ref().is_none_or(|c| {
+                            c.wheel_r != wheel_r
+                                || c.val_q != val_q
+                                || c.side != side
+                                || c.pixels.len() != (side as usize) * (side as usize)
+                        });
+                        if rebuild {
+                            let mut wbuf = vec![0u32; (side as usize) * (side as usize)];
+                            let r_sq = (r + 1.0) * (r + 1.0);
+                            let inv_2pi = 1.0 / (2.0 * std::f32::consts::PI);
+                            for dy in -pad..=pad {
+                                let row = (dy + pad) as usize * side as usize;
+                                for dx in -pad..=pad {
+                                    let dist_sq = (dx * dx + dy * dy) as f32;
+                                    if dist_sq <= r_sq {
+                                        let dist = dist_sq.sqrt();
+                                        let sat = (dist / r).clamp(0.0, 1.0);
+                                        let hue = ((dy as f32).atan2(dx as f32) * inv_2pi)
+                                            .rem_euclid(1.0);
+                                        let col = hsv_to_rgb(hue, sat, val_effective);
+                                        wbuf[row + (dx + pad) as usize] = if dist <= r {
+                                            0xFF00_0000 | col
+                                        } else {
+                                            0xFF55_5555
+                                        };
+                                    }
+                                }
+                            }
+                            *cache = Some(CachedClockWheel {
+                                wheel_r,
+                                val_q,
+                                pad,
+                                side,
+                                pixels: wbuf,
+                            });
+                        }
+                        if let Some(c) = cache.as_ref() {
+                            for dy in -c.pad..=c.pad {
+                                let py = g.wheel_cy + dy - buf.area.top;
+                                if py < 0 || py >= buf_h {
+                                    continue;
+                                }
+                                let dst_row = py as usize * stride as usize;
+                                let src_row = (dy + c.pad) as usize * c.side as usize;
+                                for dx in -c.pad..=c.pad {
+                                    let px = g.wheel_cx + dx - buf.area.left;
+                                    if px < 0 || px >= buf_w {
+                                        continue;
+                                    }
+                                    let src = c.pixels[src_row + (dx + c.pad) as usize];
+                                    if src != 0 {
+                                        pixels[dst_row + px as usize] = src;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    // Selection ring inside wheel.
+                    let ang = st.hue * 2.0 * std::f32::consts::PI;
+                    let tx = (g.wheel_cx as f32 + st.sat * r * ang.cos()).round() as i32;
+                    let ty = (g.wheel_cy as f32 + st.sat * r * ang.sin()).round() as i32;
+                    let tr = s(5).max(4);
+                    for dy in -tr..=tr {
+                        let py = ty + dy - buf.area.top;
+                        if py < 0 || py >= buf_h {
+                            continue;
+                        }
+                        let row = py as usize * stride as usize;
+                        for dx in -tr..=tr {
+                            let px = tx + dx - buf.area.left;
+                            if px < 0 || px >= buf_w {
+                                continue;
+                            }
+                            let d = ((dx * dx + dy * dy) as f32).sqrt();
+                            if (d - (tr - 1) as f32).abs() <= 1.2 {
+                                pixels[row + px as usize] = 0xFFFF_FFFF;
+                            } else if (d - tr as f32).abs() <= 1.1 {
+                                pixels[row + px as usize] = 0xFF11_1111;
+                            }
+                        }
+                    }
+                    // Brightness bar gradient.
+                    let bw = (g.val_bar.right - g.val_bar.left).max(1);
+                    for py_abs in g.val_bar.top..g.val_bar.bottom {
+                        let py = py_abs - buf.area.top;
+                        if py < 0 || py >= buf_h {
+                            continue;
+                        }
+                        let row = py as usize * stride as usize;
+                        for px_abs in g.val_bar.left..g.val_bar.right {
+                            let px = px_abs - buf.area.left;
+                            if px < 0 || px >= buf_w {
+                                continue;
+                            }
+                            let v = (px_abs - g.val_bar.left) as f32 / (bw - 1).max(1) as f32;
+                            let col = hsv_to_rgb(st.hue, st.sat, v);
+                            let edge = py_abs == g.val_bar.top
+                                || py_abs == g.val_bar.bottom - 1
+                                || px_abs == g.val_bar.left
+                                || px_abs == g.val_bar.right - 1;
+                            pixels[row + px as usize] =
+                                if edge { 0xFF66_6666 } else { 0xFF00_0000 | col };
+                        }
+                    }
+                    // Brightness thumb indicator.
+                    let vx = g.val_bar.left + (st.val * bw as f32).round() as i32;
+                    let vy = (g.val_bar.top + g.val_bar.bottom) / 2;
+                    let vr = s(7).max(6);
+                    for dy in -vr..=vr {
+                        let py = vy + dy - buf.area.top;
+                        if py < 0 || py >= buf_h {
+                            continue;
+                        }
+                        let row = py as usize * stride as usize;
+                        for dx in -vr..=vr {
+                            let px = vx + dx - buf.area.left;
+                            if px < 0 || px >= buf_w {
+                                continue;
+                            }
+                            let d = ((dx * dx + dy * dy) as f32).sqrt();
+                            if d <= vr as f32 {
+                                pixels[row + px as usize] = if d >= (vr - 2) as f32 {
+                                    0xFFFF_FFFF
+                                } else {
+                                    0xFF00_0000 | (st.color & 0x00FF_FFFF)
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -8207,5 +9292,126 @@ mod tests {
             let _ = DestroyWindow(win);
         }
         clear();
+    }
+
+    #[test]
+    fn update_popup_layout_and_buffered_paint_render_cleanly() {
+        clear();
+        for dpi in [96, 144] {
+            let layout = UpdatePopupLayout::measure(dpi, false);
+            assert!(layout.width >= 368 && layout.height >= 154);
+            assert!(layout.update_btn.right < layout.whats_new_btn.left);
+            assert_eq!(
+                layout.hit_test(layout.close.left + 2, layout.close.top + 2),
+                Some(UpdatePopupHit::Close)
+            );
+            assert_eq!(
+                layout.hit_test(layout.update_btn.left + 4, layout.update_btn.top + 4),
+                Some(UpdatePopupHit::Update)
+            );
+            assert_eq!(
+                layout.hit_test(layout.whats_new_btn.left + 4, layout.whats_new_btn.top + 4),
+                Some(UpdatePopupHit::WhatsNew)
+            );
+            assert_eq!(
+                layout.hit_test(layout.disable_link.left + 4, layout.disable_link.top + 4),
+                Some(UpdatePopupHit::Disable)
+            );
+            assert_eq!(layout.hit_test(2, 2), None);
+        }
+
+        // SAFETY: offscreen DIB created and destroyed solely within this test.
+        unsafe {
+            let layout = UpdatePopupLayout::measure(96, false);
+            let area = rect(0, 0, layout.width, layout.height);
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(
+                dc,
+                &BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: layout.width,
+                        biHeight: -layout.height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+            .expect("popup paint DIB");
+            let prev = SelectObject(dc, bmp);
+            assert!(paint_update_popup_into(
+                dc,
+                area,
+                &UpdatePopupPaint {
+                    layout: &layout,
+                    title: "WallpaperLive 0.2.2 is out",
+                    subtitle: "You are on 0.2.1. Read what changed, or update now.",
+                    update_label: "Update",
+                    downloading: false,
+                    hover: Some(UpdatePopupHit::WhatsNew),
+                    pressed: None,
+                    dpi: 96,
+                    glass: false,
+                },
+            ));
+            let _ = GdiFlush();
+            let out = std::slice::from_raw_parts(
+                bits as *const u32,
+                (layout.width * layout.height) as usize,
+            );
+            let ux = ((layout.update_btn.left + layout.update_btn.right) / 2) as usize;
+            let uy = ((layout.update_btn.top + layout.update_btn.bottom) / 2) as usize;
+            assert_ne!(out[uy * layout.width as usize + ux] & 0x00FF_FFFF, 0);
+            SelectObject(dc, prev);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(dc);
+        }
+        clear();
+    }
+
+    #[test]
+    fn clock_appearance_hsv_and_layout_bounds_stay_clean() {
+        assert_eq!(hsv_to_rgb(0.0, 1.0, 1.0), 0x00FF_0000);
+        assert_eq!(hsv_to_rgb(1.0 / 3.0, 1.0, 1.0), 0x0000_FF00);
+        assert_eq!(hsv_to_rgb(2.0 / 3.0, 1.0, 1.0), 0x0000_00FF);
+        assert_eq!(hsv_to_rgb(0.0, 0.0, 1.0), 0x00FF_FFFF);
+        let (h, s, v) = rgb_to_hsv(0x00D9_541E);
+        let roundtrip = hsv_to_rgb(h, s, v);
+        assert!((((roundtrip >> 16) & 255) as i32 - 0xD9).abs() <= 1);
+        assert!((((roundtrip >> 8) & 255) as i32 - 0x54).abs() <= 1);
+        assert!(((roundtrip & 255) as i32 - 0x1E).abs() <= 1);
+
+        let layout = Layout::new(MIN_CLIENT_WIDTH, MIN_CLIENT_HEIGHT);
+        let tab_clock = layout.control(TAB_CLOCK).unwrap();
+        let tab_settings = layout.control(TAB_SETTINGS).unwrap();
+        let add_btn = layout.control(101).unwrap();
+        assert!(tab_clock.left > tab_settings.right && tab_clock.right < add_btn.left);
+        for id in [
+            CLOCK_ENABLE,
+            CLOCK_LOCK,
+            CLOCK_BEHIND_ICONS,
+            CLOCK_24H,
+            CLOCK_REPOSITION,
+            CLOCK_RESET_POS,
+        ] {
+            let area = layout.control(id).unwrap();
+            assert!(
+                area.left >= layout.settings_preferences_panel.left
+                    && area.right <= layout.settings_preferences_panel.right
+                    && area.bottom <= layout.settings_preferences_panel.bottom
+            );
+            assert!(visible_on(Tab::Clock, id));
+        }
+
+        let g = clock_appearance_geom(&layout, 96);
+        assert!(g.wheel_r >= 44 && g.val_bar.bottom <= layout.settings_resources_panel.bottom);
     }
 }

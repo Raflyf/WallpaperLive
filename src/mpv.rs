@@ -702,6 +702,9 @@ impl Mpv {
             ("gpu-api", "d3d11"),
             ("gpu-context", "d3d11"),
             ("hwdec", "auto-safe"),
+            // ponytail: cap GPU decode surface pool and skip frame-exact resume seeks on low-VRAM laptops.
+            ("hwdec-extra-frames", "3"),
+            ("hr-seek", "no"),
             ("scale", "bilinear"),
             ("cscale", "bilinear"),
             ("dscale", "bilinear"),

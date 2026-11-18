@@ -20,6 +20,15 @@ pub struct Settings {
     pub pause_fullscreen: bool,
     pub fps: u32,
     pub acrylic_blur: bool,
+    pub auto_update_check: bool,
+    pub clock_enabled: bool,
+    pub clock_locked: bool,
+    pub clock_behind_icons: bool,
+    pub clock_24h: bool,
+    pub clock_size: u32,
+    pub clock_opacity: u32,
+    pub clock_color: u32,
+    pub clock_pos: Option<(i32, i32)>,
 }
 
 impl Default for Settings {
@@ -34,6 +43,15 @@ impl Default for Settings {
             pause_fullscreen: true,
             fps: 30,
             acrylic_blur: true,
+            auto_update_check: true,
+            clock_enabled: false,
+            clock_locked: false,
+            clock_behind_icons: true,
+            clock_24h: true,
+            clock_size: 100,
+            clock_opacity: 100,
+            clock_color: 0x00FF_FFFF,
+            clock_pos: None,
         }
     }
 }
@@ -93,6 +111,39 @@ impl Settings {
         if !self.acrylic_blur {
             content.push_str("acrylic=false\n");
         }
+        if !self.auto_update_check {
+            content.push_str("updates=false\n");
+        }
+        if self.clock_enabled {
+            content.push_str("clock=true\n");
+        }
+        if self.clock_locked {
+            content.push_str("clock_lock=true\n");
+        }
+        if !self.clock_behind_icons {
+            content.push_str("clock_icons=false\n");
+        }
+        if !self.clock_24h {
+            content.push_str("clock_24h=false\n");
+        }
+        if self.clock_size != 100 {
+            content.push_str(&format!("clock_size={}\n", self.clock_size.clamp(50, 200)));
+        }
+        if self.clock_opacity != 100 {
+            content.push_str(&format!(
+                "clock_opacity={}\n",
+                self.clock_opacity.clamp(20, 100)
+            ));
+        }
+        if (self.clock_color & 0x00FF_FFFF) != 0x00FF_FFFF {
+            content.push_str(&format!(
+                "clock_color={:06X}\n",
+                self.clock_color & 0x00FF_FFFF
+            ));
+        }
+        if let Some((cx, cy)) = self.clock_pos {
+            content.push_str(&format!("clock_pos={cx},{cy}\n"));
+        }
         Ok(content)
     }
     pub fn decode(text: &str) -> Result<Self, String> {
@@ -101,17 +152,99 @@ impl Settings {
         }
         let mut lines: Vec<_> = text.lines().collect();
         let mut acrylic = None;
-        if lines.first() == Some(&"version=4")
-            && lines
-                .last()
-                .is_some_and(|line| line.starts_with("acrylic="))
-        {
-            let line = lines.pop().unwrap_or("");
-            acrylic = Some(match line {
-                "acrylic=true" => true,
-                "acrylic=false" => false,
-                _ => return Err("Invalid acrylic blur setting".into()),
-            });
+        let mut auto_update_check = None;
+        let mut clock_enabled = None;
+        let mut clock_locked = None;
+        let mut clock_behind_icons = None;
+        let mut clock_24h = None;
+        let mut clock_size = None;
+        let mut clock_opacity = None;
+        let mut clock_color = None;
+        let mut clock_pos = None;
+        let parse_bool = |v: &str, err: &str| match v {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(err.to_string()),
+        };
+        if lines.first() == Some(&"version=4") {
+            while let Some(last) = lines.last().copied() {
+                if let Some(v) = last.strip_prefix("acrylic=")
+                    && acrylic.is_none()
+                {
+                    lines.pop();
+                    acrylic = Some(parse_bool(v, "Invalid acrylic blur setting")?);
+                } else if let Some(v) = last.strip_prefix("updates=")
+                    && auto_update_check.is_none()
+                {
+                    lines.pop();
+                    auto_update_check = Some(parse_bool(v, "Invalid update check setting")?);
+                } else if let Some(v) = last.strip_prefix("clock=")
+                    && clock_enabled.is_none()
+                {
+                    lines.pop();
+                    clock_enabled = Some(parse_bool(v, "Invalid clock toggle setting")?);
+                } else if let Some(v) = last.strip_prefix("clock_lock=")
+                    && clock_locked.is_none()
+                {
+                    lines.pop();
+                    clock_locked = Some(parse_bool(v, "Invalid clock lock setting")?);
+                } else if let Some(v) = last.strip_prefix("clock_icons=")
+                    && clock_behind_icons.is_none()
+                {
+                    lines.pop();
+                    clock_behind_icons = Some(parse_bool(v, "Invalid clock layering setting")?);
+                } else if let Some(v) = last.strip_prefix("clock_24h=")
+                    && clock_24h.is_none()
+                {
+                    lines.pop();
+                    clock_24h = Some(parse_bool(v, "Invalid clock format setting")?);
+                } else if let Some(v) = last.strip_prefix("clock_size=")
+                    && clock_size.is_none()
+                {
+                    lines.pop();
+                    let sz = v
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|s| (50..=200).contains(s))
+                        .ok_or("Invalid clock size setting")?;
+                    clock_size = Some(sz);
+                } else if let Some(v) = last.strip_prefix("clock_opacity=")
+                    && clock_opacity.is_none()
+                {
+                    lines.pop();
+                    let op = v
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|o| (20..=100).contains(o))
+                        .ok_or("Invalid clock opacity setting")?;
+                    clock_opacity = Some(op);
+                } else if let Some(v) = last.strip_prefix("clock_color=")
+                    && clock_color.is_none()
+                {
+                    lines.pop();
+                    let hex = v.strip_prefix('#').unwrap_or(v);
+                    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err("Invalid clock colour setting".into());
+                    }
+                    clock_color = Some(
+                        u32::from_str_radix(hex, 16).map_err(|_| "Invalid clock colour setting")?,
+                    );
+                } else if let Some(v) = last.strip_prefix("clock_pos=")
+                    && clock_pos.is_none()
+                {
+                    lines.pop();
+                    let (xs, ys) = v.split_once(',').ok_or("Invalid clock position setting")?;
+                    let x = xs
+                        .parse::<i32>()
+                        .map_err(|_| "Invalid clock position setting")?;
+                    let y = ys
+                        .parse::<i32>()
+                        .map_err(|_| "Invalid clock position setting")?;
+                    clock_pos = Some(Some((x, y)));
+                } else {
+                    break;
+                }
+            }
         }
         let legacy = lines.len() == 5 && lines[0] == "version=1";
         let previous = lines.len() == 7 && lines[0] == "version=2";
@@ -211,6 +344,15 @@ impl Settings {
             pause_fullscreen,
             fps,
             acrylic_blur: acrylic.unwrap_or(true),
+            auto_update_check: auto_update_check.unwrap_or(true),
+            clock_enabled: clock_enabled.unwrap_or(false),
+            clock_locked: clock_locked.unwrap_or(false),
+            clock_behind_icons: clock_behind_icons.unwrap_or(true),
+            clock_24h: clock_24h.unwrap_or(true),
+            clock_size: clock_size.unwrap_or(100),
+            clock_opacity: clock_opacity.unwrap_or(100),
+            clock_color: clock_color.unwrap_or(0x00FF_FFFF),
+            clock_pos: clock_pos.unwrap_or(None),
         })
     }
 }
@@ -378,6 +520,15 @@ mod tests {
             pause_fullscreen: false,
             fps: 45,
             acrylic_blur: false,
+            auto_update_check: false,
+            clock_enabled: true,
+            clock_locked: true,
+            clock_behind_icons: false,
+            clock_24h: false,
+            clock_size: 135,
+            clock_opacity: 85,
+            clock_color: 0xD9541E,
+            clock_pos: Some((320, 140)),
         };
         assert_eq!(Settings::decode(&s.encode().unwrap()).unwrap(), s);
         assert!(
@@ -388,8 +539,17 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            Settings::decode(
+                &s.encode()
+                    .unwrap()
+                    .replace("updates=false", "updates=always")
+            )
+            .is_err()
+        );
         let empty = Settings::default();
         assert!(empty.acrylic_blur);
+        assert!(empty.auto_update_check);
         assert_eq!(Settings::decode(&empty.encode().unwrap()).unwrap(), empty);
     }
 

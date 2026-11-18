@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
 mod cache;
+mod clock_widget;
 mod core;
 mod desktop;
 mod library;
@@ -8,6 +9,7 @@ mod mpv;
 mod thumbnail;
 mod tray;
 mod update;
+mod update_popup;
 mod visuals;
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();

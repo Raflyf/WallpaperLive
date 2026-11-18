@@ -63,6 +63,7 @@ const PREPARED: u32 = WM_APP + 10;
 const UPDATE_READY: u32 = WM_APP + 11;
 const UPDATE_RELEASE: usize = 126;
 const CONTEXT_MENU: u32 = WM_APP + 12;
+const UPDATE_DOWNLOAD: u32 = WM_APP + 13;
 const CTX_SET: usize = 201;
 const CTX_EXPLORER: usize = 202;
 const CTX_COPY_PATH: usize = 203;
@@ -99,6 +100,8 @@ struct DragMoveState {
 thread_local! {
     static DRAG_MOVE: std::cell::RefCell<DragMoveState> =
         std::cell::RefCell::new(DragMoveState::default());
+    static CLOCK_DRAG: std::cell::Cell<Option<visuals::ClockDragTarget>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn enter_drag_move(window: HWND) {
@@ -715,9 +718,16 @@ struct App {
     tray_present: bool,
     update_tag: Option<String>,
     update_manual: bool,
+    update_popup_dismissed: bool,
     update_tx: std::sync::mpsc::Sender<Result<Option<String>, String>>,
     update_rx: std::sync::mpsc::Receiver<Result<Option<String>, String>>,
     update_thread: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    update_download_tx: std::sync::mpsc::Sender<crate::update::DownloadEvent>,
+    update_download_rx: std::sync::mpsc::Receiver<crate::update::DownloadEvent>,
+    update_download_thread: Option<(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::thread::JoinHandle<()>,
     )>,
@@ -1228,6 +1238,12 @@ impl App {
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::AUTO_UPDATES,
+                    w!("BUTTON"),
+                    "Check for updates on launch",
+                    BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+                ),
+                (
                     STATUS,
                     w!("EDIT"),
                     "",
@@ -1243,6 +1259,48 @@ impl App {
                     visuals::TAB_SETTINGS,
                     w!("BUTTON"),
                     "Settings",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::TAB_CLOCK,
+                    w!("BUTTON"),
+                    "Day Clock",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_ENABLE,
+                    w!("BUTTON"),
+                    "Day clock on the desktop",
+                    BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_LOCK,
+                    w!("BUTTON"),
+                    "Lock position & click-through",
+                    BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_BEHIND_ICONS,
+                    w!("BUTTON"),
+                    "Keep below desktop shortcuts",
+                    BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_24H,
+                    w!("BUTTON"),
+                    "Use 24-hour clock",
+                    BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_REPOSITION,
+                    w!("BUTTON"),
+                    "Reposition on desktop",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
+                    visuals::CLOCK_RESET_POS,
+                    w!("BUTTON"),
+                    "Center position",
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -1354,7 +1412,18 @@ impl App {
                 )
                 .map_err(native_error)?;
                 self.controls.push((id, child));
-                if matches!(id, BATTERY | STARTUP | 121 | visuals::ACRYLIC) {
+                if matches!(
+                    id,
+                    BATTERY
+                        | STARTUP
+                        | 121
+                        | visuals::ACRYLIC
+                        | visuals::AUTO_UPDATES
+                        | visuals::CLOCK_ENABLE
+                        | visuals::CLOCK_LOCK
+                        | visuals::CLOCK_BEHIND_ICONS
+                        | visuals::CLOCK_24H
+                ) {
                     let _ = windows::Win32::UI::Controls::SetWindowTheme(child, w!(""), w!(""));
                 }
             }
@@ -1446,6 +1515,13 @@ impl App {
                 WPARAM(self.settings.acrylic_blur as usize),
                 LPARAM(0),
             );
+            SendMessageW(
+                self.control(visuals::AUTO_UPDATES),
+                BM_SETCHECK,
+                WPARAM(self.settings.auto_update_check as usize),
+                LPARAM(0),
+            );
+            self.sync_clock_controls();
             if let Ok(enabled) = startup_enabled() {
                 SendMessageW(
                     self.control(STARTUP),
@@ -2570,10 +2646,33 @@ impl App {
         unsafe {
             let _ = KillTimer(self.hwnd, 2);
         }
-        if let Ok(tag) = &result {
-            self.update_tag = tag.clone();
+        let manual = std::mem::take(&mut self.update_manual);
+        if let Ok(Some(tag)) = &result {
+            self.update_tag = Some(tag.clone());
+            self.update_popup_dismissed = false;
+            let has_window = !self.hwnd.0.is_null() && unsafe { IsWindow(self.hwnd).as_bool() };
+            let visible = has_window
+                && unsafe {
+                    IsWindowVisible(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool()
+                };
+            if manual {
+                if has_window {
+                    if !visible {
+                        self.show();
+                    }
+                    crate::update_popup::show(self.hwnd, ACTION, tag);
+                    return Ok(());
+                }
+            } else {
+                if visible {
+                    crate::update_popup::show(self.hwnd, ACTION, tag);
+                } else {
+                    self.notify_update()?;
+                }
+                return Ok(());
+            }
         }
-        if std::mem::take(&mut self.update_manual) {
+        if manual {
             let newer = matches!(result, Ok(Some(_)));
             let text = wide(&crate::update::message(&result));
             let flags = if newer {
@@ -2597,10 +2696,123 @@ impl App {
             if newer && choice == IDYES {
                 self.open_release()?;
             }
-        } else if matches!(result, Ok(Some(_))) {
-            self.notify_update()?;
         }
         Ok(())
+    }
+    fn start_update_download(&mut self) -> Result<(), String> {
+        let Some(tag) = self.update_tag.clone() else {
+            return Ok(());
+        };
+        if self.update_download_thread.is_some() {
+            return Ok(());
+        }
+        let updates_dir = self
+            .config
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join("updates"))
+            .unwrap_or_else(|| std::env::temp_dir().join("WallpaperLive-updates"));
+        crate::update_popup::set_progress(self.hwnd, Some(0));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let tx = self.update_download_tx.clone();
+        let hwnd = self.hwnd.0 as usize;
+        self.update_download_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                let post_event = |event: crate::update::DownloadEvent| {
+                    if !flag.load(std::sync::atomic::Ordering::Relaxed) && tx.send(event).is_ok() {
+                        // SAFETY: completion targets only the owned panel HWND until the worker joins on Drop.
+                        unsafe {
+                            let _ = PostMessageW(
+                                HWND(hwnd as *mut _),
+                                UPDATE_DOWNLOAD,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                };
+                let result =
+                    crate::update::download_verified_installer(&tag, &updates_dir, &flag, |pct| {
+                        if pct == Some(100) {
+                            post_event(crate::update::DownloadEvent::Verifying);
+                        } else {
+                            post_event(crate::update::DownloadEvent::Progress(pct));
+                        }
+                    });
+                match result {
+                    Ok(path) => post_event(crate::update::DownloadEvent::Ready(path)),
+                    Err(err) => post_event(crate::update::DownloadEvent::Failed(err)),
+                }
+            }),
+        ));
+        Ok(())
+    }
+    fn update_download_event(&mut self) -> Result<bool, String> {
+        let mut launch_path: Option<PathBuf> = None;
+        let mut finished_err: Option<String> = None;
+        while let Ok(ev) = self.update_download_rx.try_recv() {
+            match ev {
+                crate::update::DownloadEvent::Progress(pct) => {
+                    crate::update_popup::set_progress(self.hwnd, pct);
+                }
+                crate::update::DownloadEvent::Verifying => {
+                    crate::update_popup::set_verifying(self.hwnd);
+                }
+                crate::update::DownloadEvent::Ready(path) => {
+                    launch_path = Some(path);
+                }
+                crate::update::DownloadEvent::Failed(err) => {
+                    finished_err = Some(err);
+                }
+            }
+        }
+        if launch_path.is_some() || finished_err.is_some() {
+            if let Some((_, worker)) = self.update_download_thread.take() {
+                let _ = worker.join();
+            }
+        } else if self
+            .update_download_thread
+            .as_ref()
+            .is_some_and(|(_, worker)| worker.is_finished())
+            && let Some((_, worker)) = self.update_download_thread.take()
+            && worker.join().is_err()
+        {
+            finished_err = Some("Update downloader stopped unexpectedly".into());
+        }
+        if let Some(err) = finished_err {
+            crate::update_popup::set_error(self.hwnd, &err);
+            return Ok(false);
+        }
+        if let Some(path) = launch_path {
+            let file_w = wide(&path.to_string_lossy());
+            let dir_w = path
+                .parent()
+                .map(|p| wide(&p.to_string_lossy()))
+                .unwrap_or_else(|| wide(""));
+            // SAFETY: launches only the SHA-256 verified GitHub release installer just downloaded by user action.
+            let res = unsafe {
+                ShellExecuteW(
+                    self.hwnd,
+                    w!("open"),
+                    PCWSTR(file_w.as_ptr()),
+                    PCWSTR::null(),
+                    PCWSTR(dir_w.as_ptr()),
+                    SW_SHOWNORMAL,
+                )
+            };
+            if res.0 as isize <= 32 {
+                crate::update_popup::set_error(
+                    self.hwnd,
+                    "Could not launch the downloaded installer",
+                );
+                return Ok(false);
+            }
+            crate::update_popup::dismiss(self.hwnd);
+            return Ok(true);
+        }
+        Ok(false)
     }
     fn notify_update(&self) -> Result<(), String> {
         if !self.tray_present || self.update_tag.is_none() {
@@ -2616,7 +2828,7 @@ impl App {
         };
         let title = wide("WallpaperLive update available");
         let info = wide(&format!(
-            "A newer version is available ({}). Click to open its GitHub release page. No automatic download or installation.",
+            "A newer version is available ({}). Open WallpaperLive to update, or click to view the GitHub release.",
             self.update_tag.as_deref().unwrap_or_default()
         ));
         let title_len = title.len().min(data.szInfoTitle.len() - 1);
@@ -2632,13 +2844,7 @@ impl App {
         Ok(())
     }
     fn open_release(&self) -> Result<(), String> {
-        let url = wide(
-            &self
-                .update_tag
-                .as_ref()
-                .map(|tag| format!("https://github.com/Raflyf/WallpaperLive/releases/tag/{tag}"))
-                .unwrap_or_else(|| "https://github.com/Raflyf/WallpaperLive/releases".into()),
-        );
+        let url = wide(&crate::update::release_page_url(self.update_tag.as_deref()));
         // SAFETY: tag was validated by the update checker; no response-provided URL or command is executed.
         let result = unsafe {
             ShellExecuteW(
@@ -2740,6 +2946,11 @@ impl App {
                 None,
                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
             );
+        }
+        if let Some(tag) = self.update_tag.as_deref()
+            && !self.update_popup_dismissed
+        {
+            crate::update_popup::show(self.hwnd, ACTION, tag);
         }
         self.request_thumbnails();
     }
@@ -2961,6 +3172,7 @@ impl App {
                 specs: PlaybackSpecs::default(),
             });
         }
+        crate::clock_widget::sync_zorder();
         self.playback_info = Some(prepared);
         self.resume_position = position;
         self.requested_pause = true;
@@ -3806,6 +4018,7 @@ impl App {
             UPDATE_RELEASE => self.check_updates(true)?,
             visuals::TAB_LIBRARY => self.switch_tab(visuals::Tab::Library)?,
             visuals::TAB_SETTINGS => self.switch_tab(visuals::Tab::Settings)?,
+            visuals::TAB_CLOCK => self.switch_tab(visuals::Tab::Clock)?,
             visuals::CLEAR_CACHE => self.clear_cache()?,
             visuals::ADD_FOLDER => self.pick_folder()?,
             visuals::FOLDER_FILTER => {
@@ -3957,6 +4170,7 @@ impl App {
                         visuals::clear_backdrop_transition(self.hwnd);
                         visuals::invalidate_backdrop_cache();
                         let _ = ShowWindow(self.hwnd, SW_HIDE);
+                        crate::update_popup::sync(self.hwnd);
                     }
                     self.cancel_thumbnails();
                     visuals::retain_thumbnails(&[]);
@@ -4076,6 +4290,7 @@ impl App {
                 self.save()?;
                 visuals::set_user_acrylic(enabled);
                 let _ = visuals::enable_backdrop(self.hwnd);
+                crate::update_popup::refresh_theme(self.hwnd);
                 unsafe {
                     let _ = RedrawWindow(
                         self.hwnd,
@@ -4085,9 +4300,191 @@ impl App {
                     );
                 }
             }
+            visuals::AUTO_UPDATES => {
+                let enabled = unsafe {
+                    SendMessageW(
+                        self.control(visuals::AUTO_UPDATES),
+                        BM_GETCHECK,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                    .0
+                } == BST_CHECKED.0 as isize;
+                self.settings.auto_update_check = enabled;
+                if !self.config.as_os_str().is_empty() {
+                    self.save()?;
+                }
+            }
+            visuals::UPDATE_NOW => {
+                self.start_update_download()?;
+            }
+            visuals::UPDATE_WHATS_NEW => {
+                self.open_release()?;
+            }
+            visuals::UPDATE_DISABLE => {
+                self.settings.auto_update_check = false;
+                if !self.config.as_os_str().is_empty() {
+                    self.save()?;
+                }
+                let ctrl = self.control(visuals::AUTO_UPDATES);
+                if !ctrl.0.is_null() {
+                    unsafe {
+                        SendMessageW(ctrl, BM_SETCHECK, WPARAM(0), LPARAM(0));
+                    }
+                }
+                self.update_popup_dismissed = true;
+                crate::update_popup::dismiss(self.hwnd);
+            }
+            visuals::UPDATE_DISMISS => {
+                self.update_popup_dismissed = true;
+                crate::update_popup::dismiss(self.hwnd);
+            }
+            visuals::CLOCK_ENABLE => {
+                let ctrl = self.control(visuals::CLOCK_ENABLE);
+                self.settings.clock_enabled =
+                    unsafe { SendMessageW(ctrl, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 }
+                        == BST_CHECKED.0 as isize;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_LOCK => {
+                let ctrl = self.control(visuals::CLOCK_LOCK);
+                self.settings.clock_locked =
+                    unsafe { SendMessageW(ctrl, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 }
+                        == BST_CHECKED.0 as isize;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_BEHIND_ICONS => {
+                let ctrl = self.control(visuals::CLOCK_BEHIND_ICONS);
+                self.settings.clock_behind_icons =
+                    unsafe { SendMessageW(ctrl, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 }
+                        == BST_CHECKED.0 as isize;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_24H => {
+                let ctrl = self.control(visuals::CLOCK_24H);
+                self.settings.clock_24h =
+                    unsafe { SendMessageW(ctrl, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 }
+                        == BST_CHECKED.0 as isize;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_REPOSITION => {
+                if !self.settings.clock_enabled {
+                    self.settings.clock_enabled = true;
+                    self.save_and_sync_clock()?;
+                }
+                crate::clock_widget::begin_reposition(self.hwnd, ACTION, self.clock_config());
+            }
+            visuals::CLOCK_RESET_POS => {
+                self.settings.clock_pos = None;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_STYLE_CHANGED => {
+                let st = visuals::clock_ui_state();
+                self.settings.clock_size = st.size_pct;
+                self.settings.clock_opacity = st.opacity_pct;
+                self.settings.clock_color = st.color;
+                self.sync_clock();
+            }
+            visuals::CLOCK_STYLE_COMMIT => {
+                let st = visuals::clock_ui_state();
+                self.settings.clock_size = st.size_pct;
+                self.settings.clock_opacity = st.opacity_pct;
+                self.settings.clock_color = st.color;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_CTX_POS_SAVED => {
+                if let Some(pos) = crate::clock_widget::take_saved_position() {
+                    self.settings.clock_pos = Some(pos);
+                    self.save_and_sync_clock()?;
+                }
+            }
+            visuals::CLOCK_CTX_SIZE_DELTA => {
+                let steps = crate::clock_widget::take_wheel_steps();
+                if steps != 0 {
+                    let next = (self.settings.clock_size as i32 + steps * 5).clamp(50, 200) as u32;
+                    self.settings.clock_size = next;
+                    self.save_and_sync_clock()?;
+                }
+            }
+            visuals::CLOCK_CTX_24H => {
+                self.settings.clock_24h = !self.settings.clock_24h;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_CTX_LOCK => {
+                self.settings.clock_locked = !self.settings.clock_locked;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_CTX_BEHIND_ICONS => {
+                self.settings.clock_behind_icons = !self.settings.clock_behind_icons;
+                self.save_and_sync_clock()?;
+            }
+            visuals::CLOCK_CTX_OPEN_SETTINGS => {
+                self.show();
+                self.switch_tab(visuals::Tab::Clock)?;
+            }
+            visuals::CLOCK_CTX_REMOVE => {
+                self.settings.clock_enabled = false;
+                self.save_and_sync_clock()?;
+            }
             _ => {}
         }
         Ok(false)
+    }
+    fn clock_config(&self) -> crate::clock_widget::ClockConfig {
+        crate::clock_widget::ClockConfig {
+            enabled: self.settings.clock_enabled,
+            locked: self.settings.clock_locked,
+            behind_icons: self.settings.clock_behind_icons,
+            use_24h: self.settings.clock_24h,
+            size_pct: self.settings.clock_size,
+            opacity_pct: self.settings.clock_opacity,
+            color: self.settings.clock_color,
+            pos: self.settings.clock_pos,
+        }
+    }
+    fn sync_clock_controls(&self) {
+        visuals::sync_clock_ui(
+            self.settings.clock_size,
+            self.settings.clock_opacity,
+            self.settings.clock_color,
+        );
+        for (id, checked) in [
+            (visuals::CLOCK_ENABLE, self.settings.clock_enabled),
+            (visuals::CLOCK_LOCK, self.settings.clock_locked),
+            (
+                visuals::CLOCK_BEHIND_ICONS,
+                self.settings.clock_behind_icons,
+            ),
+            (visuals::CLOCK_24H, self.settings.clock_24h),
+        ] {
+            let ctrl = self.control(id);
+            if !ctrl.0.is_null() {
+                unsafe {
+                    SendMessageW(ctrl, BM_SETCHECK, WPARAM(checked as usize), LPARAM(0));
+                }
+            }
+        }
+        if self.tab == visuals::Tab::Clock
+            && !self.hwnd.0.is_null()
+            && unsafe { IsWindow(self.hwnd).as_bool() }
+        {
+            unsafe {
+                let _ = InvalidateRect(self.hwnd, None, false);
+            }
+        }
+    }
+    fn sync_clock(&self) {
+        self.sync_clock_controls();
+        if !self.hwnd.0.is_null() && unsafe { IsWindow(self.hwnd).as_bool() } {
+            crate::clock_widget::sync(self.hwnd, ACTION, self.clock_config());
+        }
+    }
+    fn save_and_sync_clock(&self) -> Result<(), String> {
+        if !self.config.as_os_str().is_empty() {
+            self.save()?;
+        }
+        self.sync_clock();
+        Ok(())
     }
     fn switch_tab(&mut self, tab: visuals::Tab) -> Result<(), String> {
         let previous = self.tab;
@@ -4127,6 +4524,7 @@ impl App {
         let focus = match tab {
             visuals::Tab::Sources => visuals::SOURCES_BACK,
             visuals::Tab::Settings => visuals::TAB_SETTINGS,
+            visuals::Tab::Clock => visuals::TAB_CLOCK,
             visuals::Tab::Library if previous == visuals::Tab::Sources => visuals::FIND_WALLPAPERS,
             visuals::Tab::Library => visuals::TAB_LIBRARY,
         };
@@ -4180,7 +4578,10 @@ impl App {
                 unsafe {
                     let _ = InvalidateRect(self.control(visuals::TAB_LIBRARY), None, false);
                     let _ = InvalidateRect(self.control(visuals::TAB_SETTINGS), None, false);
-                    if (previous == visuals::Tab::Settings) != (tab == visuals::Tab::Settings) {
+                    let _ = InvalidateRect(self.control(visuals::TAB_CLOCK), None, false);
+                    if matches!(previous, visuals::Tab::Settings | visuals::Tab::Clock)
+                        != matches!(tab, visuals::Tab::Settings | visuals::Tab::Clock)
+                    {
                         let mut client = RECT::default();
                         if GetClientRect(self.hwnd, &mut client).is_ok() {
                             let header_clip = RECT {
@@ -4218,6 +4619,11 @@ impl Drop for App {
         if let Some((cancelled, _)) = &self.update_thread {
             cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        if let Some((cancelled, _)) = &self.update_download_thread {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        crate::update_popup::dismiss(self.hwnd);
+        crate::clock_widget::hide_all();
         self.cancel_preparation();
         if let Some((_, worker)) = self.preparation_thread.take() {
             let _ = worker.join();
@@ -4229,6 +4635,9 @@ impl Drop for App {
         self.displays.clear();
         self.release_playback();
         if let Some((_, worker)) = self.update_thread.take() {
+            let _ = worker.join();
+        }
+        if let Some((_, worker)) = self.update_download_thread.take() {
             let _ = worker.join();
         }
         // SAFETY: unregister only notifications/timer/tray and HWND owned by this App.
@@ -4490,6 +4899,7 @@ pub fn run() -> Result<(), String> {
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (update_download_tx, update_download_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd,
             controls: vec![],
@@ -4521,9 +4931,13 @@ pub fn run() -> Result<(), String> {
             tray_present: false,
             update_tag: None,
             update_manual: false,
+            update_popup_dismissed: false,
             update_tx: update_tx.clone(),
             update_rx,
             update_thread: None,
+            update_download_tx,
+            update_download_rx,
+            update_download_thread: None,
             error,
             library,
             folder_filter: None,
@@ -4613,7 +5027,10 @@ pub fn run() -> Result<(), String> {
             app.show();
         }
         app.update_status();
-        if let Err(error) = app.check_updates(false) {
+        app.sync_clock();
+        if app.settings.auto_update_check
+            && let Err(error) = app.check_updates(false)
+        {
             app.set_error(error);
         }
         let mut message = MSG::default();
@@ -4683,6 +5100,7 @@ pub fn run() -> Result<(), String> {
                     }
                     PREPARED => app.tick().map(|_| false),
                     UPDATE_READY => app.update_ready().map(|_| false),
+                    UPDATE_DOWNLOAD => app.update_download_event(),
                     LAYOUT => {
                         app.request_thumbnails();
                         app.layout().map(|_| false)
@@ -4723,6 +5141,7 @@ pub fn run() -> Result<(), String> {
                             let _ = app.tray(true);
                         }
                         app.displays_changed()?;
+                        app.sync_clock();
                         Ok(false)
                     })(),
                     TRAY => match tray_event(message.lParam.0 as u32) {
@@ -4864,6 +5283,11 @@ unsafe extern "system" fn window_proc(
             WM_MOUSEMOVE => {
                 let x = (lparam.0 & 0xffff) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                if let Some(target) = CLOCK_DRAG.with(std::cell::Cell::get) {
+                    let _ = visuals::apply_clock_pointer(window, target, x, y);
+                    post(ACTION, WPARAM(visuals::CLOCK_STYLE_CHANGED), LPARAM(0));
+                    return LRESULT(0);
+                }
                 let hot = visuals::caption_button_hit(window, x, y);
                 if visuals::set_caption_hover(window, hot) && hot.is_some() {
                     let mut track = TRACKMOUSEEVENT {
@@ -4883,7 +5307,17 @@ unsafe extern "system" fn window_proc(
             WM_LBUTTONDOWN => {
                 let x = (lparam.0 & 0xffff) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-                if let Some(btn) = visuals::caption_button_hit(window, x, y) {
+                if let Some(target) = visuals::clock_control_hit(window, x, y) {
+                    let _ = visuals::apply_clock_pointer(window, target, x, y);
+                    if matches!(target, visuals::ClockDragTarget::Swatch(_)) {
+                        post(ACTION, WPARAM(visuals::CLOCK_STYLE_COMMIT), LPARAM(0));
+                    } else {
+                        CLOCK_DRAG.with(|c| c.set(Some(target)));
+                        let _ = SetCapture(window);
+                        post(ACTION, WPARAM(visuals::CLOCK_STYLE_CHANGED), LPARAM(0));
+                    }
+                    LRESULT(0)
+                } else if let Some(btn) = visuals::caption_button_hit(window, x, y) {
                     let _ = SetCapture(window);
                     visuals::set_caption_down(window, Some(btn));
                     LRESULT(0)
@@ -4892,7 +5326,14 @@ unsafe extern "system" fn window_proc(
                 }
             }
             WM_LBUTTONUP => {
-                if let Some(pressed) = visuals::caption_down() {
+                if let Some(target) = CLOCK_DRAG.with(|c| c.take()) {
+                    let _ = ReleaseCapture();
+                    let x = (lparam.0 & 0xffff) as i16 as i32;
+                    let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                    let _ = visuals::apply_clock_pointer(window, target, x, y);
+                    post(ACTION, WPARAM(visuals::CLOCK_STYLE_COMMIT), LPARAM(0));
+                    LRESULT(0)
+                } else if let Some(pressed) = visuals::caption_down() {
                     visuals::set_caption_down(window, None);
                     let _ = ReleaseCapture();
                     let x = (lparam.0 & 0xffff) as i16 as i32;
@@ -4921,6 +5362,7 @@ unsafe extern "system" fn window_proc(
                 }
             }
             WM_CAPTURECHANGED => {
+                CLOCK_DRAG.with(|c| c.set(None));
                 visuals::set_caption_down(window, None);
                 DefWindowProcW(window, message, wparam, lparam)
             }
@@ -4983,6 +5425,8 @@ unsafe extern "system" fn window_proc(
             WM_DESTROY => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                 reset_drag_move(window);
+                crate::update_popup::dismiss(window);
+                crate::clock_widget::hide_all();
                 visuals::clear_backdrop_transition(window);
                 visuals::invalidate_theme_cache();
                 let _ = RemovePropW(window, ICONIC_PROPERTY);
@@ -5104,6 +5548,7 @@ unsafe extern "system" fn window_proc(
                 if !IsIconic(window).as_bool() && visuals::drag_move_backdrop_active(window) {
                     visuals::update_drag_move_backdrop(window);
                 }
+                crate::update_popup::sync(window);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_SIZE => {
@@ -5115,9 +5560,11 @@ unsafe extern "system" fn window_proc(
                 }
                 if wparam.0 == SIZE_MINIMIZED as usize {
                     let _ = SetPropW(window, ICONIC_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+                    crate::update_popup::sync(window);
                     return LRESULT(0);
                 }
                 visuals::sync_child_positions(window);
+                crate::update_popup::sync(window);
                 if matches!(wparam.0 as u32, SIZE_MAXIMIZED | SIZE_RESTORED) {
                     let was_iconic = !GetPropW(window, ICONIC_PROPERTY).0.is_null();
                     if was_iconic {
@@ -5164,6 +5611,7 @@ unsafe extern "system" fn window_proc(
                 }
                 let was_glass = visuals::glass_enabled(window);
                 let is_glass = visuals::enable_backdrop(window);
+                crate::update_popup::refresh_theme(window);
                 if !visuals::os_window_animations_enabled()
                     && visuals::backdrop_transition_active(window)
                 {
@@ -5343,6 +5791,7 @@ mod tests {
         let (thumbnail_tx, thumbnail_rx) = std::sync::mpsc::channel();
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (update_download_tx, update_download_rx) = std::sync::mpsc::channel();
         App {
             hwnd: HWND::default(),
             controls: vec![],
@@ -5374,9 +5823,13 @@ mod tests {
             tray_present: false,
             update_tag: None,
             update_manual: false,
+            update_popup_dismissed: false,
             update_tx,
             update_rx,
             update_thread: None,
+            update_download_tx,
+            update_download_rx,
+            update_download_thread: None,
             error: None,
             library: vec![],
             folder_filter: None,
@@ -5979,7 +6432,7 @@ mod tests {
                                 expected_card,
                                 "library sidebar must use frosted Card acrylic"
                             ),
-                            visuals::Tab::Settings => {
+                            visuals::Tab::Settings | visuals::Tab::Clock => {
                                 assert_eq!(
                                     canvas_pixel(
                                         (layout.settings_preferences_panel.left + 6) * dpi / 96,
@@ -6759,6 +7212,7 @@ mod tests {
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         // No windows or decoder are created: every exercised path fails validation first.
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (update_download_tx, update_download_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd: HWND::default(),
             controls: vec![],
@@ -6790,9 +7244,13 @@ mod tests {
             tray_present: false,
             update_tag: None,
             update_manual: false,
+            update_popup_dismissed: false,
             update_tx: update_tx.clone(),
             update_rx,
             update_thread: None,
+            update_download_tx,
+            update_download_rx,
+            update_download_thread: None,
             error: None,
             library: vec![],
             folder_filter: None,
@@ -7976,5 +8434,83 @@ mod tests {
                 let _ = UnregisterClassW(class_name, instance);
             }
         }
+    }
+
+    #[test]
+    fn update_popup_actions_dismiss_disable_and_handle_download_errors() {
+        let mut app = fixture();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!("update-popup-actions-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        app.config = dir.join("settings.ini");
+        app.update_tag = Some("v0.2.2".into());
+
+        // Dismiss hides the prompt for the session while keeping auto_update_check intact.
+        assert!(!app.action(visuals::UPDATE_DISMISS, 0).unwrap());
+        assert!(app.update_popup_dismissed);
+        assert!(app.settings.auto_update_check);
+
+        // Selecting "Don't check for updates" persists auto_update_check = false.
+        app.update_popup_dismissed = false;
+        assert!(!app.action(visuals::UPDATE_DISABLE, 0).unwrap());
+        assert!(!app.settings.auto_update_check);
+        assert!(app.update_popup_dismissed);
+        let saved = fs::read_to_string(&app.config).unwrap();
+        assert!(
+            !crate::core::Settings::decode(&saved)
+                .unwrap()
+                .auto_update_check
+        );
+
+        // Failed download events report cleanly without exiting the application.
+        app.update_download_tx
+            .send(crate::update::DownloadEvent::Failed(
+                "Network unavailable".into(),
+            ))
+            .unwrap();
+        assert!(!app.update_download_event().unwrap());
+        let _ = fs::remove_file(&app.config);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn clock_widget_actions_and_style_commits_persist_settings() {
+        let mut app = fixture();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!("clock-widget-actions-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        app.config = dir.join("settings.ini");
+
+        assert!(!app.settings.clock_enabled);
+        assert!(app.settings.clock_behind_icons);
+        assert!(!app.settings.clock_locked);
+
+        // Toggle via context actions cleanly updates and persists settings.
+        assert!(!app.action(visuals::CLOCK_CTX_LOCK, 0).unwrap());
+        assert!(app.settings.clock_locked);
+        assert!(!app.action(visuals::CLOCK_CTX_BEHIND_ICONS, 0).unwrap());
+        assert!(!app.settings.clock_behind_icons);
+        assert!(!app.action(visuals::CLOCK_CTX_24H, 0).unwrap());
+        assert!(!app.settings.clock_24h);
+
+        visuals::sync_clock_ui(155, 70, 0xD9541E);
+        assert!(!app.action(visuals::CLOCK_STYLE_COMMIT, 0).unwrap());
+        assert_eq!(app.settings.clock_size, 155);
+        assert_eq!(app.settings.clock_opacity, 70);
+        assert_eq!(app.settings.clock_color, 0xD9541E);
+
+        let saved = fs::read_to_string(&app.config).unwrap();
+        let decoded = crate::core::Settings::decode(&saved).unwrap();
+        assert!(decoded.clock_locked);
+        assert!(!decoded.clock_behind_icons);
+        assert!(!decoded.clock_24h);
+        assert_eq!(decoded.clock_size, 155);
+        assert_eq!(decoded.clock_opacity, 70);
+        assert_eq!(decoded.clock_color, 0xD9541E);
+
+        let _ = fs::remove_file(&app.config);
+        let _ = fs::remove_dir(&dir);
     }
 }
