@@ -28,6 +28,7 @@
     <Property Id="ARPNOREPAIR" Value="yes" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch WallpaperLive" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <Property Id="WixShellExecTarget" Value="[#WallpaperLiveExe]" />
 
     <util:CloseApplication
@@ -46,10 +47,13 @@
         Impersonate="yes" />
 
     <UI>
-      <UIRef Id="WixUI_Minimal" />
+      <UIRef Id="WixUI_InstallDir" />
+      <UIRef Id="WixUI_ErrorProgressText" />
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
     </UI>
     <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.RepoRoot)\assets\wix-banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.RepoRoot)\assets\wix-dialog.bmp" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="LocalAppDataFolder">

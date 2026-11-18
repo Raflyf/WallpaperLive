@@ -2,7 +2,9 @@ use std::{
     ffi::c_void,
     fs::{self, File},
     io::{BufWriter, Read, Write},
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
+    process::Command,
     ptr,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -24,6 +26,10 @@ use windows::{
 const MAX_BODY: usize = 128 * 1024;
 const MAX_CHECKSUMS_BODY: usize = 32 * 1024;
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
+const DECODER_URL: &str = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261107/mpv-dev-x86_64-20261107-git-9028187538.7z";
+const DECODER_ARCHIVE_SHA256: &str =
+    "df7c433a2d481fdaf6163b201f26abbb0eff0c215c51368397088c6d8f7a001b";
+const DECODER_DLL_SHA256: &str = "c91949577ae9cc2d500208da51f2c4a24cfa7a02d0ce6e130bf67ec738b450bb";
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -146,6 +152,19 @@ pub fn split_https_url(url: &str) -> Result<(&str, &str), String> {
     Ok((authority, path))
 }
 
+pub fn parse_sha256_hex(hex: &str) -> Result<[u8; 32], String> {
+    let hex = hex.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Invalid SHA256SUMS digest entry".into());
+    }
+    let mut digest = [0u8; 32];
+    for (i, slot) in digest.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "Invalid SHA256SUMS digest entry")?;
+    }
+    Ok(digest)
+}
+
 pub fn parse_sha256sums(text: &str, expected_file: &str) -> Result<[u8; 32], String> {
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -162,16 +181,7 @@ pub fn parse_sha256sums(text: &str, expected_file: &str) -> Result<[u8; 32], Str
         if file_part.trim() != expected_file {
             continue;
         }
-        let hex = hex_part.trim();
-        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("Invalid SHA256SUMS digest entry".into());
-        }
-        let mut digest = [0u8; 32];
-        for (i, slot) in digest.iter_mut().enumerate() {
-            *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                .map_err(|_| "Invalid SHA256SUMS digest entry")?;
-        }
-        return Ok(digest);
+        return parse_sha256_hex(hex_part);
     }
     Err(format!("Missing checksum entry for {expected_file}"))
 }
@@ -610,6 +620,104 @@ fn fetch_verified_bytes(
     Ok(out)
 }
 
+struct VerifiedDownload<'a> {
+    url: &'a str,
+    part_path: &'a Path,
+    expected_sha: [u8; 32],
+    max_bytes: u64,
+    label: &'a str,
+}
+
+fn download_verified_file(
+    spec: VerifiedDownload<'_>,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+    on_progress: &mut dyn FnMut(Option<u8>),
+) -> Result<(), String> {
+    let VerifiedDownload {
+        url,
+        part_path,
+        expected_sha,
+        max_bytes,
+        label,
+    } = spec;
+    let (_session, _conn, request, total_bytes) =
+        open_verified_https_stream(url, cancelled, deadline)?;
+    if total_bytes.is_some_and(|n| n > max_bytes) {
+        return Err(format!("{label} exceeds maximum allowed size"));
+    }
+
+    let write_res: Result<(), String> = (|| {
+        let file =
+            File::create(part_path).map_err(|e| format!("Could not create download file: {e}"))?;
+        let mut writer = BufWriter::new(file);
+        let mut downloaded = 0u64;
+        let mut last_pct: Option<u8> = None;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            checkpoint_capped(cancelled, deadline, PHASE_TIMEOUT)?;
+            let mut read = 0u32;
+            // SAFETY: writes at most buf.len() bytes into local buffer.
+            unsafe {
+                WinHttpReadData(
+                    request.0,
+                    buf.as_mut_ptr().cast(),
+                    buf.len() as u32,
+                    &mut read,
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            if read == 0 {
+                break;
+            }
+            downloaded = downloaded
+                .checked_add(u64::from(read))
+                .ok_or("Download size overflow")?;
+            if downloaded > max_bytes {
+                return Err(format!("{label} download exceeded maximum allowed size"));
+            }
+            writer
+                .write_all(&buf[..read as usize])
+                .map_err(|e| format!("Could not write download file: {e}"))?;
+            if let Some(total) = total_bytes.filter(|&t| t > 0) {
+                let pct = ((downloaded.saturating_mul(100)) / total).min(100) as u8;
+                if last_pct != Some(pct) {
+                    last_pct = Some(pct);
+                    on_progress(Some(pct));
+                }
+            } else if last_pct.is_none() {
+                last_pct = Some(0);
+                on_progress(None);
+            }
+        }
+        writer
+            .flush()
+            .map_err(|e| format!("Could not flush download file: {e}"))?;
+        if downloaded == 0 {
+            return Err(format!("Downloaded {label} file was empty"));
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(part_path);
+        return Err(err);
+    }
+
+    let actual_sha = match sha256_file(part_path) {
+        Ok(digest) => digest,
+        Err(err) => {
+            let _ = fs::remove_file(part_path);
+            return Err(err);
+        }
+    };
+    if actual_sha != expected_sha {
+        let _ = fs::remove_file(part_path);
+        return Err(format!("{label} SHA-256 verification failed"));
+    }
+    Ok(())
+}
+
 pub fn download_verified_installer(
     tag: &str,
     dir: &Path,
@@ -634,80 +742,18 @@ pub fn download_verified_installer(
     let final_path = dir.join(&installer_name);
     let part_path = dir.join(format!("{installer_name}.part"));
 
-    let (_session, _conn, request, total_bytes) =
-        open_verified_https_stream(&exe_url, cancelled, deadline)?;
-    if total_bytes.is_some_and(|n| n > MAX_INSTALLER_BYTES) {
-        return Err("Installer exceeds maximum allowed size".into());
-    }
-
-    let write_res: Result<(), String> = (|| {
-        let file =
-            File::create(&part_path).map_err(|e| format!("Could not create download file: {e}"))?;
-        let mut writer = BufWriter::new(file);
-        let mut downloaded = 0u64;
-        let mut last_pct: Option<u8> = None;
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            checkpoint_capped(cancelled, deadline, PHASE_TIMEOUT)?;
-            let mut read = 0u32;
-            // SAFETY: writes at most buf.len() bytes into local buffer.
-            unsafe {
-                WinHttpReadData(
-                    request.0,
-                    buf.as_mut_ptr().cast(),
-                    buf.len() as u32,
-                    &mut read,
-                )
-            }
-            .map_err(|e| e.to_string())?;
-            if read == 0 {
-                break;
-            }
-            downloaded = downloaded
-                .checked_add(u64::from(read))
-                .ok_or("Download size overflow")?;
-            if downloaded > MAX_INSTALLER_BYTES {
-                return Err("Installer download exceeded maximum allowed size".into());
-            }
-            writer
-                .write_all(&buf[..read as usize])
-                .map_err(|e| format!("Could not write download file: {e}"))?;
-            if let Some(total) = total_bytes.filter(|&t| t > 0) {
-                let pct = ((downloaded.saturating_mul(100)) / total).min(100) as u8;
-                if last_pct != Some(pct) {
-                    last_pct = Some(pct);
-                    on_progress(Some(pct));
-                }
-            } else if last_pct.is_none() {
-                last_pct = Some(0);
-                on_progress(None);
-            }
-        }
-        writer
-            .flush()
-            .map_err(|e| format!("Could not flush download file: {e}"))?;
-        if downloaded == 0 {
-            return Err("Downloaded installer file was empty".into());
-        }
-        Ok(())
-    })();
-
-    if let Err(err) = write_res {
-        let _ = fs::remove_file(&part_path);
-        return Err(err);
-    }
-
-    let actual_sha = match sha256_file(&part_path) {
-        Ok(digest) => digest,
-        Err(err) => {
-            let _ = fs::remove_file(&part_path);
-            return Err(err);
-        }
-    };
-    if actual_sha != expected_sha {
-        let _ = fs::remove_file(&part_path);
-        return Err("Installer SHA-256 verification failed".into());
-    }
+    download_verified_file(
+        VerifiedDownload {
+            url: &exe_url,
+            part_path: &part_path,
+            expected_sha,
+            max_bytes: MAX_INSTALLER_BYTES,
+            label: "Installer",
+        },
+        cancelled,
+        deadline,
+        &mut on_progress,
+    )?;
 
     if final_path.exists() {
         let _ = fs::remove_file(&final_path);
@@ -717,6 +763,120 @@ pub fn download_verified_installer(
         return Err(format!("Could not finalize installer file: {err}"));
     }
     Ok(final_path)
+}
+
+fn system_tar_exe() -> Result<PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let tar = root.join("System32").join("tar.exe");
+    if tar.is_file() {
+        Ok(tar)
+    } else {
+        Err("Windows tar.exe is unavailable to extract libmpv-2.dll".into())
+    }
+}
+
+pub fn download_verified_decoder(
+    runtime_dir: &Path,
+    cancelled: &AtomicBool,
+    mut on_progress: impl FnMut(Option<u8>),
+) -> Result<PathBuf, String> {
+    let archive_sha = parse_sha256_hex(DECODER_ARCHIVE_SHA256)?;
+    let dll_sha = parse_sha256_hex(DECODER_DLL_SHA256)?;
+    let dll_path = runtime_dir.join("libmpv-2.dll");
+    if dll_path.exists() {
+        if !dll_path.is_file() {
+            return Err("Decoder path exists but is not a regular DLL file".into());
+        }
+        if sha256_file(&dll_path)? == dll_sha {
+            return Ok(dll_path);
+        }
+        return Err("Existing libmpv-2.dll differs from pinned build; left untouched.".into());
+    }
+
+    fs::create_dir_all(runtime_dir)
+        .map_err(|e| format!("Could not prepare runtime folder: {e}"))?;
+    let stage = runtime_dir.join(format!(".decoder-stage-{}", std::process::id()));
+    fs::create_dir_all(&stage).map_err(|e| format!("Could not prepare staging folder: {e}"))?;
+    let archive_path = stage.join("mpv-dev.7z");
+    let staged_dll = stage.join("libmpv-2.dll");
+
+    let cleanup = || {
+        let _ = fs::remove_file(&archive_path);
+        let _ = fs::remove_file(&staged_dll);
+        let _ = fs::remove_dir(&stage);
+    };
+
+    let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
+    on_progress(Some(0));
+    if let Err(err) = download_verified_file(
+        VerifiedDownload {
+            url: DECODER_URL,
+            part_path: &archive_path,
+            expected_sha: archive_sha,
+            max_bytes: MAX_INSTALLER_BYTES,
+            label: "Decoder archive",
+        },
+        cancelled,
+        deadline,
+        &mut on_progress,
+    ) {
+        cleanup();
+        return Err(err);
+    }
+
+    let tar = match system_tar_exe() {
+        Ok(p) => p,
+        Err(err) => {
+            cleanup();
+            return Err(err);
+        }
+    };
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = Command::new(&tar)
+        .arg("-xf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&stage)
+        .arg("libmpv-2.dll")
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    match status {
+        Ok(exit) if exit.success() => {}
+        Ok(exit) => {
+            cleanup();
+            return Err(format!("Decoder extraction failed ({exit})"));
+        }
+        Err(err) => {
+            cleanup();
+            return Err(format!("Could not run tar.exe: {err}"));
+        }
+    }
+
+    if !staged_dll.is_file() {
+        cleanup();
+        return Err("libmpv-2.dll was missing from the downloaded archive".into());
+    }
+    match sha256_file(&staged_dll) {
+        Ok(digest) if digest == dll_sha => {}
+        Ok(_) => {
+            cleanup();
+            return Err("Extracted libmpv-2.dll SHA-256 verification failed".into());
+        }
+        Err(err) => {
+            cleanup();
+            return Err(err);
+        }
+    }
+
+    if let Err(err) = fs::rename(&staged_dll, &dll_path) {
+        cleanup();
+        return Err(format!("Could not install libmpv-2.dll: {err}"));
+    }
+    cleanup();
+    Ok(dll_path)
 }
 
 #[cfg(test)]
@@ -878,5 +1038,21 @@ mod tests {
                 0xf2, 0x00, 0x15, 0xad
             ]
         );
+    }
+
+    #[test]
+    fn decoder_pins_validate_and_reject_mismatched_existing_dll() {
+        assert!(parse_sha256_hex(DECODER_ARCHIVE_SHA256).is_ok());
+        assert!(parse_sha256_hex(DECODER_DLL_SHA256).is_ok());
+        assert!(split_https_url(DECODER_URL).is_ok());
+
+        let dir = std::env::temp_dir().join(format!("wl-decoder-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let dll = dir.join("libmpv-2.dll");
+        fs::write(&dll, b"wrong-bytes").unwrap();
+        let err = download_verified_decoder(&dir, &AtomicBool::new(false), |_| {}).unwrap_err();
+        assert!(err.contains("differs from pinned build"));
+        let _ = fs::remove_file(&dll);
+        let _ = fs::remove_dir(&dir);
     }
 }

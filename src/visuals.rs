@@ -6078,6 +6078,97 @@ unsafe fn is_static_window(window: HWND) -> bool {
     String::from_utf16_lossy(&class[..count]) == "Static"
 }
 
+fn sys_color_hex(index: SYS_COLOR_INDEX) -> u32 {
+    // SAFETY: GetSysColor reads the active Windows theme palette entry without side effects.
+    let c = unsafe { GetSysColor(index) };
+    ((c & 0xff) << 16) | (c & 0xff00) | ((c >> 16) & 0xff)
+}
+
+unsafe fn utf16_width(dc: HDC, font: HFONT, units: &[u16]) -> i32 {
+    if units.is_empty() {
+        return 0;
+    }
+    // SAFETY: temporarily selects the thread-cached control font into the paint DC to measure extents.
+    unsafe {
+        let old = SelectObject(dc, font);
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let ok = GetTextExtentPoint32W(dc, units, &mut size).as_bool();
+        SelectObject(dc, old);
+        if ok { size.cx } else { 0 }
+    }
+}
+
+struct StatusLineSpan {
+    x0: i32,
+    y0: i32,
+    line_start: usize,
+    line_end: usize,
+    sel_rel_start: usize,
+    sel_rel_end: usize,
+}
+
+unsafe fn collect_status_selection_spans(
+    window: HWND,
+    area: RECT,
+    units: &[u16],
+    sel_start: usize,
+    sel_end: usize,
+) -> Vec<StatusLineSpan> {
+    const EM_GETFIRSTVISIBLELINE_MSG: u32 = 0x00CE;
+    const EM_GETLINECOUNT_MSG: u32 = 0x00BA;
+    const EM_LINEINDEX_MSG: u32 = 0x00BB;
+    const EM_LINELENGTH_MSG: u32 = 0x00C1;
+    const EM_POSFROMCHAR_MSG: u32 = 0x00D6;
+    // SAFETY: synchronous standard EDIT metric messages against an owned HWND on the UI thread.
+    unsafe {
+        let first_line = SendMessageW(window, EM_GETFIRSTVISIBLELINE_MSG, WPARAM(0), LPARAM(0))
+            .0
+            .max(0) as usize;
+        let line_count = SendMessageW(window, EM_GETLINECOUNT_MSG, WPARAM(0), LPARAM(0))
+            .0
+            .max(0) as usize;
+        let sel0 = sel_start.min(sel_end).min(units.len());
+        let sel1 = sel_start.max(sel_end).min(units.len());
+        let mut spans = Vec::with_capacity(line_count.saturating_sub(first_line));
+        for line_idx in first_line..line_count {
+            let line_start_raw =
+                SendMessageW(window, EM_LINEINDEX_MSG, WPARAM(line_idx), LPARAM(0)).0;
+            if line_start_raw < 0 {
+                break;
+            }
+            let line_start = line_start_raw as usize;
+            let line_len = SendMessageW(window, EM_LINELENGTH_MSG, WPARAM(line_start), LPARAM(0))
+                .0
+                .max(0) as usize;
+            let line_end = (line_start + line_len).min(units.len());
+            if line_start >= line_end {
+                continue;
+            }
+            let pos = SendMessageW(window, EM_POSFROMCHAR_MSG, WPARAM(line_start), LPARAM(0)).0;
+            if pos == -1 {
+                continue;
+            }
+            let x0 = (pos & 0xffff) as i16 as i32;
+            let y0 = ((pos >> 16) & 0xffff) as i16 as i32;
+            if y0 >= area.bottom {
+                break;
+            }
+            let max_rel = line_end - line_start;
+            let sel_rel_start = sel0.saturating_sub(line_start).min(max_rel);
+            let sel_rel_end = sel1.saturating_sub(line_start).min(max_rel);
+            spans.push(StatusLineSpan {
+                x0,
+                y0,
+                line_start,
+                line_end,
+                sel_rel_start,
+                sel_rel_end,
+            });
+        }
+        spans
+    }
+}
+
 unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
     // SAFETY: DefSubclassProc reaches the original native control, not this subclass again.
     unsafe {
@@ -6104,7 +6195,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                 | CLOCK_24H
         );
         let status_edit = id == 113;
-        let mut status_selected = false;
+        let mut status_sel: Option<(usize, usize)> = None;
         if status_edit {
             let (mut sel_start, mut sel_end) = (0u32, 0u32);
             SendMessageW(
@@ -6113,8 +6204,11 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                 WPARAM((&mut sel_start as *mut u32) as usize),
                 LPARAM((&mut sel_end as *mut u32) as isize),
             );
-            status_selected = sel_start != sel_end;
+            if sel_start != sel_end {
+                status_sel = Some((sel_start as usize, sel_end as usize));
+            }
         }
+        let status_selected = status_sel.is_some();
         let color = control_color(id);
         if !parent.0.is_null()
             && !status_selected
@@ -6131,7 +6225,7 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
         if let Some(buffer) = PaintBuffer::new_for_window(dc, area, parent.0 as isize, None)
             .map(|b| b.with_drag_cache(window.0 as isize, record_drag))
         {
-            if static_text || checkbox || (status_edit && !status_selected) {
+            if static_text || checkbox || status_edit {
                 let glass = glass_enabled(parent);
                 let (surface_color, surface_alpha) = control_surface(id);
                 let theme = if glass {
@@ -6194,6 +6288,61 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                         true
                     }
                 };
+                let text_size = s(if id == PAGE { 13 } else { 14 });
+                let status_lines = if let Some((sel_start, sel_end)) = status_sel {
+                    let units: Vec<u16> = window_text(window).encode_utf16().collect();
+                    let spans =
+                        collect_status_selection_spans(window, area, &units, sel_start, sel_end);
+                    if spans.is_empty() {
+                        None
+                    } else {
+                        let status_font = cached_font(text_size, false);
+                        let old = SelectObject(buffer.dc, status_font);
+                        let mut tm = TEXTMETRICW::default();
+                        let line_h = if GetTextMetricsW(buffer.dc, &mut tm).as_bool() {
+                            tm.tmHeight.max(1)
+                        } else {
+                            s(18).max(1)
+                        };
+                        SelectObject(buffer.dc, old);
+                        let hl_bg = sys_color_hex(COLOR_HIGHLIGHT);
+                        let hl_fg = sys_color_hex(COLOR_HIGHLIGHTTEXT);
+                        for span in &spans {
+                            if span.sel_rel_start >= span.sel_rel_end {
+                                continue;
+                            }
+                            let line_units = &units[span.line_start..span.line_end];
+                            let x_start = span.x0
+                                + utf16_width(
+                                    buffer.dc,
+                                    status_font,
+                                    &line_units[..span.sel_rel_start],
+                                );
+                            let x_end = span.x0
+                                + utf16_width(
+                                    buffer.dc,
+                                    status_font,
+                                    &line_units[..span.sel_rel_end],
+                                );
+                            let hl = rect(
+                                x_start.max(area.left),
+                                span.y0.max(area.top),
+                                x_end.min(area.right),
+                                (span.y0 + line_h).min(area.bottom),
+                            );
+                            if hl.right > hl.left && hl.bottom > hl.top {
+                                fill(buffer.dc, hl, hl_bg);
+                                if theme.0 != 0 {
+                                    let _ = GdiFlush();
+                                    let _ = BufferedPaintSetAlpha(buffer.handle, Some(&hl), 255);
+                                }
+                            }
+                        }
+                        Some((units, spans, line_h, hl_fg, status_font))
+                    }
+                } else {
+                    None
+                };
                 let _text_guard =
                     TextTargetGuard::push(theme, buffer.handle, buffer.area, theme.0 != 0);
                 if checkbox {
@@ -6206,33 +6355,86 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                     text_area.right = (toggle_track.left - s(12)).max(text_area.left);
                 }
                 let (_, pressed, disabled, hot, toggle_t) = toggle_state;
-                label(
-                    buffer.dc,
-                    &window_text(window),
-                    text_area,
-                    s(if id == PAGE { 13 } else { 14 }),
-                    false,
-                    if status_edit {
-                        TEXT_ON_DARK
-                    } else if checkbox && disabled {
-                        DISABLED_TEXT
-                    } else if id == 112 || checkbox {
-                        TEXT
-                    } else {
-                        MUTED
-                    },
-                    if id == PAGE {
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE
-                    } else if checkbox {
-                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
-                    } else if id == 112 {
-                        DT_SINGLELINE | DT_END_ELLIPSIS
-                    } else if status_edit {
-                        DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX
-                    } else {
-                        DT_WORDBREAK
-                    },
-                );
+                if let Some((units, spans, line_h, hl_fg, status_font)) = status_lines {
+                    for span in &spans {
+                        let line_units = &units[span.line_start..span.line_end];
+                        let w_sel_start =
+                            utf16_width(buffer.dc, status_font, &line_units[..span.sel_rel_start]);
+                        let w_sel_end =
+                            utf16_width(buffer.dc, status_font, &line_units[..span.sel_rel_end]);
+                        let w_end = utf16_width(buffer.dc, status_font, line_units);
+                        let segments = [
+                            (
+                                0,
+                                span.sel_rel_start,
+                                span.x0,
+                                span.x0 + w_sel_start,
+                                TEXT_ON_DARK,
+                            ),
+                            (
+                                span.sel_rel_start,
+                                span.sel_rel_end,
+                                span.x0 + w_sel_start,
+                                span.x0 + w_sel_end,
+                                hl_fg,
+                            ),
+                            (
+                                span.sel_rel_end,
+                                line_units.len(),
+                                span.x0 + w_sel_end,
+                                span.x0 + w_end,
+                                TEXT_ON_DARK,
+                            ),
+                        ];
+                        for (start, end, left, right, seg_color) in segments {
+                            if start < end && right > left {
+                                let seg_text = String::from_utf16_lossy(&line_units[start..end]);
+                                label(
+                                    buffer.dc,
+                                    &seg_text,
+                                    rect(
+                                        left,
+                                        span.y0,
+                                        right.max(left + 1),
+                                        (span.y0 + line_h).min(area.bottom),
+                                    ),
+                                    text_size,
+                                    false,
+                                    seg_color,
+                                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    label(
+                        buffer.dc,
+                        &window_text(window),
+                        text_area,
+                        text_size,
+                        false,
+                        if status_edit {
+                            TEXT_ON_DARK
+                        } else if checkbox && disabled {
+                            DISABLED_TEXT
+                        } else if id == 112 || checkbox {
+                            TEXT
+                        } else {
+                            MUTED
+                        },
+                        if id == PAGE {
+                            DT_CENTER | DT_VCENTER | DT_SINGLELINE
+                        } else if checkbox {
+                            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
+                        } else if id == 112 {
+                            DT_SINGLELINE | DT_END_ELLIPSIS
+                        } else if status_edit {
+                            DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX
+                        } else {
+                            DT_WORDBREAK
+                        },
+                    );
+                }
                 if checkbox {
                     let _ = buffer.draw_toggle_switch(
                         toggle_track,
@@ -6388,7 +6590,7 @@ unsafe extern "system" fn control_proc(
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN => {
                 if let Ok(parent) = GetParent(window)
                     && !parent.0.is_null()
                 {

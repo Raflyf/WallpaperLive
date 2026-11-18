@@ -37,7 +37,7 @@ Except as contained in this notice, the name of a copyright holder shall not be 
 
 ## Native media decoder
 
-Playback and local cache encoding use libmpv, a native C library. Cache encoding invokes the H.264/AAC encoders already present in the user's installed decoder; no additional transcoder executable or decoder bytes are bundled. Setup verifies and reuses an installed decoder or a user-provided pinned archive named `mpv-dev.7z` beside the installer. If neither is available, it obtains the pinned Windows build directly from its publisher after explicit consent. Neither the decoder archive nor DLL is included in WallpaperLive's source or installer.
+Playback and local cache encoding use libmpv, a native C library. Cache encoding invokes the H.264/AAC encoders already present in the user's installed decoder; no additional transcoder executable or decoder bytes are bundled. When the decoder is missing, WallpaperLive asks for explicit consent to download and verify the pinned Windows build directly inside the app (or users can run `scripts\Get-Decoder.ps1`), reusing a compatible existing `libmpv-2.dll` or a local `mpv-dev.7z` archive when present. Neither the decoder archive nor DLL is included in WallpaperLive's source or installer.
 
 Selected decoder: `mpv-dev-x86_64-20261107-git-9028187538.7z`.
 
@@ -50,9 +50,7 @@ mpv is GPL-2.0-or-later by default. Its client API header is ISC-licensed, which
 
 ## Installer components
 
-Inno Setup: Copyright (C) 1997-2026 Jordan Russell; portions Copyright (C) 2000-2026 Martijn Laan.
-
-Native archive extraction uses 7-Zip/LZMA components with their upstream notices retained in the installer engine. No compiler program is installed on the user's machine. Inno Setup 7.1.0 used for this build reports non-commercial use; review its licensing before commercial distribution. The produced WallpaperLive installer is unsigned.
+Windows Installer packages are built using WiX Toolset v3, licensed under the Microsoft Reciprocal License (MS-RL). No WiX compiler component is installed on the user's machine. The produced WallpaperLive installer is unsigned.
 
 ## Application license
 

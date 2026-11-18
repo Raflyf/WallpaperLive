@@ -64,6 +64,7 @@ const UPDATE_READY: u32 = WM_APP + 11;
 const UPDATE_RELEASE: usize = visuals::CHECK_UPDATES;
 const CONTEXT_MENU: u32 = WM_APP + 12;
 const UPDATE_DOWNLOAD: u32 = WM_APP + 13;
+const DECODER_DOWNLOAD: u32 = WM_APP + 14;
 const CTX_SET: usize = 201;
 const CTX_EXPLORER: usize = 202;
 const CTX_COPY_PATH: usize = 203;
@@ -851,6 +852,14 @@ struct App {
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::thread::JoinHandle<()>,
     )>,
+    decoder_download_tx: std::sync::mpsc::Sender<crate::update::DownloadEvent>,
+    decoder_download_rx: std::sync::mpsc::Receiver<crate::update::DownloadEvent>,
+    decoder_download_thread: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    decoder_download_status: Option<String>,
+    pending_decoder_apply: Option<PathBuf>,
     error: Option<String>,
     library: Vec<PathBuf>,
     folder_filter: Option<PathBuf>,
@@ -2968,7 +2977,149 @@ impl App {
                 return Ok(false);
             }
             crate::update_popup::dismiss(self.hwnd);
+            self.error = None;
             return Ok(true);
+        }
+        Ok(false)
+    }
+    fn start_decoder_download(&mut self, pending_path: PathBuf) -> Result<(), String> {
+        if self.decoder_download_thread.is_some() {
+            self.pending_decoder_apply = Some(pending_path);
+            return Ok(());
+        }
+        let runtime_dir = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .ok_or("Application directory not found")?
+            .join("runtime");
+        self.pending_decoder_apply = Some(pending_path);
+        self.error = None;
+        self.decoder_download_status = Some("Downloading native decoder... 0%".into());
+        self.update_status();
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let tx = self.decoder_download_tx.clone();
+        let hwnd = self.hwnd.0 as usize;
+        self.decoder_download_thread = Some((
+            cancelled,
+            std::thread::spawn(move || {
+                let post_event = |event: crate::update::DownloadEvent| {
+                    if !flag.load(std::sync::atomic::Ordering::Relaxed) && tx.send(event).is_ok() {
+                        // SAFETY: completion targets only the owned panel HWND until the worker joins on Drop.
+                        unsafe {
+                            let _ = PostMessageW(
+                                HWND(hwnd as *mut _),
+                                DECODER_DOWNLOAD,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                };
+                let result = crate::update::download_verified_decoder(&runtime_dir, &flag, |pct| {
+                    if pct == Some(100) {
+                        post_event(crate::update::DownloadEvent::Verifying);
+                    } else {
+                        post_event(crate::update::DownloadEvent::Progress(pct));
+                    }
+                });
+                match result {
+                    Ok(path) => post_event(crate::update::DownloadEvent::Ready(path)),
+                    Err(err) => post_event(crate::update::DownloadEvent::Failed(err)),
+                }
+            }),
+        ));
+        Ok(())
+    }
+    fn ensure_decoder_for(&mut self, source: &Path) -> Result<bool, String> {
+        if decoder_path().is_ok() {
+            return Ok(true);
+        }
+        if self.hwnd.0.is_null() {
+            let _ = decoder_path()?;
+            return Ok(true);
+        }
+        if self.decoder_download_thread.is_some() {
+            self.pending_decoder_apply = Some(source.to_path_buf());
+            return Ok(false);
+        }
+        let prompt = wide(
+            "Native video decoder (libmpv-2.dll, ~31.8 MB download from GitHub, SHA-256 verified) is not installed yet.\n\nDownload and install it now?",
+        );
+        // SAFETY: modal user-consent prompt owned by the panel window.
+        let choice = unsafe {
+            MessageBoxW(
+                self.hwnd,
+                PCWSTR(prompt.as_ptr()),
+                w!("Native decoder required"),
+                MB_YESNO | MB_ICONQUESTION,
+            )
+        };
+        if choice != IDYES {
+            let _ = decoder_path()?;
+            return Ok(true);
+        }
+        self.start_decoder_download(source.to_path_buf())?;
+        Ok(false)
+    }
+    fn decoder_download_event(&mut self) -> Result<bool, String> {
+        let mut ready_path: Option<PathBuf> = None;
+        let mut finished_err: Option<String> = None;
+        let mut status_changed = false;
+        while let Ok(ev) = self.decoder_download_rx.try_recv() {
+            match ev {
+                crate::update::DownloadEvent::Progress(Some(pct)) => {
+                    self.decoder_download_status =
+                        Some(format!("Downloading native decoder... {pct}%"));
+                    status_changed = true;
+                }
+                crate::update::DownloadEvent::Progress(None) => {
+                    self.decoder_download_status = Some("Downloading native decoder...".into());
+                    status_changed = true;
+                }
+                crate::update::DownloadEvent::Verifying => {
+                    self.decoder_download_status =
+                        Some("Verifying and extracting native decoder...".into());
+                    status_changed = true;
+                }
+                crate::update::DownloadEvent::Ready(path) => {
+                    ready_path = Some(path);
+                }
+                crate::update::DownloadEvent::Failed(err) => {
+                    finished_err = Some(err);
+                }
+            }
+        }
+        if ready_path.is_some() || finished_err.is_some() {
+            if let Some((_, worker)) = self.decoder_download_thread.take() {
+                let _ = worker.join();
+            }
+            self.decoder_download_status = None;
+        } else if self
+            .decoder_download_thread
+            .as_ref()
+            .is_some_and(|(_, worker)| worker.is_finished())
+            && let Some((_, worker)) = self.decoder_download_thread.take()
+            && worker.join().is_err()
+        {
+            self.decoder_download_status = None;
+            finished_err = Some("Decoder downloader stopped unexpectedly".into());
+        }
+        if let Some(err) = finished_err {
+            self.pending_decoder_apply = None;
+            return Err(err);
+        }
+        if ready_path.is_some() {
+            self.error = None;
+            if let Some(pending) = self.pending_decoder_apply.take() {
+                return self.start_path(&pending).map(|_| false);
+            }
+            self.update_status();
+            return Ok(false);
+        }
+        if status_changed {
+            self.update_status();
         }
         Ok(false)
     }
@@ -3227,6 +3378,9 @@ impl App {
         // SAFETY: read-only local drive check; no remote media or command execution.
         if !matches!(unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) }, 2 | 3 | 5) {
             return Err("Media must be on a local drive, not a network drive".into());
+        }
+        if !self.ensure_decoder_for(&path)? {
+            return Ok(());
         }
         if !self.multi_dispatch && !self.monitors.is_empty() {
             return self.start_targets(&path);
@@ -3888,6 +4042,8 @@ impl App {
         self.status_dirty.set(false);
         let status = if let Some(error) = &self.error {
             format!("Error: {error}")
+        } else if let Some(msg) = &self.decoder_download_status {
+            msg.clone()
         } else if self.displays.iter().any(DisplayState::active) {
             let ready = self
                 .displays
@@ -4924,6 +5080,9 @@ impl Drop for App {
         if let Some((cancelled, _)) = &self.update_download_thread {
             cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        if let Some((cancelled, _)) = &self.decoder_download_thread {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         crate::update_popup::dismiss(self.hwnd);
         crate::clock_widget::hide_all();
         self.cancel_preparation();
@@ -4940,6 +5099,9 @@ impl Drop for App {
             let _ = worker.join();
         }
         if let Some((_, worker)) = self.update_download_thread.take() {
+            let _ = worker.join();
+        }
+        if let Some((_, worker)) = self.decoder_download_thread.take() {
             let _ = worker.join();
         }
         // SAFETY: unregister only notifications/timer/tray and HWND owned by this App.
@@ -5315,6 +5477,7 @@ pub fn run() -> Result<(), String> {
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         let (update_tx, update_rx) = std::sync::mpsc::channel();
         let (update_download_tx, update_download_rx) = std::sync::mpsc::channel();
+        let (decoder_download_tx, decoder_download_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd,
             controls: vec![],
@@ -5353,6 +5516,11 @@ pub fn run() -> Result<(), String> {
             update_download_tx,
             update_download_rx,
             update_download_thread: None,
+            decoder_download_tx,
+            decoder_download_rx,
+            decoder_download_thread: None,
+            decoder_download_status: None,
+            pending_decoder_apply: None,
             error,
             library,
             folder_filter: None,
@@ -5516,6 +5684,7 @@ pub fn run() -> Result<(), String> {
                     PREPARED => app.tick().map(|_| false),
                     UPDATE_READY => app.update_ready().map(|_| false),
                     UPDATE_DOWNLOAD => app.update_download_event(),
+                    DECODER_DOWNLOAD => app.decoder_download_event(),
                     LAYOUT => {
                         app.request_thumbnails();
                         app.layout().map(|_| false)
@@ -6230,6 +6399,7 @@ mod tests {
         let (preparation_tx, preparation_rx) = std::sync::mpsc::channel();
         let (update_tx, update_rx) = std::sync::mpsc::channel();
         let (update_download_tx, update_download_rx) = std::sync::mpsc::channel();
+        let (decoder_download_tx, decoder_download_rx) = std::sync::mpsc::channel();
         App {
             hwnd: HWND::default(),
             controls: vec![],
@@ -6268,6 +6438,11 @@ mod tests {
             update_download_tx,
             update_download_rx,
             update_download_thread: None,
+            decoder_download_tx,
+            decoder_download_rx,
+            decoder_download_thread: None,
+            decoder_download_status: None,
+            pending_decoder_apply: None,
             error: None,
             library: vec![],
             folder_filter: None,
@@ -7681,6 +7856,7 @@ mod tests {
         // No windows or decoder are created: every exercised path fails validation first.
         let (update_tx, update_rx) = std::sync::mpsc::channel();
         let (update_download_tx, update_download_rx) = std::sync::mpsc::channel();
+        let (decoder_download_tx, decoder_download_rx) = std::sync::mpsc::channel();
         let mut app = App {
             hwnd: HWND::default(),
             controls: vec![],
@@ -7719,6 +7895,11 @@ mod tests {
             update_download_tx,
             update_download_rx,
             update_download_thread: None,
+            decoder_download_tx,
+            decoder_download_rx,
+            decoder_download_thread: None,
+            decoder_download_status: None,
+            pending_decoder_apply: None,
             error: None,
             library: vec![],
             folder_filter: None,
@@ -9102,5 +9283,36 @@ mod tests {
         assert_eq!(entries[4].id, TB_CMD_UPDATE);
         assert!(entries[4].separator_before);
         assert_eq!(entries[7].id, TB_CMD_EXIT);
+    }
+
+    #[test]
+    fn decoder_download_event_tracks_progress_and_resets_on_failure() {
+        let mut app = fixture();
+        app.pending_decoder_apply = Some(PathBuf::from("demo.mp4"));
+        app.decoder_download_tx
+            .send(crate::update::DownloadEvent::Progress(Some(42)))
+            .unwrap();
+        assert!(!app.decoder_download_event().unwrap());
+        assert_eq!(
+            app.decoder_download_status.as_deref(),
+            Some("Downloading native decoder... 42%")
+        );
+
+        app.decoder_download_tx
+            .send(crate::update::DownloadEvent::Verifying)
+            .unwrap();
+        assert!(!app.decoder_download_event().unwrap());
+        assert_eq!(
+            app.decoder_download_status.as_deref(),
+            Some("Verifying and extracting native decoder...")
+        );
+
+        app.decoder_download_tx
+            .send(crate::update::DownloadEvent::Failed("network down".into()))
+            .unwrap();
+        let err = app.decoder_download_event().unwrap_err();
+        assert_eq!(err, "network down");
+        assert!(app.decoder_download_status.is_none());
+        assert!(app.pending_decoder_apply.is_none());
     }
 }
