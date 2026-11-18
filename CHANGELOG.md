@@ -13,10 +13,32 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ## Unreleased
 
+---
+
+## v0.2.2
+
+### Added
+
+- Add a 5-tier **Quality** selector (`Native`, `High`, `Optimize`, `Medium`, `Low`) beside **FPS** in the Library sidebar (`Core::Quality`, `Mpv::open_at_with_quality`, `cache::prepare_local_with_quality`), giving users direct control over native untouched playback vs GPU shader scaling, dithering depth, and cache compression presets.
+- Add consent-based in-app native decoder setup (`download_verified_decoder`) using WinHTTP, SHA-256 verification for both archive and `libmpv-2.dll`, and `System32\tar.exe` extraction, presented inside a matching dark Acrylic popup card (`update_popup::show_decoder`).
+- Add manual hex color editing (`CLOCK_HEX_EDIT`) with a dedicated **Confirm** button (`CLOCK_HEX_CONFIRM`) on the Day Clock appearance controls.
+
+### Changed
+
+- Switch Windows installer packaging from Inno Setup to WiX Toolset v3.14 `.msi` (`installer/WallpaperLive.wxs`) with a modern dark-sidebar `WixUI_InstallDir` setup wizard (`assets/wix-dialog.bmp`, `assets/wix-banner.bmp`) and `.msi` self-update asset support (`src/update.rs`).
+- Replace the external `#32768` TransparentBar menu with WallpaperLive's own rounded Acrylic dropdown (`tray::menu_at`).
+
 ### Fixed
 
+- Preserve translucent Acrylic glass behind the bottom `STATUS` control when text is selected (`paint_control_into`, `collect_status_selection_spans`), eliminating the solid black background artifact during text highlight.
+- Align top-level tab slide transition directions cleanly across Library, Settings, and Day Clock (`visuals::tab_slide_direction`).
 - Allow center-handle dragging and wheel resizing of an unlocked desktop clock while Behind desktop shortcuts is enabled. Keep shortcut icon and label areas clickable, map drag coordinates to the desktop parent, and retain the saved position. Lock position & size remains independent of the visual layer.
 - Include WallpaperLive panel activation in clock foreground handling so a popup clock raised for Show desktop is lowered when returning to the application.
+
+### Verification and limits
+
+- Update application, manifest, and WiX installer metadata to `0.2.2`.
+- Release v0.2.2 publishes `wallpaperlivesetup-v0.2.2.msi` and `SHA256SUMS.txt` via the GitHub Actions Release workflow.
 
 ---
 
