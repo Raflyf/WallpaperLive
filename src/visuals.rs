@@ -9737,19 +9737,21 @@ mod tests {
                 pre_bits as *const RGBQUAD,
                 (pre_stride as usize) * (h as usize),
             );
-            if let Some(i) = pre.iter().position(|p| {
-                p.rgbRed > p.rgbReserved || p.rgbGreen > p.rgbReserved || p.rgbBlue > p.rgbReserved
-            }) {
-                let p = pre[i];
-                panic!(
-                    "pre-label violation at ({}, {}) stride={pre_stride}: r={} g={} b={} a={}",
-                    i % pre_stride as usize,
-                    i / pre_stride as usize,
-                    p.rgbRed,
-                    p.rgbGreen,
-                    p.rgbBlue,
-                    p.rgbReserved
-                );
+            // BeginBufferedPaint may return a shared scratch surface wider than `w`; inspect only `0..w`.
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let p = pre[y * pre_stride as usize + x];
+                    assert!(
+                        p.rgbRed <= p.rgbReserved
+                            && p.rgbGreen <= p.rgbReserved
+                            && p.rgbBlue <= p.rgbReserved,
+                        "pre-label violation at ({x}, {y}) stride={pre_stride}: r={} g={} b={} a={}",
+                        p.rgbRed,
+                        p.rgbGreen,
+                        p.rgbBlue,
+                        p.rgbReserved
+                    );
+                }
             }
 
             {
@@ -9795,19 +9797,20 @@ mod tests {
                 })
             });
             assert!(has_glyph, "glass label must draw antialiased glyph pixels");
-            if let Some(i) = out.iter().position(|p| {
-                p.rgbRed > p.rgbReserved || p.rgbGreen > p.rgbReserved || p.rgbBlue > p.rgbReserved
-            }) {
-                let p = out[i];
-                panic!(
-                    "all pixels after glass label compositing must stay premultiplied: ({}, {}) stride={stride} r={} g={} b={} a={}",
-                    i % stride as usize,
-                    i / stride as usize,
-                    p.rgbRed,
-                    p.rgbGreen,
-                    p.rgbBlue,
-                    p.rgbReserved
-                );
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let p = out[y * stride as usize + x];
+                    assert!(
+                        p.rgbRed <= p.rgbReserved
+                            && p.rgbGreen <= p.rgbReserved
+                            && p.rgbBlue <= p.rgbReserved,
+                        "all pixels after glass label compositing must stay premultiplied: ({x}, {y}) stride={stride} r={} g={} b={} a={}",
+                        p.rgbRed,
+                        p.rgbGreen,
+                        p.rgbBlue,
+                        p.rgbReserved
+                    );
+                }
             }
             drop(buffer);
             SelectObject(dc, prev);
