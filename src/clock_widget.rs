@@ -538,6 +538,7 @@ struct ClockRuntime {
     behind_attached: bool,
     cached_layer: Option<DesktopLayer>,
     dcomp: Option<DCompPresenter>,
+    input: Option<ClockInput>,
     repositioning: bool,
     dragging: bool,
     drag_moved: bool,
@@ -551,6 +552,329 @@ struct ClockRuntime {
     last_bounds: Option<(i32, i32, i32, i32, bool, bool)>,
     pending_wheel_delta: i32,
     hooks: [isize; 2],
+}
+
+struct ClockInput {
+    hwnd: HWND,
+    hook: HWINEVENTHOOK,
+}
+impl Drop for ClockInput {
+    fn drop(&mut self) {
+        // SAFETY: only this UI thread owns the input-only child and event hook.
+        unsafe {
+            if !self.hook.0.is_null() {
+                let _ = UnhookWinEvent(self.hook);
+            }
+            if GetCapture() == self.hwnd {
+                let _ = ReleaseCapture();
+            }
+            let _ = KillTimer(self.hwnd, CLOCK_INPUT_REFRESH as usize);
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+const CLOCK_INPUT_CLASS: PCWSTR = w!("WallpaperLive.ClockInput");
+const CLOCK_INPUT_REFRESH: u32 = WM_APP + 81;
+
+fn desktop_shortcut_rects(view: HWND) -> Option<Vec<RECT>> {
+    use windows::Win32::{System::Com::*, UI::Accessibility::*};
+    // SAFETY: MSAA marshals Explorer's accessible child bounds; no remote LVHITTESTINFO pointers.
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let result = (|| {
+            let mut raw = std::ptr::null_mut();
+            AccessibleObjectFromWindow(view, OBJID_CLIENT.0 as u32, &IAccessible::IID, &mut raw)
+                .ok()?;
+            if raw.is_null() {
+                return None;
+            }
+            let acc = IAccessible::from_raw(raw);
+            let count = acc.accChildCount().ok()?;
+            if !(0..=4096).contains(&count) {
+                return None;
+            }
+            let mut rects = Vec::with_capacity(count as usize);
+            for child in 1..=count {
+                let (mut x, mut y, mut w, mut h) = (0, 0, 0, 0);
+                acc.accLocation(
+                    &mut x,
+                    &mut y,
+                    &mut w,
+                    &mut h,
+                    &windows::core::VARIANT::from(child),
+                )
+                .ok()?;
+                if w > 0 && h > 0 {
+                    rects.push(RECT {
+                        left: x,
+                        top: y,
+                        right: x.saturating_add(w),
+                        bottom: y.saturating_add(h),
+                    });
+                }
+            }
+            Some(rects)
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
+unsafe extern "system" fn clock_input_event(
+    _: HWINEVENTHOOK,
+    event: u32,
+    event_hwnd: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    if !matches!(
+        event,
+        EVENT_OBJECT_CREATE
+            | EVENT_OBJECT_DESTROY
+            | EVENT_OBJECT_SHOW
+            | EVENT_OBJECT_HIDE
+            | EVENT_OBJECT_REORDER
+            | EVENT_OBJECT_LOCATIONCHANGE
+    ) {
+        return;
+    }
+    let state = CLOCK_RUNTIME.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|r| Some((r.input.as_ref()?.hwnd, r.cached_layer?.icons)))
+    });
+    if let Some((input, icons)) = state {
+        unsafe {
+            if event_hwnd == icons || IsChild(icons, event_hwnd).as_bool() {
+                let _ = ShowWindow(input, SW_HIDE);
+                let _ = SetTimer(input, CLOCK_INPUT_REFRESH as usize, 60, None);
+            }
+        }
+    }
+}
+
+fn sync_clock_input() {
+    let state = CLOCK_RUNTIME.with(|s| {
+        s.borrow().as_ref().map(|r| {
+            (
+                r.hwnd,
+                r.behind_attached && !r.cfg.locked && !r.repositioning,
+                r.cached_layer,
+                r.width,
+                r.height,
+                r.input.as_ref().map(|i| i.hwnd),
+                r.dragging,
+            )
+        })
+    });
+    let Some((raw, enabled, layer, w, h, input, dragging)) = state else {
+        return;
+    };
+    if dragging && enabled {
+        return;
+    }
+    let layer = layer.filter(|&l| layer_still_valid(l));
+    if !enabled || layer.is_none() {
+        let old = CLOCK_RUNTIME.with(|s| s.borrow_mut().as_mut().and_then(|r| r.input.take()));
+        drop(old);
+        return;
+    }
+    let layer = layer.unwrap();
+    // SAFETY: the input-only child stays inside Explorer's icon layer, never topmost above apps.
+    unsafe {
+        let Ok(view) = FindWindowExW(layer.icons, None, w!("SysListView32"), PCWSTR::null()) else {
+            return;
+        };
+        let Some(exclusions) = desktop_shortcut_rects(view) else {
+            if let Some(input) = input {
+                let _ = ShowWindow(input, SW_HIDE);
+            }
+            return;
+        };
+        let hwnd = if let Some(input) = input {
+            input
+        } else {
+            if ensure_class(
+                CLOCK_INPUT_CLASS,
+                Some(clock_input_proc),
+                HGDIOBJ::default(),
+                IDC_SIZEALL,
+            )
+            .is_err()
+            {
+                return;
+            }
+            let Ok(instance) = GetModuleHandleW(None) else {
+                return;
+            };
+            let Ok(hwnd) = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_NOACTIVATE,
+                CLOCK_INPUT_CLASS,
+                w!("WallpaperLive clock drag handle"),
+                WS_CHILD,
+                0,
+                0,
+                w,
+                h,
+                layer.icons,
+                None,
+                instance,
+                None,
+            ) else {
+                return;
+            };
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw);
+            if SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA).is_err() {
+                let _ = DestroyWindow(hwnd);
+                return;
+            }
+            let mut pid = 0;
+            GetWindowThreadProcessId(layer.icons, Some(&mut pid));
+            let hook = SetWinEventHook(
+                EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                None,
+                Some(clock_input_event),
+                pid,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+            CLOCK_RUNTIME.with(|s| {
+                if let Some(rt) = s.borrow_mut().as_mut() {
+                    rt.input = Some(ClockInput { hwnd, hook });
+                }
+            });
+            hwnd
+        };
+        let mut area = RECT::default();
+        if GetWindowRect(HWND(raw as *mut c_void), &mut area).is_err() {
+            return;
+        }
+        let mut origin = [POINT {
+            x: area.left,
+            y: area.top,
+        }];
+        MapWindowPoints(None, layer.icons, &mut origin);
+        let handle = drag_handle_rect(w, h);
+        let region = windows::Win32::Graphics::Gdi::CreateRectRgnIndirect(&handle);
+        if region.0.is_null() {
+            return;
+        }
+        for icon in exclusions {
+            let hole = windows::Win32::Graphics::Gdi::CreateRectRgn(
+                icon.left - area.left,
+                icon.top - area.top,
+                icon.right - area.left,
+                icon.bottom - area.top,
+            );
+            if !hole.0.is_null() {
+                windows::Win32::Graphics::Gdi::CombineRgn(
+                    region,
+                    region,
+                    hole,
+                    windows::Win32::Graphics::Gdi::RGN_DIFF,
+                );
+                let _ = DeleteObject(HGDIOBJ(hole.0));
+            }
+        }
+        if windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, region, false) == 0 {
+            let _ = DeleteObject(HGDIOBJ(region.0));
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            origin[0].x,
+            origin[0].y,
+            w,
+            h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
+unsafe extern "system" fn clock_input_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    unsafe {
+        let clock = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut c_void);
+        if !IsWindow(clock).as_bool() {
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        match msg {
+            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            WM_NCHITTEST => LRESULT(HTCLIENT as isize),
+            WM_LBUTTONDOWN => {
+                let result = SendMessageW(clock, msg, wp, lp);
+                if CLOCK_RUNTIME.with(|s| s.borrow().as_ref().is_some_and(|r| r.dragging)) {
+                    let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
+                    let _ = SetCapture(hwnd);
+                }
+                result
+            }
+            WM_MOUSEMOVE | WM_LBUTTONUP | WM_MOUSEWHEEL | WM_RBUTTONUP => {
+                let result = SendMessageW(clock, msg, wp, lp);
+                if msg == WM_MOUSEMOVE
+                    && CLOCK_RUNTIME.with(|s| s.borrow().as_ref().is_some_and(|r| r.dragging))
+                {
+                    let mut rect = RECT::default();
+                    if GetWindowRect(clock, &mut rect).is_ok()
+                        && let Ok(parent) = GetParent(hwnd)
+                    {
+                        let mut pt = [POINT {
+                            x: rect.left,
+                            y: rect.top,
+                        }];
+                        MapWindowPoints(None, parent, &mut pt);
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            pt[0].x,
+                            pt[0].y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+                if msg == WM_LBUTTONUP {
+                    if GetCapture() == hwnd {
+                        let _ = ReleaseCapture();
+                    }
+                    sync_clock_input();
+                }
+                result
+            }
+            WM_CAPTURECHANGED => {
+                if CLOCK_RUNTIME.with(|s| s.borrow().as_ref().is_some_and(|r| r.dragging)) {
+                    let _ = SendMessageW(clock, WM_LBUTTONUP, WPARAM(0), LPARAM(0));
+                    sync_clock_input();
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == CLOCK_INPUT_REFRESH as usize => {
+                let _ = KillTimer(hwnd, CLOCK_INPUT_REFRESH as usize);
+                sync_clock_input();
+                LRESULT(0)
+            }
+            WM_PAINT => {
+                let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+                windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
+                let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -699,7 +1023,7 @@ fn unhook_events(hooks: [isize; 2]) {
 }
 
 fn install_events() -> [isize; 2] {
-    // SAFETY: out-of-context UI-thread WinEvent hooks skip own process so idle CPU stays zero.
+    // SAFETY: out-of-context UI-thread hooks; own panel activation must also demote the clock.
     unsafe {
         let h1 = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
@@ -708,7 +1032,7 @@ fn install_events() -> [isize; 2] {
             Some(win_event_proc),
             0,
             0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            WINEVENT_OUTOFCONTEXT,
         );
         let h2 = SetWinEventHook(
             EVENT_SYSTEM_MINIMIZESTART,
@@ -1028,9 +1352,10 @@ fn destroy_clock_hwnd(raw: isize, hooks: [isize; 2]) {
 
 pub fn hide_all() {
     cancel_color_pick();
-    let old = CLOCK_RUNTIME.with(|slot| slot.borrow_mut().take().map(|r| (r.hwnd, r.hooks)));
-    if let Some((raw, hooks)) = old {
-        destroy_clock_hwnd(raw, hooks);
+    let old = CLOCK_RUNTIME.with(|slot| slot.borrow_mut().take());
+    if let Some(mut rt) = old {
+        drop(rt.input.take());
+        destroy_clock_hwnd(rt.hwnd, rt.hooks);
     }
     CLOCK_TEXT_SCRATCH.with(|s| s.borrow_mut().free());
 }
@@ -1107,9 +1432,8 @@ fn sync_inner(owner: HWND, action_msg: u32, cfg: ClockConfig, repositioning: boo
     });
 
     if need_recreate {
-        CLOCK_RUNTIME.with(|slot| {
-            *slot.borrow_mut() = None;
-        });
+        let old = CLOCK_RUNTIME.with(|slot| slot.borrow_mut().take());
+        drop(old);
         destroy_clock_hwnd(old_raw, old_hooks);
         let Ok(instance) = (unsafe { GetModuleHandleW(None) }) else {
             return;
@@ -1248,6 +1572,7 @@ fn sync_inner(owner: HWND, action_msg: u32, cfg: ClockConfig, repositioning: boo
                 behind_attached: attached_behind,
                 cached_layer: attached_layer,
                 dcomp,
+                input: None,
                 repositioning,
                 dragging: false,
                 drag_moved: false,
@@ -2437,6 +2762,7 @@ fn render_and_place(hwnd: HWND) {
         let _ = DeleteObject(HGDIOBJ(bmp.0));
         let _ = DeleteDC(mem_dc);
     }
+    sync_clock_input();
 }
 
 fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
@@ -2605,8 +2931,7 @@ unsafe extern "system" fn clock_proc(
                 let _ = ScreenToClient(hwnd, &mut cur);
                 let can_move = CLOCK_RUNTIME.with(|slot| {
                     slot.borrow().as_ref().is_some_and(|rt| {
-                        !rt.behind_attached
-                            && (!rt.cfg.locked || rt.repositioning)
+                        (!rt.cfg.locked || rt.repositioning)
                             && in_drag_handle(cur.x, cur.y, rt.width, rt.height)
                     })
                 });
@@ -2654,15 +2979,17 @@ unsafe extern "system" fn clock_proc(
                 LRESULT(0)
             }
             WM_NCDESTROY => {
-                let hooks = CLOCK_RUNTIME.with(|slot| {
+                let old = CLOCK_RUNTIME.with(|slot| {
                     let mut borrow = slot.borrow_mut();
                     if borrow.as_ref().is_some_and(|rt| rt.hwnd == hwnd.0 as isize) {
-                        borrow.take().map_or([0, 0], |rt| rt.hooks)
+                        borrow.take()
                     } else {
-                        [0, 0]
+                        None
                     }
                 });
-                unhook_events(hooks);
+                if let Some(rt) = old {
+                    unhook_events(rt.hooks);
+                }
                 CLOCK_TEXT_SCRATCH.with(|s| s.borrow_mut().free());
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -2673,8 +3000,7 @@ unsafe extern "system" fn clock_proc(
                 let _ = ScreenToClient(hwnd, &mut client_pt);
                 let allow_drag = CLOCK_RUNTIME.with(|slot| {
                     slot.borrow().as_ref().is_some_and(|rt| {
-                        !rt.behind_attached
-                            && (!rt.cfg.locked || rt.repositioning)
+                        (!rt.cfg.locked || rt.repositioning)
                             && in_drag_handle(client_pt.x, client_pt.y, rt.width, rt.height)
                     })
                 });
@@ -2717,13 +3043,20 @@ unsafe extern "system" fn clock_proc(
                             }
                         });
                     }
-                    let nx = cur.x - ox;
-                    let ny = cur.y - oy;
+                    let mut origin = [POINT {
+                        x: cur.x - ox,
+                        y: cur.y - oy,
+                    }];
+                    if GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CHILD.0 != 0
+                        && let Ok(parent) = GetParent(hwnd)
+                    {
+                        MapWindowPoints(None, parent, &mut origin);
+                    }
                     let _ = SetWindowPos(
                         hwnd,
                         HWND::default(),
-                        nx,
-                        ny,
+                        origin[0].x,
+                        origin[0].y,
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
@@ -2746,6 +3079,12 @@ unsafe extern "system" fn clock_proc(
                 if moved {
                     let mut wr = RECT::default();
                     if GetWindowRect(hwnd, &mut wr).is_ok() {
+                        CLOCK_RUNTIME.with(|s| {
+                            if let Some(rt) = s.borrow_mut().as_mut() {
+                                rt.cfg.pos = Some((wr.left, wr.top));
+                                rt.last_bounds = None;
+                            }
+                        });
                         CLOCK_SAVED_POS.with(|s| *s.borrow_mut() = Some((wr.left, wr.top)));
                         if owner != 0 {
                             let _ = PostMessageW(
@@ -2764,7 +3103,7 @@ unsafe extern "system" fn clock_proc(
                 let (allowed, owner, action_msg) = CLOCK_RUNTIME.with(|slot| {
                     slot.borrow_mut().as_mut().map_or((false, 0, 0), |rt| {
                         // Lock position disables accidental drag & scroll-resizing; repositioning unlocks both.
-                        let ok = !rt.behind_attached && (!rt.cfg.locked || rt.repositioning);
+                        let ok = !rt.cfg.locked || rt.repositioning;
                         if ok {
                             rt.pending_wheel_delta += delta;
                             let steps = rt.pending_wheel_delta / 120;
@@ -3425,6 +3764,387 @@ unsafe extern "system" fn picker_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ClockFixture {
+        panel: HWND,
+        clock: HWND,
+    }
+    impl ClockFixture {
+        fn popup() -> Self {
+            unsafe {
+                ensure_class(CLOCK_CLASS, Some(clock_proc), HGDIOBJ::default(), IDC_ARROW).unwrap();
+                let instance = GetModuleHandleW(None).unwrap();
+                let panel = CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    w!("STATIC"),
+                    w!("WallpaperLive clock regression"),
+                    WS_POPUP,
+                    40,
+                    40,
+                    320,
+                    200,
+                    None,
+                    None,
+                    instance,
+                    None,
+                )
+                .unwrap();
+                let clock = CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    CLOCK_CLASS,
+                    w!("WallpaperLive clock regression"),
+                    WS_POPUP,
+                    80,
+                    80,
+                    400,
+                    176,
+                    None,
+                    None,
+                    instance,
+                    None,
+                )
+                .unwrap();
+                CLOCK_RUNTIME.with(|s| {
+                    *s.borrow_mut() = Some(ClockRuntime {
+                        hwnd: clock.0 as isize,
+                        owner: panel.0 as isize,
+                        cfg: ClockConfig {
+                            enabled: true,
+                            behind_icons: false,
+                            ..Default::default()
+                        },
+                        width: 400,
+                        height: 176,
+                        ..Default::default()
+                    })
+                });
+                Self { panel, clock }
+            }
+        }
+    }
+    impl Drop for ClockFixture {
+        fn drop(&mut self) {
+            hide_all();
+            unsafe {
+                let _ = DestroyWindow(self.panel);
+            }
+        }
+    }
+
+    #[test]
+    fn clock_unlocked_behind_icons_accepts_drag_without_changing_layer() {
+        let fixture = ClockFixture::popup();
+        unsafe {
+            let mut cursor = POINT::default();
+            assert!(GetCursorPos(&mut cursor).is_ok());
+            SetWindowPos(
+                fixture.panel,
+                None,
+                cursor.x - 280,
+                cursor.y - 168,
+                600,
+                400,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            SetParent(fixture.clock, fixture.panel).unwrap();
+            SetWindowLongPtrW(
+                fixture.clock,
+                GWL_STYLE,
+                (WS_CHILD | WS_CLIPSIBLINGS).0 as isize,
+            );
+            SetWindowPos(
+                fixture.clock,
+                None,
+                80,
+                80,
+                400,
+                176,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            CLOCK_RUNTIME.with(|s| {
+                let mut slot = s.borrow_mut();
+                let rt = slot.as_mut().unwrap();
+                rt.behind_attached = true;
+                rt.cfg.behind_icons = true;
+                rt.cached_layer = Some(DesktopLayer {
+                    parent: fixture.panel,
+                    icons: fixture.panel,
+                    raised: true,
+                });
+            });
+            SendMessageW(fixture.clock, WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+            assert!(
+                CLOCK_RUNTIME.with(|s| s.borrow().as_ref().unwrap().dragging),
+                "Behind desktop shortcuts must not lock an unlocked clock"
+            );
+            let mut before = RECT::default();
+            GetWindowRect(fixture.clock, &mut before).unwrap();
+            CLOCK_RUNTIME.with(|s| {
+                let mut slot = s.borrow_mut();
+                let rt = slot.as_mut().unwrap();
+                rt.drag_offset_x -= 30;
+                rt.drag_offset_y -= 24;
+            });
+            SendMessageW(fixture.clock, WM_MOUSEMOVE, WPARAM(0), LPARAM(0));
+            let mut after = RECT::default();
+            GetWindowRect(fixture.clock, &mut after).unwrap();
+            assert_eq!(
+                (after.left - before.left, after.top - before.top),
+                (30, 24),
+                "child drag must translate screen coordinates to its desktop parent"
+            );
+            SendMessageW(fixture.clock, WM_LBUTTONUP, WPARAM(0), LPARAM(0));
+            assert_eq!(GetParent(fixture.clock).unwrap(), fixture.panel);
+            CLOCK_RUNTIME.with(|s| s.borrow_mut().as_mut().unwrap().cfg.locked = true);
+            SendMessageW(fixture.clock, WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+            assert!(
+                !CLOCK_RUNTIME.with(|s| s.borrow().as_ref().unwrap().dragging),
+                "Lock must block dragging regardless of desktop layer"
+            );
+        }
+    }
+
+    #[test]
+    fn clock_behind_icons_routes_mouse_through_a_desktop_child() {
+        let fixture = ClockFixture::popup();
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            let list = CreateWindowExW(
+                Default::default(),
+                w!("SysListView32"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                600,
+                400,
+                fixture.panel,
+                None,
+                instance,
+                None,
+            )
+            .unwrap();
+            SetParent(fixture.clock, fixture.panel).unwrap();
+            SetWindowLongPtrW(
+                fixture.clock,
+                GWL_STYLE,
+                (WS_CHILD | WS_CLIPSIBLINGS).0 as isize,
+            );
+            CLOCK_RUNTIME.with(|s| {
+                let mut slot = s.borrow_mut();
+                let rt = slot.as_mut().unwrap();
+                rt.behind_attached = true;
+                rt.cfg.behind_icons = true;
+                rt.cached_layer = Some(DesktopLayer {
+                    parent: fixture.panel,
+                    icons: fixture.panel,
+                    raised: true,
+                });
+            });
+            render_and_place(fixture.clock);
+            let input = FindWindowExW(
+                fixture.panel,
+                None,
+                w!("WallpaperLive.ClockInput"),
+                PCWSTR::null(),
+            );
+            assert!(
+                input.is_ok(),
+                "behind-icons clock needs a native input child above the icon view"
+            );
+            let input = input.unwrap();
+            assert_eq!(GetParent(input).unwrap(), fixture.panel);
+            assert_eq!(
+                GetWindowLongPtrW(input, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,
+                0
+            );
+            let mut cursor = POINT::default();
+            GetCursorPos(&mut cursor).unwrap();
+            let mut input_rect = RECT::default();
+            let mut widget_rect = RECT::default();
+            let (width, height) = CLOCK_RUNTIME.with(|s| {
+                let slot = s.borrow();
+                let rt = slot.as_ref().unwrap();
+                (rt.width, rt.height)
+            });
+            SetWindowPos(
+                fixture.panel,
+                None,
+                cursor.x - width / 2 - 80,
+                cursor.y - height / 2 - 80,
+                2000,
+                1400,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            SetWindowPos(
+                fixture.clock,
+                None,
+                80,
+                80,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            sync_clock_input();
+            SendMessageW(input, WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+            assert_eq!(GetCapture(), input);
+            GetWindowRect(fixture.clock, &mut widget_rect).unwrap();
+            let mut client_pt = cursor;
+            let _ = ScreenToClient(fixture.clock, &mut client_pt);
+            assert!(
+                CLOCK_RUNTIME.with(|s| s.borrow().as_ref().unwrap().dragging),
+                "forwarded down: cursor={cursor:?} widget={widget_rect:?} client={client_pt:?}, userdata={} rt={:?}",
+                GetWindowLongPtrW(input, GWLP_USERDATA),
+                CLOCK_RUNTIME.with(|s| s.borrow().as_ref().map(|r| (
+                    r.hwnd,
+                    r.width,
+                    r.height,
+                    r.cfg.locked,
+                    r.dragging
+                )))
+            );
+            CLOCK_RUNTIME.with(|s| {
+                let mut slot = s.borrow_mut();
+                let rt = slot.as_mut().unwrap();
+                rt.drag_offset_x -= 30;
+                rt.drag_offset_y -= 24;
+                rt.drag_start_x -= 30;
+                rt.drag_start_y -= 24;
+            });
+            SendMessageW(input, WM_MOUSEMOVE, WPARAM(0), LPARAM(0));
+            GetWindowRect(input, &mut input_rect).unwrap();
+            GetWindowRect(fixture.clock, &mut widget_rect).unwrap();
+            assert_eq!(
+                (input_rect.left, input_rect.top),
+                (widget_rect.left, widget_rect.top),
+                "input child must follow the visual child throughout a background drag"
+            );
+            SendMessageW(input, WM_LBUTTONUP, WPARAM(0), LPARAM(0));
+            assert_eq!(GetCapture(), HWND::default());
+            assert_eq!(
+                take_saved_position(),
+                Some((widget_rect.left, widget_rect.top))
+            );
+            assert_eq!(
+                CLOCK_RUNTIME.with(|s| s.borrow().as_ref().unwrap().cfg.pos),
+                Some((widget_rect.left, widget_rect.top)),
+                "minute redraw must keep the dragged position"
+            );
+            SendMessageW(input, WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+            let _ = ReleaseCapture();
+            assert!(
+                !CLOCK_RUNTIME.with(|s| s.borrow().as_ref().unwrap().dragging),
+                "losing input capture must not leave the clock dragging"
+            );
+            CLOCK_RUNTIME.with(|s| s.borrow_mut().as_mut().unwrap().cfg.locked = true);
+            render_and_place(fixture.clock);
+            assert!(
+                !IsWindow(input).as_bool(),
+                "Lock removes the drag input child"
+            );
+            CLOCK_RUNTIME.with(|s| s.borrow_mut().as_mut().unwrap().cfg.locked = false);
+            sync_clock_input();
+            let input =
+                FindWindowExW(fixture.panel, None, CLOCK_INPUT_CLASS, PCWSTR::null()).unwrap();
+            use windows::Win32::UI::Controls::{
+                LVIF_TEXT, LVITEMW, LVM_INSERTITEMW, LVM_SETITEMPOSITION,
+            };
+            let mut label: Vec<u16> = "Desktop shortcut".encode_utf16().chain(Some(0)).collect();
+            let item = LVITEMW {
+                mask: LVIF_TEXT,
+                pszText: windows::core::PWSTR(label.as_mut_ptr()),
+                ..Default::default()
+            };
+            assert_eq!(
+                SendMessageW(
+                    list,
+                    LVM_INSERTITEMW,
+                    WPARAM(0),
+                    LPARAM((&item as *const LVITEMW) as isize)
+                )
+                .0,
+                0
+            );
+            SendMessageW(
+                list,
+                LVM_SETITEMPOSITION,
+                WPARAM(0),
+                LPARAM(100 | (100 << 16)),
+            );
+            let icons = desktop_shortcut_rects(list).expect("native icon view bounds");
+            assert_eq!(icons.len(), 1);
+            let center = POINT {
+                x: (icons[0].left + icons[0].right) / 2,
+                y: (icons[0].top + icons[0].bottom) / 2,
+            };
+            let mut widget = RECT::default();
+            GetWindowRect(fixture.clock, &mut widget).unwrap();
+            let x = center.x - (widget.right - widget.left) / 2;
+            let y = center.y - (widget.bottom - widget.top) / 2;
+            let mut origin = [POINT { x, y }];
+            MapWindowPoints(None, fixture.panel, &mut origin);
+            SetWindowPos(
+                fixture.clock,
+                None,
+                origin[0].x,
+                origin[0].y,
+                widget.right - widget.left,
+                widget.bottom - widget.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            sync_clock_input();
+            let region = windows::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0);
+            assert_ne!(
+                windows::Win32::Graphics::Gdi::GetWindowRgn(input, region).0,
+                0
+            );
+            assert!(
+                !windows::Win32::Graphics::Gdi::PtInRegion(region, center.x - x, center.y - y)
+                    .as_bool(),
+                "input child must leave shortcut icon and label clickable"
+            );
+            let _ = DeleteObject(HGDIOBJ(region.0));
+            hide_all();
+            assert!(!IsWindow(input).as_bool());
+            let _ = DestroyWindow(list);
+        }
+    }
+
+    #[test]
+    fn clock_foreground_hook_observes_wallpaperlive_panel() {
+        let fixture = ClockFixture::popup();
+        unsafe {
+            let hooks = install_events();
+            CLOCK_RUNTIME.with(|s| s.borrow_mut().as_mut().unwrap().hooks = hooks);
+            assert!(hooks[0] != 0);
+            windows::Win32::UI::Accessibility::NotifyWinEvent(
+                EVENT_SYSTEM_FOREGROUND,
+                fixture.panel,
+                0,
+                0,
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let mut tick = MSG::default();
+            let mut pending = false;
+            while std::time::Instant::now() < deadline {
+                pending = PeekMessageW(&mut tick, fixture.clock, WM_TIMER, WM_TIMER, PM_NOREMOVE)
+                    .as_bool();
+                if pending {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(
+                pending,
+                "own-panel foreground must schedule clock z-order repair"
+            );
+        }
+    }
 
     #[test]
     fn mond_clock_formatting_anurati_raster_and_hit_policy() {

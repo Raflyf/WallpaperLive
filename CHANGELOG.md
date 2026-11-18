@@ -11,6 +11,15 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- Allow center-handle dragging and wheel resizing of an unlocked desktop clock while Behind desktop shortcuts is enabled. Keep shortcut icon and label areas clickable, map drag coordinates to the desktop parent, and retain the saved position. Lock position & size remains independent of the visual layer.
+- Include WallpaperLive panel activation in clock foreground handling so a popup clock raised for Show desktop is lowered when returning to the application.
+
+---
+
 ## v0.2.1
 
 ### Changed
