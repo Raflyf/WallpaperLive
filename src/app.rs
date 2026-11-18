@@ -2493,7 +2493,8 @@ impl App {
             .thumbnail_thread
             .as_ref()
             .is_some_and(|(_, worker)| worker.is_finished());
-        if !results.is_empty() || worker_done {
+        let batch_drained = !results.is_empty() || worker_done;
+        if batch_drained {
             let was_cancelled = if let Some((cancelled, worker)) = self.thumbnail_thread.take() {
                 let _ = worker.join();
                 self.thumbnail_pending = None;
@@ -2562,6 +2563,10 @@ impl App {
             .into_iter()
             .find(|path| !visuals::has_thumbnail(path) && !self.thumbnail_failed.contains(path))
         else {
+            if batch_drained && !self.hwnd.0.is_null() {
+                visuals::trim_transient_caches();
+                trim_working_set();
+            }
             return;
         };
         self.thumbnail_pending = Some(path.clone());
@@ -4232,11 +4237,9 @@ impl App {
                     crate::clock_widget::ensure_desktop_visible();
                     self.cancel_thumbnails();
                     visuals::retain_thumbnails(&[]);
+                    visuals::trim_transient_caches();
                     // ponytail: trim panel memory while running in tray; active display keeps running.
-                    unsafe {
-                        let _ =
-                            SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-                    }
+                    trim_working_set();
                 } else {
                     return Ok(true);
                 }
@@ -4614,6 +4617,20 @@ impl App {
             self.unfreeze_controls_matching(frozen, |id| !visuals::is_body_control(id));
         }
         update_result?;
+        if previous == visuals::Tab::Library && tab != visuals::Tab::Library {
+            let mut keep: Vec<PathBuf> = self
+                .library_view()
+                .into_iter()
+                .skip(self.page * 9)
+                .take(9)
+                .collect();
+            if let Some(selected) = &self.selected
+                && !keep.contains(selected)
+            {
+                keep.push(selected.clone());
+            }
+            visuals::retain_thumbnails(&keep);
+        }
         let focus = match tab {
             visuals::Tab::Sources => visuals::SOURCES_BACK,
             visuals::Tab::Settings => visuals::TAB_SETTINGS,
@@ -4880,6 +4897,13 @@ fn set_startup(enabled: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn trim_working_set() {
+    // SAFETY: pseudo-handle for current process; best-effort working-set trim of cold/freed pages.
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
 }
 
 fn read_hkcu_string(subkey: PCWSTR, name: PCWSTR) -> Option<String> {
@@ -5769,6 +5793,8 @@ unsafe extern "system" fn window_proc(
                     }
                     crate::clock_widget::ensure_desktop_visible();
                     crate::update_popup::sync(window);
+                    visuals::trim_transient_caches();
+                    trim_working_set();
                     return LRESULT(0);
                 }
                 visuals::sync_child_positions(window);
@@ -5797,7 +5823,10 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == visuals::ANIM_TIMER_ID => {
-                let _ = visuals::tick_animations(window);
+                if !visuals::tick_animations(window) {
+                    visuals::trim_transient_caches();
+                    trim_working_set();
+                }
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == RESTORE_BACKDROP_TIMER_ID => {
@@ -7700,6 +7729,26 @@ mod tests {
 
         app.tab = visuals::Tab::Settings;
         assert!(app.ordered_thumbnail_paths(true).is_empty());
+        // Leaving Library prunes off-page thumbnails while preserving visible page + selected item.
+        visuals::clear();
+        app.tab = visuals::Tab::Library;
+        app.library = (0..12)
+            .map(|i| PathBuf::from(format!(r"C:\wallpapers\tab-{i:02}.mp4")))
+            .collect();
+        app.page = 0;
+        app.selected = Some(app.library[11].clone());
+        for p in &app.library {
+            let bmp = unsafe { CreateBitmap(1, 1, 1, 32, None) };
+            assert!(!bmp.0.is_null());
+            visuals::thumbnail(p.clone(), bmp);
+        }
+        app.switch_tab(visuals::Tab::Settings).unwrap();
+        assert!(visuals::has_thumbnail(&app.library[0]));
+        assert!(visuals::has_thumbnail(&app.library[8]));
+        assert!(visuals::has_thumbnail(&app.library[11]));
+        assert!(!visuals::has_thumbnail(&app.library[9]));
+        assert!(!visuals::has_thumbnail(&app.library[10]));
+        visuals::clear();
     }
 
     #[test]

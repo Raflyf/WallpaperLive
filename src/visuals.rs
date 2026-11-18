@@ -539,7 +539,7 @@ impl Drop for Bitmap {
         }
     }
 }
-pub const MAX_CACHED_THUMBNAILS: usize = 162;
+pub const MAX_CACHED_THUMBNAILS: usize = 36;
 
 struct ThumbEntry {
     bitmap: Bitmap,
@@ -606,7 +606,9 @@ pub fn retain_thumbnails(paths: &[PathBuf]) {
     SKIN.with(|s| {
         let mut skin = s.borrow_mut();
         skin.thumbnails.retain(|path, _| paths.contains(path));
-        if skin.thumbnails.is_empty() && skin.thumbnails.capacity() > 0 {
+        if (skin.thumbnails.is_empty() && skin.thumbnails.capacity() > 0)
+            || skin.thumbnails.capacity() > skin.thumbnails.len().saturating_mul(2) + 8
+        {
             skin.thumbnails.shrink_to_fit();
         }
     });
@@ -1428,6 +1430,7 @@ fn end_transition(window: HWND, anim: TransitionAnim) {
     }
     drop(anim.old_layer);
     drop(anim.new_layer);
+    trim_transient_caches();
 }
 
 pub fn cancel_transition(window: HWND) {
@@ -1609,6 +1612,15 @@ pub fn clear() {
     SYNCED_LAYOUT.with(|slot| slot.set(None));
     invalidate_theme_cache();
     invalidate_os_settings_cache();
+}
+
+/// Frees scratch DIBs and inactive offscreen caches once transitions or panel paints settle.
+pub fn trim_transient_caches() {
+    TEXT_SCRATCH.with(|slot| slot.borrow_mut().reset());
+    BX_COLS_SCRATCH.with(|slot| *slot.borrow_mut() = Vec::new());
+    if SKIN.with(|s| s.borrow().tab != Tab::Clock) {
+        CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 #[derive(Default)]
@@ -5126,6 +5138,7 @@ pub fn finish_backdrop_transition(window: HWND) {
         (window.0.is_null() || bd.hwnd == window.0 as isize) && bd.acrylic_suspended
     });
     reset_transition_backdrop(window, true);
+    trim_transient_caches();
     if window.0.is_null() {
         return;
     }
@@ -8221,10 +8234,16 @@ mod tests {
         assert!(has_thumbnail(&paths[1]));
         assert!(has_thumbnail(&paths[10]));
 
-        // Hiding to tray clears all cached thumbnails.
+        // Hiding to tray clears all cached thumbnails, and trimming transient caches resets scratch.
         retain_thumbnails(&[]);
         assert!(!has_thumbnail(&paths[0]));
         assert!(!has_thumbnail(&paths[MAX_CACHED_THUMBNAILS]));
+        TEXT_SCRATCH.with(|s| unsafe {
+            let _ = s.borrow_mut().ensure(64, 64);
+            assert!(!s.borrow().dc.0.is_null());
+        });
+        trim_transient_caches();
+        TEXT_SCRATCH.with(|s| assert!(s.borrow().dc.0.is_null()));
         clear();
     }
 
