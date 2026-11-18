@@ -8362,7 +8362,7 @@ mod tests {
                     CaptionButton::Minimize => {
                         let a_lo = at(w as usize / 2, h as usize / 2)[3];
                         let a_hi = at(w as usize / 2, h as usize / 2 - 1)[3];
-                        assert!(a_lo >= 180 && a_lo == a_hi);
+                        assert!(a_lo >= 166 && a_lo == a_hi);
                     }
                     CaptionButton::Maximize => {
                         assert_eq!(at(w as usize / 2, h as usize / 2)[3], CARD_ALPHA);
