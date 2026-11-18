@@ -112,7 +112,7 @@
             Name="DataPath"
             Type="string"
             Value="[LocalAppDataFolder]WallpaperLive" />
-        <RegistryKey Root="HKCU" Key="Software\Raflyf\WallpaperLive" Action="createKeyAndRemoveKeyOnUninstall" />
+        <RegistryKey Root="HKCU" Key="Software\Raflyf\WallpaperLive" ForceDeleteOnUninstall="yes" />
         <util:RemoveFolderEx Id="CleanupInstallFolder" On="uninstall" Property="INSTALLFOLDER_CLEANUP" />
         <util:RemoveFolderEx Id="CleanupAppDataFolder" On="uninstall" Property="APPDATA_CLEANUP" />
         <File Id="WallpaperLiveExe" Source="$(var.AppExe)" />
