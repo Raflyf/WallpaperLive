@@ -76,6 +76,7 @@ const WALLPAPER_SITES: [(&str, &str); 4] = [
     ("DesktopHut", "https://www.desktophut.com"),
 ];
 const PRODUCT_URL: &str = "https://livelydesk.vercel.app";
+const TRANSPARENT_BAR_URL: &str = "https://github.com/Raflyf/TransparentBar/releases/latest";
 const SUPPORT_URL: &str = "https://yapp.ink/raflyf";
 const SAWERIA_URL: &str = "https://saweria.co/BuyMatcha";
 const CLASS: PCWSTR = w!("WallpaperLive.Panel");
@@ -1142,6 +1143,12 @@ impl App {
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::TRANSPARENT_BAR,
+                    w!("BUTTON"),
+                    transparentbar_button_label(),
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
                     visuals::SUPPORT,
                     w!("BUTTON"),
                     "Buy me a coffee",
@@ -1648,6 +1655,7 @@ impl App {
             visuals::CACHE_INFO,
             &format!("Video cache: {:.0} MB of 2048 MB", cache as f64 / 1048576.0),
         );
+        self.text(visuals::TRANSPARENT_BAR, transparentbar_button_label());
     }
     fn clear_cache(&mut self) -> Result<(), String> {
         if self.preparation.is_some()
@@ -2890,6 +2898,7 @@ impl App {
     }
     fn open_website(&self, url: &'static str) -> Result<(), String> {
         if url != PRODUCT_URL
+            && url != TRANSPARENT_BAR_URL
             && url != SUPPORT_URL
             && url != SAWERIA_URL
             && !WALLPAPER_SITES.iter().any(|(_, site)| *site == url)
@@ -2912,6 +2921,21 @@ impl App {
             return Err("Windows could not open the website in your default browser".into());
         }
         Ok(())
+    }
+    fn open_or_get_transparentbar(&self) -> Result<(), String> {
+        if let Some(exe) = find_transparentbar_exe() {
+            let mut cmd = std::process::Command::new(&exe);
+            if let Some(dir) = exe.parent()
+                && !dir.as_os_str().is_empty()
+            {
+                cmd.current_dir(dir);
+            }
+            cmd.spawn()
+                .map_err(|e| format!("Could not launch TransparentBar: {e}"))?;
+            Ok(())
+        } else {
+            self.open_website(TRANSPARENT_BAR_URL)
+        }
     }
     fn find_wallpapers(&mut self) -> Result<(), String> {
         self.switch_tab(visuals::Tab::Sources)
@@ -4025,6 +4049,7 @@ impl App {
                 self.open_website(WALLPAPER_SITES[id - visuals::SITE_BASE].1)?;
             }
             visuals::PRODUCT_WEBSITE => self.open_website(PRODUCT_URL)?,
+            visuals::TRANSPARENT_BAR => self.open_or_get_transparentbar()?,
             visuals::SUPPORT => self.open_website(SUPPORT_URL)?,
             visuals::SAWERIA => self.open_website(SAWERIA_URL)?,
             visuals::SORT => {
@@ -4855,6 +4880,112 @@ fn set_startup(enabled: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn read_hkcu_string(subkey: PCWSTR, name: PCWSTR) -> Option<String> {
+    let mut raw = HKEY::default();
+    // SAFETY: read-only HKCU query on static subkey/value names; closed via RegKey RAII wrapper.
+    unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_QUERY_VALUE, &mut raw) }
+        .ok()
+        .ok()?;
+    let key = RegKey(raw);
+    let mut size = 0u32;
+    let mut kind = REG_VALUE_TYPE::default();
+    unsafe { RegQueryValueExW(key.0, name, None, Some(&mut kind), None, Some(&mut size)) }
+        .ok()
+        .ok()?;
+    if kind != REG_SZ || size == 0 || size > 65536 {
+        return None;
+    }
+    let mut bytes = vec![0u8; size as usize];
+    unsafe {
+        RegQueryValueExW(
+            key.0,
+            name,
+            None,
+            None,
+            Some(bytes.as_mut_ptr()),
+            Some(&mut size),
+        )
+    }
+    .ok()
+    .ok()?;
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| u16::from_le_bytes(*p))
+        .take_while(|u| *u != 0)
+        .collect();
+    let val = String::from_utf16_lossy(&units);
+    (!val.trim().is_empty()).then_some(val)
+}
+
+fn parse_transparentbar_run_command(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    let exe_str = if let Some(rest) = trimmed.strip_prefix('"') {
+        rest.split('"').next()?
+    } else {
+        let lower = trimmed.to_ascii_lowercase();
+        let idx = lower.find(".exe")?;
+        &trimmed[..idx + 4]
+    };
+    let path = PathBuf::from(exe_str);
+    let file = path.file_name()?.to_str()?;
+    file.eq_ignore_ascii_case("transparentbar.exe")
+        .then_some(path)
+}
+
+fn find_transparentbar_exe() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("transparentbar.exe"));
+        candidates.push(dir.join("TransparentBar").join("transparentbar.exe"));
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.join("TransparentBar").join("transparentbar.exe"));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(local)
+                .join("Programs")
+                .join("TransparentBar")
+                .join("transparentbar.exe"),
+        );
+    }
+    if let Some(pf) = std::env::var_os("ProgramFiles") {
+        candidates.push(
+            PathBuf::from(pf)
+                .join("TransparentBar")
+                .join("transparentbar.exe"),
+        );
+    }
+    if let Some(loc) = read_hkcu_string(
+        w!(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{C38347CB-7CD0-4D9F-BEE5-05204A3B269F}_is1"
+        ),
+        w!("InstallLocation"),
+    ) {
+        candidates.push(PathBuf::from(loc.trim()).join("transparentbar.exe"));
+    }
+    if let Some(cmd) = read_hkcu_string(
+        w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+        w!("TransparentBar"),
+    ) && let Some(path) = parse_transparentbar_run_command(&cmd)
+    {
+        candidates.push(path);
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn transparentbar_button_label() -> &'static str {
+    if find_transparentbar_exe().is_some() {
+        "Open TransparentBar"
+    } else {
+        "Get TransparentBar"
+    }
 }
 
 fn register_control_class(
@@ -6308,6 +6439,27 @@ mod tests {
                 GetWindowLongW(app.control(visuals::CHECK_UPDATES), GWL_STYLE) as u32
                     & WS_VISIBLE.0,
                 0
+            );
+            assert_eq!(
+                window_text(app.control(visuals::TRANSPARENT_BAR)),
+                transparentbar_button_label()
+            );
+            assert_ne!(
+                GetWindowLongW(app.control(visuals::TRANSPARENT_BAR), GWL_STYLE) as u32
+                    & WS_VISIBLE.0,
+                0
+            );
+            assert_eq!(
+                parse_transparentbar_run_command(
+                    r#""C:\Users\u\AppData\Local\Programs\TransparentBar\transparentbar.exe" --minimized"#
+                ),
+                Some(PathBuf::from(
+                    r"C:\Users\u\AppData\Local\Programs\TransparentBar\transparentbar.exe"
+                ))
+            );
+            assert_eq!(
+                parse_transparentbar_run_command(r#"C:\Windows\System32\cmd.exe /c foo"#),
+                None
             );
             app.action(visuals::FIND_WALLPAPERS, BN_CLICKED)?;
             app.action(visuals::SOURCES_BACK, BN_CLICKED)?;
