@@ -100,9 +100,24 @@ pub fn release_page_url(tag: Option<&str>) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn installer_filename(tag: &str) -> Result<String, String> {
     let canonical = normalize_tag(tag)?;
-    Ok(format!("wallpaperlivesetup-{canonical}.exe"))
+    Ok(format!("wallpaperlivesetup-{canonical}.msi"))
+}
+
+pub fn resolve_installer_from_sums(
+    sums_text: &str,
+    tag: &str,
+) -> Result<(String, [u8; 32]), String> {
+    let canonical = normalize_tag(tag)?;
+    let msi_name = format!("wallpaperlivesetup-{canonical}.msi");
+    if let Ok(digest) = parse_sha256sums(sums_text, &msi_name) {
+        return Ok((msi_name, digest));
+    }
+    let exe_name = format!("wallpaperlivesetup-{canonical}.exe");
+    let digest = parse_sha256sums(sums_text, &exe_name)?;
+    Ok((exe_name, digest))
 }
 
 pub fn allowed_download_host(host: &str) -> bool {
@@ -602,22 +617,22 @@ pub fn download_verified_installer(
     mut on_progress: impl FnMut(Option<u8>),
 ) -> Result<PathBuf, String> {
     let canonical = normalize_tag(tag)?;
-    let exe_name = installer_filename(&canonical)?;
     let sums_url = format!(
         "https://github.com/Raflyf/WallpaperLive/releases/download/{canonical}/SHA256SUMS.txt"
     );
-    let exe_url =
-        format!("https://github.com/Raflyf/WallpaperLive/releases/download/{canonical}/{exe_name}");
     let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
 
     on_progress(Some(0));
     let sums_bytes = fetch_verified_bytes(&sums_url, MAX_CHECKSUMS_BODY, cancelled, deadline)?;
     let sums_text = std::str::from_utf8(&sums_bytes).map_err(|_| "SHA256SUMS.txt is not UTF-8")?;
-    let expected_sha = parse_sha256sums(sums_text, &exe_name)?;
+    let (installer_name, expected_sha) = resolve_installer_from_sums(sums_text, &canonical)?;
+    let exe_url = format!(
+        "https://github.com/Raflyf/WallpaperLive/releases/download/{canonical}/{installer_name}"
+    );
 
     fs::create_dir_all(dir).map_err(|e| format!("Could not prepare updates folder: {e}"))?;
-    let final_path = dir.join(&exe_name);
-    let part_path = dir.join(format!("{exe_name}.part"));
+    let final_path = dir.join(&installer_name);
+    let part_path = dir.join(format!("{installer_name}.part"));
 
     let (_session, _conn, request, total_bytes) =
         open_verified_https_stream(&exe_url, cancelled, deadline)?;
@@ -806,13 +821,13 @@ mod tests {
         );
         assert_eq!(
             installer_filename("v0.2.2").unwrap(),
-            "wallpaperlivesetup-v0.2.2.exe"
+            "wallpaperlivesetup-v0.2.2.msi"
         );
         assert!(installer_filename("../evil").is_err());
 
         assert!(
             split_https_url(
-                "https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.2/a.exe"
+                "https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.2/a.msi"
             )
             .is_ok()
         );
@@ -828,15 +843,25 @@ mod tests {
         assert!(split_https_url("https://github.com@evil.example/a").is_err());
 
         let expected = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let manifest = format!("{expected}  wallpaperlivesetup-v0.2.2.exe\n");
-        let parsed = parse_sha256sums(&manifest, "wallpaperlivesetup-v0.2.2.exe").unwrap();
+        let manifest_msi = format!("{expected}  wallpaperlivesetup-v0.2.2.msi\n");
+        let (resolved_name, resolved_sha) =
+            resolve_installer_from_sums(&manifest_msi, "v0.2.2").unwrap();
+        assert_eq!(resolved_name, "wallpaperlivesetup-v0.2.2.msi");
+        assert_eq!(resolved_sha[0], 0x01);
+        assert_eq!(resolved_sha[31], 0xef);
+
+        let manifest_legacy = format!("{expected}  wallpaperlivesetup-v0.2.2.exe\n");
+        let (legacy_name, _) = resolve_installer_from_sums(&manifest_legacy, "v0.2.2").unwrap();
+        assert_eq!(legacy_name, "wallpaperlivesetup-v0.2.2.exe");
+
+        let parsed = parse_sha256sums(&manifest_msi, "wallpaperlivesetup-v0.2.2.msi").unwrap();
         assert_eq!(parsed[0], 0x01);
         assert_eq!(parsed[31], 0xef);
-        assert!(parse_sha256sums(&manifest, "other.exe").is_err());
+        assert!(parse_sha256sums(&manifest_msi, "other.msi").is_err());
         assert!(
             parse_sha256sums(
-                "deadbeef  wallpaperlivesetup-v0.2.2.exe\n",
-                "wallpaperlivesetup-v0.2.2.exe"
+                "deadbeef  wallpaperlivesetup-v0.2.2.msi\n",
+                "wallpaperlivesetup-v0.2.2.msi"
             )
             .is_err()
         );

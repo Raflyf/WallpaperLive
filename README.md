@@ -1,4 +1,4 @@
-<p align="center">
+﻿<p align="center">
   <img src="assets/wallpaperlive.png" width="96" height="96" alt="WallpaperLive logo">
 </p>
 
@@ -15,16 +15,16 @@
 
 <p align="center">
   <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.1/wallpaperlivesetup-v0.2.1.exe"><strong>Download Windows installer</strong></a>
-  &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
-  &nbsp;·&nbsp; <a href="#resource-use">Resource use</a>
-  &nbsp;·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
-  &nbsp;·&nbsp; <a href="#code-signing-policy">Code signing policy</a>
-  &nbsp;·&nbsp; <a href="#privacy-policy">Privacy policy</a>
-  &nbsp;·&nbsp; <a href="https://saweria.co/BuyMatcha">Saweria</a>
-  &nbsp;·&nbsp; <a href="https://yapp.ink/raflyf">Buy me a coffee</a>
+  &nbsp;Â·&nbsp; <a href="CHANGELOG.md">Changelog</a>
+  &nbsp;Â·&nbsp; <a href="#resource-use">Resource use</a>
+  &nbsp;Â·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
+  &nbsp;Â·&nbsp; <a href="#code-signing-policy">Code signing policy</a>
+  &nbsp;Â·&nbsp; <a href="#privacy-policy">Privacy policy</a>
+  &nbsp;Â·&nbsp; <a href="https://saweria.co/BuyMatcha">Saweria</a>
+  &nbsp;Â·&nbsp; <a href="https://yapp.ink/raflyf">Buy me a coffee</a>
 </p>
 
-WallpaperLive plays trusted local videos, GIFs and images on multiple displays. Apply the same wallpaper to All displays, or set a different file on each display without stopping the others. Search your thumbnail library in a 3x3 grid and control playback from the panel or tray. Right-click thumbnails for file actions or Retry thumbnail, use Library hotkeys (`Space` on the grid, `←`/`→`), monitor live RAM and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
+WallpaperLive plays trusted local videos, GIFs and images on multiple displays. Apply the same wallpaper to All displays, or set a different file on each display without stopping the others. Search your thumbnail library in a 3x3 grid and control playback from the panel or tray. Right-click thumbnails for file actions or Retry thumbnail, use Library hotkeys (`Space` on the grid, `â†`/`â†’`), monitor live RAM and manage your video cache directly in Settings. Rust and Win32 keep the interface native; libmpv handles decoding without a browser engine or an account.
 
 > Windows 10/11 x64. Unsigned installer. Wallpapers and the native decoder are not bundled; Setup asks before downloading a decoder if none is available locally.
 
@@ -82,12 +82,12 @@ The project author captured the same wallpaper while its display cache was being
 | State captured in Task Manager | Memory shown | CPU shown | What the row includes |
 | :--- | ---: | ---: | :--- |
 | Background cache preparation (v0.1.6, 4K source) | 437.5 MB | 42.4% | App plus background cache worker during initial conversion |
-| Cache ready, panel open (v0.1.6) | 41.4 MB – 47.4 MB | 1.3% – 2.5% | WallpaperLive app with library and controls visible |
+| Cache ready, panel open (v0.1.6) | 41.4 MB â€“ 47.4 MB | 1.3% â€“ 2.5% | WallpaperLive app with library and controls visible |
 | Desktop live playback (v0.1.6) | 37.8 MB | 1.5% | WallpaperLive app with the control panel closed |
 | Minimized to tray (v0.1.5, retained photo) | 20.3 MB | 0.5% | WallpaperLive app with the control panel closed |
 | Fullscreen/maximized auto-pause (v0.1.5, retained photo) | 4.5 MB | 0% | WallpaperLive app, playback paused |
 
-The v0.1.6 snapshot shows **437.5 MB / 42.4% CPU during initial 4K wallpaper conversion**, including the app and its background cache worker. Later panel-open captures show **41.4–47.4 MB**; a separate desktop playback capture shows **37.8 MB / 1.5% CPU**. The retained v0.1.5 photos show **20.3 MB / 0.5% CPU** in tray and **4.5 MB / 0% CPU** while auto-paused. These are individual Task Manager observations on the author's Windows 11 setup, not averages or fixed memory ceilings.
+The v0.1.6 snapshot shows **437.5 MB / 42.4% CPU during initial 4K wallpaper conversion**, including the app and its background cache worker. Later panel-open captures show **41.4â€“47.4 MB**; a separate desktop playback capture shows **37.8 MB / 1.5% CPU**. The retained v0.1.5 photos show **20.3 MB / 0.5% CPU** in tray and **4.5 MB / 0% CPU** while auto-paused. These are individual Task Manager observations on the author's Windows 11 setup, not averages or fixed memory ceilings.
 
 ### Tray playback efficiency and auto-pause
 
@@ -119,13 +119,13 @@ The desktop capture also shows 0 MB/s disk and 0 Mbps network; paused shows 0 MB
 2. If Setup needs a native decoder, review its download prompt and grant consent to continue. A matching installed decoder or verified local archive skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.1/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases) · [Code signing policy](#code-signing-policy)
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.1/SHA256SUMS.txt) Â· [All releases](https://github.com/Raflyf/WallpaperLive/releases) Â· [Code signing policy](#code-signing-policy)
 
 Installer downloads include the release version, such as `wallpaperlivesetup-v0.2.1.exe`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
-Setup installs per user without administrator rights. It provides an option to launch the app on completion, but does not apply a wallpaper or enable startup automatically. Published builds prior to CI signing activation (including `v0.2.1`) are unsigned: keep Windows security protections enabled. See [Code signing policy](#code-signing-policy) for planned release signing details. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
+Setup installs per user without administrator rights. Releases after v0.2.1 ship as an MSI package (`wallpaperlivesetup-vX.Y.Z.msi`). It provides an option to launch the app on completion, but does not apply a wallpaper or enable startup automatically. Published builds prior to CI signing activation (including `v0.2.1`) are unsigned: keep Windows security protections enabled. See [Code signing policy](#code-signing-policy) for planned release signing details. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
 
 <details>
 <summary>Offline install or upgrade</summary>
@@ -153,10 +153,10 @@ The picker accepts `MP4`, `GIF`, `MKV`, `WebM`, `MOV`, `AVI`, `MPG`, `MPEG`, `M4
 - Runtime FPS changes use a pure frame-rate filter, without interpolation or playback-speed changes. CFR resampling can repeat frames around irregular timestamps; decoding still processes the cached source rate. One isolated native v0.1.3 test measured scheduled rates of 59.6 / 24.2 / 60.2 FPS for 60 / 24 / 60 choices, not physical display scanout.
 - Conversion accepts finite video up to one hour/16 GiB, uses one below-normal-priority worker and stops at 15 minutes or 512 MiB per output. Cache budget is 2 GiB; if another copy cannot fit within the budget, conversion is refused and original playback continues. No files are evicted automatically. Clear unused cache requires confirmation and protects imported library media, all active originals and active or waiting cache outputs. Original media is never removed. Cancelled partials are never played. Cache lives in `%LOCALAPPDATA%\WallpaperLive\video-cache`.
 - Pause stops animation/audio, releases thumbnails and cancels/defer conversion. Windows receives a resident-page trim request on confirmed pause, load completion and hiding the panel; this can reclaim resident pages without releasing private decoder allocations or dedicated VRAM. Pages can become resident again and page faults can increase. An unfinished conversion restarts in the background after resume. A completed cache waits at least two seconds after resume before a separate handoff near the current media position.
-- Only nine visible thumbnails plus the selection are retained, each at most 480 × 270 pixels. Hidden, minimized or paused panels drop those buffers. Packet settings are 4 MiB forward, no backward cache and 0.2 seconds readahead, with two software-decode threads. These are not a total RAM cap.
+- Only nine visible thumbnails plus the selection are retained, each at most 480 Ã— 270 pixels. Hidden, minimized or paused panels drop those buffers. Packet settings are 4 MiB forward, no backward cache and 0.2 seconds readahead, with two software-decode threads. These are not a total RAM cap.
 - The encoder uses x264 `veryfast`, CRF 23, two threads, lookahead 10 and one reference frame (`refs=1`). Reference/lookahead values already match `veryfast`; an additional 75% memory saving was not measured. CRF encoding is lossy, not a guarantee of identical pixels.
 
-Historical v0.1.1 comparison, **not the screenshot results above**: one sequential RTX 3050 Laptop GPU fixture pair used a 1920 × 1080 native window with D3D11VA decoding for 15 seconds per condition. Original 4K/60 FPS used median 275.5 MiB working set / 856.3 MiB private bytes; 1080p/30 FPS cache used 187.1 MiB / 355.1 MiB. Process CPU was 3.79% / 1.84% of total machine capacity. After decoder destruction, working sets were about 57 MiB including the Python host, excluding the app panel. It was not a repeatability test; GPU utilization and VRAM were not measured.
+Historical v0.1.1 comparison, **not the screenshot results above**: one sequential RTX 3050 Laptop GPU fixture pair used a 1920 Ã— 1080 native window with D3D11VA decoding for 15 seconds per condition. Original 4K/60 FPS used median 275.5 MiB working set / 856.3 MiB private bytes; 1080p/30 FPS cache used 187.1 MiB / 355.1 MiB. Process CPU was 3.79% / 1.84% of total machine capacity. After decoder destruction, working sets were about 57 MiB including the Python host, excluding the app panel. It was not a repeatability test; GPU utilization and VRAM were not measured.
 
 </details>
 
@@ -188,7 +188,7 @@ cargo test --locked
 
 [Windows checks](.github/workflows/ci.yml) builds the application and installer on GitHub Actions. Download the installer and SHA256 manifest from the run's `wallpaperlive-windows-x64` artifact. Version tags beginning with `v` publish those same files after checks pass; tags containing `-` are prereleases. CI does not install the app or exercise live desktop playback.
 
-For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a release build and downloads a checksum-verified portable Inno Setup compiler when needed, without a global tool install:
+For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a release build and builds an MSI with WiX Toolset 3.14 (preinstalled WiX or a checksum-verified portable copy), without a global tool install:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
@@ -227,6 +227,6 @@ WallpaperLive does not collect, store, or transmit personal information, telemet
 
 ## License
 
-[GPL-3.0-or-later](LICENSE) · [Dependency notices](THIRD_PARTY.md) · [Icon sources](assets/SOURCES.md) · [Screenshot sources](assets/screenshots/SOURCES.md)
+[GPL-3.0-or-later](LICENSE) Â· [Dependency notices](THIRD_PARTY.md) Â· [Icon sources](assets/SOURCES.md) Â· [Screenshot sources](assets/screenshots/SOURCES.md)
 
 WallpaperLive's GPL license covers the app, not third-party wallpaper artwork shown in screenshots. libmpv is a separate native decoder; no wallpapers or decoder binaries are bundled.

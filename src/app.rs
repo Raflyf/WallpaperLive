@@ -4989,7 +4989,7 @@ fn decoder_path() -> Result<PathBuf, String> {
     candidates
         .into_iter()
         .find(|p| p.is_file())
-        .ok_or("Decoder is missing. Run scripts/Get-Decoder.ps1 once.".into())
+        .ok_or("Decoder is missing. Run scripts\\Get-Decoder.ps1 from the install folder once, then try again.".into())
 }
 struct RegKey(HKEY);
 impl Drop for RegKey {
@@ -6219,10 +6219,9 @@ mod tests {
             assert_eq!(registered.hIconSm, small_icon.0);
             let id = text.expect("taskbar identity text");
             assert_eq!(id, "Raflyf.WallpaperLive");
-            assert!(
-                include_str!("../installer/WallpaperLive.iss")
-                    .contains(&format!("AppUserModelID: \"{id}\""))
-            );
+            let wxs = include_str!("../installer/WallpaperLive.wxs");
+            assert!(wxs.contains("Key=\"System.AppUserModel.ID\""));
+            assert!(wxs.contains(&format!("Value=\"{id}\"")));
         }
     }
 

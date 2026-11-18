@@ -58,8 +58,8 @@ jobs:
       - name: Build installer
         run: |
           & .\scripts\Installer.ps1
-          $installer = @(Get-ChildItem -LiteralPath .\dist -Filter 'wallpaperlivesetup-v*.exe' -File)
-          if ($installer.Count -ne 1) { throw 'Expected exactly one versioned installer.' }
+          $installer = @(Get-ChildItem -LiteralPath .\dist -Filter 'wallpaperlivesetup-v*.msi' -File)
+          if ($installer.Count -ne 1) { throw 'Expected exactly one versioned MSI installer.' }
           $hash = (Get-FileHash -LiteralPath $installer[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           [IO.File]::WriteAllText((Join-Path $PWD 'dist\SHA256SUMS.txt'), "$hash  $($installer[0].Name)`n", [Text.Encoding]::ASCII)
       - name: Upload installer
@@ -67,7 +67,7 @@ jobs:
         with:
           name: wallpaperlive-windows-x64
           path: |
-            dist/wallpaperlivesetup-v*.exe
+            dist/wallpaperlivesetup-v*.msi
             dist/SHA256SUMS.txt
           if-no-files-found: error
           compression-level: 0
@@ -94,7 +94,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $installerName = "wallpaperlivesetup-$env:RELEASE_TAG.exe"
+          $installerName = "wallpaperlivesetup-$env:RELEASE_TAG.msi"
           $installerPath = Join-Path .\dist $installerName
           $hash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
           $expected = "$hash  $installerName"
