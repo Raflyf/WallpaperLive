@@ -209,9 +209,6 @@ impl Surface {
             Ok(surface)
         }
     }
-    pub fn is_raised(&self) -> bool {
-        self.raised
-    }
     pub fn place(&self, rect: Rect) -> Result<(), String> {
         // SAFETY: validated parent/own HWND; screen origin mapped to actual native parent coordinates.
         unsafe {

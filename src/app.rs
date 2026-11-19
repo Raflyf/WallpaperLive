@@ -3599,7 +3599,7 @@ impl App {
                     quality: self.settings.quality,
                     gpu_preference: self.settings.gpu_preference,
                     monitor: Some(&monitor_name),
-                    d3d11_flip: !surface.is_raised(),
+                    d3d11_flip: false,
                     shader_cache_dir: shader_cache_dir.as_deref(),
                 },
             )?;

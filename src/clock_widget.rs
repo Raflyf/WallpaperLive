@@ -18,7 +18,7 @@ use windows::{
             BOOL, COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
         },
         Graphics::{
-            Dwm::DwmFlush,
+            Dwm::{DWMWA_CLOAKED, DwmFlush, DwmGetWindowAttribute},
             Dxgi::{
                 Common::{
                     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -74,6 +74,8 @@ const CLOCK_TIMER_ID: usize = 91;
 const CLOCK_ZORDER_SETTLE_TIMER_ID: usize = 92;
 const CLOCK_ZORDER_LATE_TIMER_ID: usize = 93;
 const CTX_LOCAL_DONE_REPOS: usize = 9001;
+const CTX_LOCAL_SIZE_UP: usize = 9002;
+const CTX_LOCAL_SIZE_DOWN: usize = 9003;
 
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
 const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
@@ -166,8 +168,7 @@ unsafe extern "system" fn search_desktop_cb(window: HWND, data: LPARAM) -> BOOL 
     // SAFETY: synchronous EnumWindows reading live Explorer hierarchy.
     unsafe {
         let out = &mut *(data.0 as *mut DesktopSearch);
-        if is_workerw_class(window)
-            && belong_to_pid(window, out.progman_pid)
+        if belong_to_pid(window, out.progman_pid)
             && let Ok(icons) = FindWindowExW(window, None, w!("SHELLDLL_DefView"), PCWSTR::null())
         {
             out.icons = icons;
@@ -1260,6 +1261,33 @@ struct DesktopTopSearch {
     top_shell: HWND,
 }
 
+fn is_desktop_shell_window(hwnd: HWND, progman: HWND, progman_pid: u32) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    if !progman.0.is_null() && hwnd == progman {
+        return true;
+    }
+    // SAFETY: read-only child and rect lookups on a live top-level desktop window handle.
+    unsafe {
+        if FindWindowExW(hwnd, None, w!("SHELLDLL_DefView"), PCWSTR::null()).is_ok()
+            || FindWindowExW(hwnd, None, w!("WallpaperLive.Surface"), PCWSTR::null()).is_ok()
+        {
+            return true;
+        }
+        if is_workerw_class(hwnd) && belong_to_pid(hwnd, progman_pid) {
+            let mut rc = RECT::default();
+            if GetWindowRect(hwnd, &mut rc).is_ok()
+                && (rc.right - rc.left) >= 640
+                && (rc.bottom - rc.top) >= 480
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 unsafe extern "system" fn find_top_shell_cb(window: HWND, data: LPARAM) -> BOOL {
     // SAFETY: read-only EnumWindows top-to-bottom scan matching Explorer's desktop host windows.
     unsafe {
@@ -1267,14 +1295,7 @@ unsafe extern "system" fn find_top_shell_cb(window: HWND, data: LPARAM) -> BOOL 
             return BOOL(1);
         }
         let out = &mut *(data.0 as *mut DesktopTopSearch);
-        if window == out.progman {
-            out.top_shell = window;
-            return BOOL(0);
-        }
-        if is_workerw_class(window)
-            && belong_to_pid(window, out.progman_pid)
-            && FindWindowExW(window, None, w!("SHELLDLL_DefView"), PCWSTR::null()).is_ok()
-        {
+        if is_desktop_shell_window(window, out.progman, out.progman_pid) {
             out.top_shell = window;
             return BOOL(0);
         }
@@ -1282,27 +1303,92 @@ unsafe extern "system" fn find_top_shell_cb(window: HWND, data: LPARAM) -> BOOL 
     BOOL(1)
 }
 
-fn window_belongs_to_shell(hwnd: HWND, shell_top: HWND, progman: HWND) -> bool {
+fn window_belongs_to_shell(hwnd: HWND, shell_top: HWND, progman: HWND, progman_pid: u32) -> bool {
     if hwnd.0.is_null() {
         return false;
     }
-    if hwnd == shell_top || hwnd == progman {
+    if (!shell_top.0.is_null() && hwnd == shell_top)
+        || is_desktop_shell_window(hwnd, progman, progman_pid)
+    {
         return true;
     }
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    root == shell_top || root == progman
+    (!shell_top.0.is_null() && root == shell_top)
+        || is_desktop_shell_window(root, progman, progman_pid)
+}
+
+fn is_window_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    // SAFETY: DwmGetWindowAttribute reads a 4-byte cloaked flag into stack storage.
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+    }
+}
+
+fn is_real_app_window_above_shell(
+    cur: HWND,
+    clock_hwnd: HWND,
+    own_hwnds: [isize; 2],
+    progman: HWND,
+    progman_pid: u32,
+) -> bool {
+    if cur.0.is_null() || cur == clock_hwnd || own_hwnds.contains(&(cur.0 as isize)) {
+        return false;
+    }
+    // SAFETY: read-only window visibility, iconic state, bounds, and DWM cloaked queries.
+    unsafe {
+        if !IsWindowVisible(cur).as_bool() || IsIconic(cur).as_bool() {
+            return false;
+        }
+        if is_desktop_shell_window(cur, progman, progman_pid) || is_window_cloaked(cur) {
+            return false;
+        }
+        let mut rc = RECT::default();
+        GetWindowRect(cur, &mut rc).is_ok() && rc.right > rc.left && rc.bottom > rc.top
+    }
+}
+
+fn is_above_in_zorder(upper: HWND, lower: HWND) -> bool {
+    if upper.0.is_null() || lower.0.is_null() || upper == lower {
+        return false;
+    }
+    // SAFETY: read-only Z-order walk via GW_HWNDPREV from lower toward screen front.
+    unsafe {
+        let mut cur = GetWindow(lower, GW_HWNDPREV).unwrap_or_default();
+        let mut hops = 0usize;
+        while !cur.0.is_null() && hops < 4096 {
+            if cur == upper {
+                return true;
+            }
+            cur = GetWindow(cur, GW_HWNDPREV).unwrap_or_default();
+            hops += 1;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
 enum PopupZTarget {
     ShowDesktopTopmost(HWND),
-    BehindApps(HWND),
+    BehindApps { prev_app: HWND, shell_top: HWND },
 }
 
 fn detect_popup_z_target(clock_hwnd: HWND, repositioning: bool) -> PopupZTarget {
     if repositioning {
         return PopupZTarget::ShowDesktopTopmost(HWND::default());
     }
+    let own_hwnds = CLOCK_RUNTIME.with(|s| {
+        s.borrow().as_ref().map_or([0, 0], |r| {
+            [r.hwnd, r.input.as_ref().map_or(0, |i| i.hwnd.0 as isize)]
+        })
+    });
     // SAFETY: walks global top-level Z-order to mirror Rainmeter System::PrepareHelperWindow.
     unsafe {
         let progman = FindWindowW(w!("Progman"), PCWSTR::null()).unwrap_or_default();
@@ -1325,7 +1411,33 @@ fn detect_popup_z_target(clock_hwnd: HWND, repositioning: bool) -> PopupZTarget 
             progman
         };
         if shell_top.0.is_null() {
-            return PopupZTarget::BehindApps(HWND_BOTTOM);
+            return PopupZTarget::BehindApps {
+                prev_app: HWND_BOTTOM,
+                shell_top: HWND::default(),
+            };
+        }
+
+        let shell_ex = GetWindowLongPtrW(shell_top, GWL_EXSTYLE) as u32;
+        if shell_ex & WS_EX_TOPMOST.0 != 0 {
+            let mut last_topmost = HWND::default();
+            let mut cur = GetWindow(shell_top, GW_HWNDPREV).unwrap_or_default();
+            let mut hops = 0usize;
+            while !cur.0.is_null() && hops < 4096 {
+                hops += 1;
+                if cur != clock_hwnd
+                    && !own_hwnds.contains(&(cur.0 as isize))
+                    && IsWindowVisible(cur).as_bool()
+                    && !is_desktop_shell_window(cur, progman, progman_pid)
+                {
+                    let ex = GetWindowLongPtrW(cur, GWL_EXSTYLE) as u32;
+                    if ex & WS_EX_TOPMOST.0 != 0 {
+                        last_topmost = cur;
+                        break;
+                    }
+                }
+                cur = GetWindow(cur, GW_HWNDPREV).unwrap_or_default();
+            }
+            return PopupZTarget::ShowDesktopTopmost(last_topmost);
         }
 
         let fg = GetForegroundWindow();
@@ -1333,9 +1445,13 @@ fn detect_popup_z_target(clock_hwnd: HWND, repositioning: bool) -> PopupZTarget 
         let mut last_topmost = HWND::default();
         let mut cur = GetWindow(shell_top, GW_HWNDPREV).unwrap_or_default();
         let mut hops = 0usize;
-        while !cur.0.is_null() && hops < 256 {
+        while !cur.0.is_null() && hops < 4096 {
             hops += 1;
-            if cur == clock_hwnd || !IsWindowVisible(cur).as_bool() {
+            if cur == clock_hwnd
+                || own_hwnds.contains(&(cur.0 as isize))
+                || !IsWindowVisible(cur).as_bool()
+                || is_desktop_shell_window(cur, progman, progman_pid)
+            {
                 cur = GetWindow(cur, GW_HWNDPREV).unwrap_or_default();
                 continue;
             }
@@ -1346,7 +1462,7 @@ fn detect_popup_z_target(clock_hwnd: HWND, repositioning: bool) -> PopupZTarget 
                 }
                 break;
             }
-            if prev_non_topmost.0.is_null() {
+            if is_real_app_window_above_shell(cur, clock_hwnd, own_hwnds, progman, progman_pid) {
                 prev_non_topmost = cur;
                 break;
             }
@@ -1354,12 +1470,15 @@ fn detect_popup_z_target(clock_hwnd: HWND, repositioning: bool) -> PopupZTarget 
         }
 
         // Exact Rainmeter ShowDesktop rule: if desktop is foreground or sits directly under TOPMOST band.
-        let show_desktop =
-            prev_non_topmost.0.is_null() || window_belongs_to_shell(fg, shell_top, progman);
+        let show_desktop = prev_non_topmost.0.is_null()
+            || window_belongs_to_shell(fg, shell_top, progman, progman_pid);
         if show_desktop {
             PopupZTarget::ShowDesktopTopmost(last_topmost)
         } else {
-            PopupZTarget::BehindApps(prev_non_topmost)
+            PopupZTarget::BehindApps {
+                prev_app: prev_non_topmost,
+                shell_top,
+            }
         }
     }
 }
@@ -1397,7 +1516,10 @@ fn place_popup_on_desktop(
                     );
                 }
             }
-            PopupZTarget::BehindApps(prev_app) => {
+            PopupZTarget::BehindApps {
+                prev_app,
+                shell_top,
+            } => {
                 let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
                 if ex & WS_EX_TOPMOST.0 != 0 {
                     let _ = SetWindowPos(
@@ -1411,6 +1533,12 @@ fn place_popup_on_desktop(
                     );
                 }
                 let _ = SetWindowPos(hwnd, prev_app, x, y, w, h, base_flags);
+                if !shell_top.0.is_null() && !is_above_in_zorder(hwnd, shell_top) {
+                    let _ = SetWindowPos(hwnd, HWND_TOP, x, y, w, h, base_flags);
+                    if !is_above_in_zorder(hwnd, shell_top) {
+                        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, base_flags);
+                    }
+                }
             }
         }
     }
@@ -2939,26 +3067,28 @@ fn render_and_place(hwnd: HWND) {
             }
 
             let next_bounds = (dst.x, dst.y, w, h, repositioning, behind_attached);
-            if last_bounds != Some(next_bounds) || !IsWindowVisible(hwnd).as_bool() {
-                if behind_attached && let Some(l) = cached_layer.filter(|&l| layer_still_valid(l)) {
-                    let after = if l.raised { l.icons } else { HWND_TOP };
-                    IN_ZORDER_SYNC.with(|g| g.set(true));
-                    let _ = SetWindowPos(
-                        hwnd,
-                        after,
-                        dst.x,
-                        dst.y,
-                        w,
-                        h,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    );
-                    IN_ZORDER_SYNC.with(|g| g.set(false));
-                } else {
-                    place_popup_on_desktop(hwnd, dst.x, dst.y, w, h, true, repositioning);
-                }
-            }
-
+            let place_needed = last_bounds != Some(next_bounds) || !IsWindowVisible(hwnd).as_bool();
             if has_dcomp {
+                if place_needed {
+                    if behind_attached
+                        && let Some(l) = cached_layer.filter(|&l| layer_still_valid(l))
+                    {
+                        let after = if l.raised { l.icons } else { HWND_TOP };
+                        IN_ZORDER_SYNC.with(|g| g.set(true));
+                        let _ = SetWindowPos(
+                            hwnd,
+                            after,
+                            dst.x,
+                            dst.y,
+                            w,
+                            h,
+                            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                        );
+                        IN_ZORDER_SYNC.with(|g| g.set(false));
+                    } else {
+                        place_popup_on_desktop(hwnd, dst.x, dst.y, w, h, true, repositioning);
+                    }
+                }
                 let ok = CLOCK_RUNTIME.with(|slot| {
                     slot.borrow_mut()
                         .as_mut()
@@ -2997,6 +3127,26 @@ fn render_and_place(hwnd: HWND) {
                     Some(&blend),
                     ULW_ALPHA,
                 );
+                if place_needed {
+                    if behind_attached
+                        && let Some(l) = cached_layer.filter(|&l| layer_still_valid(l))
+                    {
+                        let after = if l.raised { l.icons } else { HWND_TOP };
+                        IN_ZORDER_SYNC.with(|g| g.set(true));
+                        let _ = SetWindowPos(
+                            hwnd,
+                            after,
+                            dst.x,
+                            dst.y,
+                            w,
+                            h,
+                            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                        );
+                        IN_ZORDER_SYNC.with(|g| g.set(false));
+                    } else {
+                        place_popup_on_desktop(hwnd, dst.x, dst.y, w, h, true, repositioning);
+                    }
+                }
             }
 
             CLOCK_RUNTIME.with(|slot| {
@@ -3025,20 +3175,7 @@ fn render_and_place(hwnd: HWND) {
     sync_clock_input();
 }
 
-fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
-    let (owner, action_msg, cfg, repositioning) = match CLOCK_RUNTIME.with(|s| {
-        s.borrow().as_ref().map(|r| {
-            (
-                HWND(r.owner as *mut c_void),
-                r.action_msg,
-                r.cfg,
-                r.repositioning,
-            )
-        })
-    }) {
-        Some(v) => v,
-        None => return,
-    };
+fn build_context_menu_items(cfg: ClockConfig, repositioning: bool) -> Vec<(usize, &'static str)> {
     let lock_label = if cfg.locked {
         "Lock position (On)"
     } else {
@@ -3055,8 +3192,8 @@ fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
         "12-hour clock (AM/PM)"
     };
     let mut items: Vec<(usize, &str)> = vec![
-        (CLOCK_CTX_SIZE_DELTA + 1, "Bigger\tScroll up"),
-        (CLOCK_CTX_SIZE_DELTA + 2, "Smaller\tScroll down"),
+        (CTX_LOCAL_SIZE_UP, "Bigger (Scroll up)"),
+        (CTX_LOCAL_SIZE_DOWN, "Smaller (Scroll down)"),
         (CLOCK_CTX_PICK_COLOR, "Pick colour from screen..."),
         (CLOCK_CTX_24H, fmt_label),
         (CLOCK_CTX_LOCK, lock_label),
@@ -3067,6 +3204,24 @@ fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
     }
     items.push((CLOCK_CTX_OPEN_SETTINGS, "Widget settings"));
     items.push((CLOCK_CTX_REMOVE, "Remove from desktop"));
+    items
+}
+
+fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
+    let (owner, action_msg, cfg, repositioning) = match CLOCK_RUNTIME.with(|s| {
+        s.borrow().as_ref().map(|r| {
+            (
+                HWND(r.owner as *mut c_void),
+                r.action_msg,
+                r.cfg,
+                r.repositioning,
+            )
+        })
+    }) {
+        Some(v) => v,
+        None => return,
+    };
+    let items = build_context_menu_items(cfg, repositioning);
 
     let target_owner = if !owner.0.is_null()
         && unsafe { IsWindow(owner).as_bool() && IsWindowVisible(owner).as_bool() }
@@ -3095,12 +3250,12 @@ fn show_context_menu(hwnd: HWND, screen_pt: POINT) {
         if owner.0.is_null() {
             return;
         }
-        if choice == CLOCK_CTX_SIZE_DELTA + 1 {
+        if choice == CTX_LOCAL_SIZE_UP {
             CLOCK_WHEEL_STEPS.with(|s| *s.borrow_mut() += 2);
             unsafe {
                 let _ = PostMessageW(owner, action_msg, WPARAM(CLOCK_CTX_SIZE_DELTA), LPARAM(0));
             }
-        } else if choice == CLOCK_CTX_SIZE_DELTA + 2 {
+        } else if choice == CTX_LOCAL_SIZE_DOWN {
             CLOCK_WHEEL_STEPS.with(|s| *s.borrow_mut() -= 2);
             unsafe {
                 let _ = PostMessageW(owner, action_msg, WPARAM(CLOCK_CTX_SIZE_DELTA), LPARAM(0));
@@ -4622,5 +4777,103 @@ mod tests {
             resolve_screen_position(None, left_monitor, 400, 180),
             (-1160, 170)
         );
+    }
+
+    #[test]
+    fn context_menu_ids_are_unique_and_formatted_without_tabs() {
+        for repositioning in [false, true] {
+            let items = build_context_menu_items(ClockConfig::default(), repositioning);
+            let mut ids: Vec<usize> = items.iter().map(|(id, _)| *id).collect();
+            let count = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                count,
+                "context menu command IDs must never collide (repositioning={repositioning})"
+            );
+            for (id, label) in &items {
+                assert!(*id != 0, "menu ID must be non-zero for {label}");
+                assert!(
+                    !label.contains('\t'),
+                    "menu label `{label}` must not contain unexpanded tabs"
+                );
+            }
+            assert!(
+                items
+                    .iter()
+                    .any(|&(id, l)| id == CLOCK_CTX_24H && l.contains("24-hour"))
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|&(id, l)| id == CLOCK_CTX_LOCK && l.contains("Lock position"))
+            );
+            assert!(
+                items.iter().any(|&(id, _)| id == CTX_LOCAL_SIZE_UP)
+                    && items.iter().any(|&(id, _)| id == CTX_LOCAL_SIZE_DOWN)
+            );
+        }
+    }
+
+    #[test]
+    fn zorder_helper_detects_relative_window_order() {
+        // SAFETY: isolated hidden WS_POPUP windows strictly created and destroyed on this test thread.
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            let lower = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("WallpaperLive ZOrder Lower"),
+                WS_POPUP,
+                10,
+                10,
+                100,
+                100,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .unwrap();
+            let upper = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("WallpaperLive ZOrder Upper"),
+                WS_POPUP,
+                20,
+                20,
+                100,
+                100,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .unwrap();
+            let _ = SetWindowPos(
+                lower,
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                upper,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            assert!(is_above_in_zorder(upper, lower));
+            assert!(!is_above_in_zorder(lower, upper));
+            assert!(!is_above_in_zorder(upper, upper));
+            let _ = DestroyWindow(upper);
+            let _ = DestroyWindow(lower);
+        }
     }
 }
