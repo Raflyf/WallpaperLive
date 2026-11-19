@@ -13,10 +13,28 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ## Unreleased
 
-- Add a main-page **GPU** selector in the Library sidebar (`Auto`, `Power Saving (iGPU)`, `High Performance (dGPU)`), where `Auto` selects a dedicated GPU when available and falls back to integrated graphics (with `low_memory_uma <= 512 MiB` limits) on integrated-only devices.
-- Eliminate window drag-move frame drops, UI stutter, frozen drag backgrounds, and post-drag/minimize/maximize/restore Acrylic brightness shifts by recognizing move-only `WM_WINDOWPOSCHANGING` ticks without `SWP_NOSIZE` (preventing per-frame `SWP_NOCOPYBITS` and `WM_SIZE` full-tree redraws while keeping live DWM Acrylic active and unfrozen during drag), preserving natural wallpaper luminance in `tint_transition_backdrop_pixel` during minimize/maximize/restore zoom animations and smoothstep fade-ins (`0x053c_3a38`), keeping translucent 3D glass rims on buttons, sections, toggles, search bar, and dropdowns, and making the `FPS` and `Quality` pills symmetrical (`142 x 32`).
-- Replace coarse monitor occlusion checks with per-display `EnumWindows` + `DWMWA_EXTENDED_FRAME_BOUNDS` 2D union coverage, `SetWinEventHook` reactivity, and adaptive `500 ms` / `2000 ms` timer polling while keeping instant `0 ms` warm pause/resume on maximize, fullscreen, battery, and manual pause (`3 s` release preserved for lock, display-off, sleep, and remote sessions).
-- Enable Windows EcoQoS efficiency mode, background heap compaction (`HeapCompact`), working-set trimming, single-core (`SetProcessAffinityMask`) / single-thread `PROCESS_MODE_BACKGROUND_BEGIN` cache transcoding (`CACHE_FPS=60`), clean `partial-*.mp4` reclamation, and `mpv` overhead tuning (`swapchain-depth=1`, disk shader caching, `rgb10_a2` on Optimize, `gpu-dumb-mode=yes` on Low) without altering user-selectable `Native` or `High` fidelity.
+---
+
+## v0.2.3
+
+### Added
+
+- **Main-page GPU selector (`GPU_PREF`):** Added a **GPU** selector (`Auto`, `Power Saving (iGPU)`, `High Performance (dGPU)`) directly on the main **Library** right sidebar below `FPS` and `Quality`. `Auto` prefers a dedicated hardware GPU (`dedicated_vram > 512 MiB`, selecting the highest-VRAM adapter with target-monitor tie-breaking) when available and falls back to integrated graphics (`low_memory_uma: true`) on integrated-only devices.
+
+### Changed
+
+- **Symmetrical Library sidebar pills & translucent 3D Acrylic controls:** Made the `FPS` (`142 x 32`) and `Quality` (`142 x 32`) selector pills symmetrical with a `12px` gap and compact text/chevron alignment, while pairing a clear DWM Acrylic window backdrop (`ACRYLIC_TINT_COLOR = 0x053c_3a38`) with raised translucent 3D glass rims (`CREAM` / `GLASS_RIM` top specular highlights and upper-face sheen) across buttons, sections, toggles, search bar, and dropdown menus.
+- **Per-display 2D union occlusion & adaptive auto-pause:** Replaced single-window foreground checks with per-monitor `EnumWindows` + `DWMWA_EXTENDED_FRAME_BOUNDS` 2D rectangle union coverage (`>= 95%` monitor area), `SetWinEventHook` reactivity, and adaptive `500 ms` / `2000 ms` timer polling while preserving instant `0 ms` warm pause/resume on maximize, fullscreen, occlusion, battery, and manual pause (`3 s` dormant release preserved for lock, display-off, sleep, and remote sessions).
+
+### Performance
+
+- **Smooth live-Acrylic window dragging:** Recognized move-only `WM_WINDOWPOSCHANGING` ticks during Windows' native `SC_MOVE` modal drag loop (`pos.cx == cur_w && pos.cy == cur_h`) and tagged them with `SWP_NOSIZE`, eliminating per-mouse-tick `SWP_NOCOPYBITS` copy-bit discards and `WM_SIZE` full child-tree layout/redraw cascades while keeping live DWM Acrylic active and unfrozen throughout the drag.
+- **Runtime & cache efficiency:** Enabled Windows EcoQoS efficiency mode, background heap compaction (`HeapCompact`) and working-set trimming on pause, single-core (`SetProcessAffinityMask`) / single-thread `PROCESS_MODE_BACKGROUND_BEGIN` background cache transcoding (`CACHE_FPS = 60`), RAII `partial-*.mp4` cleanup on interrupted conversions, and `mpv` overhead tuning (`swapchain-depth=1`, disk shader cache, `rgb10_a2` on Optimize, `gpu-dumb-mode=yes` on Low) without altering `Native` or `High` quality presets.
+
+### Verification and limits
+
+- Update application, manifest, and WiX installer metadata to `0.2.3`.
+- Release v0.2.3 publishes `wallpaperlivesetup-v0.2.3.msi` and `SHA256SUMS.txt` via the GitHub Actions Release workflow.
 
 ---
 
