@@ -1585,7 +1585,7 @@ pub fn tick_animations(window: HWND) -> bool {
     }
     if finish_fade {
         finish_backdrop_transition(window);
-    } else if fade_tick && !glass_enabled(window) {
+    } else if fade_tick && TRANSITION_BACKDROP.with(|s| s.borrow().pixels.len() > 1) {
         unsafe {
             redraw_backdrop_surfaces(window);
         }
@@ -2881,7 +2881,8 @@ impl PaintBuffer {
         }
         TRANSITION_BACKDROP.with(|slot| {
             let bd = slot.borrow();
-            if !bd.active || bd.pixels.is_empty() || bd.width <= 0 || bd.height <= 0 {
+            if !bd.active || bd.drag_move || bd.pixels.len() <= 1 || bd.width <= 0 || bd.height <= 0
+            {
                 return;
             }
             let total_bg = (bd.width as usize).saturating_mul(bd.height as usize);
@@ -2920,9 +2921,6 @@ impl PaintBuffer {
             } else {
                 return;
             };
-            if glass_enabled(root) {
-                return;
-            }
             let (win_left, win_top) = if let Some(pt) = self.client_origin {
                 (pt.x, pt.y)
             } else if unsafe {
@@ -4254,18 +4252,13 @@ fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let g = (px >> 8) & 255;
     let b = px & 255;
     let y_px = (77 * r + 150 * g + 29 * b + 128) >> 8;
-    // Preserve ~94% of wallpaper chroma before the 5/255 tint blend (~0.92 total, lighter Win11 DWM Acrylic).
+    // Preserve ~94% of wallpaper chroma and natural luminance before the 5/255 tint blend
+    // so transition frames match steady-state 0x053c_3a38 DWM Acrylic without a bright flash.
     let desat = |ch: u32| -> u32 { (ch * 240 + y_px * 15 + 127) / 255 };
     let dr = desat(r);
     let dg = desat(g);
     let db = desat(b);
-    let y_desat = (77 * dr + 150 * dg + 29 * db + 128) >> 8;
-    let y_target = 65 + (y_px * 30 + 127) / 255;
-    let dy = y_target as i32 - y_desat as i32;
-    let blend = |ch: u32, tint_ch: u32| -> u32 {
-        let shifted = (ch as i32 + dy).clamp(0, 255) as u32;
-        (shifted * 250 + tint_ch * 5 + 127) / 255
-    };
+    let blend = |ch: u32, tint_ch: u32| -> u32 { (ch * 250 + tint_ch * 5 + 127) / 255 };
     let out_r = blend(dr, tint_r);
     let out_g = blend(dg, tint_g);
     let out_b = blend(db, tint_b);
@@ -4887,6 +4880,20 @@ pub fn begin_backdrop_transition(window: HWND) {
             bd.fade_duration_ms = 0;
         });
         disarm_timer_if_idle(window);
+        if !iconic_or_hidden {
+            let _ = RedrawWindow(
+                window,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
+            // Flush the alpha=255 frame to DWM before DefWindowProcW snapshots the From visual.
+            if windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled()
+                .is_ok_and(|enabled| enabled.as_bool())
+            {
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            }
+        }
     }
 }
 
@@ -4956,16 +4963,20 @@ pub fn end_minimize_backdrop_transition(window: HWND) {
 }
 
 pub fn finish_backdrop_transition(window: HWND) {
-    let was_suspended = TRANSITION_BACKDROP.with(|slot| {
+    let (was_suspended, had_real_backdrop) = TRANSITION_BACKDROP.with(|slot| {
         let bd = slot.borrow();
-        (window.0.is_null() || bd.hwnd == window.0 as isize) && bd.acrylic_suspended
+        let matches = window.0.is_null() || bd.hwnd == window.0 as isize;
+        (
+            matches && bd.acrylic_suspended,
+            matches && bd.pixels.len() > 1,
+        )
     });
     reset_transition_backdrop(window, true);
     trim_transient_caches();
     if window.0.is_null() {
         return;
     }
-    // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND if still suspended.
+    // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND if still suspended, then redraws when transition pixels were active.
     unsafe {
         if !IsWindow(window).as_bool()
             || IsIconic(window).as_bool()
@@ -4980,7 +4991,7 @@ pub fn finish_backdrop_transition(window: HWND) {
         {
             let _ = set_acrylic_composition(window, true);
         }
-        if !glass_enabled(window) {
+        if had_real_backdrop || !glass_enabled(window) {
             redraw_backdrop_surfaces(window);
         }
     }
@@ -8756,41 +8767,41 @@ mod tests {
         for px in [dark, mid, bright, neutral_dark, fallback, black, white] {
             assert_eq!(px >> 24, 0xFF);
         }
-        assert!((64..=72).contains(&luma(black)));
-        assert!((64..=72).contains(&luma(neutral_dark)));
-        assert!((65..=74).contains(&luma(fallback)));
-        assert!((66..=75).contains(&luma(dark)));
-        assert!((76..=86).contains(&luma(mid)));
-        assert!((80..=90).contains(&luma(bright)));
-        assert!((90..=98).contains(&luma(white)));
-        assert!(luma(white) - luma(black) >= 20);
+        assert!((0..=4).contains(&luma(black)));
+        assert!((6..=13).contains(&luma(neutral_dark)));
+        assert!((15..=22).contains(&luma(fallback)));
+        assert!((29..=36).contains(&luma(dark)));
+        assert!((123..=131).contains(&luma(mid)));
+        assert!((170..=178).contains(&luma(bright)));
+        assert!((247..=255).contains(&luma(white)));
+        assert!(luma(white) - luma(black) >= 240);
         let (ndr, _ndg, ndb) = rgb(neutral_dark);
         assert!(ndb >= ndr);
 
         let orange = tint_transition_backdrop_pixel(0xFFE0_8820);
         assert_eq!(orange >> 24, 0xFF);
-        assert!((76..=94).contains(&luma(orange)));
+        assert!((140..=164).contains(&luma(orange)));
         let (or, og, ob) = rgb(orange);
         assert!(or > og && og > ob);
         assert!(or - ob >= 100);
 
         let peach = tint_transition_backdrop_pixel(0xFFE0_88A0);
         assert_eq!(peach >> 24, 0xFF);
-        assert!((76..=94).contains(&luma(peach)));
+        assert!((152..=176).contains(&luma(peach)));
         let (pr, pg, pb) = rgb(peach);
         assert!(pr > pb && pb > pg);
         assert!(pr - pg >= 50);
 
         let amber_peach = tint_transition_backdrop_pixel(0xFFD8_9870);
         assert_eq!(amber_peach >> 24, 0xFF);
-        assert!((76..=94).contains(&luma(amber_peach)));
+        assert!((152..=176).contains(&luma(amber_peach)));
         let (ar, ag, ab) = rgb(amber_peach);
         assert!(ar > ag && ag > ab);
         assert!(ar - ab >= 65);
 
         let cyan = tint_transition_backdrop_pixel(0xFF20_90D0);
         assert_eq!(cyan >> 24, 0xFF);
-        assert!((72..=90).contains(&luma(cyan)));
+        assert!((104..=126).contains(&luma(cyan)));
         let (cr, cg, cb) = rgb(cyan);
         assert!(cb > cg && cg > cr);
         assert!(cb - cr >= 100);
