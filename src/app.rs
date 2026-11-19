@@ -6131,6 +6131,18 @@ unsafe extern "system" fn window_proc(
                 }
                 def
             }
+            WM_NCLBUTTONDOWN => {
+                if wparam.0 as u32 == HTCAPTION && !IsZoomed(window).as_bool() {
+                    let _ = visuals::begin_drag_move_backdrop(window);
+                }
+                let res = DefWindowProcW(window, message, wparam, lparam);
+                if GetPropW(window, SIZE_MOVE_PROPERTY).0.is_null()
+                    && visuals::drag_move_backdrop_active(window)
+                {
+                    visuals::end_drag_move_backdrop(window);
+                }
+                res
+            }
             WM_NCMOUSEMOVE => {
                 if wparam.0 as u32 != HTCLIENT {
                     visuals::set_caption_hover(window, None);
@@ -6337,7 +6349,14 @@ unsafe extern "system" fn window_proc(
             WM_WINDOWPOSCHANGING if lparam.0 != 0 => {
                 let pos = &mut *(lparam.0 as *mut WINDOWPOS);
                 let iconic = IsIconic(window).as_bool();
-                if !iconic && (pos.flags.0 & SWP_NOSIZE.0) != 0 && pos.x > -30000 {
+                let mut cur_rect = RECT::default();
+                let has_cur_rect = !iconic && GetWindowRect(window, &mut cur_rect).is_ok();
+                let cur_w = cur_rect.right - cur_rect.left;
+                let cur_h = cur_rect.bottom - cur_rect.top;
+                let same_size = (pos.flags.0 & SWP_NOSIZE.0) != 0
+                    || (has_cur_rect && pos.cx == cur_w && pos.cy == cur_h);
+                if !iconic && same_size && pos.x > -30000 {
+                    pos.flags |= SWP_NOSIZE;
                     if (pos.flags.0 & (SWP_NOMOVE.0 | SWP_HIDEWINDOW.0)) == 0
                         && !GetPropW(window, SIZE_MOVE_PROPERTY).0.is_null()
                     {
@@ -8927,7 +8946,7 @@ mod tests {
             .expect("drag backdrop test window");
             let _ = ShowWindow(hwnd, SW_SHOWNA);
 
-            let send_pos = |x, y, cx, cy, flags| {
+            let send_pos = |x, y, cx, cy, flags| -> SET_WINDOW_POS_FLAGS {
                 let mut pos = WINDOWPOS {
                     hwnd,
                     hwndInsertAfter: HWND::default(),
@@ -8946,24 +8965,31 @@ mod tests {
                     ),
                     LRESULT(0)
                 );
+                pos.flags
             };
 
             if visuals::enable_backdrop(hwnd) {
                 visuals::set_os_animations_for_test(Some(true));
                 let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
-                send_pos(120, 120, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = send_pos(120, 120, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
                 assert!(visuals::drag_move_backdrop_active(hwnd));
                 assert!(visuals::backdrop_transition_active(hwnd));
 
+                // Native SC_MOVE modal drag sends unchanged (cx, cy) without SWP_NOSIZE: must stay in fast drag mode without SWP_NOCOPYBITS.
+                let move_flags = send_pos(130, 130, 240, 160, SWP_NOZORDER | SWP_NOACTIVATE);
+                assert!(visuals::drag_move_backdrop_active(hwnd));
+                assert_ne!(move_flags.0 & SWP_NOSIZE.0, 0);
+                assert_eq!(move_flags.0 & SWP_NOCOPYBITS.0, 0);
+
                 // Aero Snap / resize mid-drag cancels the cached drag-move backdrop cleanly.
-                send_pos(0, 0, 320, 240, SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = send_pos(0, 0, 320, 240, SWP_NOZORDER | SWP_NOACTIVATE);
                 assert!(!visuals::drag_move_backdrop_active(hwnd));
                 assert!(!visuals::backdrop_transition_active(hwnd));
                 let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
 
                 // Subsequent drag moves keep drag_move_backdrop_active until WM_EXITSIZEMOVE fades out.
                 let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
-                send_pos(140, 140, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = send_pos(140, 140, 240, 160, SWP_NOZORDER | SWP_NOACTIVATE);
                 assert!(visuals::drag_move_backdrop_active(hwnd));
                 let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
                 assert!(!visuals::drag_move_backdrop_active(hwnd));
@@ -8975,7 +9001,7 @@ mod tests {
                 // Even with OS animations disabled, drag-move uses the fast backdrop and finishes at 0ms.
                 visuals::set_os_animations_for_test(Some(false));
                 let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
-                send_pos(160, 160, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = send_pos(160, 160, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
                 assert!(visuals::drag_move_backdrop_active(hwnd));
                 let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
                 assert!(!visuals::drag_move_backdrop_active(hwnd));
