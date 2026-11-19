@@ -116,40 +116,59 @@ fn preparation_output(
             .map(|_| bytes)
     });
     let start = Instant::now();
-    let success = loop {
-        if let Some(ok) = child.try_wait()? {
-            break ok;
+    let wait_result = loop {
+        match child.try_wait() {
+            Ok(Some(ok)) => break Ok(ok),
+            Ok(None) => {}
+            Err(e) => break Err(e),
         }
         if cancelled.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(920) {
-            child.kill_and_wait()?;
-            let _ = reader.join();
-            if let Some(dir) = directory {
-                remove_pid_partials(dir, pid);
-            }
-            return Err(if cancelled.load(Ordering::Relaxed) {
-                "Preparation cancelled"
-            } else {
-                "Video preparation timed out"
-            }
-            .into());
+            break match child.kill_and_wait() {
+                Ok(()) => Err(if cancelled.load(Ordering::Relaxed) {
+                    "Preparation cancelled"
+                } else {
+                    "Video preparation timed out"
+                }
+                .into()),
+                Err(e) => Err(e),
+            };
         }
         std::thread::park_timeout(Duration::from_millis(50));
     };
-    let bytes = reader
-        .join()
-        .map_err(|_| "Preparation reader failed")?
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > RESPONSE_LIMIT as usize {
+    drop(child);
+    let read_result = reader.join();
+    let cleanup = || {
         if let Some(dir) = directory {
             remove_pid_partials(dir, pid);
         }
+    };
+    let success = match wait_result {
+        Ok(ok) => ok,
+        Err(e) => {
+            cleanup();
+            return Err(e);
+        }
+    };
+    let bytes = match read_result
+        .map_err(|_| "Preparation reader failed".to_owned())
+        .and_then(|res| res.map_err(|e| e.to_string()))
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            cleanup();
+            return Err(e);
+        }
+    };
+    if bytes.len() > RESPONSE_LIMIT as usize {
+        cleanup();
         return Err("Preparation response is too large".into());
     }
-    let text = String::from_utf8(bytes).map_err(|_| "Invalid preparation response")?;
+    let Ok(text) = String::from_utf8(bytes) else {
+        cleanup();
+        return Err("Invalid preparation response".into());
+    };
     if !success {
-        if let Some(dir) = directory {
-            remove_pid_partials(dir, pid);
-        }
+        cleanup();
         return Err(text
             .strip_prefix("error\n")
             .unwrap_or("Video preparation failed")
@@ -157,6 +176,7 @@ fn preparation_output(
             .to_owned());
     }
     if cancelled.load(Ordering::Relaxed) {
+        cleanup();
         return Err("Preparation cancelled".into());
     }
     Ok(text)

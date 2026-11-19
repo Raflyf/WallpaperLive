@@ -485,7 +485,7 @@ fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
 }
 
 fn control_corner_ellipse(id: usize, dpi: i32) -> i32 {
-    let base = if matches!(id, TAB_LIBRARY | TAB_SETTINGS) {
+    let base = if matches!(id, TAB_LIBRARY | TAB_SETTINGS | TAB_CLOCK) {
         18
     } else if id == PREVIEW || (TILE_BASE..TILE_BASE + 9).contains(&id) {
         12
@@ -9997,5 +9997,14 @@ mod tests {
         assert_eq!(tab_slide_direction(Tab::Library, Tab::Sources), -1);
         assert_eq!(tab_slide_direction(Tab::Sources, Tab::Library), 1);
         assert_eq!(tab_slide_direction(Tab::Sources, Tab::Settings), -1);
+    }
+
+    #[test]
+    fn header_tabs_share_consistent_corner_ellipse() {
+        for dpi in [96, 144] {
+            let expected = control_corner_ellipse(TAB_LIBRARY, dpi);
+            assert_eq!(control_corner_ellipse(TAB_SETTINGS, dpi), expected);
+            assert_eq!(control_corner_ellipse(TAB_CLOCK, dpi), expected);
+        }
     }
 }

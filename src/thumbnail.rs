@@ -135,106 +135,115 @@ impl SilentChild {
         let nul_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open("NUL")
+            .open(r"\\.\NUL")
             .map_err(|e| format!("Could not open NUL device: {e}"))?;
-        let stdin_pipe = if pipe_stdin {
-            Some(std::io::pipe().map_err(|e| format!("Could not create worker stdin pipe: {e}"))?)
+        #[cfg(test)]
+        let (stdin_reader, stdin_writer) = if pipe_stdin {
+            let (r, w) =
+                std::io::pipe().map_err(|e| format!("Could not create worker stdin pipe: {e}"))?;
+            (Some(r), Some(w))
         } else {
-            None
+            (None, None)
+        };
+        #[cfg(not(test))]
+        let stdin_reader = {
+            let _ = pipe_stdin;
+            None::<std::io::PipeReader>
         };
 
         let app_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut cmd_wide = build_windows_command_line(exe, args);
-        let nul_handle = HANDLE(nul_file.as_raw_handle());
-        let stdout_write_handle = HANDLE(stdout_writer.as_raw_handle());
-        let stdin_handle = stdin_pipe
-            .as_ref()
-            .map_or(nul_handle, |(r, _)| HANDLE(r.as_raw_handle()));
-        let inherit_storage = [nul_handle, stdout_write_handle, stdin_handle];
-        let inherit_handles = if pipe_stdin {
-            &inherit_storage[..3]
-        } else {
-            &inherit_storage[..2]
+
+        let pi = {
+            let _lock = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep inheritable handles inner-scoped so Rust drops them strictly before `_lock`.
+            let _nul_guard = nul_file;
+            let _stdout_guard = stdout_writer;
+            let _stdin_guard = stdin_reader;
+            let nul_handle = HANDLE(_nul_guard.as_raw_handle());
+            let stdout_write_handle = HANDLE(_stdout_guard.as_raw_handle());
+            let stdin_handle = _stdin_guard
+                .as_ref()
+                .map_or(nul_handle, |r| HANDLE(r.as_raw_handle()));
+            let inherit_storage = [nul_handle, stdout_write_handle, stdin_handle];
+            let inherit_handles = if pipe_stdin {
+                &inherit_storage[..3]
+            } else {
+                &inherit_storage[..2]
+            };
+
+            // SAFETY: `attr_list._buf`, `inherit_handles`, `app_wide`, and `cmd_wide` stay alive across CreateProcessW.
+            unsafe {
+                for &h in inherit_handles {
+                    SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
+                        .map_err(|e| format!("Could not mark worker handle inheritable: {e}"))?;
+                }
+                let mut attr_size = 0usize;
+                let _ = InitializeProcThreadAttributeList(
+                    LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
+                    1,
+                    0,
+                    &mut attr_size,
+                );
+                if attr_size == 0 {
+                    return Err("Could not size worker attribute list".into());
+                }
+                let mut attr_list = ProcAttrList {
+                    _buf: vec![0u64; attr_size.div_ceil(size_of::<u64>())],
+                    ptr: LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
+                };
+                let list_ptr = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list._buf.as_mut_ptr().cast());
+                InitializeProcThreadAttributeList(list_ptr, 1, 0, &mut attr_size)
+                    .map_err(|e| format!("Could not initialize worker attribute list: {e}"))?;
+                attr_list.ptr = list_ptr;
+                UpdateProcThreadAttribute(
+                    attr_list.ptr,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    Some(inherit_handles.as_ptr().cast()),
+                    size_of_val(inherit_handles),
+                    None,
+                    None,
+                )
+                .map_err(|e| format!("Could not scope worker inherited handles: {e}"))?;
+
+                let startup = STARTUPINFOEXW {
+                    StartupInfo: STARTUPINFOW {
+                        cb: size_of::<STARTUPINFOEXW>() as u32,
+                        dwFlags: SILENT_STARTUP_FLAGS,
+                        hStdInput: stdin_handle,
+                        hStdOutput: stdout_write_handle,
+                        hStdError: nul_handle,
+                        ..Default::default()
+                    },
+                    lpAttributeList: attr_list.ptr,
+                };
+                let mut pi = PROCESS_INFORMATION::default();
+                CreateProcessW(
+                    PCWSTR(app_wide.as_ptr()),
+                    PWSTR(cmd_wide.as_mut_ptr()),
+                    None,
+                    None,
+                    true,
+                    PROCESS_CREATION_FLAGS(creation_flags | EXTENDED_STARTUPINFO_PRESENT.0),
+                    None,
+                    PCWSTR::null(),
+                    &startup.StartupInfo,
+                    &mut pi,
+                )
+                .map_err(|e| format!("Could not start worker process: {e}"))?;
+                if !pi.hThread.is_invalid() {
+                    let _ = CloseHandle(pi.hThread);
+                }
+                let _keep_alive = &inherit_storage;
+                pi
+            }
         };
 
-        let _lock = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `attr_list._buf`, `inherit_handles`, `app_wide`, and `cmd_wide` stay alive across CreateProcessW.
-        let pi = unsafe {
-            for &h in inherit_handles {
-                SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
-                    .map_err(|e| format!("Could not mark worker handle inheritable: {e}"))?;
-            }
-            let mut attr_size = 0usize;
-            let _ = InitializeProcThreadAttributeList(
-                LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
-                1,
-                0,
-                &mut attr_size,
-            );
-            if attr_size == 0 {
-                return Err("Could not size worker attribute list".into());
-            }
-            let mut attr_list = ProcAttrList {
-                _buf: vec![0u64; attr_size.div_ceil(size_of::<u64>())],
-                ptr: LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
-            };
-            let list_ptr = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list._buf.as_mut_ptr().cast());
-            InitializeProcThreadAttributeList(list_ptr, 1, 0, &mut attr_size)
-                .map_err(|e| format!("Could not initialize worker attribute list: {e}"))?;
-            attr_list.ptr = list_ptr;
-            UpdateProcThreadAttribute(
-                attr_list.ptr,
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                Some(inherit_handles.as_ptr().cast()),
-                size_of_val(inherit_handles),
-                None,
-                None,
-            )
-            .map_err(|e| format!("Could not scope worker inherited handles: {e}"))?;
-
-            let startup = STARTUPINFOEXW {
-                StartupInfo: STARTUPINFOW {
-                    cb: size_of::<STARTUPINFOEXW>() as u32,
-                    dwFlags: SILENT_STARTUP_FLAGS,
-                    hStdInput: stdin_handle,
-                    hStdOutput: stdout_write_handle,
-                    hStdError: nul_handle,
-                    ..Default::default()
-                },
-                lpAttributeList: attr_list.ptr,
-            };
-            let mut pi = PROCESS_INFORMATION::default();
-            CreateProcessW(
-                PCWSTR(app_wide.as_ptr()),
-                PWSTR(cmd_wide.as_mut_ptr()),
-                None,
-                None,
-                true,
-                PROCESS_CREATION_FLAGS(creation_flags | EXTENDED_STARTUPINFO_PRESENT.0),
-                None,
-                PCWSTR::null(),
-                &startup.StartupInfo,
-                &mut pi,
-            )
-            .map_err(|e| format!("Could not start worker process: {e}"))?;
-            if !pi.hThread.is_invalid() {
-                let _ = CloseHandle(pi.hThread);
-            }
-            let _keep_alive = &inherit_storage;
-            pi
-        };
-        drop(stdout_writer);
-        drop(nul_file);
-        #[cfg(test)]
-        let stdin_writer = stdin_pipe.map(|(r, w)| {
-            drop(r);
-            w
-        });
-        #[cfg(not(test))]
-        drop(stdin_pipe);
-
-        // SAFETY: `pi.hProcess` is a fresh unique HANDLE returned by CreateProcessW.
+        if pi.hProcess.is_invalid() {
+            return Err("Worker process returned an invalid handle".into());
+        }
+        // SAFETY: `pi.hProcess` is a verified valid unique HANDLE returned by CreateProcessW.
         let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0) };
         Ok(Self {
             process,
@@ -274,7 +283,8 @@ impl SilentChild {
         // SAFETY: terminates and reaps the owned process handle synchronously.
         unsafe {
             let term = TerminateProcess(h, 1);
-            let wait = WaitForSingleObject(h, INFINITE);
+            let timeout = if term.is_ok() { INFINITE } else { 5000 };
+            let wait = WaitForSingleObject(h, timeout);
             if wait != WAIT_OBJECT_0 {
                 return Err(format!("Could not wait for stopped worker ({})", wait.0));
             }
@@ -336,28 +346,31 @@ fn capture_output(
             .map(|_| output)
     });
     let start = Instant::now();
-    let success = loop {
-        if let Some(ok) = child.try_wait()? {
-            break ok;
+    let wait_result = loop {
+        match child.try_wait() {
+            Ok(Some(ok)) => break Ok(ok),
+            Ok(None) => {}
+            Err(e) => break Err(e),
         }
         if cancelled.load(std::sync::atomic::Ordering::Relaxed)
             || start.elapsed() >= Duration::from_secs(10)
         {
-            child
-                .kill_and_wait()
-                .map_err(|e| format!("Could not stop thumbnail worker: {e}"))?;
-            let _ = reader.join();
-            return Err(if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                "Thumbnail cancelled"
-            } else {
-                "Thumbnail worker timed out"
-            }
-            .into());
+            break match child.kill_and_wait() {
+                Ok(()) => Err(if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    "Thumbnail cancelled"
+                } else {
+                    "Thumbnail worker timed out"
+                }
+                .into()),
+                Err(e) => Err(format!("Could not stop thumbnail worker: {e}")),
+            };
         }
         std::thread::park_timeout(Duration::from_millis(50));
     };
-    let output = reader
-        .join()
+    drop(child);
+    let read_result = reader.join();
+    let success = wait_result?;
+    let output = read_result
         .map_err(|_| "Thumbnail output reader failed")?
         .map_err(|e| e.to_string())?;
     if !success {

@@ -13,11 +13,23 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ## Unreleased
 
-- Fix Day Clock right-click context menu command ID collision where selecting `24-hour clock` (`164`) or `Lock position` (`165`) previously triggered resize actions instead of toggling `24h` / `Lock`, and format `Bigger (Scroll up)` / `Smaller (Scroll down)` without unexpanded tabs.
-- Harden desktop popup Z-order detection (`is_desktop_shell_window`, `detect_popup_z_target`, `place_popup_on_desktop`) and `UpdateLayeredWindow` ordering so the Day Clock never slips behind Explorer/wallpaper `WorkerW` windows or `DWMWA_CLOAKED` helpers when `Behind desktop shortcuts` is off or when panel toggles are clicked, and restore `d3d11-flip=no` for clean desktop child compositing.
-- Prevent `Behind desktop shortcuts` off-mode popup invisibility caused by UIPI `SetWindowPos` `ERROR_ACCESS_DENIED` swallowing `SWP_SHOWWINDOW` against elevated/helper windows, upgrade `IN_ZORDER_SYNC` to a reentrant RAII guard, filter owned/tool/shell-helper windows from popup Z-targets, and commit `UpdateLayeredWindow` with `GdiFlush` + screen DC before and on reveal.
-- Switch Acrylic backdrop tint from slate grey (`#383A3C`) to smoked Ink Black (`#111111` at `0x0c`), reduce card/control/dropdown overlay alphas (`CARD_ALPHA = 16`, `DROPDOWN_ALPHA = 56`) so background wallpaper patterns show through more clearly, anchor solid-mode derived surfaces closer to `#111111` (`PANEL`/`CARD`/`CARD_LIT`), disable `fTransitionOnMaximized`, and call `refresh_acrylic_backdrop` immediately on maximize/restore.
-- Launch thumbnail and cache preparation workers via `CreateProcessW` with `STARTF_FORCEOFFFEEDBACK` (`SilentChild`) and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` so opening or restoring the WallpaperLive window no longer flashes the system `IDC_APPSTARTING` blue loading cursor ring.
+---
+
+## v0.2.4
+
+### Changed
+
+- **Deep Ink Black Acrylic & 3-color brand palette alignment:** Switched the Acrylic backdrop tint from slate grey (`#383A3C`) to smoked Ink Black (`#111111` at `0x0c`), lowered translucent surface alphas (`CARD_ALPHA = 16`, `DROPDOWN_ALPHA = 56`, empty tile `12`) so background wallpaper patterns remain visible, anchored solid-mode derived surfaces (`PANEL`, `CARD`, `CARD_LIT`, `LINE`, `HIGHLIGHT`, `DISABLED_*`, `GLASS_RIM`) strictly within the Ink Black / Cream / Burnt Orange palette, set `fTransitionOnMaximized: false`, refreshed Acrylic composition immediately on maximize/restore (`refresh_acrylic_backdrop`), and aligned the **Day Clock** header tab corner radius (`18px`) with **Library** and **Settings**.
+
+### Fixed
+
+- **Day Clock right-click context menu & desktop Z-order visibility:** Resolved the command ID collision where selecting `24-hour clock` (`164`) or `Lock position` (`165`) previously triggered resize actions (`CTX_LOCAL_SIZE_UP` / `CTX_LOCAL_SIZE_DOWN`) and formatted resize labels without unexpanded tabs (`Bigger (Scroll up)` / `Smaller (Scroll down)`). Hardened desktop shell Z-order detection (`is_desktop_shell_window`, `detect_popup_z_target`, `place_popup_on_desktop`) with a reentrant RAII `ZOrderSyncGuard`, shell-helper/owned/tool/cloaked window filtering, UIPI-resilient multi-candidate `BehindApps` verification, `GdiFlush` + screen-DC `UpdateLayeredWindow` reveal commits, and `d3d11-flip=no` compositing so the clock remains visible and properly ordered when toggling `Behind desktop shortcuts`.
+- **Silent worker launch (`IDC_APPSTARTING` cursor flash) & worker cleanup:** Launched thumbnail and cache preparation child workers via `CreateProcessW` with `STARTF_FORCEOFFFEEDBACK` and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`SilentChild`) to eliminate the rapidly blinking blue cursor loading ring when opening or restoring the panel, with strict `SPAWN_LOCK`-scoped inheritable handle closure, process-handle validity checks, bounded kill waits, guaranteed output-reader thread joining, and complete `partial-{pid}-*.mp4` cleanup across all preparation error paths.
+
+### Verification and limits
+
+- Update application, manifest, and WiX installer metadata to `0.2.4`.
+- Release v0.2.4 publishes `wallpaperlivesetup-v0.2.4.msi` and `SHA256SUMS.txt` via the GitHub Actions Release workflow.
 
 ---
 
