@@ -16,6 +16,7 @@ Release history for WallpaperLive. Each version describes its own changes; older
 - Fix Day Clock right-click context menu command ID collision where selecting `24-hour clock` (`164`) or `Lock position` (`165`) previously triggered resize actions instead of toggling `24h` / `Lock`, and format `Bigger (Scroll up)` / `Smaller (Scroll down)` without unexpanded tabs.
 - Harden desktop popup Z-order detection (`is_desktop_shell_window`, `detect_popup_z_target`, `place_popup_on_desktop`) and `UpdateLayeredWindow` ordering so the Day Clock never slips behind Explorer/wallpaper `WorkerW` windows or `DWMWA_CLOAKED` helpers when `Behind desktop shortcuts` is off or when panel toggles are clicked, and restore `d3d11-flip=no` for clean desktop child compositing.
 - Prevent `Behind desktop shortcuts` off-mode popup invisibility caused by UIPI `SetWindowPos` `ERROR_ACCESS_DENIED` swallowing `SWP_SHOWWINDOW` against elevated/helper windows, upgrade `IN_ZORDER_SYNC` to a reentrant RAII guard, filter owned/tool/shell-helper windows from popup Z-targets, and commit `UpdateLayeredWindow` with `GdiFlush` + screen DC before and on reveal.
+- Switch Acrylic backdrop tint from slate grey (`#383A3C`) to smoked Ink Black (`#111111` at `0x0c`), reduce card/control/dropdown overlay alphas (`CARD_ALPHA = 16`, `DROPDOWN_ALPHA = 56`) so background wallpaper patterns show through more clearly, anchor solid-mode derived surfaces closer to `#111111` (`PANEL`/`CARD`/`CARD_LIT`), disable `fTransitionOnMaximized`, and call `refresh_acrylic_backdrop` immediately on maximize/restore.
 
 ---
 

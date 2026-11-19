@@ -412,33 +412,32 @@ pub const ACCENT: u32 = ORANGE;
 pub const BODY: u32 = INK;
 pub const CANVAS: u32 = INK;
 pub const FOOTER: u32 = INK;
-pub const PANEL: u32 = mix(INK, CREAM, 8, 100);
-pub const CARD: u32 = mix(INK, CREAM, 14, 100);
-pub const CARD_LIT: u32 = mix(INK, CREAM, 23, 100);
-pub const LINE: u32 = mix(INK, CREAM, 42, 100);
-pub const HIGHLIGHT: u32 = mix(INK, CREAM, 60, 100);
+pub const PANEL: u32 = mix(INK, CREAM, 3, 100);
+pub const CARD: u32 = mix(INK, CREAM, 5, 100);
+pub const CARD_LIT: u32 = mix(INK, CREAM, 10, 100);
+pub const LINE: u32 = mix(INK, CREAM, 18, 100);
+pub const HIGHLIGHT: u32 = mix(INK, CREAM, 30, 100);
 pub const DISABLED_TEXT: u32 = mix(CREAM, INK, 26, 100);
-const DISABLED_FILL: u32 = mix(INK, CREAM, 10, 100);
-const DISABLED_BORDER: u32 = mix(INK, CREAM, 26, 100);
+const DISABLED_FILL: u32 = mix(INK, CREAM, 4, 100);
+const DISABLED_BORDER: u32 = mix(INK, CREAM, 12, 100);
 pub const ACTIVE_SURFACE: u32 = mix(INK, ORANGE, 26, 100);
 pub const ACCENT_DARK: u32 = mix(ORANGE, INK, 22, 100);
 pub const ACCENT_DEEP: u32 = mix(ORANGE, INK, 38, 100);
 pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
 pub const ACCENT_HOVER: u32 = mix(ORANGE, CREAM, 12, 100);
-pub const GLASS_RIM: u32 = mix(INK, CREAM, 74, 100);
+pub const GLASS_RIM: u32 = mix(INK, CREAM, 48, 100);
 pub const PANEL_ALPHA: u8 = 0;
-pub const CARD_ALPHA: u8 = 28;
-const CONTROL_ALPHA: u8 = 54;
-const HOVER_ALPHA: u8 = 92;
-const ACTIVE_TILE_ALPHA: u8 = 112;
+pub const CARD_ALPHA: u8 = 16;
+const CONTROL_ALPHA: u8 = 32;
+const HOVER_ALPHA: u8 = 64;
+const ACTIVE_TILE_ALPHA: u8 = 96;
 const ACTIVE_ALPHA: u8 = 244;
 pub const BORDER_ALPHA: u8 = 200;
 const DIVIDER_ALPHA: u8 = 136;
 const SEARCH_ALPHA: u8 = 228;
-pub const DROPDOWN_ALPHA: u8 = 76;
-// Subtle cool-neutral slate Acrylic tint (ABGR: AA=0x05, B=0x3c=60, G=0x3a=58, R=0x38=56)
-// keeps Win11 DWM Acrylic clear and airy without muting the wallpaper underneath.
-const ACRYLIC_TINT_COLOR: u32 = 0x053c_3a38;
+pub const DROPDOWN_ALPHA: u8 = 56;
+// Clear smoked Ink Black Acrylic tint (ABGR: AA=0x0c, #111111) avoids grey cast while letting wallpaper patterns show through.
+const ACRYLIC_TINT_COLOR: u32 = 0x0c11_1111;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -3537,7 +3536,7 @@ unsafe fn draw_item_into(
                 fill_alpha = if !glass_active {
                     255
                 } else if id == PREVIEW {
-                    if path.is_some() { CARD_ALPHA } else { 22 }
+                    if path.is_some() { CARD_ALPHA } else { 12 }
                 } else if active {
                     ACTIVE_TILE_ALPHA
                 } else if hot {
@@ -4064,7 +4063,7 @@ unsafe fn apply_accent_acrylic(window: HWND) -> bool {
             dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION | DWM_BB_TRANSITIONONMAXIMIZED,
             fEnable: true.into(),
             hRgnBlur: region,
-            fTransitionOnMaximized: true.into(),
+            fTransitionOnMaximized: false.into(),
         };
         let blur_ok = DwmEnableBlurBehindWindow(window, &blur).is_ok();
         if !region.0.is_null() {
@@ -4247,6 +4246,8 @@ fn map_backdrop_overlay_rects(
 }
 
 fn tint_transition_backdrop_pixel(px: u32) -> u32 {
+    let tint_a = (ACRYLIC_TINT_COLOR >> 24) & 255;
+    let inv_a = 255 - tint_a;
     let tint_b = (ACRYLIC_TINT_COLOR >> 16) & 255;
     let tint_g = (ACRYLIC_TINT_COLOR >> 8) & 255;
     let tint_r = ACRYLIC_TINT_COLOR & 255;
@@ -4254,17 +4255,17 @@ fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let g = (px >> 8) & 255;
     let b = px & 255;
     let y_px = (77 * r + 150 * g + 29 * b + 128) >> 8;
-    // Preserve ~94% of wallpaper chroma before the 5/255 tint blend (~0.92 total, lighter Win11 DWM Acrylic).
+    // Preserve ~94% of wallpaper chroma before the Ink Black Acrylic tint blend.
     let desat = |ch: u32| -> u32 { (ch * 240 + y_px * 15 + 127) / 255 };
     let dr = desat(r);
     let dg = desat(g);
     let db = desat(b);
     let y_desat = (77 * dr + 150 * dg + 29 * db + 128) >> 8;
-    let y_target = 65 + (y_px * 30 + 127) / 255;
+    let y_target = 22 + (y_px * 44 + 127) / 255;
     let dy = y_target as i32 - y_desat as i32;
     let blend = |ch: u32, tint_ch: u32| -> u32 {
         let shifted = (ch as i32 + dy).clamp(0, 255) as u32;
-        (shifted * 250 + tint_ch * 5 + 127) / 255
+        (shifted * inv_a + tint_ch * tint_a + 127) / 255
     };
     let out_r = blend(dr, tint_r);
     let out_g = blend(dg, tint_g);
@@ -5127,6 +5128,25 @@ pub fn enable_backdrop(window: HWND) -> bool {
         }
         sync_edit_layerings(window);
         true
+    }
+}
+
+pub fn refresh_acrylic_backdrop(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    // SAFETY: re-applies AccentPolicy on live non-iconic Acrylic windows immediately on maximize/restore.
+    unsafe {
+        if IsWindow(window).as_bool()
+            && !IsIconic(window).as_bool()
+            && IsWindowVisible(window).as_bool()
+            && glass_enabled(window)
+            && user_acrylic_enabled()
+            && transparency_enabled()
+            && !drag_move_backdrop_active(window)
+        {
+            let _ = set_acrylic_composition(window, true);
+        }
     }
 }
 
@@ -8756,44 +8776,46 @@ mod tests {
         for px in [dark, mid, bright, neutral_dark, fallback, black, white] {
             assert_eq!(px >> 24, 0xFF);
         }
-        assert!((64..=72).contains(&luma(black)));
-        assert!((64..=72).contains(&luma(neutral_dark)));
-        assert!((65..=74).contains(&luma(fallback)));
-        assert!((66..=75).contains(&luma(dark)));
-        assert!((76..=86).contains(&luma(mid)));
-        assert!((80..=90).contains(&luma(bright)));
-        assert!((90..=98).contains(&luma(white)));
-        assert!(luma(white) - luma(black) >= 20);
+        assert!((18..=26).contains(&luma(black)));
+        assert!((20..=28).contains(&luma(neutral_dark)));
+        assert!((21..=29).contains(&luma(fallback)));
+        assert!((23..=31).contains(&luma(dark)));
+        assert!((39..=47).contains(&luma(mid)));
+        assert!((46..=54).contains(&luma(bright)));
+        assert!((60..=68).contains(&luma(white)));
+        assert!(luma(white) - luma(black) >= 35);
+        let (fr, fg, fb) = rgb(fallback);
+        assert!(fr == fg && fg == fb);
         let (ndr, _ndg, ndb) = rgb(neutral_dark);
         assert!(ndb >= ndr);
 
         let orange = tint_transition_backdrop_pixel(0xFFE0_8820);
         assert_eq!(orange >> 24, 0xFF);
-        assert!((76..=94).contains(&luma(orange)));
+        assert!((46..=62).contains(&luma(orange)));
         let (or, og, ob) = rgb(orange);
         assert!(or > og && og > ob);
-        assert!(or - ob >= 100);
+        assert!(or - ob >= 90);
 
         let peach = tint_transition_backdrop_pixel(0xFFE0_88A0);
         assert_eq!(peach >> 24, 0xFF);
-        assert!((76..=94).contains(&luma(peach)));
+        assert!((42..=58).contains(&luma(peach)));
         let (pr, pg, pb) = rgb(peach);
         assert!(pr > pb && pb > pg);
         assert!(pr - pg >= 50);
 
         let amber_peach = tint_transition_backdrop_pixel(0xFFD8_9870);
         assert_eq!(amber_peach >> 24, 0xFF);
-        assert!((76..=94).contains(&luma(amber_peach)));
+        assert!((42..=58).contains(&luma(amber_peach)));
         let (ar, ag, ab) = rgb(amber_peach);
         assert!(ar > ag && ag > ab);
         assert!(ar - ab >= 65);
 
         let cyan = tint_transition_backdrop_pixel(0xFF20_90D0);
         assert_eq!(cyan >> 24, 0xFF);
-        assert!((72..=90).contains(&luma(cyan)));
+        assert!((44..=60).contains(&luma(cyan)));
         let (cr, cg, cb) = rgb(cyan);
         assert!(cb > cg && cg > cr);
-        assert!(cb - cr >= 100);
+        assert!(cb - cr >= 90);
     }
 
     #[test]
@@ -8966,10 +8988,10 @@ mod tests {
 
     #[test]
     fn ease_out_quart_and_transition_phase_separation() {
-        assert_eq!(CARD_ALPHA, 28);
+        assert_eq!(CARD_ALPHA, 16);
         assert_eq!(BORDER_ALPHA, 200);
-        assert_eq!(DROPDOWN_ALPHA, 76);
-        assert_eq!(ACRYLIC_TINT_COLOR, 0x053c_3a38);
+        assert_eq!(DROPDOWN_ALPHA, 56);
+        assert_eq!(ACRYLIC_TINT_COLOR, 0x0c11_1111);
         assert_eq!(ease_out_quart(-0.5), 0.0);
         assert_eq!(ease_out_quart(0.0), 0.0);
         assert_eq!(ease_out_quart(1.0), 1.0);

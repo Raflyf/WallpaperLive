@@ -6445,6 +6445,7 @@ unsafe extern "system" fn window_proc(
                     if was_iconic {
                         let _ = RemovePropW(window, ICONIC_PROPERTY);
                     }
+                    visuals::refresh_acrylic_backdrop(window);
                     let _ = RedrawWindow(
                         window,
                         None,
