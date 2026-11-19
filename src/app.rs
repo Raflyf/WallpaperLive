@@ -101,7 +101,6 @@ const CLASS: PCWSTR = w!("WallpaperLive.Panel");
 const APP_ID: PCWSTR = w!("Raflyf.WallpaperLive");
 const RESTORE_BACKDROP_TIMER_ID: usize = 4;
 const RESTORE_BACKDROP_MS: u32 = 320;
-const DRAG_MOVE_TIMER_ID: usize = 5;
 const ICONIC_PROPERTY: PCWSTR = w!("WallpaperLive.Iconic");
 const SIZE_MOVE_PROPERTY: PCWSTR = w!("WallpaperLive.SizeMove");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -109,19 +108,7 @@ static WINDOW_EVENT_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::
 static WINDOW_EVENT_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[derive(Default)]
-struct DragMoveState {
-    hwnd: isize,
-    interval_ms: u32,
-    last_commit: Option<Instant>,
-    pending: Option<(i32, i32)>,
-    timer_armed: bool,
-    flushing: bool,
-}
-
 thread_local! {
-    static DRAG_MOVE: std::cell::RefCell<DragMoveState> =
-        std::cell::RefCell::new(DragMoveState::default());
     static CLOCK_DRAG: std::cell::Cell<Option<visuals::ClockDragTarget>> =
         const { std::cell::Cell::new(None) };
     static HEX_EDIT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -243,130 +230,6 @@ fn transparentbar_menu_entries() -> [crate::tray::MenuEntry<'static>; 8] {
     let pattern = read_hkcu_dword(w!(r"Software\TransparentBar"), w!("TaskbarPattern"), true);
     let reduce_motion = read_hkcu_dword(w!(r"Software\TransparentBar"), w!("ReduceMotion"), false);
     build_transparentbar_entries(connector, startup, pattern, reduce_motion)
-}
-
-fn enter_drag_move(window: HWND) {
-    let interval_ms = visuals::drag_pacing_ms().max(4);
-    DRAG_MOVE.with(|cell| {
-        *cell.borrow_mut() = DragMoveState {
-            hwnd: window.0 as isize,
-            interval_ms,
-            ..Default::default()
-        };
-    });
-}
-
-fn maybe_coalesce_drag_move(window: HWND, pos: &mut WINDOWPOS) {
-    let now = Instant::now();
-    let timer_action = DRAG_MOVE.with(|cell| {
-        let mut state = cell.borrow_mut();
-        if state.hwnd != window.0 as isize || state.flushing {
-            return None;
-        }
-        let interval = state.interval_ms.max(4);
-        let due = state.last_commit.is_none_or(|last| {
-            now.saturating_duration_since(last) >= Duration::from_millis(u64::from(interval))
-        });
-        if due {
-            state.last_commit = Some(now);
-            state.pending = None;
-            let had_timer = std::mem::take(&mut state.timer_armed);
-            Some((false, had_timer, interval))
-        } else {
-            state.pending = Some((pos.x, pos.y));
-            pos.flags |= SWP_NOMOVE;
-            if !state.timer_armed {
-                state.timer_armed = true;
-                Some((true, false, interval))
-            } else {
-                None
-            }
-        }
-    });
-    if let Some((arm, kill, interval)) = timer_action {
-        // SAFETY: window is a live UI thread HWND owning DRAG_MOVE_TIMER_ID.
-        unsafe {
-            if kill {
-                let _ = KillTimer(window, DRAG_MOVE_TIMER_ID);
-            } else if arm {
-                let _ = SetTimer(window, DRAG_MOVE_TIMER_ID, interval, None);
-            }
-        }
-    }
-}
-
-fn clear_pending_drag_move(window: HWND) {
-    let kill = DRAG_MOVE.with(|cell| {
-        let mut state = cell.borrow_mut();
-        if state.hwnd != window.0 as isize {
-            return false;
-        }
-        state.pending = None;
-        std::mem::take(&mut state.timer_armed)
-    });
-    if kill {
-        // SAFETY: window is a live UI thread HWND.
-        unsafe {
-            let _ = KillTimer(window, DRAG_MOVE_TIMER_ID);
-        }
-    }
-}
-
-unsafe fn flush_drag_move(window: HWND) {
-    let pending = DRAG_MOVE.with(|cell| {
-        let mut state = cell.borrow_mut();
-        if state.hwnd != window.0 as isize {
-            return (None, false);
-        }
-        let kill = std::mem::take(&mut state.timer_armed);
-        let pending = state.pending.take();
-        if pending.is_some() {
-            state.flushing = true;
-            state.last_commit = Some(Instant::now());
-        }
-        (pending, kill)
-    });
-    if pending.1 {
-        unsafe {
-            let _ = KillTimer(window, DRAG_MOVE_TIMER_ID);
-        }
-    }
-    if let Some((x, y)) = pending.0 {
-        unsafe {
-            let _ = SetWindowPos(
-                window,
-                None,
-                x,
-                y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-        DRAG_MOVE.with(|cell| {
-            let mut state = cell.borrow_mut();
-            if state.hwnd == window.0 as isize {
-                state.flushing = false;
-            }
-        });
-    }
-}
-
-unsafe fn reset_drag_move(window: HWND) {
-    let active = DRAG_MOVE.with(|cell| {
-        let mut state = cell.borrow_mut();
-        if state.hwnd != window.0 as isize {
-            return false;
-        }
-        let armed = state.timer_armed;
-        *state = DragMoveState::default();
-        armed
-    });
-    if active {
-        unsafe {
-            let _ = KillTimer(window, DRAG_MOVE_TIMER_ID);
-        }
-    }
 }
 
 fn playback_position(playback: &Playback) -> Option<f64> {
@@ -626,14 +489,6 @@ fn dormant_grace(reasons: &PauseReasons) -> Option<Duration> {
         || reasons.display_off
     {
         Some(Duration::from_secs(3))
-    } else if reasons.manual
-        || reasons.battery
-        || reasons.fullscreen
-        || reasons.maximized
-        || reasons.occluded
-    {
-        // Keep warm for short Alt-Tab/clicks, then release libmpv/D3D11 while preserving the GDI DDB frozen frame.
-        Some(Duration::from_secs(15))
     } else {
         None
     }
@@ -915,10 +770,6 @@ struct Playback {
 struct Dormant {
     path: PathBuf,
     position: f64,
-    surface: Option<Surface>,
-    still_image: bool,
-    specs: PlaybackSpecs,
-    playback_info: Option<crate::cache::Prepared>,
 }
 struct DisplayState {
     monitor: String,
@@ -944,10 +795,8 @@ struct DisplayState {
     prepared_waiting: Option<(Instant, PathBuf, crate::cache::Prepared)>,
     playback_info: Option<crate::cache::Prepared>,
     dormant: Option<Dormant>,
-    pending_surface: Option<Surface>,
     resume_position: f64,
     paused_since: Option<Instant>,
-    still_freeze_since: Option<Instant>,
     pause_trimmed: bool,
 }
 impl DisplayState {
@@ -974,10 +823,8 @@ impl DisplayState {
             prepared_waiting: None,
             playback_info: None,
             dormant: None,
-            pending_surface: None,
             resume_position: 0.0,
             paused_since: None,
-            still_freeze_since: None,
             pause_trimmed: false,
         }
     }
@@ -1068,10 +915,8 @@ struct App {
     prepared_waiting: Option<(Instant, PathBuf, crate::cache::Prepared)>,
     playback_info: Option<crate::cache::Prepared>,
     dormant: Option<Dormant>,
-    pending_surface: Option<Surface>,
     resume_position: f64,
     paused_since: Option<Instant>,
-    still_freeze_since: Option<Instant>,
     pause_trimmed: bool,
     window_snapshot: Option<Vec<(Rect, bool)>>,
     timer_interval_ms: u32,
@@ -1113,10 +958,8 @@ impl App {
             prepared_waiting,
             playback_info,
             dormant,
-            pending_surface,
             resume_position,
             paused_since,
-            still_freeze_since,
             pause_trimmed
         );
     }
@@ -1237,7 +1080,6 @@ impl App {
                 });
             if let Err(failure) = self.with_display(index, |app| {
                 app.dormant = None;
-                app.pending_surface = None;
                 app.resume_position = 0.0;
                 app.start_path(source)
             }) {
@@ -1749,7 +1591,7 @@ impl App {
                 (
                     visuals::GPU_PREF,
                     w!("BUTTON"),
-                    "GPU: Auto (Display)",
+                    "GPU: Auto",
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
@@ -1977,12 +1819,6 @@ impl App {
             .filter(|p| p.cached)
             .map(|p| p.path.clone())
             .collect();
-        paths.extend(self.dormant.iter().filter_map(|d| {
-            d.playback_info
-                .as_ref()
-                .filter(|p| p.cached)
-                .map(|p| p.path.clone())
-        }));
         paths.extend(self.prepared_waiting.iter().map(|(_, _, p)| p.path.clone()));
         for display in &self.displays {
             paths.extend(
@@ -1992,12 +1828,6 @@ impl App {
                     .filter(|p| p.cached)
                     .map(|p| p.path.clone()),
             );
-            paths.extend(display.dormant.iter().filter_map(|d| {
-                d.playback_info
-                    .as_ref()
-                    .filter(|p| p.cached)
-                    .map(|p| p.path.clone())
-            }));
             paths.extend(
                 display
                     .prepared_waiting
@@ -3572,7 +3402,6 @@ impl App {
     fn release_playback(&mut self) {
         self.playback = None;
         self.playback_info = None;
-        self.pending_surface = None;
         visuals::playing(None);
         self.loaded = false;
         self.load_request = 0;
@@ -3581,7 +3410,6 @@ impl App {
         self.video_ready = None;
         self.loading_since = None;
         self.paused_since = None;
-        self.still_freeze_since = None;
         self.pause_trimmed = false;
         self.actual_pause = false;
         self.requested_pause = false;
@@ -3593,71 +3421,12 @@ impl App {
             }
         }
     }
-    fn enter_frozen_dormant(&mut self, require_snapshot: bool) -> bool {
-        let Some(mut playback) = self.playback.take() else {
-            return false;
-        };
-        let still_image = playback.specs.still_image;
-        let position = if still_image {
-            0.0
-        } else {
-            playback_position(&playback).unwrap_or(0.0)
-        };
-        let captured = playback.player.capture_frame().and_then(|frame| {
-            playback.surface.set_frozen_frame(
-                frame.width,
-                frame.height,
-                frame.stride,
-                &frame.bytes,
-            )?;
-            playback.surface.hide_player();
-            Ok(())
-        });
-        let surface = match captured {
-            Ok(()) => Some(playback.surface),
-            Err(_) if require_snapshot => {
-                self.playback = Some(playback);
-                return false;
-            }
-            Err(_) => {
-                drop(playback.surface);
-                None
-            }
-        };
-        let path = playback.path;
-        let specs = playback.specs;
-        drop(playback.player);
-        let playback_info = self.playback_info.take();
-        self.pending_surface = None;
-        self.loaded = false;
-        self.load_request = 0;
-        self.load_entry = None;
-        self.file_loaded = None;
-        self.video_ready = None;
-        self.loading_since = None;
-        self.paused_since = None;
-        self.still_freeze_since = None;
-        self.pause_trimmed = false;
-        self.actual_pause = false;
-        self.requested_pause = false;
-        self.dormant = Some(Dormant {
-            path,
-            position,
-            surface,
-            still_image,
-            specs,
-            playback_info,
-        });
-        trim_working_set();
-        true
-    }
     fn start(&mut self) -> Result<(), String> {
         let path = self
             .selected
             .clone()
             .ok_or("Select a wallpaper file first")?;
         self.dormant = None;
-        self.pending_surface = None;
         self.resume_position = 0.0;
         self.start_path(&path)
     }
@@ -3686,7 +3455,6 @@ impl App {
         self.cancel_preparation();
         self.dormant = None;
         self.paused_since = None;
-        self.still_freeze_since = None;
         self.pause_trimmed = false;
         self.update_reasons();
         let prepared = crate::cache::Prepared {
@@ -3703,7 +3471,7 @@ impl App {
         };
         self.load_prepared(path.clone(), prepared, self.resume_position)?;
         if self.settings.quality != crate::core::Quality::Native {
-            self.preparation = Some((path, display, self.settings.fps));
+            self.preparation = Some((path, display, crate::cache::CACHE_FPS));
             self.launch_preparation()?;
         }
         self.update_status();
@@ -3817,23 +3585,14 @@ impl App {
             request = playback.player.load(&prepared.path)?;
             playback.path = path;
         } else {
-            let surface = if let Some(reused) = self.pending_surface.take().filter(Surface::valid) {
-                reused.place(rect)?;
-                reused
-            } else {
-                #[cfg(not(test))]
-                {
-                    Surface::create(rect)?
-                }
-                #[cfg(test)]
-                {
-                    Surface::isolated(self.hwnd, rect)?
-                }
-            };
+            #[cfg(not(test))]
+            let surface = Surface::create(rect)?;
+            #[cfg(test)]
+            let surface = Surface::isolated(self.hwnd, rect)?;
             let shader_cache_dir = self.shader_cache_directory();
             let player = Mpv::open_at_with_options(
                 &decoder_path()?,
-                surface.player_host(),
+                surface.hwnd,
                 self.hwnd,
                 mpv::OpenOptions {
                     fit: self.settings.fit,
@@ -3864,7 +3623,6 @@ impl App {
         self.load_entry = None;
         self.file_loaded = None;
         self.video_ready = None;
-        self.still_freeze_since = None;
         self.loading_since = Some(Instant::now());
         self.error = None;
         self.arm_monitor()?;
@@ -3996,15 +3754,13 @@ impl App {
             || self.recovery.is_some()
             || self.preparation.is_some()
             || self.prepared_waiting.is_some()
-            || self.paused_since.is_some()
-            || self.still_freeze_since.is_some();
+            || self.paused_since.is_some();
         let display_fast = self.displays.iter().any(|d| {
             (d.playback.is_some() && !d.loaded)
                 || d.recovery.is_some()
                 || d.preparation.is_some()
                 || d.prepared_waiting.is_some()
                 || d.paused_since.is_some()
-                || d.still_freeze_since.is_some()
         });
         self_fast || display_fast || self.thumbnail_thread.is_some()
     }
@@ -4047,7 +3803,7 @@ impl App {
                         (rect.right - rect.left) as u32,
                         (rect.bottom - rect.top) as u32,
                     ),
-                    self.settings.fps,
+                    crate::cache::CACHE_FPS,
                 ));
             }
             if self.preparation.is_some()
@@ -4067,25 +3823,18 @@ impl App {
             }
             self.launch_preparation()?;
             self.request_thumbnails();
-            let require_snapshot = !(self.reasons.locked
-                || self.reasons.remote
-                || self.reasons.disconnected
-                || self.reasons.suspended
-                || self.reasons.display_off);
-            if !require_snapshot
-                && let Some(dormant) = &mut self.dormant
-                && dormant.still_image
-                && dormant.surface.is_some()
-            {
-                dormant.surface = None;
-                trim_working_set();
-            }
             if self.loaded && self.requested_pause && self.dormant.is_none() {
                 let since = *self.paused_since.get_or_insert_with(Instant::now);
                 let entered = if let Some(grace) = dormant_grace(&self.reasons)
                     && since.elapsed() >= grace
+                    && let Some(playback) = &self.playback
                 {
-                    self.enter_frozen_dormant(require_snapshot)
+                    let path = playback.path.clone();
+                    let position = playback_position(playback).unwrap_or(0.0);
+                    self.release_playback();
+                    self.dormant = Some(Dormant { path, position });
+                    trim_working_set();
+                    true
                 } else {
                     false
                 };
@@ -4120,25 +3869,9 @@ impl App {
                 .unwrap_or(0.0);
             self.load_prepared(path, prepared, position)?;
         }
-        if self.loaded
-            && !self.requested_pause
-            && self
-                .still_freeze_since
-                .is_some_and(|t| t.elapsed() >= Duration::from_secs(1))
-        {
-            let _ = self.enter_frozen_dormant(true);
-        }
         self.launch_preparation()?;
-        let should_wake_dormant = self.dormant.as_ref().is_some_and(|d| {
-            !d.still_image || d.surface.as_ref().is_none_or(|surface| !surface.valid())
-        });
-        if should_wake_dormant && let Some(dormant) = self.dormant.take() {
-            self.pending_surface = dormant.surface.filter(Surface::valid);
-            self.resume_position = if dormant.still_image {
-                0.0
-            } else {
-                dormant.position
-            };
+        if let Some(dormant) = self.dormant.take() {
+            self.resume_position = dormant.position;
             self.start_path(&dormant.path)?;
         }
         if self
@@ -4302,10 +4035,8 @@ impl App {
         let (width, height, specs) =
             read_playback_specs(&playback.player, &playback.path, &info_path);
         let paused = self.reasons.reason().is_some();
-        let still_image = specs.still_image;
         playback.player.pause(paused)?;
         self.requested_pause = paused;
-        playback.surface.show_player();
         playback.surface.show();
         crate::clock_widget::sync_zorder();
         let playing_path = playback.path.clone();
@@ -4318,7 +4049,6 @@ impl App {
         }
         if let Some(playback) = &mut self.playback {
             playback.specs = specs;
-            playback.surface.clear_frozen_frame();
         }
         if let Some(info) = &mut self.playback_info {
             info.fps = source_fps;
@@ -4330,7 +4060,6 @@ impl App {
             }
         }
         self.loaded = true;
-        self.still_freeze_since = still_image.then(Instant::now);
         visuals::playing(Some(playing_path));
         visuals::invalidate_backdrop_cache();
         for i in 0..9 {
@@ -4349,19 +4078,10 @@ impl App {
     fn format_display_specs(&self) -> Option<String> {
         let mut entries = Vec::new();
         for (idx, display) in self.displays.iter().enumerate() {
-            let Some(info) = display.playback_info.as_ref().or_else(|| {
-                display
-                    .dormant
-                    .as_ref()
-                    .and_then(|d| d.playback_info.as_ref())
-            }) else {
+            let Some(info) = display.playback_info.as_ref() else {
                 continue;
             };
-            let specs = display
-                .playback
-                .as_ref()
-                .map(|p| &p.specs)
-                .or_else(|| display.dormant.as_ref().map(|d| &d.specs));
+            let specs = display.playback.as_ref().map(|p| &p.specs);
             let display_number = self
                 .monitors
                 .iter()
@@ -4424,21 +4144,13 @@ impl App {
             let ready = self
                 .displays
                 .iter()
-                .filter(|d| {
-                    (d.loaded && d.playback.is_some())
-                        || d.dormant
-                            .as_ref()
-                            .is_some_and(|dm| dm.still_image && dm.surface.is_some())
-                })
+                .filter(|d| d.loaded && d.playback.is_some())
                 .count();
             let paused = self
                 .displays
                 .iter()
                 .filter(|d| {
-                    (d.loaded && (d.requested_pause || d.actual_pause))
-                        || d.dormant
-                            .as_ref()
-                            .is_some_and(|dm| !dm.still_image || d.pause_reason.is_some())
+                    (d.loaded && (d.requested_pause || d.actual_pause)) || d.dormant.is_some()
                 })
                 .count();
             let loading = self
@@ -4494,34 +4206,11 @@ impl App {
         } else if self.preparation.is_some() {
             "Playing original; preparing display cache in background. Temporary RAM may be higher."
                 .into()
-        } else if let Some(dormant) = &self.dormant {
-            if dormant.still_image && self.reasons.reason().is_none() {
-                let line1 = format!(
-                    "Sound: Off. Auto-pause: {}.",
-                    if self.settings.pause_fullscreen {
-                        "On"
-                    } else {
-                        "Off"
-                    }
-                );
-                match dormant.playback_info.as_ref() {
-                    Some(info) => format!(
-                        "{line1}\r\nWallpaper: {}.",
-                        format_playback_specs(info, Some(&dormant.specs), self.settings.fps, true,)
-                    ),
-                    None => line1,
-                }
-            } else if dormant.surface.is_some() {
-                format!(
-                    "{}. Last frame frozen (0% GPU / 0 MB VRAM).",
-                    self.reasons.reason().unwrap_or("Waiting to resume")
-                )
-            } else {
-                format!(
-                    "{}. Decoder released; resume reloads wallpaper.",
-                    self.reasons.reason().unwrap_or("Waiting to resume")
-                )
-            }
+        } else if self.dormant.is_some() {
+            format!(
+                "{}. Decoder released; resume reloads wallpaper.",
+                self.reasons.reason().unwrap_or("Waiting to resume")
+            )
         } else if self.playback.is_none() {
             "Choose a file from your library, then Set wallpaper.".into()
         } else if !self.loaded {
@@ -4740,58 +4429,6 @@ impl App {
         {
             let source_fps = effective_source_fps(self.playback_info.as_ref(), playback);
             playback.player.set_fps(fps, source_fps)?;
-        }
-        if self.settings.quality != crate::core::Quality::Native {
-            if !self.multi_dispatch && !self.displays.is_empty() {
-                for index in 0..self.displays.len() {
-                    let source_path = self.displays[index]
-                        .playback
-                        .as_ref()
-                        .filter(|p| !p.specs.still_image)
-                        .map(|p| p.path.clone())
-                        .or_else(|| {
-                            self.displays[index]
-                                .dormant
-                                .as_ref()
-                                .filter(|d| !d.still_image)
-                                .map(|d| d.path.clone())
-                        });
-                    if let Some(path) = source_path {
-                        self.with_display(index, |app| {
-                            let rect = app.screen().rect;
-                            let display_size = (
-                                (rect.right - rect.left) as u32,
-                                (rect.bottom - rect.top) as u32,
-                            );
-                            app.cancel_preparation();
-                            app.preparation = Some((path, display_size, fps));
-                            app.launch_preparation()
-                        })?;
-                    }
-                }
-            } else {
-                let source_path = self
-                    .playback
-                    .as_ref()
-                    .filter(|p| !p.specs.still_image)
-                    .map(|p| p.path.clone())
-                    .or_else(|| {
-                        self.dormant
-                            .as_ref()
-                            .filter(|d| !d.still_image)
-                            .map(|d| d.path.clone())
-                    });
-                if let Some(path) = source_path {
-                    let rect = self.screen().rect;
-                    let display_size = (
-                        (rect.right - rect.left) as u32,
-                        (rect.bottom - rect.top) as u32,
-                    );
-                    self.cancel_preparation();
-                    self.preparation = Some((path, display_size, fps));
-                    self.launch_preparation()?;
-                }
-            }
         }
         self.update_status();
         Ok(())
@@ -5173,11 +4810,7 @@ impl App {
                         } else if self.displays[index].dormant.is_some() {
                             self.with_display(index, |app| {
                                 if let Some(dormant) = app.dormant.take() {
-                                    app.resume_position = if dormant.still_image {
-                                        0.0
-                                    } else {
-                                        dormant.position
-                                    };
+                                    app.resume_position = dormant.position;
                                     app.start_path(&dormant.path)?;
                                 }
                                 Ok(())
@@ -5187,11 +4820,7 @@ impl App {
                     if let Some(playback) = &self.playback {
                         playback.player.set_fit(fit)?;
                     } else if let Some(dormant) = self.dormant.take() {
-                        self.resume_position = if dormant.still_image {
-                            0.0
-                        } else {
-                            dormant.position
-                        };
+                        self.resume_position = dormant.position;
                         self.start_path(&dormant.path)?;
                     }
                     self.text(FIT, &labels[index]);
@@ -6174,10 +5803,8 @@ pub fn run() -> Result<(), String> {
             prepared_waiting: None,
             playback_info: None,
             dormant: None,
-            pending_surface: None,
             resume_position: 0.0,
             paused_since: None,
-            still_freeze_since: None,
             pause_trimmed: false,
             window_snapshot: None,
             timer_interval_ms: 0,
@@ -6348,10 +5975,6 @@ pub fn run() -> Result<(), String> {
                     WM_TIMER if message.wParam.0 == RESTORE_BACKDROP_TIMER_ID => {
                         let _ = KillTimer(hwnd, RESTORE_BACKDROP_TIMER_ID);
                         visuals::begin_backdrop_fade(hwnd);
-                        Ok(false)
-                    }
-                    WM_TIMER if message.wParam.0 == DRAG_MOVE_TIMER_ID => {
-                        flush_drag_move(hwnd);
                         Ok(false)
                     }
                     WM_TIMER => app.tick().map(|_| false),
@@ -6656,19 +6279,15 @@ unsafe extern "system" fn window_proc(
             }
             WM_ENTERSIZEMOVE => {
                 let _ = SetPropW(window, SIZE_MOVE_PROPERTY, HANDLE(std::ptr::dangling_mut()));
-                enter_drag_move(window);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_EXITSIZEMOVE => {
-                flush_drag_move(window);
-                reset_drag_move(window);
                 let _ = RemovePropW(window, SIZE_MOVE_PROPERTY);
                 visuals::end_drag_move_backdrop(window);
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_DESTROY => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
-                reset_drag_move(window);
                 crate::update_popup::dismiss(window);
                 crate::clock_widget::hide_all();
                 visuals::clear_backdrop_transition(window);
@@ -6680,7 +6299,6 @@ unsafe extern "system" fn window_proc(
             }
             WM_NCDESTROY => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
-                reset_drag_move(window);
                 visuals::clear_backdrop_transition(window);
                 visuals::invalidate_theme_cache();
                 let _ = RemovePropW(window, ICONIC_PROPERTY);
@@ -6723,14 +6341,10 @@ unsafe extern "system" fn window_proc(
                     if (pos.flags.0 & (SWP_NOMOVE.0 | SWP_HIDEWINDOW.0)) == 0
                         && !GetPropW(window, SIZE_MOVE_PROPERTY).0.is_null()
                     {
-                        maybe_coalesce_drag_move(window, pos);
-                        if (pos.flags.0 & SWP_NOMOVE.0) == 0 {
-                            let _ = visuals::begin_drag_move_backdrop(window);
-                        }
+                        let _ = visuals::begin_drag_move_backdrop(window);
                     }
                     return DefWindowProcW(window, message, wparam, lparam);
                 }
-                clear_pending_drag_move(window);
                 visuals::cancel_drag_move_backdrop(window);
                 let animate_backdrop = visuals::os_window_animations_enabled();
                 if !iconic && pos.x <= -30000 && pos.y <= -30000 {
@@ -6789,9 +6403,6 @@ unsafe extern "system" fn window_proc(
                 DefWindowProcW(window, message, wparam, lparam)
             }
             WM_MOVE => {
-                if !IsIconic(window).as_bool() && visuals::drag_move_backdrop_active(window) {
-                    visuals::update_drag_move_backdrop(window);
-                }
                 crate::update_popup::sync(window);
                 DefWindowProcW(window, message, wparam, lparam)
             }
@@ -6855,10 +6466,6 @@ unsafe extern "system" fn window_proc(
             WM_TIMER if wparam.0 == RESTORE_BACKDROP_TIMER_ID => {
                 let _ = KillTimer(window, RESTORE_BACKDROP_TIMER_ID);
                 visuals::begin_backdrop_fade(window);
-                LRESULT(0)
-            }
-            WM_TIMER if wparam.0 == DRAG_MOVE_TIMER_ID => {
-                flush_drag_move(window);
                 LRESULT(0)
             }
             WM_DWMCOMPOSITIONCHANGED
@@ -7110,10 +6717,8 @@ mod tests {
             prepared_waiting: None,
             playback_info: None,
             dormant: None,
-            pending_surface: None,
             resume_position: 0.0,
             paused_since: None,
-            still_freeze_since: None,
             pause_trimmed: false,
             window_snapshot: None,
             timer_interval_ms: 0,
@@ -8286,7 +7891,7 @@ mod tests {
         }
         .map_err(|e| e.to_string())?;
         let surface = Surface::isolated(app.hwnd, app.screen().rect)?;
-        let surface_hwnd = surface.player_host();
+        let surface_hwnd = surface.hwnd;
         let player = Mpv::open_at_with_quality(
             &root.join("runtime/libmpv-2.dll"),
             surface_hwnd,
@@ -8294,7 +7899,6 @@ mod tests {
             Fit::Fill,
             crate::core::Quality::Optimize,
         )?;
-        surface.show_player();
         app.playback = Some(Playback {
             player,
             surface,
@@ -8588,10 +8192,8 @@ mod tests {
             prepared_waiting: None,
             playback_info: None,
             dormant: None,
-            pending_surface: None,
             resume_position: 0.0,
             paused_since: None,
-            still_freeze_since: None,
             pause_trimmed: false,
             window_snapshot: None,
             timer_interval_ms: 0,
@@ -8729,31 +8331,31 @@ mod tests {
         assert_eq!(dormant_grace(&reasons), None);
 
         reasons.battery = true;
-        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
+        assert_eq!(dormant_grace(&reasons), None);
 
         reasons = PauseReasons {
             fullscreen: true,
             ..PauseReasons::default()
         };
-        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
+        assert_eq!(dormant_grace(&reasons), None);
 
         reasons = PauseReasons {
             maximized: true,
             ..PauseReasons::default()
         };
-        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
+        assert_eq!(dormant_grace(&reasons), None);
 
         reasons = PauseReasons {
             occluded: true,
             ..PauseReasons::default()
         };
-        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
+        assert_eq!(dormant_grace(&reasons), None);
 
         reasons = PauseReasons {
             manual: true,
             ..PauseReasons::default()
         };
-        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
+        assert_eq!(dormant_grace(&reasons), None);
 
         reasons = PauseReasons {
             locked: true,
@@ -9233,126 +8835,6 @@ mod tests {
 
                 visuals::disable_backdrop(hwnd);
             }
-
-            let _ = DestroyWindow(hwnd);
-            let mut msg = MSG::default();
-            while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
-            if atom != 0 {
-                let _ = UnregisterClassW(class_name, instance);
-            }
-        }
-    }
-
-    #[test]
-    fn drag_move_coalesces_rapid_moves_and_flushes_on_timer_snap_and_exit() {
-        // SAFETY: isolated hidden HWND created and destroyed within this test thread.
-        unsafe {
-            let instance = GetModuleHandleW(None).expect("module handle");
-            let class_name = w!("WallpaperLive.DragMoveCoalesceTest");
-            let atom = RegisterClassW(&WNDCLASSW {
-                lpfnWndProc: Some(window_proc),
-                hInstance: instance.into(),
-                lpszClassName: class_name,
-                ..Default::default()
-            });
-            assert!(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
-            let hwnd = CreateWindowExW(
-                WS_EX_CONTROLPARENT | WS_EX_NOACTIVATE,
-                class_name,
-                w!("WallpaperLive Drag Move Test"),
-                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                100,
-                100,
-                1040,
-                720,
-                None,
-                None,
-                instance,
-                None,
-            )
-            .expect("drag move test window");
-
-            let send_pos = |x, y, cx, cy, flags| {
-                let mut pos = WINDOWPOS {
-                    hwnd,
-                    hwndInsertAfter: HWND::default(),
-                    x,
-                    y,
-                    cx,
-                    cy,
-                    flags,
-                };
-                assert_eq!(
-                    SendMessageW(
-                        hwnd,
-                        WM_WINDOWPOSCHANGING,
-                        WPARAM(0),
-                        LPARAM((&mut pos as *mut WINDOWPOS) as isize),
-                    ),
-                    LRESULT(0)
-                );
-                pos.flags
-            };
-
-            let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
-            assert!(!GetPropW(hwnd, SIZE_MOVE_PROPERTY).0.is_null());
-            DRAG_MOVE.with(|cell| {
-                let st = cell.borrow();
-                assert_eq!(st.hwnd, hwnd.0 as isize);
-                assert!((4..=12).contains(&st.interval_ms));
-            });
-
-            // First move commits immediately without SWP_NOMOVE.
-            let first = send_pos(110, 110, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            assert_eq!(first.0 & SWP_NOMOVE.0, 0);
-
-            // Lock interval wide during test assertions so VM scheduling jitter cannot race.
-            DRAG_MOVE.with(|cell| {
-                let mut st = cell.borrow_mut();
-                st.interval_ms = 5_000;
-                st.last_commit = Some(Instant::now());
-            });
-
-            let second = send_pos(125, 115, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            assert_ne!(second.0 & SWP_NOMOVE.0, 0);
-            let third = send_pos(140, 122, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            assert_ne!(third.0 & SWP_NOMOVE.0, 0);
-            DRAG_MOVE.with(|cell| {
-                let st = cell.borrow();
-                assert_eq!(st.pending, Some((140, 122)));
-                assert!(st.timer_armed);
-            });
-
-            // Pacing timer flushes coalesced coordinates synchronously to HWND.
-            let _ = SendMessageW(hwnd, WM_TIMER, WPARAM(DRAG_MOVE_TIMER_ID), LPARAM(0));
-            let mut wr = RECT::default();
-            GetWindowRect(hwnd, &mut wr).expect("window rect after timer flush");
-            assert_eq!((wr.left, wr.top), (140, 122));
-            DRAG_MOVE.with(|cell| {
-                let st = cell.borrow();
-                assert_eq!(st.pending, None);
-                assert!(!st.timer_armed);
-            });
-
-            // Aero Snap / size changes pass unthrottled and discard stale pending moves.
-            let queued = send_pos(155, 130, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            assert_ne!(queued.0 & SWP_NOMOVE.0, 0);
-            let snap = send_pos(0, 0, 960, 720, SWP_NOZORDER | SWP_NOACTIVATE);
-            assert_eq!(snap.0 & SWP_NOMOVE.0, 0);
-            DRAG_MOVE.with(|cell| {
-                let st = cell.borrow();
-                assert_eq!(st.pending, None);
-                assert!(!st.timer_armed);
-            });
-
-            // Ending drag flushes any pending coordinates before clearing SIZE_MOVE_PROPERTY.
-            let tail = send_pos(175, 140, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            assert_ne!(tail.0 & SWP_NOMOVE.0, 0);
-            let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
-            GetWindowRect(hwnd, &mut wr).expect("window rect after exit flush");
-            assert_eq!((wr.left, wr.top), (175, 140));
-            assert!(GetPropW(hwnd, SIZE_MOVE_PROPERTY).0.is_null());
-            DRAG_MOVE.with(|cell| assert_eq!(cell.borrow().hwnd, 0));
 
             let _ = DestroyWindow(hwnd);
             let mut msg = MSG::default();
@@ -10101,18 +9583,16 @@ mod tests {
     }
 
     #[test]
-    fn dormant_still_and_frozen_wallpapers_stay_protected_and_report_status() {
+    fn dormant_wallpapers_stay_protected_in_active_paths_and_status() {
         let mut app = fixture();
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("scratch")
             .join(format!("dormant-status-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let video_path = dir.join("clip.mp4");
-        let cache_path = dir.join("cached.mkv");
-        let still_path = dir.join("still.png");
+        let second_path = dir.join("second.mp4");
         fs::write(&video_path, b"video").unwrap();
-        fs::write(&cache_path, b"cache").unwrap();
-        fs::write(&still_path, b"png").unwrap();
+        fs::write(&second_path, b"video2").unwrap();
 
         let rect = Rect {
             left: 0,
@@ -10141,42 +9621,24 @@ mod tests {
         app.displays[0].dormant = Some(Dormant {
             path: video_path.clone(),
             position: 4.5,
-            surface: None,
-            still_image: false,
-            specs: PlaybackSpecs::default(),
-            playback_info: Some(crate::cache::Prepared {
-                path: cache_path.clone(),
-                width: 1920,
-                height: 1080,
-                fps: 30.0,
-                cached: true,
-                note: String::new(),
-            }),
         });
-        app.displays[0].pause_reason = Some("Paused: maximized window");
+        app.displays[0].pause_reason = Some("Paused: locked");
         app.displays[1].dormant = Some(Dormant {
-            path: still_path.clone(),
-            position: 0.0,
-            surface: None,
-            still_image: true,
-            specs: PlaybackSpecs::default(),
-            playback_info: None,
+            path: second_path.clone(),
+            position: 1.0,
         });
 
         let paths = app.active_paths();
         assert!(paths.contains(&video_path));
-        assert!(paths.contains(&still_path));
-        let caches = app.active_cache();
-        assert!(caches.contains(&cache_path));
+        assert!(paths.contains(&second_path));
 
         app.update_status();
         let status_text = app.status_cache.borrow().0.clone();
         assert!(!status_text.is_empty());
-        assert!(status_text.contains("Paused") || status_text.contains("Active"));
+        assert!(status_text.contains("paused"));
 
         let _ = fs::remove_file(&video_path);
-        let _ = fs::remove_file(&cache_path);
-        let _ = fs::remove_file(&still_path);
+        let _ = fs::remove_file(&second_path);
         let _ = fs::remove_dir(&dir);
     }
 }

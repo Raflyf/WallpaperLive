@@ -73,7 +73,7 @@ fn main() -> Result<(), String> {
             #[cfg(test)]
             return Err("Desktop attachment is disabled in tests; use --window".into());
         };
-        let host = surface.as_ref().map(|s| s.player_host()).unwrap_or(window);
+        let host = surface.as_ref().map(|s| s.hwnd).unwrap_or(window);
         let player = mpv::Mpv::open_at_with_quality(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/libmpv-2.dll"),
             host,
@@ -108,7 +108,6 @@ fn main() -> Result<(), String> {
                         }
                         if let Some(surface) = &surface {
                             surface.prepare_renderer()?;
-                            surface.show_player();
                             surface.show();
                         }
                         loaded = true;

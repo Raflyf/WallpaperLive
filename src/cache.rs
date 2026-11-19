@@ -16,16 +16,15 @@ use windows::{
         Security::Cryptography::*,
         Storage::FileSystem::GetDiskFreeSpaceExW,
         System::Threading::{
-            GetCurrentProcess, PROCESS_MODE_BACKGROUND_BEGIN,
+            GetCurrentProcess, GetProcessAffinityMask, PROCESS_MODE_BACKGROUND_BEGIN,
             PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
             PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetPriorityClass,
-            SetProcessInformation,
+            SetProcessAffinityMask, SetProcessInformation,
         },
     },
     core::PCWSTR,
 };
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub const CACHE_FPS: u32 = 60;
 const MAX_OUTPUT: u64 = 512 * 1024 * 1024;
 const MAX_CACHE: u64 = 2 * 1024 * 1024 * 1024;
@@ -79,7 +78,7 @@ pub fn prepare(
             .spawn()
             .map_err(|e| format!("Could not start video preparation: {e}"))?,
     );
-    let text = preparation_output(child, cancelled)?;
+    let text = preparation_output(child, Some(directory), cancelled)?;
     let result = parse_response(&text)?;
     let original = validate_media(source)?;
     let root = directory.canonicalize().map_err(|e| e.to_string())?;
@@ -90,7 +89,33 @@ pub fn prepare(
     Ok(result)
 }
 
-fn preparation_output(mut child: Child, cancelled: &AtomicBool) -> Result<String, String> {
+fn remove_pid_partials(directory: &Path, pid: u32) {
+    let prefix = format!("partial-{pid}-");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    use std::os::windows::fs::MetadataExt;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix)
+            && name.ends_with(".mp4")
+            && fs::symlink_metadata(&path)
+                .is_ok_and(|meta| meta.is_file() && meta.file_attributes() & 0x400 == 0)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn preparation_output(
+    mut child: Child,
+    directory: Option<&Path>,
+    cancelled: &AtomicBool,
+) -> Result<String, String> {
+    let pid = child.0.id();
     let stdout = child
         .0
         .stdout
@@ -112,6 +137,9 @@ fn preparation_output(mut child: Child, cancelled: &AtomicBool) -> Result<String
             child.0.kill().map_err(|e| e.to_string())?;
             child.0.wait().map_err(|e| e.to_string())?;
             let _ = reader.join();
+            if let Some(dir) = directory {
+                remove_pid_partials(dir, pid);
+            }
             return Err(if cancelled.load(Ordering::Relaxed) {
                 "Preparation cancelled"
             } else {
@@ -126,10 +154,16 @@ fn preparation_output(mut child: Child, cancelled: &AtomicBool) -> Result<String
         .map_err(|_| "Preparation reader failed")?
         .map_err(|e| e.to_string())?;
     if bytes.len() > RESPONSE_LIMIT as usize {
+        if let Some(dir) = directory {
+            remove_pid_partials(dir, pid);
+        }
         return Err("Preparation response is too large".into());
     }
     let text = String::from_utf8(bytes).map_err(|_| "Invalid preparation response")?;
     if !status.success() {
+        if let Some(dir) = directory {
+            remove_pid_partials(dir, pid);
+        }
         return Err(text
             .strip_prefix("error\n")
             .unwrap_or("Video preparation failed")
@@ -174,11 +208,18 @@ fn parse_response(text: &str) -> Result<Prepared, String> {
         note: lines[7].to_owned(),
     })
 }
+fn single_background_core_mask(process_mask: usize) -> Option<usize> {
+    if process_mask == 0 {
+        return None;
+    }
+    Some(1usize << (usize::BITS - 1 - process_mask.leading_zeros()))
+}
+
 pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
     if !(6..=7).contains(&args.len()) {
         return Err("Invalid preparation arguments".into());
     }
-    // SAFETY: best-effort background CPU, I/O, and EcoQoS throttling for cache transcoding worker.
+    // SAFETY: best-effort background CPU, I/O, EcoQoS, and single-core affinity throttling.
     unsafe {
         let process = GetCurrentProcess();
         let _ = SetPriorityClass(process, PROCESS_MODE_BACKGROUND_BEGIN);
@@ -193,6 +234,13 @@ pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
             (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
             std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
         );
+        let mut proc_mask = 0usize;
+        let mut sys_mask = 0usize;
+        if GetProcessAffinityMask(process, &mut proc_mask, &mut sys_mask).is_ok()
+            && let Some(core_mask) = single_background_core_mask(proc_mask)
+        {
+            let _ = SetProcessAffinityMask(process, core_mask);
+        }
     }
     let number = |i: usize| {
         args[i]
@@ -486,10 +534,19 @@ pub fn prepare_local_with_quality(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_nanos();
+    struct PartialCleanup(Option<PathBuf>);
+    impl Drop for PartialCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = self.0.take() {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
     let partial = directory.join(format!("partial-{}-{stamp}.mp4", std::process::id()));
     if partial.exists() || destination.exists() {
         return Err("Cache destination already exists; existing bytes were kept".into());
     }
+    let mut partial_guard = PartialCleanup(Some(partial.clone()));
     mpv::encode_with_quality(
         dll, &source, &partial, target.0, target.1, fps, quality, cancelled,
     )?;
@@ -506,6 +563,7 @@ pub fn prepare_local_with_quality(
     }
     fs::rename(&partial, &destination)
         .map_err(|e| format!("Could not commit video cache; previous files were kept: {e}"))?;
+    partial_guard.0 = None;
     prepared.path = destination;
     prepared.width = output.width;
     prepared.height = output.height;
@@ -594,7 +652,7 @@ mod tests {
         let process = unsafe { OwnedHandle::from_raw_handle(duplicate.0) };
         let started = Instant::now();
         assert!(
-            preparation_output(Child(child), &AtomicBool::new(true))
+            preparation_output(Child(child), None, &AtomicBool::new(true))
                 .unwrap_err()
                 .contains("cancelled")
         );
@@ -746,5 +804,13 @@ mod tests {
             target_size_for_quality(2160, 3840, (1080, 1920), Quality::Low).unwrap(),
             (720, 1280)
         );
+    }
+
+    #[test]
+    fn single_background_core_mask_picks_highest_available_logical_cpu() {
+        assert_eq!(single_background_core_mask(0), None);
+        assert_eq!(single_background_core_mask(0b0001), Some(0b0001));
+        assert_eq!(single_background_core_mask(0b1111_1111), Some(0b1000_0000));
+        assert_eq!(single_background_core_mask(0b1010_1100), Some(0b1000_0000));
     }
 }

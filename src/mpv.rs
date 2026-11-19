@@ -54,17 +54,11 @@ struct LogMessage {
 }
 
 #[repr(C)]
-struct ByteArray {
-    data: *mut c_void,
-    size: usize,
-}
-#[repr(C)]
 #[derive(Clone, Copy)]
 union NodeValue {
     string: *const c_char,
     integer: i64,
     list: *const NodeList,
-    ba: *const ByteArray,
 }
 #[repr(C)]
 struct Node {
@@ -154,8 +148,6 @@ struct Api {
     destroy: unsafe extern "C" fn(*mut c_void),
     option: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
     command: unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int,
-    command_node: unsafe extern "C" fn(*mut c_void, *const Node, *mut Node) -> c_int,
-    free_node: unsafe extern "C" fn(*mut Node),
     set: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int, *mut c_void) -> c_int,
     get: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
     observe: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int,
@@ -212,11 +204,6 @@ impl Api {
                 "mpv_command_async",
                 unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int
             ),
-            command_node: symbol!(
-                "mpv_command_node",
-                unsafe extern "C" fn(*mut c_void, *const Node, *mut Node) -> c_int
-            ),
-            free_node: symbol!("mpv_free_node_contents", unsafe extern "C" fn(*mut Node)),
             set: symbol!(
                 "mpv_set_property_async",
                 unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int, *mut c_void) -> c_int
@@ -470,6 +457,7 @@ struct RenderProfile {
     dither_depth: &'static str,
     linear_downscaling: &'static str,
     sigmoid_upscaling: &'static str,
+    dumb_mode: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -488,6 +476,7 @@ fn render_profile(quality: Quality) -> RenderProfile {
             dither_depth: "auto",
             linear_downscaling: "yes",
             sigmoid_upscaling: "yes",
+            dumb_mode: "no",
         },
         Quality::Optimize => RenderProfile {
             scale: "catmull_rom",
@@ -497,6 +486,7 @@ fn render_profile(quality: Quality) -> RenderProfile {
             dither_depth: "auto",
             linear_downscaling: "yes",
             sigmoid_upscaling: "yes",
+            dumb_mode: "no",
         },
         Quality::Medium => RenderProfile {
             scale: "bilinear",
@@ -506,6 +496,7 @@ fn render_profile(quality: Quality) -> RenderProfile {
             dither_depth: "auto",
             linear_downscaling: "no",
             sigmoid_upscaling: "no",
+            dumb_mode: "no",
         },
         Quality::Low => RenderProfile {
             scale: "bilinear",
@@ -515,6 +506,7 @@ fn render_profile(quality: Quality) -> RenderProfile {
             dither_depth: "no",
             linear_downscaling: "no",
             sigmoid_upscaling: "no",
+            dumb_mode: "yes",
         },
     }
 }
@@ -523,23 +515,23 @@ fn encode_profile(quality: Quality) -> EncodeProfile {
     match quality {
         Quality::Native => EncodeProfile {
             filter_flags: "lanczos",
-            ovcopts: "preset=medium,crf=15,threads=2,rc-lookahead=25,refs=3",
+            ovcopts: "preset=medium,crf=15,threads=1,rc-lookahead=25,refs=3",
         },
         Quality::High => EncodeProfile {
             filter_flags: "lanczos",
-            ovcopts: "preset=medium,crf=17,threads=2,rc-lookahead=25,refs=3",
+            ovcopts: "preset=medium,crf=17,threads=1,rc-lookahead=25,refs=3",
         },
         Quality::Optimize => EncodeProfile {
             filter_flags: "bicubic",
-            ovcopts: "preset=fast,crf=19,threads=2,rc-lookahead=16,refs=2",
+            ovcopts: "preset=fast,crf=19,threads=1,rc-lookahead=16,refs=2",
         },
         Quality::Medium => EncodeProfile {
             filter_flags: "bicubic",
-            ovcopts: "preset=veryfast,crf=22,threads=2,rc-lookahead=10,refs=1",
+            ovcopts: "preset=veryfast,crf=22,threads=1,rc-lookahead=10,refs=1",
         },
         Quality::Low => EncodeProfile {
             filter_flags: "bilinear",
-            ovcopts: "preset=veryfast,crf=26,threads=2,rc-lookahead=8,refs=1",
+            ovcopts: "preset=veryfast,crf=26,threads=1,rc-lookahead=8,refs=1",
         },
     }
 }
@@ -617,16 +609,17 @@ pub fn encode_with_quality(
     };
     let encode_cfg = encode_profile(quality);
     let filter = format!(
-        "lavfi=graph=[{rotate}scale=w={width}:h={height}:flags={},setsar=1,fps={rate:.6}:round=near,format=yuv420p]:o=[threads=2]",
+        "lavfi=graph=[{rotate}scale=w={width}:h={height}:flags={},setsar=1,fps={rate:.6}:round=near,format=yuv420p]:o=[threads=1]",
         encode_cfg.filter_flags
     );
     for (name, value) in [
+        ("vd-lavc-threads", "1"),
         ("of", "mp4"),
         ("ovc", "libx264"),
         // FFmpeg names this AVOption "refs"; "ref" is only valid inside x264-params.
         ("ovcopts", encode_cfg.ovcopts),
         ("oac", "aac"),
-        ("oacopts", "b=128000,threads=2"),
+        ("oacopts", "b=128000,threads=1"),
         ("aid", "auto"),
         ("vo", "lavc"),
         ("ao", "lavc"),
@@ -713,13 +706,6 @@ pub fn encode_with_quality(
         ));
     }
     Ok(())
-}
-
-pub struct CapturedFrame {
-    pub width: u32,
-    pub height: u32,
-    pub stride: usize,
-    pub bytes: Vec<u8>,
 }
 
 pub struct OpenOptions<'a> {
@@ -877,6 +863,7 @@ impl Mpv {
             ("vo", "gpu"),
             ("gpu-api", "d3d11"),
             ("gpu-context", "d3d11"),
+            ("gpu-dumb-mode", render.dumb_mode),
             ("hwdec", "auto-safe"),
             // ponytail: cap GPU decode surface pool and skip frame-exact resume seeks on low-VRAM/UMA laptops.
             ("hwdec-extra-frames", hwdec_frames),
@@ -1137,124 +1124,6 @@ impl Mpv {
             .into_owned();
         unsafe { (self.api.free)(value.cast()) };
         Some(text)
-    }
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn capture_frame(&self) -> Result<CapturedFrame, String> {
-        struct NodeGuard<'a> {
-            node: Node,
-            api: &'a Api,
-        }
-        impl Drop for NodeGuard<'_> {
-            fn drop(&mut self) {
-                // SAFETY: result node initialized by mpv_command_node; freed once via mpv_free_node_contents.
-                unsafe {
-                    (self.api.free_node)(&mut self.node);
-                }
-            }
-        }
-        let values = [
-            Node {
-                value: NodeValue {
-                    string: c"screenshot-raw".as_ptr(),
-                },
-                format: 1,
-            },
-            Node {
-                value: NodeValue {
-                    string: c"window".as_ptr(),
-                },
-                format: 1,
-            },
-        ];
-        let arg_list = NodeList {
-            count: values.len() as c_int,
-            values: values.as_ptr(),
-            keys: ptr::null(),
-        };
-        let arg = Node {
-            value: NodeValue { list: &arg_list },
-            format: 7,
-        };
-        let mut guard = NodeGuard {
-            node: Node {
-                value: NodeValue { integer: 0 },
-                format: 0,
-            },
-            api: &self.api,
-        };
-        // SAFETY: args stay alive across synchronous call; guard always frees result contents.
-        self.api
-            .check(unsafe { (self.api.command_node)(self.handle, &arg, &mut guard.node) })?;
-        // SAFETY: command_node populated `guard.node.format`; union `.list` is valid when format == 8.
-        if guard.node.format != 8 || unsafe { guard.node.value.list }.is_null() {
-            return Err("Snapshot result is missing frame map".into());
-        }
-        // SAFETY: MPV_FORMAT_NODE_MAP (8) provides valid count, keys, and values until guard drops.
-        unsafe {
-            let map = &*guard.node.value.list;
-            if !(1..=16).contains(&map.count) || map.keys.is_null() || map.values.is_null() {
-                return Err("Snapshot frame map is malformed".into());
-            }
-            let mut width: Option<u32> = None;
-            let mut height: Option<u32> = None;
-            let mut stride: Option<usize> = None;
-            let mut is_bgr0 = false;
-            let mut data_slice: Option<(*const u8, usize)> = None;
-            for i in 0..map.count as usize {
-                let key_ptr = *map.keys.add(i);
-                if key_ptr.is_null() {
-                    continue;
-                }
-                let key = CStr::from_ptr(key_ptr).to_bytes();
-                let val = &*map.values.add(i);
-                match key {
-                    b"w" if val.format == 4 => {
-                        width = u32::try_from(val.value.integer)
-                            .ok()
-                            .filter(|&v| (1..=16384).contains(&v));
-                    }
-                    b"h" if val.format == 4 => {
-                        height = u32::try_from(val.value.integer)
-                            .ok()
-                            .filter(|&v| (1..=16384).contains(&v));
-                    }
-                    b"stride" if val.format == 4 => {
-                        stride = usize::try_from(val.value.integer).ok().filter(|&v| v > 0);
-                    }
-                    b"format" if val.format == 1 && !val.value.string.is_null() => {
-                        is_bgr0 = CStr::from_ptr(val.value.string) == c"bgr0";
-                    }
-                    b"data" if val.format == 9 && !val.value.ba.is_null() => {
-                        let ba = &*val.value.ba;
-                        if !ba.data.is_null() && ba.size > 0 {
-                            data_slice = Some((ba.data.cast::<u8>(), ba.size));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if !is_bgr0 {
-                return Err("Snapshot pixel format is not bgr0".into());
-            }
-            let w = width.ok_or("Snapshot width is invalid")?;
-            let h = height.ok_or("Snapshot height is invalid")?;
-            let s = stride.ok_or("Snapshot stride is invalid")?;
-            let row_bytes = (w as usize).checked_mul(4).ok_or("Snapshot row overflow")?;
-            let expected = s
-                .checked_mul(h as usize)
-                .ok_or("Snapshot buffer overflow")?;
-            let (ptr, size) = data_slice.ok_or("Snapshot pixel data is missing")?;
-            if s < row_bytes || size < expected {
-                return Err("Snapshot pixel buffer size mismatch".into());
-            }
-            let bytes = std::slice::from_raw_parts(ptr, expected).to_vec();
-            Ok(CapturedFrame {
-                width: w,
-                height: h,
-                stride: s,
-                bytes,
-            })
-        }
     }
 }
 
@@ -1691,21 +1560,25 @@ mod tests {
         assert_eq!(native.fbo_format, "rgba16f");
         assert_eq!(native.scale, "spline36");
         assert_eq!(native.linear_downscaling, "yes");
+        assert_eq!(native.dumb_mode, "no");
 
         let optimize = render_profile(Quality::Optimize);
         assert_eq!(optimize.fbo_format, "rgb10_a2");
         assert_eq!(optimize.scale, "catmull_rom");
         assert_eq!(optimize.linear_downscaling, "yes");
         assert_eq!(optimize.sigmoid_upscaling, "yes");
+        assert_eq!(optimize.dumb_mode, "no");
 
         let medium = render_profile(Quality::Medium);
         assert_eq!(medium.fbo_format, "rgba8");
         assert_eq!(medium.linear_downscaling, "no");
         assert_eq!(medium.sigmoid_upscaling, "no");
+        assert_eq!(medium.dumb_mode, "no");
 
         let low = render_profile(Quality::Low);
         assert_eq!(low.fbo_format, "rgba8");
         assert_eq!(low.dither_depth, "no");
         assert_eq!(low.linear_downscaling, "no");
+        assert_eq!(low.dumb_mode, "yes");
     }
 }

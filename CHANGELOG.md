@@ -13,11 +13,10 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ## Unreleased
 
-- Match DXGI monitor outputs to their physical GPU adapters (`Auto (Display)`, `Power Saving (iGPU)`, `High Performance (dGPU)` in Settings) so internal laptop displays stay on integrated graphics while external dGPU monitors render directly without cross-GPU copy.
-- Freeze active wallpapers seamlessly into kernel GDI bitmaps (`screenshot-raw` -> `HBITMAP` DDB) during pause (`15s` grace for manual/battery/fullscreen/maximized/covered, `3s` for lock/display-off/sleep/remote) and permanently `1s` after loading static images, releasing `libmpv` and D3D11 memory with zero flicker on pause or resume.
-- Enable Windows EcoQoS efficiency mode, background heap compaction (`HeapCompact`), working-set trimming, and `IDLE_PRIORITY_CLASS` background transcoding when the UI is hidden or paused, lowering dormant RAM footprint.
-- Replace coarse monitor occlusion checks with per-display `EnumWindows` + `DWMWA_EXTENDED_FRAME_BOUNDS` 2D union coverage and `SetWinEventHook` tracking so fullscreen/maximized or multi-window coverage only freezes the covered monitor while other monitors continue playing.
-- Tune `mpv` decode and swapchain overhead (`demuxer-max-bytes`, UMA-aware buffer limits, `swapchain-depth=1`, disk shader caching, `rgb10_a2` on Optimize, FPS-matched background cache transcode preserving `d3d11va` zero-copy) without altering user-selectable `Native` or `High` fidelity.
+- Add a main-page **GPU** selector in the Library sidebar (`Auto`, `Power Saving (iGPU)`, `High Performance (dGPU)`), where `Auto` selects a dedicated GPU when available and falls back to integrated graphics (with `low_memory_uma <= 512 MiB` limits) on integrated-only devices.
+- Eliminate window drag-move frame drops and UI stutter by stopping `WM_MOVE` full-tree Acrylic redraws and `SetTimer` move coalescing, sliding dragged windows as an opaque DWM surface at native refresh rate and smoothly fading live Acrylic back on release.
+- Replace coarse monitor occlusion checks with per-display `EnumWindows` + `DWMWA_EXTENDED_FRAME_BOUNDS` 2D union coverage, `SetWinEventHook` reactivity, and adaptive `500 ms` / `2000 ms` timer polling while keeping instant `0 ms` warm pause/resume on maximize, fullscreen, battery, and manual pause (`3 s` release preserved for lock, display-off, sleep, and remote sessions).
+- Enable Windows EcoQoS efficiency mode, background heap compaction (`HeapCompact`), working-set trimming, single-core (`SetProcessAffinityMask`) / single-thread `PROCESS_MODE_BACKGROUND_BEGIN` cache transcoding (`CACHE_FPS=60`), clean `partial-*.mp4` reclamation, and `mpv` overhead tuning (`swapchain-depth=1`, disk shader caching, `rgb10_a2` on Optimize, `gpu-dumb-mode=yes` on Low) without altering user-selectable `Native` or `High` fidelity.
 
 ---
 

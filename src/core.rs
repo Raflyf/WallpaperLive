@@ -97,7 +97,7 @@ impl GpuPreference {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "GPU: Auto (Display)",
+            Self::Auto => "GPU: Auto",
             Self::PowerSaving => "GPU: Power Saving (iGPU)",
             Self::HighPerformance => "GPU: High Performance (dGPU)",
         }
@@ -105,7 +105,7 @@ impl GpuPreference {
 
     pub fn option_label(self) -> &'static str {
         match self {
-            Self::Auto => "Auto (Match monitor GPU, recommended)",
+            Self::Auto => "Auto (Dedicated GPU, else iGPU)",
             Self::PowerSaving => "Power Saving (Integrated GPU)",
             Self::HighPerformance => "High Performance (Dedicated GPU)",
         }

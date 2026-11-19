@@ -50,8 +50,10 @@ pub fn select_adapter(
     let chosen = match pref {
         GpuPreference::Auto => candidates
             .iter()
-            .find(|c| matches_monitor(c, monitor))
-            .or_else(|| candidates.iter().min_by_key(|c| c.dedicated_vram)),
+            .filter(|c| c.dedicated_vram > LOW_MEMORY_UMA_LIMIT)
+            .max_by_key(|c| (c.dedicated_vram, matches_monitor(c, monitor)))
+            .or_else(|| candidates.iter().find(|c| matches_monitor(c, monitor)))
+            .or_else(|| candidates.iter().max_by_key(|c| c.dedicated_vram)),
         GpuPreference::PowerSaving => candidates
             .iter()
             .min_by_key(|c| (c.dedicated_vram, !matches_monitor(c, monitor))),
@@ -132,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_routes_hybrid_laptop_and_desktop_monitors_to_output_adapter() {
+    fn auto_prefers_dedicated_gpu_and_falls_back_to_integrated() {
         let igpu = AdapterCandidate {
             name: "Intel UHD Graphics".into(),
             dedicated_vram: 128 << 20,
@@ -145,31 +147,59 @@ mod tests {
         };
         let hybrid = vec![igpu.clone(), dgpu.clone()];
 
-        // Internal laptop panel attached to iGPU uses iGPU (no PCIe copy, dGPU sleeps).
-        assert_eq!(
-            select_adapter(&hybrid, Some(r"\\.\display1"), GpuPreference::Auto),
-            AdapterChoice {
-                name: Some("Intel UHD Graphics".into()),
-                low_memory_uma: true,
-            }
-        );
+        // Hybrid laptop with a dedicated GPU picks dGPU in Auto regardless of display wiring.
+        for monitor in [Some(r"\\.\display1"), Some(r"\\.\DISPLAY2"), None] {
+            assert_eq!(
+                select_adapter(&hybrid, monitor, GpuPreference::Auto),
+                AdapterChoice {
+                    name: Some("NVIDIA GeForce RTX".into()),
+                    low_memory_uma: false,
+                }
+            );
+        }
 
-        // External display wired directly to dGPU uses dGPU with full pools.
+        // Hybrid laptop where BIOS reserves 1 GiB UMA for APU still prefers the higher-VRAM dGPU.
+        let apu_1g = AdapterCandidate {
+            name: "AMD Radeon Graphics".into(),
+            dedicated_vram: 1 << 30,
+            outputs: vec![r"\\.\DISPLAY1".into()],
+        };
+        let dgpu_headless = AdapterCandidate {
+            outputs: vec![],
+            ..dgpu.clone()
+        };
         assert_eq!(
-            select_adapter(&hybrid, Some(r"\\.\DISPLAY2"), GpuPreference::Auto),
+            select_adapter(
+                &[apu_1g, dgpu_headless],
+                Some(r"\\.\DISPLAY1"),
+                GpuPreference::Auto
+            ),
             AdapterChoice {
                 name: Some("NVIDIA GeForce RTX".into()),
                 low_memory_uma: false,
             }
         );
 
-        // Unmatched monitor in Auto mode avoids waking sleeping dGPU.
+        // Dual equal-VRAM dGPUs prefer the adapter wired to the target monitor.
+        let dual_dgpu = vec![
+            AdapterCandidate {
+                name: "GPU A".into(),
+                dedicated_vram: 8 << 30,
+                outputs: vec![r"\\.\DISPLAY1".into()],
+            },
+            AdapterCandidate {
+                name: "GPU B".into(),
+                dedicated_vram: 8 << 30,
+                outputs: vec![r"\\.\DISPLAY2".into()],
+            },
+        ];
         assert_eq!(
-            select_adapter(&hybrid, None, GpuPreference::Auto),
-            AdapterChoice {
-                name: Some("Intel UHD Graphics".into()),
-                low_memory_uma: true,
-            }
+            select_adapter(&dual_dgpu, Some(r"\\.\DISPLAY1"), GpuPreference::Auto).name,
+            Some("GPU A".into())
+        );
+        assert_eq!(
+            select_adapter(&dual_dgpu, Some(r"\\.\DISPLAY2"), GpuPreference::Auto).name,
+            Some("GPU B".into())
         );
 
         // Manual overrides honor PowerSaving / HighPerformance even when display is on the other adapter.
