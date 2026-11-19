@@ -6131,18 +6131,6 @@ unsafe extern "system" fn window_proc(
                 }
                 def
             }
-            WM_NCLBUTTONDOWN => {
-                if wparam.0 as u32 == HTCAPTION && !IsZoomed(window).as_bool() {
-                    let _ = visuals::begin_drag_move_backdrop(window);
-                }
-                let res = DefWindowProcW(window, message, wparam, lparam);
-                if GetPropW(window, SIZE_MOVE_PROPERTY).0.is_null()
-                    && visuals::drag_move_backdrop_active(window)
-                {
-                    visuals::end_drag_move_backdrop(window);
-                }
-                res
-            }
             WM_NCMOUSEMOVE => {
                 if wparam.0 as u32 != HTCLIENT {
                     visuals::set_caption_hover(window, None);

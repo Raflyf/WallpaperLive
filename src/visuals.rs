@@ -436,9 +436,9 @@ pub const BORDER_ALPHA: u8 = 200;
 const DIVIDER_ALPHA: u8 = 136;
 const SEARCH_ALPHA: u8 = 228;
 pub const DROPDOWN_ALPHA: u8 = 76;
-// Cool-neutral slate Acrylic tint (ABGR: AA=0x14, B=0x50=80, G=0x4e=78, R=0x4d=77) matches
-// idle Win11 DWM Acrylic (~70, 70, 72 with R-B = -2..-3) and transition backdrop without color shift.
-const ACRYLIC_TINT_COLOR: u32 = 0x1450_4e4d;
+// Subtle cool-neutral slate Acrylic tint (ABGR: AA=0x05, B=0x3c=60, G=0x3a=58, R=0x38=56)
+// keeps Win11 DWM Acrylic clear and airy without muting the wallpaper underneath.
+const ACRYLIC_TINT_COLOR: u32 = 0x053c_3a38;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -1585,7 +1585,7 @@ pub fn tick_animations(window: HWND) -> bool {
     }
     if finish_fade {
         finish_backdrop_transition(window);
-    } else if fade_tick {
+    } else if fade_tick && !glass_enabled(window) {
         unsafe {
             redraw_backdrop_surfaces(window);
         }
@@ -2920,6 +2920,9 @@ impl PaintBuffer {
             } else {
                 return;
             };
+            if glass_enabled(root) {
+                return;
+            }
             let (win_left, win_top) = if let Some(pt) = self.client_origin {
                 (pt.x, pt.y)
             } else if unsafe {
@@ -4251,7 +4254,7 @@ fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let g = (px >> 8) & 255;
     let b = px & 255;
     let y_px = (77 * r + 150 * g + 29 * b + 128) >> 8;
-    // Preserve ~94% of wallpaper chroma before the 20/255 tint blend (~0.87 total, matching Win11 DWM Acrylic).
+    // Preserve ~94% of wallpaper chroma before the 5/255 tint blend (~0.92 total, lighter Win11 DWM Acrylic).
     let desat = |ch: u32| -> u32 { (ch * 240 + y_px * 15 + 127) / 255 };
     let dr = desat(r);
     let dg = desat(g);
@@ -4261,7 +4264,7 @@ fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let dy = y_target as i32 - y_desat as i32;
     let blend = |ch: u32, tint_ch: u32| -> u32 {
         let shifted = (ch as i32 + dy).clamp(0, 255) as u32;
-        (shifted * 235 + tint_ch * 20 + 127) / 255
+        (shifted * 250 + tint_ch * 5 + 127) / 255
     };
     let out_r = blend(dr, tint_r);
     let out_g = blend(dg, tint_g);
@@ -4761,26 +4764,8 @@ pub fn drag_move_backdrop_active(window: HWND) -> bool {
         })
 }
 
-unsafe fn suspend_acrylic_for_drag(window: HWND, suspend: bool) {
-    use windows::Win32::Graphics::Dwm::{DWM_BB_ENABLE, DWM_BLURBEHIND, DwmEnableBlurBehindWindow};
-    // SAFETY: window is a live UI-thread HWND; toggles both AccentPolicy and DWM blur-behind region during drag.
-    unsafe {
-        if suspend {
-            let _ = set_acrylic_composition(window, false);
-            let blur = DWM_BLURBEHIND {
-                dwFlags: DWM_BB_ENABLE,
-                fEnable: false.into(),
-                ..Default::default()
-            };
-            let _ = DwmEnableBlurBehindWindow(window, &blur);
-        } else {
-            let _ = apply_hybrid_acrylic(window);
-        }
-    }
-}
-
-/// Captures a screen-space blurred backdrop once on drag-move start and disables DWM
-/// `ACCENT_ENABLE_ACRYLICBLURBEHIND` + blur-behind so window moves compose as an opaque alpha=255 surface.
+/// Tracks active drag-move state without freezing or suspending live DWM Acrylic so the
+/// animated desktop wallpaper remains live and transparent behind the window during moves.
 pub fn begin_drag_move_backdrop(window: HWND) -> bool {
     if window.0.is_null() {
         return false;
@@ -4799,22 +4784,35 @@ pub fn begin_drag_move_backdrop(window: HWND) -> bool {
         {
             return false;
         }
-        capture_transition_backdrop(window);
+        let mon = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon_rect = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcMonitor
+        } else {
+            RECT::default()
+        };
         TRANSITION_BACKDROP.with(|slot| {
             let mut bd = slot.borrow_mut();
+            bd.hwnd = window.0 as isize;
+            bd.mon_rect = mon_rect;
+            if bd.pixels.is_empty() {
+                bd.width = 1;
+                bd.height = 1;
+                bd.pixels.push(0xFF08_090C);
+            }
             bd.active = true;
             bd.captured_while_visible = true;
             bd.drag_move = true;
-            bd.acrylic_suspended = true;
+            bd.acrylic_suspended = false;
             bd.fading = false;
             bd.fade_start = None;
             bd.fade_warmup_ms = 0;
             bd.fade_duration_ms = 0;
         });
         disarm_timer_if_idle(window);
-        // Paint the alpha=255 transition surface once before turning off DWM Acrylic so OS drag slides an opaque bitmap cleanly.
-        redraw_backdrop_surfaces(window);
-        suspend_acrylic_for_drag(window, true);
         true
     }
 }
@@ -4889,20 +4887,6 @@ pub fn begin_backdrop_transition(window: HWND) {
             bd.fade_duration_ms = 0;
         });
         disarm_timer_if_idle(window);
-        if !iconic_or_hidden {
-            let _ = RedrawWindow(
-                window,
-                None,
-                None,
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
-            );
-            // Flush the alpha=255 frame to DWM before DefWindowProcW snapshots the From visual.
-            if windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled()
-                .is_ok_and(|enabled| enabled.as_bool())
-            {
-                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
-            }
-        }
     }
 }
 
@@ -4949,7 +4933,7 @@ pub fn begin_backdrop_fade(window: HWND) {
         // Re-enable live hardware Acrylic once behind the opaque warmup hold before fade-out begins.
         // SAFETY: window is a live non-iconic HWND on the UI thread.
         unsafe {
-            suspend_acrylic_for_drag(window, false);
+            let _ = set_acrylic_composition(window, true);
         }
     }
     arm_anim_timer(window);
@@ -4981,7 +4965,7 @@ pub fn finish_backdrop_transition(window: HWND) {
     if window.0.is_null() {
         return;
     }
-    // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND if still suspended, then redraws without erase flicker.
+    // SAFETY: restores steady-state ACCENT_ENABLE_ACRYLICBLURBEHIND if still suspended.
     unsafe {
         if !IsWindow(window).as_bool()
             || IsIconic(window).as_bool()
@@ -4994,9 +4978,11 @@ pub fn finish_backdrop_transition(window: HWND) {
             && user_acrylic_enabled()
             && transparency_enabled()
         {
-            suspend_acrylic_for_drag(window, false);
+            let _ = set_acrylic_composition(window, true);
         }
-        redraw_backdrop_surfaces(window);
+        if !glass_enabled(window) {
+            redraw_backdrop_surfaces(window);
+        }
     }
 }
 
@@ -8983,7 +8969,7 @@ mod tests {
         assert_eq!(CARD_ALPHA, 28);
         assert_eq!(BORDER_ALPHA, 200);
         assert_eq!(DROPDOWN_ALPHA, 76);
-        assert_eq!(ACRYLIC_TINT_COLOR, 0x1450_4e4d);
+        assert_eq!(ACRYLIC_TINT_COLOR, 0x053c_3a38);
         assert_eq!(ease_out_quart(-0.5), 0.0);
         assert_eq!(ease_out_quart(0.0), 0.0);
         assert_eq!(ease_out_quart(1.0), 1.0);
