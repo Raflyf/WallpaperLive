@@ -427,18 +427,18 @@ pub const ACCENT_SOFT: u32 = mix(ORANGE, CREAM, 16, 100);
 pub const ACCENT_HOVER: u32 = mix(ORANGE, CREAM, 12, 100);
 pub const GLASS_RIM: u32 = mix(INK, CREAM, 74, 100);
 pub const PANEL_ALPHA: u8 = 0;
-pub const CARD_ALPHA: u8 = 28;
-const CONTROL_ALPHA: u8 = 48;
-const HOVER_ALPHA: u8 = 84;
-const ACTIVE_TILE_ALPHA: u8 = 108;
-const ACTIVE_ALPHA: u8 = 244;
-pub const BORDER_ALPHA: u8 = 140;
-const DIVIDER_ALPHA: u8 = 92;
+pub const CARD_ALPHA: u8 = 72;
+const CONTROL_ALPHA: u8 = 188;
+const HOVER_ALPHA: u8 = 228;
+const ACTIVE_TILE_ALPHA: u8 = 216;
+const ACTIVE_ALPHA: u8 = 250;
+pub const BORDER_ALPHA: u8 = 216;
+const DIVIDER_ALPHA: u8 = 168;
 const SEARCH_ALPHA: u8 = 255;
-pub const DROPDOWN_ALPHA: u8 = 76;
-// Subtle cool-neutral slate Acrylic tint (ABGR: AA=0x05, B=0x3c=60, G=0x3a=58, R=0x38=56)
-// keeps Win11 DWM Acrylic clear and airy without muting the wallpaper underneath.
-const ACRYLIC_TINT_COLOR: u32 = 0x053c_3a38;
+pub const DROPDOWN_ALPHA: u8 = 156;
+// Cool-neutral slate Acrylic tint (ABGR: AA=0x14, B=0x50=80, G=0x4e=78, R=0x4d=77) matches
+// idle Win11 DWM Acrylic (~70, 70, 72 with R-B = -2..-3) and transition backdrop without color shift.
+const ACRYLIC_TINT_COLOR: u32 = 0x1450_4e4d;
 const ODS_NOFOCUSRECT_FLAG: u32 = 0x0200;
 const UISF_HIDEFOCUS_FLAG: isize = 0x0001;
 
@@ -2245,7 +2245,7 @@ impl PaintBuffer {
                 if v < 0.42 {
                     mask.sheen_strength * (1.0 - v / 0.42)
                 } else if v > 0.62 {
-                    -mask.sheen_strength * 0.55 * ((v - 0.62) / 0.38)
+                    -mask.sheen_strength * 0.75 * ((v - 0.62) / 0.38)
                 } else {
                     0.0
                 }
@@ -2255,10 +2255,10 @@ impl PaintBuffer {
             let (sheen_target_r, sheen_target_g, sheen_target_b, sheen_w) = if face_sheen > 0.0 {
                 (250.0, 246.0, 238.0, face_sheen.clamp(0.0, 0.35))
             } else {
-                (14.0, 14.0, 16.0, (-face_sheen).clamp(0.0, 0.35))
+                (10.0, 10.0, 12.0, (-face_sheen).clamp(0.0, 0.35))
             };
-            let top_w = top_edge * 0.58;
-            let bot_w = bot_edge * 0.48;
+            let top_w = top_edge * 0.76;
+            let bot_w = bot_edge * 0.78;
             let mut row_br = br;
             let mut row_bg = bg;
             let mut row_bb = bb;
@@ -2272,7 +2272,8 @@ impl PaintBuffer {
                 row_bg += (dg - row_bg) * bot_w;
                 row_bb += (db - row_bb) * bot_w;
             }
-            let row_ba = (ba + (255.0 - ba) * 0.38 * top_edge).clamp(0.0, 255.0);
+            let row_ba =
+                (ba + (255.0 - ba) * (0.55 * top_edge + 0.50 * bot_edge)).clamp(0.0, 255.0);
             let border_scale = row_ba / 255.0;
             let border_pre_r = row_br * border_scale;
             let border_pre_g = row_bg * border_scale;
@@ -2413,9 +2414,9 @@ impl PaintBuffer {
         } else if pressed {
             CARD_LIT
         } else if hot {
-            mix(INK, CREAM, 12, 100)
+            mix(INK, CREAM, 10, 100)
         } else {
-            mix(INK, CREAM, 7, 100)
+            INK
         };
         let on_fill = if disabled {
             DISABLED_BORDER
@@ -2432,11 +2433,17 @@ impl PaintBuffer {
         } else if hot || pressed {
             168
         } else {
-            132
+            152
         };
-        let on_alpha = if glass { 244 } else { 255 };
+        let on_alpha = if glass { 250 } else { 255 };
         let track_alpha = lerp_u8(off_alpha, on_alpha, t) as f32;
-        let off_border = if disabled { DISABLED_BORDER } else { HIGHLIGHT };
+        let off_border = if disabled {
+            DISABLED_BORDER
+        } else if hot {
+            CREAM
+        } else {
+            GLASS_RIM
+        };
         let on_border = if pressed { ACCENT_DEEP } else { ACCENT_SOFT };
         let border_color = lerp_rgb(off_border, on_border, t);
         let split = |c: u32| -> (f32, f32, f32) {
@@ -2490,23 +2497,23 @@ impl PaintBuffer {
                 let border_cov = (track_cov - inner_cov).max(0.0);
                 // Concave inner recess when OFF, warm dome lift when ON.
                 let v = (py / h).clamp(0.0, 1.0);
-                let depth = ((0.5 - v) * 2.0) * (t * 0.14 - (1.0 - t) * 0.12);
+                let depth = ((0.5 - v) * 2.0) * (t * 0.22 - (1.0 - t) * 0.20);
                 let face_r = (tfr * (1.0 + depth)).clamp(0.0, 255.0);
                 let face_g = (tfg * (1.0 + depth)).clamp(0.0, 255.0);
                 let face_b = (tfb * (1.0 + depth)).clamp(0.0, 255.0);
-                let trk_a = track_alpha * inner_cov + 210.0 * border_cov;
+                let trk_a = track_alpha * inner_cov + 236.0 * border_cov;
                 let trk_r = if track_cov > 0.0 {
-                    (face_r * track_alpha * inner_cov + tbr * 210.0 * border_cov) / trk_a.max(1.0)
+                    (face_r * track_alpha * inner_cov + tbr * 236.0 * border_cov) / trk_a.max(1.0)
                 } else {
                     0.0
                 };
                 let trk_g = if track_cov > 0.0 {
-                    (face_g * track_alpha * inner_cov + tbg * 210.0 * border_cov) / trk_a.max(1.0)
+                    (face_g * track_alpha * inner_cov + tbg * 236.0 * border_cov) / trk_a.max(1.0)
                 } else {
                     0.0
                 };
                 let trk_b = if track_cov > 0.0 {
-                    (face_b * track_alpha * inner_cov + tbb * 210.0 * border_cov) / trk_a.max(1.0)
+                    (face_b * track_alpha * inner_cov + tbb * 236.0 * border_cov) / trk_a.max(1.0)
                 } else {
                     0.0
                 };
@@ -2517,12 +2524,12 @@ impl PaintBuffer {
                 };
 
                 // Soft 3D knob shadow over track.
-                let d_shadow = (px - knob_cx).hypot(py - (knob_cy + 1.2)) - (knob_r + 0.9);
+                let d_shadow = (px - knob_cx).hypot(py - (knob_cy + 1.3)) - (knob_r + 1.1);
                 let shadow_cov = (0.5 - d_shadow).clamp(0.0, 1.0);
                 if shadow_cov > 0.0 {
-                    let s_a = shadow_cov * 96.0;
+                    let s_a = shadow_cov * 136.0;
                     (cur_r, cur_g, cur_b, cur_a) =
-                        over_pre(cur_r, cur_g, cur_b, cur_a, 10.0, 10.0, 12.0, s_a);
+                        over_pre(cur_r, cur_g, cur_b, cur_a, 8.0, 8.0, 10.0, s_a);
                 }
 
                 // 3D spherical thumb with upper-left specular highlight and grounded rim.
@@ -2531,8 +2538,8 @@ impl PaintBuffer {
                 if knob_cov > 0.0 {
                     let nx = ((px - knob_cx) / knob_r).clamp(-1.0, 1.0);
                     let ny = ((py - knob_cy) / knob_r).clamp(-1.0, 1.0);
-                    let spec = (-nx * 0.45 - ny * 0.85).clamp(0.0, 1.0) * 0.14;
-                    let rim = (d_knob / 1.0 + 0.5).clamp(0.0, 1.0) * 0.06;
+                    let spec = (-nx * 0.45 - ny * 0.85).clamp(0.0, 1.0) * 0.22;
+                    let rim = (d_knob / 1.0 + 0.5).clamp(0.0, 1.0) * 0.14;
                     let kr = (kr_base + (255.0 - kr_base) * spec - kr_base * rim).clamp(0.0, 255.0);
                     let kg = (kg_base + (255.0 - kg_base) * spec - kg_base * rim).clamp(0.0, 255.0);
                     let kb = (kb_base + (255.0 - kb_base) * spec - kb_base * rim).clamp(0.0, 255.0);
@@ -3520,14 +3527,14 @@ unsafe fn draw_item_into(
                 card_border = if active {
                     ACCENT
                 } else if hot && id != PREVIEW {
-                    HIGHLIGHT
+                    GLASS_RIM
                 } else {
-                    LINE
+                    HIGHLIGHT
                 };
                 fill_alpha = if !glass_active {
                     255
                 } else if id == PREVIEW {
-                    if path.is_some() { CARD_ALPHA } else { 22 }
+                    if path.is_some() { CARD_ALPHA } else { 44 }
                 } else if active {
                     ACTIVE_TILE_ALPHA
                 } else if hot {
@@ -3538,7 +3545,7 @@ unsafe fn draw_item_into(
                 border_alpha = if !glass_active || active {
                     255
                 } else if hot && id != PREVIEW {
-                    196
+                    244
                 } else {
                     BORDER_ALPHA
                 };
@@ -3552,13 +3559,13 @@ unsafe fn draw_item_into(
                     GLASS_RIM
                 };
                 card_top_rim = card_highlight;
-                card_bottom_rim = if active { ACCENT_DEEP } else { INK };
+                card_bottom_rim = if active { ACCENT_DEEP } else { 0x050507 };
                 card_sheen = if id == PREVIEW {
                     0.0
                 } else if hot {
-                    0.08
+                    0.18
                 } else {
-                    0.05
+                    0.12
                 };
                 if buffered {
                     fill(dc, r, card_color);
@@ -3733,57 +3740,55 @@ unsafe fn draw_item_into(
             };
             let active_c = if pressed { ACCENT_DARK } else { ACCENT };
             let c = lerp_rgb(base_c, active_c, tab_weight);
-            let b = lerp_rgb(if hot { HIGHLIGHT } else { LINE }, ACCENT_DARK, tab_weight);
+            let b = lerp_rgb(
+                if hot { GLASS_RIM } else { HIGHLIGHT },
+                ACCENT_DARK,
+                tab_weight,
+            );
             let top = lerp_rgb(
-                if pressed {
-                    INK
-                } else if hot {
-                    CREAM
-                } else {
-                    GLASS_RIM
-                },
+                if pressed { INK } else { CREAM },
                 if pressed { ACCENT_DEEP } else { ACCENT_SOFT },
                 tab_weight,
             );
-            let bot = lerp_rgb(INK, ACCENT_DEEP, tab_weight);
+            let bot = lerp_rgb(0x050507, ACCENT_DEEP, tab_weight);
             let sheen = if pressed {
-                -0.07
+                -0.12
             } else {
-                0.05 + 0.06 * tab_weight + if hot { 0.03 } else { 0.0 }
+                0.14 + 0.06 * tab_weight + if hot { 0.05 } else { 0.0 }
             };
             (c, b, top, bot, sheen)
         } else if primary {
             if pressed {
-                (ACCENT_DARK, ACCENT_DEEP, ACCENT_DEEP, ACCENT_SOFT, -0.08)
+                (ACCENT_DARK, ACCENT_DEEP, ACCENT_DEEP, ACCENT_SOFT, -0.12)
             } else if hot {
-                (ACCENT_HOVER, ACCENT, CREAM, ACCENT_DEEP, 0.13)
+                (ACCENT_HOVER, ACCENT_SOFT, CREAM, ACCENT_DEEP, 0.22)
             } else {
-                (ACCENT, ACCENT_DARK, ACCENT_SOFT, ACCENT_DEEP, 0.10)
+                (ACCENT, ACCENT_DARK, CREAM, ACCENT_DEEP, 0.18)
             }
         } else if pressed {
-            (CARD_LIT, HIGHLIGHT, INK, HIGHLIGHT, -0.07)
+            (CARD_LIT, HIGHLIGHT, INK, HIGHLIGHT, -0.12)
         } else if hot {
-            (CARD_LIT, HIGHLIGHT, CREAM, INK, 0.08)
+            (CARD_LIT, GLASS_RIM, CREAM, 0x050507, 0.22)
         } else {
-            (CARD, LINE, GLASS_RIM, INK, 0.05)
+            (CARD, HIGHLIGHT, CREAM, 0x050507, 0.16)
         };
         let fill_alpha = if !glass_active {
             255
         } else if disabled {
-            if is_card_host { 48 } else { 56 }
+            if is_card_host { 64 } else { 72 }
         } else if is_tab {
             let base_a = if pressed {
-                176
+                220
             } else if hot {
                 HOVER_ALPHA
             } else {
-                CARD_ALPHA
+                CONTROL_ALPHA
             };
             lerp_u8(base_a, ACTIVE_ALPHA, tab_weight)
         } else if primary {
             ACTIVE_ALPHA
         } else if pressed {
-            188
+            236
         } else if hot {
             HOVER_ALPHA
         } else {
@@ -3792,11 +3797,11 @@ unsafe fn draw_item_into(
         let border_alpha = if !glass_active || (primary && !disabled) {
             255
         } else if is_tab {
-            lerp_u8(if hot { 216 } else { BORDER_ALPHA }, 255, tab_weight)
+            lerp_u8(if hot { 244 } else { BORDER_ALPHA }, 255, tab_weight)
         } else if disabled {
-            132
+            148
         } else if hot || pressed {
-            224
+            248
         } else {
             BORDER_ALPHA
         };
@@ -4231,7 +4236,7 @@ fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let g = (px >> 8) & 255;
     let b = px & 255;
     let y_px = (77 * r + 150 * g + 29 * b + 128) >> 8;
-    // Preserve ~94% of wallpaper chroma before the 5/255 tint blend (~0.92 total, lighter Win11 DWM Acrylic).
+    // Preserve ~94% of wallpaper chroma before the 20/255 tint blend (~0.87 total, matching Win11 DWM Acrylic).
     let desat = |ch: u32| -> u32 { (ch * 240 + y_px * 15 + 127) / 255 };
     let dr = desat(r);
     let dg = desat(g);
@@ -4241,7 +4246,7 @@ fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let dy = y_target as i32 - y_desat as i32;
     let blend = |ch: u32, tint_ch: u32| -> u32 {
         let shifted = (ch as i32 + dy).clamp(0, 255) as u32;
-        (shifted * 250 + tint_ch * 5 + 127) / 255
+        (shifted * 235 + tint_ch * 20 + 127) / 255
     };
     let out_r = blend(dr, tint_r);
     let out_g = blend(dg, tint_g);
@@ -5990,39 +5995,52 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                     let t = toggle_progress(id, checked, parent);
                     toggle_state = (checked, pressed, disabled, hot, t);
                     let glass = theme.0 != 0;
-                    if hot || pressed {
-                        fill(buffer.dc, area, CARD_LIT);
-                        let row_mask = RoundedMask {
-                            ellipse: s(8),
-                            border: if glass || pressed { HIGHLIGHT } else { LINE },
-                            border_width: 1.0,
-                            border_alpha: if !glass {
-                                255
-                            } else if pressed {
-                                148
-                            } else {
-                                116
-                            },
-                            fill_alpha: if !glass {
-                                255
-                            } else if pressed {
-                                96
-                            } else {
-                                78
-                            },
-                            focus: 0,
-                            focus_inset: 0.0,
-                            host_color: surface_color,
-                            host_alpha: if glass { surface_alpha } else { 255 },
-                            top_rim: if glass { CREAM } else { GLASS_RIM },
-                            bottom_rim: if glass { 0 } else { INK },
-                            sheen_strength: if glass { 0.04 } else { 0.02 },
-                        };
-                        buffer.apply_rounded_rect_mask(area, &row_mask)
-                    } else {
-                        fill(buffer.dc, area, surface_color);
-                        buffer.tint_background(area, if glass { surface_alpha } else { 255 })
-                    }
+                    fill(
+                        buffer.dc,
+                        area,
+                        if hot || pressed { CARD_LIT } else { CARD },
+                    );
+                    let row_mask = RoundedMask {
+                        ellipse: s(8),
+                        border: if checked {
+                            ACCENT_DARK
+                        } else if glass || hot || pressed {
+                            HIGHLIGHT
+                        } else {
+                            LINE
+                        },
+                        border_width: 1.0,
+                        border_alpha: if !glass {
+                            255
+                        } else if pressed || hot {
+                            228
+                        } else {
+                            184
+                        },
+                        fill_alpha: if !glass {
+                            255
+                        } else if pressed {
+                            196
+                        } else if hot {
+                            176
+                        } else {
+                            136
+                        },
+                        focus: 0,
+                        focus_inset: 0.0,
+                        host_color: surface_color,
+                        host_alpha: if glass { surface_alpha } else { 255 },
+                        top_rim: if hot { CREAM } else { GLASS_RIM },
+                        bottom_rim: 0x050507,
+                        sheen_strength: if pressed {
+                            -0.08
+                        } else if hot {
+                            0.16
+                        } else {
+                            0.11
+                        },
+                    };
+                    buffer.apply_rounded_rect_mask(area, &row_mask)
                 } else {
                     fill(buffer.dc, area, surface_color);
                     if theme.0 != 0 {
@@ -6092,9 +6110,9 @@ unsafe fn paint_control_into(window: HWND, dc: HDC, area: RECT) {
                     let track_h = (s(22).max(16) / 2) * 2;
                     let track_w = s(40).max(28);
                     let top = (area.top + area.bottom - track_h) / 2;
-                    let right = (area.right - s(4)).max(area.left + track_w + s(4));
+                    let right = (area.right - s(10)).max(area.left + track_w + s(8));
                     toggle_track = rect(right - track_w, top, right, top + track_h);
-                    text_area.left = (area.left + s(6)).min(toggle_track.left);
+                    text_area.left = (area.left + s(12)).min(toggle_track.left);
                     text_area.right = (toggle_track.left - s(12)).max(text_area.left);
                 }
                 let (_, pressed, disabled, hot, toggle_t) = toggle_state;
@@ -8928,10 +8946,10 @@ mod tests {
 
     #[test]
     fn ease_out_quart_and_transition_phase_separation() {
-        assert_eq!(CARD_ALPHA, 28);
-        assert_eq!(BORDER_ALPHA, 140);
-        assert_eq!(DROPDOWN_ALPHA, 76);
-        assert_eq!(ACRYLIC_TINT_COLOR, 0x053c_3a38);
+        assert_eq!(CARD_ALPHA, 72);
+        assert_eq!(BORDER_ALPHA, 216);
+        assert_eq!(DROPDOWN_ALPHA, 156);
+        assert_eq!(ACRYLIC_TINT_COLOR, 0x1450_4e4d);
         assert_eq!(ease_out_quart(-0.5), 0.0);
         assert_eq!(ease_out_quart(0.0), 0.0);
         assert_eq!(ease_out_quart(1.0), 1.0);
