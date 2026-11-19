@@ -1,27 +1,308 @@
 use crate::core::validate_media;
 use std::{
+    ffi::OsStr,
+    fs::OpenOptions,
     io::Read,
-    os::windows::process::CommandExt,
+    mem::{size_of, size_of_val},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     path::Path,
-    process::{Command, Stdio},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use windows::{
-    Win32::{Foundation::SIZE, Graphics::Gdi::*, System::Com::*, UI::Shell::*},
-    core::PCWSTR,
+    Win32::{
+        Foundation::{
+            CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SIZE, SetHandleInformation, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
+        Graphics::Gdi::*,
+        System::{
+            Com::*,
+            Threading::{
+                CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+                GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+                LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_FORCEOFFFEEDBACK,
+                STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, STARTUPINFOW_FLAGS,
+                TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+            },
+        },
+        UI::Shell::*,
+    },
+    core::{PCWSTR, PWSTR},
 };
 
 const WIDTH: i32 = 480;
 const HEIGHT: i32 = 270;
 const LIMIT: u64 = (WIDTH * HEIGHT * 4 + 8) as u64;
 const MAX_SOURCE_DIMENSION: i32 = 8192;
+// Suppresses Windows' background-launch hourglass cursor (IDC_APPSTARTING) for short GUI workers.
+const SILENT_STARTUP_FLAGS: STARTUPINFOW_FLAGS =
+    STARTUPINFOW_FLAGS(STARTF_USESTDHANDLES.0 | STARTF_FORCEOFFFEEDBACK.0);
 
-struct Worker(std::process::Child);
-impl Drop for Worker {
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+fn append_quoted_win32_arg(out: &mut Vec<u16>, arg: &OsStr, force_quote: bool) {
+    let units: Vec<u16> = arg.encode_wide().collect();
+    let needs_quotes = force_quote
+        || units.is_empty()
+        || units
+            .iter()
+            .any(|&u| u == b' ' as u16 || u == b'\t' as u16 || u == b'"' as u16);
+    if !needs_quotes {
+        out.extend_from_slice(&units);
+        return;
+    }
+    out.push(b'"' as u16);
+    let mut backslashes = 0usize;
+    for &u in &units {
+        if u == b'\\' as u16 {
+            backslashes += 1;
+        } else if u == b'"' as u16 {
+            out.resize(out.len() + backslashes * 2 + 1, b'\\' as u16);
+            out.push(b'"' as u16);
+            backslashes = 0;
+        } else {
+            out.resize(out.len() + backslashes, b'\\' as u16);
+            out.push(u);
+            backslashes = 0;
+        }
+    }
+    out.resize(out.len() + backslashes * 2, b'\\' as u16);
+    out.push(b'"' as u16);
+}
+
+fn build_windows_command_line(exe: &Path, args: &[&OsStr]) -> Vec<u16> {
+    let mut out = Vec::new();
+    append_quoted_win32_arg(&mut out, exe.as_os_str(), true);
+    for arg in args {
+        out.push(b' ' as u16);
+        append_quoted_win32_arg(&mut out, arg, false);
+    }
+    out.push(0);
+    out
+}
+
+struct ProcAttrList {
+    _buf: Vec<u64>,
+    ptr: LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+impl Drop for ProcAttrList {
     fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if !self.ptr.0.is_null() {
+            // SAFETY: initialized by InitializeProcThreadAttributeList while `_buf` stays alive.
+            unsafe {
+                DeleteProcThreadAttributeList(self.ptr);
+            }
+        }
+    }
+}
+
+pub(crate) struct SilentChild {
+    process: OwnedHandle,
+    pid: u32,
+    stdout: Option<std::io::PipeReader>,
+    #[cfg(test)]
+    _stdin: Option<std::io::PipeWriter>,
+}
+
+impl SilentChild {
+    pub(crate) fn spawn(exe: &Path, args: &[&OsStr], creation_flags: u32) -> Result<Self, String> {
+        Self::spawn_inner(exe, args, creation_flags, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_piped_stdin(
+        exe: &Path,
+        args: &[&OsStr],
+        creation_flags: u32,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(exe, args, creation_flags, true)
+    }
+
+    fn spawn_inner(
+        exe: &Path,
+        args: &[&OsStr],
+        creation_flags: u32,
+        pipe_stdin: bool,
+    ) -> Result<Self, String> {
+        let (stdout_reader, stdout_writer) =
+            std::io::pipe().map_err(|e| format!("Could not create worker pipe: {e}"))?;
+        let nul_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("NUL")
+            .map_err(|e| format!("Could not open NUL device: {e}"))?;
+        let stdin_pipe = if pipe_stdin {
+            Some(std::io::pipe().map_err(|e| format!("Could not create worker stdin pipe: {e}"))?)
+        } else {
+            None
+        };
+
+        let app_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut cmd_wide = build_windows_command_line(exe, args);
+        let nul_handle = HANDLE(nul_file.as_raw_handle());
+        let stdout_write_handle = HANDLE(stdout_writer.as_raw_handle());
+        let stdin_handle = stdin_pipe
+            .as_ref()
+            .map_or(nul_handle, |(r, _)| HANDLE(r.as_raw_handle()));
+        let inherit_storage = [nul_handle, stdout_write_handle, stdin_handle];
+        let inherit_handles = if pipe_stdin {
+            &inherit_storage[..3]
+        } else {
+            &inherit_storage[..2]
+        };
+
+        let _lock = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `attr_list._buf`, `inherit_handles`, `app_wide`, and `cmd_wide` stay alive across CreateProcessW.
+        let pi = unsafe {
+            for &h in inherit_handles {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
+                    .map_err(|e| format!("Could not mark worker handle inheritable: {e}"))?;
+            }
+            let mut attr_size = 0usize;
+            let _ = InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
+                1,
+                0,
+                &mut attr_size,
+            );
+            if attr_size == 0 {
+                return Err("Could not size worker attribute list".into());
+            }
+            let mut attr_list = ProcAttrList {
+                _buf: vec![0u64; attr_size.div_ceil(size_of::<u64>())],
+                ptr: LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
+            };
+            let list_ptr = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list._buf.as_mut_ptr().cast());
+            InitializeProcThreadAttributeList(list_ptr, 1, 0, &mut attr_size)
+                .map_err(|e| format!("Could not initialize worker attribute list: {e}"))?;
+            attr_list.ptr = list_ptr;
+            UpdateProcThreadAttribute(
+                attr_list.ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(inherit_handles.as_ptr().cast()),
+                size_of_val(inherit_handles),
+                None,
+                None,
+            )
+            .map_err(|e| format!("Could not scope worker inherited handles: {e}"))?;
+
+            let startup = STARTUPINFOEXW {
+                StartupInfo: STARTUPINFOW {
+                    cb: size_of::<STARTUPINFOEXW>() as u32,
+                    dwFlags: SILENT_STARTUP_FLAGS,
+                    hStdInput: stdin_handle,
+                    hStdOutput: stdout_write_handle,
+                    hStdError: nul_handle,
+                    ..Default::default()
+                },
+                lpAttributeList: attr_list.ptr,
+            };
+            let mut pi = PROCESS_INFORMATION::default();
+            CreateProcessW(
+                PCWSTR(app_wide.as_ptr()),
+                PWSTR(cmd_wide.as_mut_ptr()),
+                None,
+                None,
+                true,
+                PROCESS_CREATION_FLAGS(creation_flags | EXTENDED_STARTUPINFO_PRESENT.0),
+                None,
+                PCWSTR::null(),
+                &startup.StartupInfo,
+                &mut pi,
+            )
+            .map_err(|e| format!("Could not start worker process: {e}"))?;
+            if !pi.hThread.is_invalid() {
+                let _ = CloseHandle(pi.hThread);
+            }
+            let _keep_alive = &inherit_storage;
+            pi
+        };
+        drop(stdout_writer);
+        drop(nul_file);
+        #[cfg(test)]
+        let stdin_writer = stdin_pipe.map(|(r, w)| {
+            drop(r);
+            w
+        });
+        #[cfg(not(test))]
+        drop(stdin_pipe);
+
+        // SAFETY: `pi.hProcess` is a fresh unique HANDLE returned by CreateProcessW.
+        let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0) };
+        Ok(Self {
+            process,
+            pid: pi.dwProcessId,
+            stdout: Some(stdout_reader),
+            #[cfg(test)]
+            _stdin: stdin_writer,
+        })
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<std::io::PipeReader> {
+        self.stdout.take()
+    }
+
+    pub(crate) fn try_wait(&mut self) -> Result<Option<bool>, String> {
+        let h = HANDLE(self.process.as_raw_handle());
+        // SAFETY: `self.process` owns a valid Windows process handle.
+        let wait = unsafe { WaitForSingleObject(h, 0) };
+        if wait == WAIT_TIMEOUT {
+            return Ok(None);
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(format!("Could not poll worker process state ({})", wait.0));
+        }
+        let mut exit_code = 1u32;
+        // SAFETY: process already signaled WAIT_OBJECT_0; writes 4-byte exit code.
+        unsafe { GetExitCodeProcess(h, &mut exit_code) }.map_err(|e| e.to_string())?;
+        Ok(Some(exit_code == 0))
+    }
+
+    pub(crate) fn kill_and_wait(&mut self) -> Result<(), String> {
+        let h = HANDLE(self.process.as_raw_handle());
+        // SAFETY: terminates and reaps the owned process handle synchronously.
+        unsafe {
+            let term = TerminateProcess(h, 1);
+            let wait = WaitForSingleObject(h, INFINITE);
+            if wait != WAIT_OBJECT_0 {
+                return Err(format!("Could not wait for stopped worker ({})", wait.0));
+            }
+            if term.is_err() {
+                let mut exit_code = 0u32;
+                if GetExitCodeProcess(h, &mut exit_code).is_err() {
+                    term.map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_process_handle(&self) -> HANDLE {
+        HANDLE(self.process.as_raw_handle())
+    }
+}
+
+impl Drop for SilentChild {
+    fn drop(&mut self) {
+        let h = HANDLE(self.process.as_raw_handle());
+        // SAFETY: ensures spawned worker never outlives its handle owner.
+        unsafe {
+            if WaitForSingleObject(h, 0) != WAIT_OBJECT_0 {
+                let _ = TerminateProcess(h, 1);
+                let _ = WaitForSingleObject(h, 5000);
+            }
         }
     }
 }
@@ -30,28 +311,22 @@ pub fn capture(path: &Path, cancelled: &std::sync::atomic::AtomicBool) -> Result
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("Thumbnail cancelled".into());
     }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // Shell codecs stay in one short-lived child, not in the wallpaper process.
-    let child = Worker(
-        Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-            .arg("--thumbnail")
-            .arg(path)
-            .creation_flags(0x08004000)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Could not start thumbnail worker: {e}"))?,
-    );
+    let child = SilentChild::spawn(
+        &exe,
+        &[OsStr::new("--thumbnail"), path.as_os_str()],
+        0x08004000,
+    )
+    .map_err(|e| format!("Could not start thumbnail worker: {e}"))?;
     capture_output(child, cancelled)
 }
 fn capture_output(
-    mut child: Worker,
+    mut child: SilentChild,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let stdout = child
-        .0
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or("Thumbnail worker has no output")?;
     let reader = std::thread::spawn(move || {
         let mut output = Vec::new();
@@ -61,21 +336,16 @@ fn capture_output(
             .map(|_| output)
     });
     let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
-            break status;
+    let success = loop {
+        if let Some(ok) = child.try_wait()? {
+            break ok;
         }
         if cancelled.load(std::sync::atomic::Ordering::Relaxed)
             || start.elapsed() >= Duration::from_secs(10)
         {
             child
-                .0
-                .kill()
+                .kill_and_wait()
                 .map_err(|e| format!("Could not stop thumbnail worker: {e}"))?;
-            child
-                .0
-                .wait()
-                .map_err(|e| format!("Could not reap thumbnail worker: {e}"))?;
             let _ = reader.join();
             return Err(if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 "Thumbnail cancelled"
@@ -90,7 +360,7 @@ fn capture_output(
         .join()
         .map_err(|_| "Thumbnail output reader failed")?
         .map_err(|e| e.to_string())?;
-    if !status.success() {
+    if !success {
         return Err("Windows could not create this thumbnail".into());
     }
     dimensions(&output)?;
@@ -338,22 +608,25 @@ mod tests {
     use super::*;
     #[test]
     fn cancelled_worker_is_killed_and_reaped() {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
         use windows::Win32::{Foundation::*, System::Threading::*};
         let command = std::env::var_os("ComSpec").expect("Windows command processor");
-        let child = Command::new(command)
-            .args(["/D", "/Q", "/C", "set /p wallpaperlive_test_wait="])
-            .creation_flags(0x08004000)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = SilentChild::spawn_with_piped_stdin(
+            Path::new(&command),
+            &[
+                OsStr::new("/D"),
+                OsStr::new("/Q"),
+                OsStr::new("/C"),
+                OsStr::new("set /p wallpaperlive_test_wait="),
+            ],
+            0x08004000,
+        )
+        .unwrap();
         let mut duplicate = HANDLE::default();
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                HANDLE(child.as_raw_handle()),
+                child.raw_process_handle(),
                 GetCurrentProcess(),
                 &mut duplicate,
                 0,
@@ -366,7 +639,7 @@ mod tests {
         let cancelled = std::sync::atomic::AtomicBool::new(true);
         let start = Instant::now();
         assert!(
-            capture_output(Worker(child), &cancelled)
+            capture_output(child, &cancelled)
                 .unwrap_err()
                 .contains("cancelled")
         );
@@ -377,6 +650,58 @@ mod tests {
                 WAIT_OBJECT_0
             );
         }
+    }
+
+    #[test]
+    fn windows_command_line_quotes_spaces_quotes_and_trailing_backslashes() {
+        let cmd = build_windows_command_line(
+            Path::new(r#"C:\Program Files\WallpaperLive\WallpaperLive.exe"#),
+            &[
+                OsStr::new("--thumbnail"),
+                OsStr::new(r#"C:\my wallpapers\clip 1\"#),
+                OsStr::new(r#"a"b"#),
+                OsStr::new(""),
+            ],
+        );
+        assert_eq!(cmd.last().copied(), Some(0));
+        let text = String::from_utf16_lossy(&cmd[..cmd.len() - 1]);
+        assert_eq!(
+            text,
+            r#""C:\Program Files\WallpaperLive\WallpaperLive.exe" --thumbnail "C:\my wallpapers\clip 1\\" "a\"b" """#
+        );
+    }
+
+    #[test]
+    fn silent_child_sets_force_off_feedback_and_captures_stdout() {
+        assert!(SILENT_STARTUP_FLAGS.contains(STARTF_FORCEOFFFEEDBACK));
+        let command = std::env::var_os("ComSpec").expect("Windows command processor");
+        let mut child = SilentChild::spawn(
+            Path::new(&command),
+            &[
+                OsStr::new("/D"),
+                OsStr::new("/Q"),
+                OsStr::new("/C"),
+                OsStr::new("echo wallpaperlive-silent-ok"),
+            ],
+            0x0800_4000,
+        )
+        .expect("spawn silent child");
+        let mut stdout = child.take_stdout().expect("stdout pipe");
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).expect("read stdout");
+        assert!(
+            text.contains("wallpaperlive-silent-ok"),
+            "unexpected stdout: {text:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let success = loop {
+            if let Some(ok) = child.try_wait().expect("poll exit") {
+                break ok;
+            }
+            assert!(Instant::now() < deadline, "silent child timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(success);
     }
 
     #[test]

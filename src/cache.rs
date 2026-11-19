@@ -1,13 +1,13 @@
 use crate::{
     core::{FPS_OPTIONS, Quality, validate_media, validate_path_syntax},
     mpv::{self, MediaInfo},
+    thumbnail::SilentChild,
 };
 use std::{
+    ffi::OsStr,
     fs,
     io::{Read, Write},
-    os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -39,16 +39,6 @@ pub struct Prepared {
     pub cached: bool,
     pub note: String,
 }
-struct Child(std::process::Child);
-impl Drop for Child {
-    fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-}
-
 pub fn prepare(
     dll: &Path,
     source: &Path,
@@ -61,23 +51,22 @@ pub fn prepare(
     if cancelled.load(Ordering::Relaxed) {
         return Err("Preparation cancelled".into());
     }
-    let child = Child(
-        Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-            .arg("--prepare-cache")
-            .arg(dll)
-            .arg(source)
-            .arg(directory)
-            .arg(display.0.to_string())
-            .arg(display.1.to_string())
-            .arg(fps.to_string())
-            .arg(quality.key())
-            .creation_flags(0x0800_0040)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Could not start video preparation: {e}"))?,
-    );
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let w_arg = display.0.to_string();
+    let h_arg = display.1.to_string();
+    let fps_arg = fps.to_string();
+    let args = [
+        OsStr::new("--prepare-cache"),
+        dll.as_os_str(),
+        source.as_os_str(),
+        directory.as_os_str(),
+        OsStr::new(&w_arg),
+        OsStr::new(&h_arg),
+        OsStr::new(&fps_arg),
+        OsStr::new(quality.key()),
+    ];
+    let child = SilentChild::spawn(&exe, &args, 0x0800_0040)
+        .map_err(|e| format!("Could not start video preparation: {e}"))?;
     let text = preparation_output(child, Some(directory), cancelled)?;
     let result = parse_response(&text)?;
     let original = validate_media(source)?;
@@ -111,15 +100,13 @@ fn remove_pid_partials(directory: &Path, pid: u32) {
 }
 
 fn preparation_output(
-    mut child: Child,
+    mut child: SilentChild,
     directory: Option<&Path>,
     cancelled: &AtomicBool,
 ) -> Result<String, String> {
-    let pid = child.0.id();
+    let pid = child.pid();
     let stdout = child
-        .0
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or("Preparation worker has no output")?;
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -129,13 +116,12 @@ fn preparation_output(
             .map(|_| bytes)
     });
     let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
-            break status;
+    let success = loop {
+        if let Some(ok) = child.try_wait()? {
+            break ok;
         }
         if cancelled.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(920) {
-            child.0.kill().map_err(|e| e.to_string())?;
-            child.0.wait().map_err(|e| e.to_string())?;
+            child.kill_and_wait()?;
             let _ = reader.join();
             if let Some(dir) = directory {
                 remove_pid_partials(dir, pid);
@@ -160,7 +146,7 @@ fn preparation_output(
         return Err("Preparation response is too large".into());
     }
     let text = String::from_utf8(bytes).map_err(|_| "Invalid preparation response")?;
-    if !status.success() {
+    if !success {
         if let Some(dir) = directory {
             remove_pid_partials(dir, pid);
         }
@@ -628,19 +614,23 @@ mod tests {
     fn cancelled_preparation_child_is_killed_and_reaped() {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows::Win32::{Foundation::*, System::Threading::*};
-        let child = Command::new(std::env::var_os("ComSpec").unwrap())
-            .args(["/D", "/Q", "/C", "set /p wallpaperlive_test_wait="])
-            .creation_flags(0x08000000)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let command = std::env::var_os("ComSpec").expect("Windows command processor");
+        let child = SilentChild::spawn_with_piped_stdin(
+            Path::new(&command),
+            &[
+                OsStr::new("/D"),
+                OsStr::new("/Q"),
+                OsStr::new("/C"),
+                OsStr::new("set /p wallpaperlive_test_wait="),
+            ],
+            0x08000000,
+        )
+        .unwrap();
         let mut duplicate = HANDLE::default();
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                HANDLE(child.as_raw_handle()),
+                child.raw_process_handle(),
                 GetCurrentProcess(),
                 &mut duplicate,
                 0,
@@ -652,7 +642,7 @@ mod tests {
         let process = unsafe { OwnedHandle::from_raw_handle(duplicate.0) };
         let started = Instant::now();
         assert!(
-            preparation_output(Child(child), None, &AtomicBool::new(true))
+            preparation_output(child, None, &AtomicBool::new(true))
                 .unwrap_err()
                 .contains("cancelled")
         );
