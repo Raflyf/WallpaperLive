@@ -64,6 +64,55 @@ impl Quality {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GpuPreference {
+    #[default]
+    Auto,
+    PowerSaving,
+    HighPerformance,
+}
+
+pub const GPU_OPTIONS: [GpuPreference; 3] = [
+    GpuPreference::Auto,
+    GpuPreference::PowerSaving,
+    GpuPreference::HighPerformance,
+];
+
+impl GpuPreference {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::PowerSaving => "igpu",
+            Self::HighPerformance => "dgpu",
+        }
+    }
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "igpu" => Some(Self::PowerSaving),
+            "dgpu" => Some(Self::HighPerformance),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "GPU: Auto (Display)",
+            Self::PowerSaving => "GPU: Power Saving (iGPU)",
+            Self::HighPerformance => "GPU: High Performance (dGPU)",
+        }
+    }
+
+    pub fn option_label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (Match monitor GPU, recommended)",
+            Self::PowerSaving => "Power Saving (Integrated GPU)",
+            Self::HighPerformance => "High Performance (Dedicated GPU)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Fit {
     #[default]
     Fill,
@@ -81,6 +130,7 @@ pub struct Settings {
     pub pause_fullscreen: bool,
     pub fps: u32,
     pub quality: Quality,
+    pub gpu_preference: GpuPreference,
     pub acrylic_blur: bool,
     pub auto_update_check: bool,
     pub clock_enabled: bool,
@@ -105,6 +155,7 @@ impl Default for Settings {
             pause_fullscreen: true,
             fps: 30,
             quality: Quality::Optimize,
+            gpu_preference: GpuPreference::Auto,
             acrylic_blur: false,
             auto_update_check: true,
             clock_enabled: false,
@@ -177,6 +228,9 @@ impl Settings {
         if self.quality != Quality::Optimize {
             content.push_str(&format!("quality={}\n", self.quality.key()));
         }
+        if self.gpu_preference != GpuPreference::Auto {
+            content.push_str(&format!("gpu={}\n", self.gpu_preference.key()));
+        }
         if !self.auto_update_check {
             content.push_str("updates=false\n");
         }
@@ -219,6 +273,7 @@ impl Settings {
         let mut lines: Vec<_> = text.lines().collect();
         let mut acrylic = None;
         let mut quality = None;
+        let mut gpu_preference = None;
         let mut auto_update_check = None;
         let mut clock_enabled = None;
         let mut clock_locked = None;
@@ -245,6 +300,12 @@ impl Settings {
                 {
                     lines.pop();
                     quality = Some(Quality::from_key(v).ok_or("Invalid quality preset setting")?);
+                } else if let Some(v) = last.strip_prefix("gpu=")
+                    && gpu_preference.is_none()
+                {
+                    lines.pop();
+                    gpu_preference =
+                        Some(GpuPreference::from_key(v).ok_or("Invalid GPU preference setting")?);
                 } else if let Some(v) = last.strip_prefix("updates=")
                     && auto_update_check.is_none()
                 {
@@ -416,6 +477,7 @@ impl Settings {
             pause_fullscreen,
             fps,
             quality: quality.unwrap_or(Quality::Optimize),
+            gpu_preference: gpu_preference.unwrap_or(GpuPreference::Auto),
             acrylic_blur: acrylic.unwrap_or(false),
             auto_update_check: auto_update_check.unwrap_or(true),
             clock_enabled: clock_enabled.unwrap_or(false),
@@ -441,8 +503,10 @@ pub struct PauseReasons {
     pub battery: bool,
     pub fullscreen: bool,
     pub maximized: bool,
+    pub occluded: bool,
 }
 impl PauseReasons {
+    #[cfg(test)]
     pub fn foreground(&mut self, eligible: bool, maximized: bool, area: Rect, display: Rect) {
         self.fullscreen = eligible && area.covers(display);
         self.maximized = eligible && maximized && area.intersects(display);
@@ -482,6 +546,8 @@ impl PauseReasons {
             Some("Paused: maximized application")
         } else if self.fullscreen {
             Some("Paused: fullscreen application")
+        } else if self.occluded {
+            Some("Paused: covered by applications")
         } else {
             None
         }
@@ -516,6 +582,100 @@ impl Rect {
             && self.right >= other.right
             && self.bottom >= other.bottom
     }
+}
+
+pub fn rect_union_covers(rects: &[Rect], target: Rect, threshold_percent: u32) -> bool {
+    if target.right <= target.left || target.bottom <= target.top {
+        return false;
+    }
+    let pct = threshold_percent.min(100);
+    if pct == 0 {
+        return true;
+    }
+    let mut clipped = Vec::new();
+    for &r in rects {
+        let left = r.left.max(target.left);
+        let top = r.top.max(target.top);
+        let right = r.right.min(target.right);
+        let bottom = r.bottom.min(target.bottom);
+        if right > left && bottom > top {
+            clipped.push(Rect {
+                left,
+                top,
+                right,
+                bottom,
+            });
+        }
+    }
+    if clipped.is_empty() {
+        return false;
+    }
+    let mut xs = Vec::with_capacity(clipped.len() * 2);
+    for r in &clipped {
+        xs.push(r.left);
+        xs.push(r.right);
+    }
+    xs.sort_unstable();
+    xs.dedup();
+    let mut intervals: Vec<(i32, i32)> = Vec::with_capacity(clipped.len());
+    let mut covered: u128 = 0;
+    for pair in xs.windows(2) {
+        let x0 = pair[0];
+        let x1 = pair[1];
+        let dx = u128::from((x1 - x0) as u32);
+        intervals.clear();
+        for r in &clipped {
+            if r.left <= x0 && r.right >= x1 {
+                intervals.push((r.top, r.bottom));
+            }
+        }
+        if intervals.is_empty() {
+            continue;
+        }
+        intervals.sort_unstable();
+        let mut cur_start = intervals[0].0;
+        let mut cur_end = intervals[0].1;
+        let mut y_sum: u128 = 0;
+        for &(top, bottom) in &intervals[1..] {
+            if top <= cur_end {
+                cur_end = cur_end.max(bottom);
+            } else {
+                y_sum += u128::from((cur_end - cur_start) as u32);
+                cur_start = top;
+                cur_end = bottom;
+            }
+        }
+        y_sum += u128::from((cur_end - cur_start) as u32);
+        covered += dx * y_sum;
+    }
+    let total = u128::from((target.right - target.left) as u32)
+        * u128::from((target.bottom - target.top) as u32);
+    covered * 100 >= total * u128::from(pct)
+}
+
+pub fn evaluate_display_windows(
+    windows: &[(Rect, bool)],
+    display: Rect,
+    work_area: Rect,
+) -> (bool, bool, bool) {
+    if display.right <= display.left || display.bottom <= display.top || windows.is_empty() {
+        return (false, false, false);
+    }
+    let area = if work_area.right > work_area.left && work_area.bottom > work_area.top {
+        work_area
+    } else {
+        display
+    };
+    let fullscreen = windows.iter().any(|(rect, _)| rect.covers(display));
+    let maximized = windows
+        .iter()
+        .any(|&(rect, zoomed)| zoomed && rect_union_covers(&[rect], area, 80));
+    let rects: Vec<Rect> = windows
+        .iter()
+        .filter_map(|&(r, _)| r.intersects(area).then_some(r))
+        .collect();
+    let occluded = rect_union_covers(&rects, area, 98);
+    (fullscreen, maximized, occluded)
 }
 
 pub fn validate_path_syntax(path: &Path) -> Result<(), String> {
@@ -593,6 +753,7 @@ mod tests {
             pause_fullscreen: false,
             fps: 45,
             quality: Quality::High,
+            gpu_preference: GpuPreference::HighPerformance,
             acrylic_blur: true,
             auto_update_check: false,
             clock_enabled: true,
@@ -891,5 +1052,133 @@ mod tests {
         }
         let invalid = format!("{}quality=ultra\n", Settings::default().encode().unwrap());
         assert!(Settings::decode(&invalid).is_err());
+    }
+
+    #[test]
+    fn gpu_preferences_encode_decode_and_reject_invalid() {
+        assert_eq!(Settings::default().gpu_preference, GpuPreference::Auto);
+        for gpu_preference in GPU_OPTIONS {
+            let settings = Settings {
+                gpu_preference,
+                ..Settings::default()
+            };
+            let decoded = Settings::decode(&settings.encode().unwrap()).unwrap();
+            assert_eq!(decoded.gpu_preference, gpu_preference);
+        }
+        let invalid = format!("{}gpu=tpu\n", Settings::default().encode().unwrap());
+        assert!(Settings::decode(&invalid).is_err());
+    }
+
+    #[test]
+    fn occlusion_checks_union_coverage_and_isolates_adjacent_monitors() {
+        let mon1 = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let work1 = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let mon2 = Rect {
+            left: 1920,
+            top: 0,
+            right: 3840,
+            bottom: 1080,
+        };
+        let work2 = Rect {
+            left: 1920,
+            top: 0,
+            right: 3840,
+            bottom: 1040,
+        };
+
+        // Split-screen two windows covering 100% of work1.
+        let left_half = Rect {
+            left: 0,
+            top: 0,
+            right: 960,
+            bottom: 1040,
+        };
+        let right_half = Rect {
+            left: 960,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert!(rect_union_covers(&[left_half, right_half], work1, 98));
+
+        // Three-window tiling layout with tiny 1px gap still clears 98%.
+        let w1 = Rect {
+            left: 0,
+            top: 0,
+            right: 960,
+            bottom: 1040,
+        };
+        let w2 = Rect {
+            left: 961,
+            top: 0,
+            right: 1920,
+            bottom: 520,
+        };
+        let w3 = Rect {
+            left: 961,
+            top: 520,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert!(rect_union_covers(&[w1, w2, w3], work1, 98));
+
+        // Visible gap leaves coverage well below 98%.
+        assert!(!rect_union_covers(&[left_half], work1, 98));
+        assert!(!rect_union_covers(&[], work1, 98));
+        assert!(!rect_union_covers(&[left_half], Rect::default(), 98));
+
+        // Maximized window on mon1 with standard 7px DWM border overhang must not pause mon2.
+        let max_with_bleed = (
+            Rect {
+                left: -7,
+                top: -7,
+                right: 1927,
+                bottom: 1047,
+            },
+            true,
+        );
+        assert_eq!(
+            evaluate_display_windows(&[max_with_bleed], mon1, work1),
+            (false, true, true)
+        );
+        assert_eq!(
+            evaluate_display_windows(&[max_with_bleed], mon2, work2),
+            (false, false, false)
+        );
+
+        // Fullscreen window covering mon1 leaves mon2 unpaused.
+        let fs = (mon1, false);
+        assert_eq!(
+            evaluate_display_windows(&[fs], mon1, work1),
+            (true, false, true)
+        );
+        assert_eq!(
+            evaluate_display_windows(&[fs], mon2, work2),
+            (false, false, false)
+        );
+
+        let mut occluded_reason = PauseReasons {
+            occluded: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            occluded_reason.reason(),
+            Some("Paused: covered by applications")
+        );
+        occluded_reason.fullscreen = true;
+        assert_eq!(
+            occluded_reason.reason(),
+            Some("Paused: fullscreen application")
+        );
     }
 }

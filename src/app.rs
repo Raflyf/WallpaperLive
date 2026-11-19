@@ -13,13 +13,23 @@ use std::{
 use windows::{
     Win32::{
         Foundation::*,
-        Graphics::Gdi::*,
+        Graphics::{
+            Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+            Gdi::*,
+        },
         Storage::FileSystem::*,
         System::{
-            Com::*, LibraryLoader::GetModuleHandleW, Power::*, Registry::*, RemoteDesktop::*,
-            SystemServices::*, Threading::*,
+            Com::*,
+            LibraryLoader::GetModuleHandleW,
+            Memory::{GetProcessHeap, HeapCompact},
+            Power::*,
+            Registry::*,
+            RemoteDesktop::*,
+            SystemServices::*,
+            Threading::*,
         },
         UI::{
+            Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             Controls::{
                 BST_CHECKED, DRAWITEMSTRUCT, Dialogs::*, ICC_STANDARD_CLASSES,
                 INITCOMMONCONTROLSEX, InitCommonControlsEx,
@@ -65,6 +75,13 @@ const UPDATE_RELEASE: usize = visuals::CHECK_UPDATES;
 const CONTEXT_MENU: u32 = WM_APP + 12;
 const UPDATE_DOWNLOAD: u32 = WM_APP + 13;
 const DECODER_DOWNLOAD: u32 = WM_APP + 14;
+const FOREGROUND_EVENT: u32 = WM_APP + 15;
+const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
+const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
+const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
+const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 const CTX_SET: usize = 201;
 const CTX_EXPLORER: usize = 202;
 const CTX_COPY_PATH: usize = 203;
@@ -88,6 +105,9 @@ const DRAG_MOVE_TIMER_ID: usize = 5;
 const ICONIC_PROPERTY: PCWSTR = w!("WallpaperLive.Iconic");
 const SIZE_MOVE_PROPERTY: PCWSTR = w!("WallpaperLive.SizeMove");
 static TASKBAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static WINDOW_EVENT_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static WINDOW_EVENT_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Default)]
 struct DragMoveState {
@@ -599,30 +619,192 @@ fn format_playback_specs(
     out
 }
 fn dormant_grace(reasons: &PauseReasons) -> Option<Duration> {
-    if reasons.manual {
-        None
-    } else if reasons.locked
+    if reasons.locked
         || reasons.remote
         || reasons.disconnected
         || reasons.suspended
         || reasons.display_off
     {
         Some(Duration::from_secs(3))
+    } else if reasons.manual
+        || reasons.battery
+        || reasons.fullscreen
+        || reasons.maximized
+        || reasons.occluded
+    {
+        // Keep warm for short Alt-Tab/clicks, then release libmpv/D3D11 while preserving the GDI DDB frozen frame.
+        Some(Duration::from_secs(15))
     } else {
-        // Keep maximized, fullscreen, and battery pauses warm on their last frame for instant desktop return.
         None
     }
 }
 fn is_shell_class(class: &[u16]) -> bool {
-    const SHELL: [&str; 4] = [
+    const SHELL: [&str; 8] = [
         "Progman",
         "WorkerW",
         "Shell_TrayWnd",
         "Shell_SecondaryTrayWnd",
+        "NotifyIconOverflowWindow",
+        "EdgeUiInputTopWndClass",
+        "Shell_InputSwitchTopLevelWindow",
+        "ForegroundStaging",
     ];
     SHELL.iter().any(|name| {
         class.len() == name.len() && class.iter().copied().eq(name.bytes().map(u16::from))
     })
+}
+
+fn collect_occluding_windows() -> Vec<(Rect, bool)> {
+    struct EnumState {
+        self_pid: u32,
+        windows: Vec<(Rect, bool)>,
+    }
+    unsafe extern "system" fn callback(hwnd: HWND, data: LPARAM) -> BOOL {
+        // SAFETY: synchronous top-level EnumWindows callback; state lives on caller stack.
+        unsafe {
+            let state = &mut *(data.0 as *mut EnumState);
+            if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == 0 || pid == state.self_pid {
+                return BOOL(1);
+            }
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            if ex & (WS_EX_TOOLWINDOW.0 | WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0) != 0 {
+                return BOOL(1);
+            }
+            if ex & WS_EX_LAYERED.0 != 0 {
+                let mut alpha = 0u8;
+                let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+                if GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags))
+                    .is_err()
+                    || flags.contains(LWA_COLORKEY)
+                    || (flags.contains(LWA_ALPHA) && alpha < 250)
+                {
+                    return BOOL(1);
+                }
+            }
+            let mut cloaked = 0u32;
+            if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                (&mut cloaked as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && cloaked != 0
+            {
+                return BOOL(1);
+            }
+            let mut class = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut class).clamp(0, class.len() as i32) as usize;
+            if is_shell_class(&class[..n]) {
+                return BOOL(1);
+            }
+            let mut rect = RECT::default();
+            let got_bounds = DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                (&mut rect as *mut RECT).cast(),
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .is_ok()
+                || GetWindowRect(hwnd, &mut rect).is_ok();
+            if !got_bounds || rect.right <= rect.left || rect.bottom <= rect.top {
+                return BOOL(1);
+            }
+            let area = Rect {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            state.windows.push((area, IsZoomed(hwnd).as_bool()));
+            BOOL(1)
+        }
+    }
+    let mut state = EnumState {
+        self_pid: std::process::id(),
+        windows: Vec::with_capacity(32),
+    };
+    // SAFETY: EnumWindows completes synchronously before returning `state.windows`.
+    unsafe {
+        let _ = EnumWindows(
+            Some(callback),
+            LPARAM((&mut state as *mut EnumState) as isize),
+        );
+    }
+    state.windows
+}
+
+unsafe extern "system" fn foreground_win_event_proc(
+    _: HWINEVENTHOOK,
+    _: u32,
+    _: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    let target = WINDOW_EVENT_TARGET.load(std::sync::atomic::Ordering::Acquire);
+    if target != 0
+        && !WINDOW_EVENT_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel)
+        // SAFETY: controller HWND outlives WinEventHookGuard and ignores invalid post on teardown.
+        && unsafe { PostMessageW(HWND(target as *mut _), FOREGROUND_EVENT, WPARAM(0), LPARAM(0)) }
+            .is_err()
+    {
+        WINDOW_EVENT_PENDING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+struct WindowHookGuard {
+    hooks: Vec<HWINEVENTHOOK>,
+}
+
+impl WindowHookGuard {
+    fn install(hwnd: HWND) -> Self {
+        WINDOW_EVENT_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        WINDOW_EVENT_TARGET.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+        let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+        let mut hooks = Vec::with_capacity(3);
+        // SAFETY: out-of-context WinEvent hooks owned and unhooked on UI thread via Drop.
+        unsafe {
+            for (min_ev, max_ev) in [
+                (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+                (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
+                (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
+            ] {
+                let hook = SetWinEventHook(
+                    min_ev,
+                    max_ev,
+                    None,
+                    Some(foreground_win_event_proc),
+                    0,
+                    0,
+                    flags,
+                );
+                if !hook.0.is_null() {
+                    hooks.push(hook);
+                }
+            }
+        }
+        Self { hooks }
+    }
+}
+
+impl Drop for WindowHookGuard {
+    fn drop(&mut self) {
+        WINDOW_EVENT_TARGET.store(0, std::sync::atomic::Ordering::Release);
+        WINDOW_EVENT_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        for hook in self.hooks.drain(..) {
+            // SAFETY: UI thread unhooks handles registered in WindowHookGuard::install.
+            unsafe {
+                let _ = UnhookWinEvent(hook);
+            }
+        }
+    }
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -733,6 +915,10 @@ struct Playback {
 struct Dormant {
     path: PathBuf,
     position: f64,
+    surface: Option<Surface>,
+    still_image: bool,
+    specs: PlaybackSpecs,
+    playback_info: Option<crate::cache::Prepared>,
 }
 struct DisplayState {
     monitor: String,
@@ -758,8 +944,10 @@ struct DisplayState {
     prepared_waiting: Option<(Instant, PathBuf, crate::cache::Prepared)>,
     playback_info: Option<crate::cache::Prepared>,
     dormant: Option<Dormant>,
+    pending_surface: Option<Surface>,
     resume_position: f64,
     paused_since: Option<Instant>,
+    still_freeze_since: Option<Instant>,
     pause_trimmed: bool,
 }
 impl DisplayState {
@@ -786,8 +974,10 @@ impl DisplayState {
             prepared_waiting: None,
             playback_info: None,
             dormant: None,
+            pending_surface: None,
             resume_position: 0.0,
             paused_since: None,
+            still_freeze_since: None,
             pause_trimmed: false,
         }
     }
@@ -878,9 +1068,13 @@ struct App {
     prepared_waiting: Option<(Instant, PathBuf, crate::cache::Prepared)>,
     playback_info: Option<crate::cache::Prepared>,
     dormant: Option<Dormant>,
+    pending_surface: Option<Surface>,
     resume_position: f64,
     paused_since: Option<Instant>,
+    still_freeze_since: Option<Instant>,
     pause_trimmed: bool,
+    window_snapshot: Option<Vec<(Rect, bool)>>,
+    timer_interval_ms: u32,
     wts_tick: u8,
     status_cache: std::cell::RefCell<(String, &'static str, &'static str, Option<bool>)>,
     status_dirty: std::cell::Cell<bool>,
@@ -919,8 +1113,10 @@ impl App {
             prepared_waiting,
             playback_info,
             dormant,
+            pending_surface,
             resume_position,
             paused_since,
+            still_freeze_since,
             pause_trimmed
         );
     }
@@ -961,11 +1157,13 @@ impl App {
         self.playback
             .iter()
             .map(|p| p.path.clone())
-            .chain(
-                self.displays
-                    .iter()
-                    .filter_map(|d| d.playback.as_ref().map(|p| p.path.clone())),
-            )
+            .chain(self.dormant.iter().map(|d| d.path.clone()))
+            .chain(self.displays.iter().filter_map(|d| {
+                d.playback
+                    .as_ref()
+                    .map(|p| p.path.clone())
+                    .or_else(|| d.dormant.as_ref().map(|dm| dm.path.clone()))
+            }))
             .collect()
     }
     fn display_audio(&self) -> bool {
@@ -1038,6 +1236,8 @@ impl App {
                     self.displays.len() - 1
                 });
             if let Err(failure) = self.with_display(index, |app| {
+                app.dormant = None;
+                app.pending_surface = None;
                 app.resume_position = 0.0;
                 app.start_path(source)
             }) {
@@ -1079,9 +1279,14 @@ impl App {
         Ok(())
     }
     fn tick_displays(&mut self) -> Result<(), String> {
+        self.window_snapshot = self
+            .settings
+            .pause_fullscreen
+            .then(collect_occluding_windows);
         self.update_reasons();
         self.reasons.fullscreen = false;
         self.reasons.maximized = false;
+        self.reasons.occluded = false;
         let mut error = None;
         for index in 0..self.displays.len() {
             if !self
@@ -1106,6 +1311,7 @@ impl App {
                 error = Some(failure);
             }
         }
+        self.window_snapshot = None;
         self.displays.retain(DisplayState::active);
         self.sync_audio()?;
         visuals::playing_all(&self.active_paths());
@@ -1122,6 +1328,7 @@ impl App {
         {
             self.arm_monitor()?;
         } else {
+            self.timer_interval_ms = 0;
             unsafe {
                 let _ = KillTimer(self.hwnd, 1);
             }
@@ -1141,6 +1348,7 @@ impl App {
                     .playback
                     .as_ref()
                     .map(|p| p.path.clone())
+                    .or_else(|| app.dormant.as_ref().map(|d| d.path.clone()))
                     .or_else(|| app.preparation.as_ref().map(|(p, _, _)| p.clone()))
                     .or_else(|| app.recovery.as_ref().map(|(_, _, p)| p.clone()));
                 if let Some(path) = path {
@@ -1148,8 +1356,10 @@ impl App {
                         .playback
                         .as_ref()
                         .and_then(playback_position)
+                        .or_else(|| app.dormant.as_ref().map(|d| d.position))
                         .unwrap_or(app.resume_position);
                     app.cancel_preparation();
+                    app.dormant = None;
                     app.release_playback();
                     app.recovery = Some((Instant::now() + Duration::from_millis(500), 0, path));
                 }
@@ -1192,6 +1402,7 @@ impl App {
             && self.prepared_waiting.is_none()
             && self.thumbnail_thread.is_none()
         {
+            self.timer_interval_ms = 0;
             // No wallpaper or worker remains to monitor after a failed preparation.
             unsafe {
                 let _ = KillTimer(self.hwnd, 1);
@@ -1536,6 +1747,12 @@ impl App {
                     BS_OWNERDRAW as u32 | WS_TABSTOP.0,
                 ),
                 (
+                    visuals::GPU_PREF,
+                    w!("BUTTON"),
+                    "GPU: Auto (Display)",
+                    BS_OWNERDRAW as u32 | WS_TABSTOP.0,
+                ),
+                (
                     visuals::CLOCK_HEX_EDIT,
                     w!("EDIT"),
                     "#5D86A8",
@@ -1687,6 +1904,7 @@ impl App {
                 LPARAM(0),
             );
             self.text(visuals::QUALITY, self.settings.quality.label());
+            self.text(visuals::GPU_PREF, self.settings.gpu_preference.label());
             self.sync_clock_controls();
             if let Ok(enabled) = startup_enabled() {
                 SendMessageW(
@@ -1749,6 +1967,9 @@ impl App {
     fn cache_directory(&self) -> Option<PathBuf> {
         Some(self.config.parent()?.join("video-cache"))
     }
+    fn shader_cache_directory(&self) -> Option<PathBuf> {
+        Some(self.config.parent()?.join("shader-cache"))
+    }
     fn active_cache(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = self
             .playback_info
@@ -1756,6 +1977,12 @@ impl App {
             .filter(|p| p.cached)
             .map(|p| p.path.clone())
             .collect();
+        paths.extend(self.dormant.iter().filter_map(|d| {
+            d.playback_info
+                .as_ref()
+                .filter(|p| p.cached)
+                .map(|p| p.path.clone())
+        }));
         paths.extend(self.prepared_waiting.iter().map(|(_, _, p)| p.path.clone()));
         for display in &self.displays {
             paths.extend(
@@ -1765,6 +1992,12 @@ impl App {
                     .filter(|p| p.cached)
                     .map(|p| p.path.clone()),
             );
+            paths.extend(display.dormant.iter().filter_map(|d| {
+                d.playback_info
+                    .as_ref()
+                    .filter(|p| p.cached)
+                    .map(|p| p.path.clone())
+            }));
             paths.extend(
                 display
                     .prepared_waiting
@@ -1786,6 +2019,7 @@ impl App {
             visuals::CACHE_INFO,
             &format!("Video cache: {:.0} MB of 2048 MB", cache as f64 / 1048576.0),
         );
+        self.text(visuals::GPU_PREF, self.settings.gpu_preference.label());
         self.text(visuals::TRANSPARENT_BAR, transparentbar_button_label());
     }
     fn clear_cache(&mut self) -> Result<(), String> {
@@ -3257,6 +3491,7 @@ impl App {
         self.refresh_library()
     }
     fn show(&mut self) {
+        set_background_efficiency(false);
         // SAFETY: own panel only; showing a hidden maximized window preserves its state.
         unsafe {
             let _ = visuals::enable_backdrop(self.hwnd);
@@ -3337,6 +3572,7 @@ impl App {
     fn release_playback(&mut self) {
         self.playback = None;
         self.playback_info = None;
+        self.pending_surface = None;
         visuals::playing(None);
         self.loaded = false;
         self.load_request = 0;
@@ -3345,21 +3581,83 @@ impl App {
         self.video_ready = None;
         self.loading_since = None;
         self.paused_since = None;
+        self.still_freeze_since = None;
         self.pause_trimmed = false;
         self.actual_pause = false;
         self.requested_pause = false;
         // SAFETY: teardown cancels only the timer owned by this controller.
         if !self.multi_dispatch {
+            self.timer_interval_ms = 0;
             unsafe {
                 let _ = KillTimer(self.hwnd, 1);
             }
         }
+    }
+    fn enter_frozen_dormant(&mut self, require_snapshot: bool) -> bool {
+        let Some(mut playback) = self.playback.take() else {
+            return false;
+        };
+        let still_image = playback.specs.still_image;
+        let position = if still_image {
+            0.0
+        } else {
+            playback_position(&playback).unwrap_or(0.0)
+        };
+        let captured = playback.player.capture_frame().and_then(|frame| {
+            playback.surface.set_frozen_frame(
+                frame.width,
+                frame.height,
+                frame.stride,
+                &frame.bytes,
+            )?;
+            playback.surface.hide_player();
+            Ok(())
+        });
+        let surface = match captured {
+            Ok(()) => Some(playback.surface),
+            Err(_) if require_snapshot => {
+                self.playback = Some(playback);
+                return false;
+            }
+            Err(_) => {
+                drop(playback.surface);
+                None
+            }
+        };
+        let path = playback.path;
+        let specs = playback.specs;
+        drop(playback.player);
+        let playback_info = self.playback_info.take();
+        self.pending_surface = None;
+        self.loaded = false;
+        self.load_request = 0;
+        self.load_entry = None;
+        self.file_loaded = None;
+        self.video_ready = None;
+        self.loading_since = None;
+        self.paused_since = None;
+        self.still_freeze_since = None;
+        self.pause_trimmed = false;
+        self.actual_pause = false;
+        self.requested_pause = false;
+        self.dormant = Some(Dormant {
+            path,
+            position,
+            surface,
+            still_image,
+            specs,
+            playback_info,
+        });
+        trim_working_set();
+        true
     }
     fn start(&mut self) -> Result<(), String> {
         let path = self
             .selected
             .clone()
             .ok_or("Select a wallpaper file first")?;
+        self.dormant = None;
+        self.pending_surface = None;
         self.resume_position = 0.0;
         self.start_path(&path)
     }
@@ -3388,6 +3686,7 @@ impl App {
         self.cancel_preparation();
         self.dormant = None;
         self.paused_since = None;
+        self.still_freeze_since = None;
         self.pause_trimmed = false;
         self.update_reasons();
         let prepared = crate::cache::Prepared {
@@ -3404,7 +3703,7 @@ impl App {
         };
         self.load_prepared(path.clone(), prepared, self.resume_position)?;
         if self.settings.quality != crate::core::Quality::Native {
-            self.preparation = Some((path, display, crate::cache::CACHE_FPS));
+            self.preparation = Some((path, display, self.settings.fps));
             self.launch_preparation()?;
         }
         self.update_status();
@@ -3505,6 +3804,7 @@ impl App {
         position: f64,
     ) -> Result<(), String> {
         let rect = self.screen().rect;
+        let monitor_name = self.screen().name.clone();
         let audio_enabled = self.display_audio();
         let request;
         if let Some(playback) = &mut self.playback {
@@ -3517,16 +3817,32 @@ impl App {
             request = playback.player.load(&prepared.path)?;
             playback.path = path;
         } else {
-            #[cfg(not(test))]
-            let surface = Surface::create(rect)?;
-            #[cfg(test)]
-            let surface = Surface::isolated(self.hwnd, rect)?;
-            let player = Mpv::open_at_with_quality(
+            let surface = if let Some(reused) = self.pending_surface.take().filter(Surface::valid) {
+                reused.place(rect)?;
+                reused
+            } else {
+                #[cfg(not(test))]
+                {
+                    Surface::create(rect)?
+                }
+                #[cfg(test)]
+                {
+                    Surface::isolated(self.hwnd, rect)?
+                }
+            };
+            let shader_cache_dir = self.shader_cache_directory();
+            let player = Mpv::open_at_with_options(
                 &decoder_path()?,
-                surface.hwnd,
+                surface.player_host(),
                 self.hwnd,
-                self.settings.fit,
-                self.settings.quality,
+                mpv::OpenOptions {
+                    fit: self.settings.fit,
+                    quality: self.settings.quality,
+                    gpu_preference: self.settings.gpu_preference,
+                    monitor: Some(&monitor_name),
+                    d3d11_flip: !surface.is_raised(),
+                    shader_cache_dir: shader_cache_dir.as_deref(),
+                },
             )?;
             player.pause(true)?;
             player.set_audio(audio_enabled)?;
@@ -3548,6 +3864,7 @@ impl App {
         self.load_entry = None;
         self.file_loaded = None;
         self.video_ready = None;
+        self.still_freeze_since = None;
         self.loading_since = Some(Instant::now());
         self.error = None;
         self.arm_monitor()?;
@@ -3592,6 +3909,7 @@ impl App {
         self.release_playback();
         self.reasons.manual = false;
         self.settings.path = None;
+        self.timer_interval_ms = 0;
         unsafe {
             let _ = KillTimer(self.hwnd, 1);
         }
@@ -3652,34 +3970,54 @@ impl App {
                 }
                 self.wts_tick = (self.wts_tick + 1) % 10;
             }
-            let foreground = GetForegroundWindow();
-            let mut pid = 0;
-            GetWindowThreadProcessId(foreground, Some(&mut pid));
-            let mut rect = RECT::default();
-            let mut class = [0u16; 64];
-            let n = GetClassNameW(foreground, &mut class).clamp(0, class.len() as i32) as usize;
-            let eligible = self.settings.pause_fullscreen
-                && pid != std::process::id()
-                && !foreground.0.is_null()
-                && !IsIconic(foreground).as_bool()
-                && !is_shell_class(&class[..n])
-                && GetWindowRect(foreground, &mut rect).is_ok();
-            let area = Rect {
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-            };
-            let display = self.screen().rect;
-            self.reasons
-                .foreground(eligible, IsZoomed(foreground).as_bool(), area, display);
+            if !self.settings.pause_fullscreen {
+                self.reasons.fullscreen = false;
+                self.reasons.maximized = false;
+                self.reasons.occluded = false;
+            } else {
+                let owned_snapshot;
+                let windows = if let Some(cached) = self.window_snapshot.as_deref() {
+                    cached
+                } else {
+                    owned_snapshot = collect_occluding_windows();
+                    &owned_snapshot
+                };
+                let screen = self.screen();
+                let (fullscreen, maximized, occluded) =
+                    crate::core::evaluate_display_windows(windows, screen.rect, screen.work_rect);
+                self.reasons.fullscreen = fullscreen;
+                self.reasons.maximized = maximized;
+                self.reasons.occluded = occluded;
+            }
         }
     }
-    fn arm_monitor(&self) -> Result<(), String> {
+    fn needs_fast_monitor(&self) -> bool {
+        let self_fast = (self.playback.is_some() && !self.loaded)
+            || self.recovery.is_some()
+            || self.preparation.is_some()
+            || self.prepared_waiting.is_some()
+            || self.paused_since.is_some()
+            || self.still_freeze_since.is_some();
+        let display_fast = self.displays.iter().any(|d| {
+            (d.playback.is_some() && !d.loaded)
+                || d.recovery.is_some()
+                || d.preparation.is_some()
+                || d.prepared_waiting.is_some()
+                || d.paused_since.is_some()
+                || d.still_freeze_since.is_some()
+        });
+        self_fast || display_fast || self.thumbnail_thread.is_some()
+    }
+    fn arm_monitor(&mut self) -> Result<(), String> {
+        let interval = if self.needs_fast_monitor() { 500 } else { 2000 };
+        if self.timer_interval_ms == interval {
+            return Ok(());
+        }
         // SAFETY: timer belongs to controller, never drives video or thumbnail redraw.
-        if unsafe { SetTimer(self.hwnd, 1, 500, None) } == 0 {
+        if unsafe { SetTimer(self.hwnd, 1, interval, None) } == 0 {
             return Err("Could not start the playback monitor".into());
         }
+        self.timer_interval_ms = interval;
         Ok(())
     }
     fn tick(&mut self) -> Result<(), String> {
@@ -3709,7 +4047,7 @@ impl App {
                         (rect.right - rect.left) as u32,
                         (rect.bottom - rect.top) as u32,
                     ),
-                    crate::cache::CACHE_FPS,
+                    self.settings.fps,
                 ));
             }
             if self.preparation.is_some()
@@ -3729,39 +4067,38 @@ impl App {
             }
             self.launch_preparation()?;
             self.request_thumbnails();
+            let require_snapshot = !(self.reasons.locked
+                || self.reasons.remote
+                || self.reasons.disconnected
+                || self.reasons.suspended
+                || self.reasons.display_off);
+            if !require_snapshot
+                && let Some(dormant) = &mut self.dormant
+                && dormant.still_image
+                && dormant.surface.is_some()
+            {
+                dormant.surface = None;
+                trim_working_set();
+            }
             if self.loaded && self.requested_pause && self.dormant.is_none() {
                 let since = *self.paused_since.get_or_insert_with(Instant::now);
-                if let Some(grace) = dormant_grace(&self.reasons) {
-                    if since.elapsed() >= grace
-                        && let Some(playback) = &self.playback
-                    {
-                        let position = playback_position(playback).unwrap_or(0.0);
-                        let path = playback.path.clone();
-                        self.release_playback();
-                        self.dormant = Some(Dormant { path, position });
-                        if !self.multi_dispatch {
-                            self.arm_monitor()?;
-                        }
-                        // SAFETY: pseudo-handle for current process; best-effort working-set trim when idle.
-                        unsafe {
-                            let _ = SetProcessWorkingSetSize(
-                                GetCurrentProcess(),
-                                usize::MAX,
-                                usize::MAX,
-                            );
-                        }
-                    }
-                } else if !self.pause_trimmed && since.elapsed() >= Duration::from_secs(1) {
+                let entered = if let Some(grace) = dormant_grace(&self.reasons)
+                    && since.elapsed() >= grace
+                {
+                    self.enter_frozen_dormant(require_snapshot)
+                } else {
+                    false
+                };
+                if !entered && !self.pause_trimmed && since.elapsed() >= Duration::from_secs(1) {
                     self.pause_trimmed = true;
-                    // SAFETY: trim resident working set after pause settles while keeping playback/frame ready.
-                    unsafe {
-                        let _ =
-                            SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-                    }
+                    trim_working_set();
                 }
             } else {
                 self.paused_since = None;
                 self.pause_trimmed = false;
+            }
+            if !self.multi_dispatch {
+                let _ = self.arm_monitor();
             }
             self.update_status();
             return Ok(());
@@ -3783,9 +4120,25 @@ impl App {
                 .unwrap_or(0.0);
             self.load_prepared(path, prepared, position)?;
         }
+        if self.loaded
+            && !self.requested_pause
+            && self
+                .still_freeze_since
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            let _ = self.enter_frozen_dormant(true);
+        }
         self.launch_preparation()?;
-        if let Some(dormant) = self.dormant.take() {
-            self.resume_position = dormant.position;
+        let should_wake_dormant = self.dormant.as_ref().is_some_and(|d| {
+            !d.still_image || d.surface.as_ref().is_none_or(|surface| !surface.valid())
+        });
+        if should_wake_dormant && let Some(dormant) = self.dormant.take() {
+            self.pending_surface = dormant.surface.filter(Surface::valid);
+            self.resume_position = if dormant.still_image {
+                0.0
+            } else {
+                dormant.position
+            };
             self.start_path(&dormant.path)?;
         }
         if self
@@ -3806,6 +4159,7 @@ impl App {
                     self.arm_monitor()?;
                 }
                 Err(error) => {
+                    self.timer_interval_ms = 0;
                     unsafe {
                         let _ = KillTimer(self.hwnd, 1);
                     }
@@ -3837,15 +4191,19 @@ impl App {
         self.request_thumbnails();
         self.update_status();
         if self.playback.is_none()
+            && self.dormant.is_none()
             && self.preparation.is_none()
             && self.recovery.is_none()
             && self.preparation_thread.is_none()
             && self.prepared_waiting.is_none()
             && self.thumbnail_thread.is_none()
         {
+            self.timer_interval_ms = 0;
             unsafe {
                 let _ = KillTimer(self.hwnd, 1);
             }
+        } else if !self.multi_dispatch {
+            self.arm_monitor()?;
         }
         Ok(())
     }
@@ -3944,8 +4302,10 @@ impl App {
         let (width, height, specs) =
             read_playback_specs(&playback.player, &playback.path, &info_path);
         let paused = self.reasons.reason().is_some();
+        let still_image = specs.still_image;
         playback.player.pause(paused)?;
         self.requested_pause = paused;
+        playback.surface.show_player();
         playback.surface.show();
         crate::clock_widget::sync_zorder();
         let playing_path = playback.path.clone();
@@ -3958,6 +4318,7 @@ impl App {
         }
         if let Some(playback) = &mut self.playback {
             playback.specs = specs;
+            playback.surface.clear_frozen_frame();
         }
         if let Some(info) = &mut self.playback_info {
             info.fps = source_fps;
@@ -3969,6 +4330,7 @@ impl App {
             }
         }
         self.loaded = true;
+        self.still_freeze_since = still_image.then(Instant::now);
         visuals::playing(Some(playing_path));
         visuals::invalidate_backdrop_cache();
         for i in 0..9 {
@@ -3978,9 +4340,7 @@ impl App {
         }
         self.loading_since = None;
         // ponytail: trim one-off decoder and startup allocations now that playback is active and steady.
-        unsafe {
-            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-        }
+        trim_working_set();
         if let Err(error) = self.save() {
             self.error = Some(format!("Playing, but settings were not saved: {error}"));
         }
@@ -3989,10 +4349,19 @@ impl App {
     fn format_display_specs(&self) -> Option<String> {
         let mut entries = Vec::new();
         for (idx, display) in self.displays.iter().enumerate() {
-            let Some(info) = display.playback_info.as_ref() else {
+            let Some(info) = display.playback_info.as_ref().or_else(|| {
+                display
+                    .dormant
+                    .as_ref()
+                    .and_then(|d| d.playback_info.as_ref())
+            }) else {
                 continue;
             };
-            let specs = display.playback.as_ref().map(|p| &p.specs);
+            let specs = display
+                .playback
+                .as_ref()
+                .map(|p| &p.specs)
+                .or_else(|| display.dormant.as_ref().map(|d| &d.specs));
             let display_number = self
                 .monitors
                 .iter()
@@ -4055,12 +4424,22 @@ impl App {
             let ready = self
                 .displays
                 .iter()
-                .filter(|d| d.loaded && d.playback.is_some())
+                .filter(|d| {
+                    (d.loaded && d.playback.is_some())
+                        || d.dormant
+                            .as_ref()
+                            .is_some_and(|dm| dm.still_image && dm.surface.is_some())
+                })
                 .count();
             let paused = self
                 .displays
                 .iter()
-                .filter(|d| d.loaded && (d.requested_pause || d.actual_pause))
+                .filter(|d| {
+                    (d.loaded && (d.requested_pause || d.actual_pause))
+                        || d.dormant
+                            .as_ref()
+                            .is_some_and(|dm| !dm.still_image || d.pause_reason.is_some())
+                })
                 .count();
             let loading = self
                 .displays
@@ -4115,11 +4494,34 @@ impl App {
         } else if self.preparation.is_some() {
             "Playing original; preparing display cache in background. Temporary RAM may be higher."
                 .into()
-        } else if self.dormant.is_some() {
-            format!(
-                "{}. Decoder released; resume reloads wallpaper.",
-                self.reasons.reason().unwrap_or("Waiting to resume")
-            )
+        } else if let Some(dormant) = &self.dormant {
+            if dormant.still_image && self.reasons.reason().is_none() {
+                let line1 = format!(
+                    "Sound: Off. Auto-pause: {}.",
+                    if self.settings.pause_fullscreen {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                );
+                match dormant.playback_info.as_ref() {
+                    Some(info) => format!(
+                        "{line1}\r\nWallpaper: {}.",
+                        format_playback_specs(info, Some(&dormant.specs), self.settings.fps, true,)
+                    ),
+                    None => line1,
+                }
+            } else if dormant.surface.is_some() {
+                format!(
+                    "{}. Last frame frozen (0% GPU / 0 MB VRAM).",
+                    self.reasons.reason().unwrap_or("Waiting to resume")
+                )
+            } else {
+                format!(
+                    "{}. Decoder released; resume reloads wallpaper.",
+                    self.reasons.reason().unwrap_or("Waiting to resume")
+                )
+            }
         } else if self.playback.is_none() {
             "Choose a file from your library, then Set wallpaper.".into()
         } else if !self.loaded {
@@ -4339,20 +4741,62 @@ impl App {
             let source_fps = effective_source_fps(self.playback_info.as_ref(), playback);
             playback.player.set_fps(fps, source_fps)?;
         }
+        if self.settings.quality != crate::core::Quality::Native {
+            if !self.multi_dispatch && !self.displays.is_empty() {
+                for index in 0..self.displays.len() {
+                    let source_path = self.displays[index]
+                        .playback
+                        .as_ref()
+                        .filter(|p| !p.specs.still_image)
+                        .map(|p| p.path.clone())
+                        .or_else(|| {
+                            self.displays[index]
+                                .dormant
+                                .as_ref()
+                                .filter(|d| !d.still_image)
+                                .map(|d| d.path.clone())
+                        });
+                    if let Some(path) = source_path {
+                        self.with_display(index, |app| {
+                            let rect = app.screen().rect;
+                            let display_size = (
+                                (rect.right - rect.left) as u32,
+                                (rect.bottom - rect.top) as u32,
+                            );
+                            app.cancel_preparation();
+                            app.preparation = Some((path, display_size, fps));
+                            app.launch_preparation()
+                        })?;
+                    }
+                }
+            } else {
+                let source_path = self
+                    .playback
+                    .as_ref()
+                    .filter(|p| !p.specs.still_image)
+                    .map(|p| p.path.clone())
+                    .or_else(|| {
+                        self.dormant
+                            .as_ref()
+                            .filter(|d| !d.still_image)
+                            .map(|d| d.path.clone())
+                    });
+                if let Some(path) = source_path {
+                    let rect = self.screen().rect;
+                    let display_size = (
+                        (rect.right - rect.left) as u32,
+                        (rect.bottom - rect.top) as u32,
+                    );
+                    self.cancel_preparation();
+                    self.preparation = Some((path, display_size, fps));
+                    self.launch_preparation()?;
+                }
+            }
+        }
         self.update_status();
         Ok(())
     }
-    fn change_quality(&mut self, quality: crate::core::Quality) -> Result<(), String> {
-        if self.settings.quality == quality {
-            return Ok(());
-        }
-        let old = self.settings.quality;
-        self.settings.quality = quality;
-        if let Err(error) = self.save() {
-            self.settings.quality = old;
-            return Err(error);
-        }
-        self.text(visuals::QUALITY, quality.label());
+    fn restart_active_wallpapers(&mut self) -> Result<(), String> {
         if !self.multi_dispatch && !self.displays.is_empty() {
             for index in 0..self.displays.len() {
                 let active_source = self
@@ -4392,6 +4836,38 @@ impl App {
             self.release_playback();
             self.start_path(&path)?;
         }
+        Ok(())
+    }
+    fn change_quality(&mut self, quality: crate::core::Quality) -> Result<(), String> {
+        if self.settings.quality == quality {
+            return Ok(());
+        }
+        let old = self.settings.quality;
+        self.settings.quality = quality;
+        if let Err(error) = self.save() {
+            self.settings.quality = old;
+            return Err(error);
+        }
+        self.text(visuals::QUALITY, quality.label());
+        self.restart_active_wallpapers()?;
+        self.update_status();
+        Ok(())
+    }
+    fn change_gpu_preference(
+        &mut self,
+        gpu_preference: crate::core::GpuPreference,
+    ) -> Result<(), String> {
+        if self.settings.gpu_preference == gpu_preference {
+            return Ok(());
+        }
+        let old = self.settings.gpu_preference;
+        self.settings.gpu_preference = gpu_preference;
+        if let Err(error) = self.save() {
+            self.settings.gpu_preference = old;
+            return Err(error);
+        }
+        self.text(visuals::GPU_PREF, gpu_preference.label());
+        self.restart_active_wallpapers()?;
         self.update_status();
         Ok(())
     }
@@ -4625,8 +5101,9 @@ impl App {
                     self.cancel_thumbnails();
                     visuals::retain_thumbnails(&[]);
                     visuals::trim_transient_caches();
-                    // ponytail: trim panel memory while running in tray; active display keeps running.
+                    // ponytail: trim panel memory and shift to EcoQoS while running in tray.
                     trim_working_set();
+                    set_background_efficiency(true);
                 } else {
                     return Ok(true);
                 }
@@ -4690,13 +5167,32 @@ impl App {
                         self.settings.fit = old;
                         return Err(error);
                     }
-                    for display in &self.displays {
-                        if let Some(playback) = &display.playback {
+                    for index in 0..self.displays.len() {
+                        if let Some(playback) = &self.displays[index].playback {
                             playback.player.set_fit(fit)?;
+                        } else if self.displays[index].dormant.is_some() {
+                            self.with_display(index, |app| {
+                                if let Some(dormant) = app.dormant.take() {
+                                    app.resume_position = if dormant.still_image {
+                                        0.0
+                                    } else {
+                                        dormant.position
+                                    };
+                                    app.start_path(&dormant.path)?;
+                                }
+                                Ok(())
+                            })?;
                         }
                     }
                     if let Some(playback) = &self.playback {
                         playback.player.set_fit(fit)?;
+                    } else if let Some(dormant) = self.dormant.take() {
+                        self.resume_position = if dormant.still_image {
+                            0.0
+                        } else {
+                            dormant.position
+                        };
+                        self.start_path(&dormant.path)?;
                     }
                     self.text(FIT, &labels[index]);
                 }
@@ -4776,6 +5272,21 @@ impl App {
                     && let Some(quality) = crate::core::QUALITY_OPTIONS.get(index)
                 {
                     self.change_quality(*quality)?;
+                }
+            }
+            visuals::GPU_PREF => {
+                let labels: Vec<_> = crate::core::GPU_OPTIONS
+                    .iter()
+                    .map(|g| g.option_label().to_owned())
+                    .collect();
+                let selected = crate::core::GPU_OPTIONS
+                    .iter()
+                    .position(|g| *g == self.settings.gpu_preference)
+                    .unwrap_or(0);
+                if let Some(index) = self.selector(visuals::GPU_PREF, &labels, selected)?
+                    && let Some(gpu_pref) = crate::core::GPU_OPTIONS.get(index)
+                {
+                    self.change_gpu_preference(*gpu_pref)?;
                 }
             }
             visuals::UPDATE_NOW => {
@@ -5347,9 +5858,43 @@ pub fn cleanup_uninstall() {
 }
 
 fn trim_working_set() {
-    // SAFETY: pseudo-handle for current process; best-effort working-set trim of cold/freed pages.
+    // SAFETY: compacts process heap before best-effort working-set trim of cold/freed pages.
     unsafe {
+        if let Ok(heap) = GetProcessHeap()
+            && !heap.is_invalid()
+        {
+            let _ = HeapCompact(heap, windows::Win32::System::Memory::HEAP_FLAGS(0));
+        }
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+fn set_background_efficiency(enabled: bool) {
+    // SAFETY: self-throttling EcoQoS + BelowNormal priority when minimized/hidden in tray.
+    unsafe {
+        let process = GetCurrentProcess();
+        let mask = if enabled {
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        } else {
+            0
+        };
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: mask,
+        };
+        let _ = SetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+        let priority = if enabled {
+            BELOW_NORMAL_PRIORITY_CLASS
+        } else {
+            NORMAL_PRIORITY_CLASS
+        };
+        let _ = SetPriorityClass(process, priority);
     }
 }
 
@@ -5629,9 +6174,13 @@ pub fn run() -> Result<(), String> {
             prepared_waiting: None,
             playback_info: None,
             dormant: None,
+            pending_surface: None,
             resume_position: 0.0,
             paused_since: None,
+            still_freeze_since: None,
             pause_trimmed: false,
+            window_snapshot: None,
+            timer_interval_ms: 0,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             status_dirty: std::cell::Cell::new(false),
@@ -5685,6 +6234,7 @@ pub fn run() -> Result<(), String> {
             RegisterWindowMessageW(w!("TaskbarCreated")),
             std::sync::atomic::Ordering::Relaxed,
         );
+        let _window_hooks = WindowHookGuard::install(hwnd);
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let background = args.iter().any(|a| a == "--background");
         if let Some(path) = args.iter().find(|a| *a != "--background") {
@@ -5701,6 +6251,9 @@ pub fn run() -> Result<(), String> {
         }
         if !background || app.error.is_some() || !app.tray_present {
             app.show();
+        } else {
+            set_background_efficiency(true);
+            trim_working_set();
         }
         app.update_status();
         app.sync_clock();
@@ -5783,6 +6336,10 @@ pub fn run() -> Result<(), String> {
                         app.layout().map(|_| false)
                     }
                     mpv::WM_MPV => app.tick().map(|_| false),
+                    FOREGROUND_EVENT => {
+                        WINDOW_EVENT_PENDING.store(false, std::sync::atomic::Ordering::Release);
+                        app.tick().map(|_| false)
+                    }
                     WM_TIMER if message.wParam.0 == 2 => app.update_ready().map(|_| false),
                     WM_TIMER if message.wParam.0 == visuals::ANIM_TIMER_ID => {
                         let _ = visuals::tick_animations(hwnd);
@@ -6259,11 +6816,13 @@ unsafe extern "system" fn window_proc(
                     crate::update_popup::sync(window);
                     visuals::trim_transient_caches();
                     trim_working_set();
+                    set_background_efficiency(true);
                     return LRESULT(0);
                 }
                 visuals::sync_child_positions(window);
                 crate::update_popup::sync(window);
                 if matches!(wparam.0 as u32, SIZE_MAXIMIZED | SIZE_RESTORED) {
+                    set_background_efficiency(false);
                     let was_iconic = !GetPropW(window, ICONIC_PROPERTY).0.is_null();
                     if was_iconic {
                         let _ = RemovePropW(window, ICONIC_PROPERTY);
@@ -6551,9 +7110,13 @@ mod tests {
             prepared_waiting: None,
             playback_info: None,
             dormant: None,
+            pending_surface: None,
             resume_position: 0.0,
             paused_since: None,
+            still_freeze_since: None,
             pause_trimmed: false,
+            window_snapshot: None,
+            timer_interval_ms: 0,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             status_dirty: std::cell::Cell::new(false),
@@ -7395,13 +7958,18 @@ mod tests {
     fn display_target_and_state_survive_switching_and_errors() {
         let mut app = fixture();
         for (name, left, width) in [("first", -1920, 1920), ("second", 0, 2712)] {
+            let rect = Rect {
+                left,
+                top: 0,
+                right: left + width,
+                bottom: 1080,
+            };
             app.monitors.push(Monitor {
                 name: name.into(),
-                rect: Rect {
-                    left,
-                    top: 0,
-                    right: left + width,
-                    bottom: 1080,
+                rect,
+                work_rect: Rect {
+                    bottom: 1040,
+                    ..rect
                 },
                 primary: left < 0,
             });
@@ -7625,13 +8193,18 @@ mod tests {
         if let Some((_, worker)) = app.preparation_thread.take() {
             worker.join().unwrap();
         }
+        let rect = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
         app.monitors.push(Monitor {
             name: "owned-test".into(),
-            rect: Rect {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 1080,
+            rect,
+            work_rect: Rect {
+                bottom: 1040,
+                ..rect
             },
             primary: true,
         });
@@ -7679,13 +8252,18 @@ mod tests {
         app.config = directory.join("settings.ini");
         app.settings.pause_battery = false;
         app.settings.pause_fullscreen = false;
+        let rect = Rect {
+            left: 0,
+            top: 0,
+            right: 640,
+            bottom: 360,
+        };
         app.monitors.push(Monitor {
             name: "owned-test".into(),
-            rect: Rect {
-                left: 0,
-                top: 0,
-                right: 640,
-                bottom: 360,
+            rect,
+            work_rect: Rect {
+                bottom: 320,
+                ..rect
             },
             primary: true,
         });
@@ -7708,7 +8286,7 @@ mod tests {
         }
         .map_err(|e| e.to_string())?;
         let surface = Surface::isolated(app.hwnd, app.screen().rect)?;
-        let surface_hwnd = surface.hwnd;
+        let surface_hwnd = surface.player_host();
         let player = Mpv::open_at_with_quality(
             &root.join("runtime/libmpv-2.dll"),
             surface_hwnd,
@@ -7716,6 +8294,7 @@ mod tests {
             Fit::Fill,
             crate::core::Quality::Optimize,
         )?;
+        surface.show_player();
         app.playback = Some(Playback {
             player,
             surface,
@@ -8009,9 +8588,13 @@ mod tests {
             prepared_waiting: None,
             playback_info: None,
             dormant: None,
+            pending_surface: None,
             resume_position: 0.0,
             paused_since: None,
+            still_freeze_since: None,
             pause_trimmed: false,
+            window_snapshot: None,
+            timer_interval_ms: 0,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
             status_dirty: std::cell::Cell::new(false),
@@ -8146,25 +8729,74 @@ mod tests {
         assert_eq!(dormant_grace(&reasons), None);
 
         reasons.battery = true;
-        assert_eq!(dormant_grace(&reasons), None);
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
 
-        reasons.fullscreen = true;
-        assert_eq!(dormant_grace(&reasons), None);
+        reasons = PauseReasons {
+            fullscreen: true,
+            ..PauseReasons::default()
+        };
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
 
-        reasons.maximized = true;
-        assert_eq!(dormant_grace(&reasons), None);
+        reasons = PauseReasons {
+            maximized: true,
+            ..PauseReasons::default()
+        };
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
 
-        reasons.locked = true;
+        reasons = PauseReasons {
+            occluded: true,
+            ..PauseReasons::default()
+        };
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
+
+        reasons = PauseReasons {
+            manual: true,
+            ..PauseReasons::default()
+        };
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(15)));
+
+        reasons = PauseReasons {
+            locked: true,
+            ..PauseReasons::default()
+        };
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(3)));
+
+        reasons = PauseReasons {
+            display_off: true,
+            ..PauseReasons::default()
+        };
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(3)));
+
+        reasons = PauseReasons {
+            suspended: true,
+            ..PauseReasons::default()
+        };
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(3)));
+
+        reasons = PauseReasons {
+            remote: true,
+            ..PauseReasons::default()
+        };
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(3)));
+
+        reasons = PauseReasons {
+            disconnected: true,
+            ..PauseReasons::default()
+        };
         assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(3)));
 
         reasons.manual = true;
-        assert_eq!(dormant_grace(&reasons), None);
+        assert_eq!(dormant_grace(&reasons), Some(Duration::from_secs(3)));
 
         let progman: Vec<u16> = "Progman".encode_utf16().collect();
         let tray: Vec<u16> = "Shell_SecondaryTrayWnd".encode_utf16().collect();
+        let overflow: Vec<u16> = "NotifyIconOverflowWindow".encode_utf16().collect();
+        let staging: Vec<u16> = "ForegroundStaging".encode_utf16().collect();
         let app_win: Vec<u16> = "Notepad".encode_utf16().collect();
         assert!(is_shell_class(&progman));
         assert!(is_shell_class(&tray));
+        assert!(is_shell_class(&overflow));
+        assert!(is_shell_class(&staging));
         assert!(!is_shell_class(&app_win));
     }
 
@@ -9429,6 +10061,122 @@ mod tests {
         app.change_quality(crate::core::Quality::High).unwrap();
         assert_eq!(app.settings.quality, crate::core::Quality::High);
         let _ = fs::remove_file(&app.config);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn change_gpu_preference_updates_setting_and_persists() {
+        let mut app = fixture();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!("gpu-change-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        app.config = dir.join("settings.ini");
+        app.change_gpu_preference(crate::core::GpuPreference::PowerSaving)
+            .unwrap();
+        assert_eq!(
+            app.settings.gpu_preference,
+            crate::core::GpuPreference::PowerSaving
+        );
+        let decoded =
+            crate::core::Settings::decode(&fs::read_to_string(&app.config).unwrap()).unwrap();
+        assert_eq!(
+            decoded.gpu_preference,
+            crate::core::GpuPreference::PowerSaving
+        );
+        app.change_gpu_preference(crate::core::GpuPreference::HighPerformance)
+            .unwrap();
+        assert_eq!(
+            app.settings.gpu_preference,
+            crate::core::GpuPreference::HighPerformance
+        );
+        app.change_gpu_preference(crate::core::GpuPreference::Auto)
+            .unwrap();
+        assert_eq!(
+            app.settings.gpu_preference,
+            crate::core::GpuPreference::Auto
+        );
+        let _ = fs::remove_file(&app.config);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn dormant_still_and_frozen_wallpapers_stay_protected_and_report_status() {
+        let mut app = fixture();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!("dormant-status-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let video_path = dir.join("clip.mp4");
+        let cache_path = dir.join("cached.mkv");
+        let still_path = dir.join("still.png");
+        fs::write(&video_path, b"video").unwrap();
+        fs::write(&cache_path, b"cache").unwrap();
+        fs::write(&still_path, b"png").unwrap();
+
+        let rect = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        app.monitors = vec![
+            Monitor {
+                name: "DISP1".into(),
+                rect,
+                work_rect: rect,
+                primary: true,
+            },
+            Monitor {
+                name: "DISP2".into(),
+                rect,
+                work_rect: rect,
+                primary: false,
+            },
+        ];
+        app.displays = vec![
+            DisplayState::new("DISP1".into()),
+            DisplayState::new("DISP2".into()),
+        ];
+        app.displays[0].dormant = Some(Dormant {
+            path: video_path.clone(),
+            position: 4.5,
+            surface: None,
+            still_image: false,
+            specs: PlaybackSpecs::default(),
+            playback_info: Some(crate::cache::Prepared {
+                path: cache_path.clone(),
+                width: 1920,
+                height: 1080,
+                fps: 30.0,
+                cached: true,
+                note: String::new(),
+            }),
+        });
+        app.displays[0].pause_reason = Some("Paused: maximized window");
+        app.displays[1].dormant = Some(Dormant {
+            path: still_path.clone(),
+            position: 0.0,
+            surface: None,
+            still_image: true,
+            specs: PlaybackSpecs::default(),
+            playback_info: None,
+        });
+
+        let paths = app.active_paths();
+        assert!(paths.contains(&video_path));
+        assert!(paths.contains(&still_path));
+        let caches = app.active_cache();
+        assert!(caches.contains(&cache_path));
+
+        app.update_status();
+        let status_text = app.status_cache.borrow().0.clone();
+        assert!(!status_text.is_empty());
+        assert!(status_text.contains("Paused") || status_text.contains("Active"));
+
+        let _ = fs::remove_file(&video_path);
+        let _ = fs::remove_file(&cache_path);
+        let _ = fs::remove_file(&still_path);
         let _ = fs::remove_dir(&dir);
     }
 }

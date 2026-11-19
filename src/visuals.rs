@@ -96,6 +96,7 @@ pub const CLOCK_HEX_CONFIRM: usize = 175;
 pub const DECODER_NOW: usize = 176;
 pub const DECODER_DISMISS: usize = 177;
 pub const QUALITY: usize = 178;
+pub const GPU_PREF: usize = 179;
 pub const MIN_CLIENT_WIDTH: i32 = 920;
 pub const MIN_CLIENT_HEIGHT: i32 = 640;
 pub const HEADER_HEIGHT: i32 = 72;
@@ -116,8 +117,8 @@ pub fn visible_on(tab: Tab, id: usize) -> bool {
         SOURCES_BACK | SOURCES_NOTE => tab == Tab::Sources,
         id if (SITE_BASE..SITE_BASE + 4).contains(&id) => tab == Tab::Sources,
         107 | 108 | 121 | ACRYLIC | AUTO_UPDATES | CHECK_UPDATES | VERSION | CACHE_INFO
-        | CLEAR_CACHE | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE | SETTINGS_INFO
-        | SUPPORT | SAWERIA => tab == Tab::Settings,
+        | CLEAR_CACHE | GPU_PREF | PRODUCT_WEBSITE | TRANSPARENT_BAR | SETTINGS_NOTE
+        | SETTINGS_INFO | SUPPORT | SAWERIA => tab == Tab::Settings,
         CLOCK_ENABLE | CLOCK_LOCK | CLOCK_BEHIND_ICONS | CLOCK_24H | CLOCK_REPOSITION
         | CLOCK_RESET_POS | CLOCK_PICK_COLOR | CLOCK_HEX_EDIT | CLOCK_HEX_CONFIRM => {
             tab == Tab::Clock
@@ -189,7 +190,7 @@ pub struct Layout {
     pub caption_divider: Rect,
     pub caption_buttons: [(CaptionButton, Rect); 3],
     pub tile_rects: [Rect; 9],
-    controls: [(usize, Rect); 56],
+    controls: [(usize, Rect); 57],
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
@@ -337,6 +338,7 @@ impl Layout {
                 ),
                 (CACHE_INFO, r(resources_x, 256, column_width, 24)),
                 (CLEAR_CACHE, r(resources_x, 292, column_width, 36)),
+                (GPU_PREF, r(resources_x, 338, column_width, 34)),
                 (FPS, r(side_x, fit.bottom + 12, 116, 34)),
                 (QUALITY, r(side_x + 128, fit.bottom + 12, 168, 34)),
                 (SELECT_ALL, r(split - 128, 164, 104, 32)),
@@ -360,7 +362,7 @@ impl Layout {
                 (SITE_BASE + 3, r(source_x, 352, source_width, 44)),
                 (SOURCES_NOTE, r(source_x, 412, source_width, 112)),
                 (SETTINGS_NOTE, settings_note),
-                (SETTINGS_INFO, r(resources_x, 344, column_width, 48)),
+                (SETTINGS_INFO, r(resources_x, 382, column_width, 48)),
             ],
         }
     }
@@ -521,6 +523,7 @@ fn control_surface(id: usize) -> (u32, u8) {
             | PRODUCT_WEBSITE
             | TRANSPARENT_BAR
             | CLEAR_CACHE
+            | GPU_PREF
             | QUALITY
             | CHECK_UPDATES
             | SUPPORT
@@ -4034,7 +4037,10 @@ unsafe fn draw_item_into(
                 return false;
             }
         }
-        let selector = matches!(id, 105 | 106 | FOLDER_FILTER | FPS | SORT | QUALITY);
+        let selector = matches!(
+            id,
+            105 | 106 | FOLDER_FILTER | FPS | SORT | QUALITY | GPU_PREF
+        );
         let label_color = if disabled {
             DISABLED_TEXT
         } else if primary && pressed {
@@ -8394,6 +8400,13 @@ mod tests {
             assert!(area(CHECK_UPDATES).left > area(VERSION).right);
             assert!(area(CHECK_UPDATES).bottom < area(CACHE_INFO).top);
             assert_eq!(area(CHECK_UPDATES).right, area(CLEAR_CACHE).right);
+            assert!(visible_on(Tab::Settings, GPU_PREF));
+            assert!(!visible_on(Tab::Library, GPU_PREF));
+            assert!(!visible_on(Tab::Clock, GPU_PREF));
+            assert_eq!(area(GPU_PREF).left, area(CLEAR_CACHE).left);
+            assert_eq!(area(GPU_PREF).right, area(CLEAR_CACHE).right);
+            assert!(area(GPU_PREF).top > area(CLEAR_CACHE).bottom);
+            assert!(area(GPU_PREF).bottom < area(SETTINGS_INFO).top);
             assert_eq!(area(105).bottom - area(105).top, 32);
             assert_eq!(layout.control(TILE_BASE), Some(layout.tile_rects[0]));
             assert!(layout.control(TILE_BASE + 9).is_none());

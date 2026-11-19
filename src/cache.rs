@@ -12,10 +12,20 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::{
-    Win32::{Security::Cryptography::*, Storage::FileSystem::GetDiskFreeSpaceExW},
+    Win32::{
+        Security::Cryptography::*,
+        Storage::FileSystem::GetDiskFreeSpaceExW,
+        System::Threading::{
+            GetCurrentProcess, PROCESS_MODE_BACKGROUND_BEGIN,
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetPriorityClass,
+            SetProcessInformation,
+        },
+    },
     core::PCWSTR,
 };
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub const CACHE_FPS: u32 = 60;
 const MAX_OUTPUT: u64 = 512 * 1024 * 1024;
 const MAX_CACHE: u64 = 2 * 1024 * 1024 * 1024;
@@ -62,7 +72,7 @@ pub fn prepare(
             .arg(display.1.to_string())
             .arg(fps.to_string())
             .arg(quality.key())
-            .creation_flags(0x08004000)
+            .creation_flags(0x0800_0040)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -167,6 +177,22 @@ fn parse_response(text: &str) -> Result<Prepared, String> {
 pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
     if !(6..=7).contains(&args.len()) {
         return Err("Invalid preparation arguments".into());
+    }
+    // SAFETY: best-effort background CPU, I/O, and EcoQoS throttling for cache transcoding worker.
+    unsafe {
+        let process = GetCurrentProcess();
+        let _ = SetPriorityClass(process, PROCESS_MODE_BACKGROUND_BEGIN);
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        };
+        let _ = SetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
     }
     let number = |i: usize| {
         args[i]

@@ -1,10 +1,9 @@
-use crate::core::{Fit, Quality};
+use crate::core::{Fit, GpuPreference, Quality};
 #[path = "gpu.rs"]
 mod gpu;
 use std::{
     cell::Cell,
     ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
-    fs::OpenOptions,
     path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicBool, Ordering},
@@ -55,10 +54,17 @@ struct LogMessage {
 }
 
 #[repr(C)]
+struct ByteArray {
+    data: *mut c_void,
+    size: usize,
+}
+#[repr(C)]
 #[derive(Clone, Copy)]
 union NodeValue {
+    string: *const c_char,
     integer: i64,
     list: *const NodeList,
+    ba: *const ByteArray,
 }
 #[repr(C)]
 struct Node {
@@ -148,6 +154,8 @@ struct Api {
     destroy: unsafe extern "C" fn(*mut c_void),
     option: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
     command: unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int,
+    command_node: unsafe extern "C" fn(*mut c_void, *const Node, *mut Node) -> c_int,
+    free_node: unsafe extern "C" fn(*mut Node),
     set: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int, *mut c_void) -> c_int,
     get: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int,
     observe: unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int,
@@ -204,6 +212,11 @@ impl Api {
                 "mpv_command_async",
                 unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int
             ),
+            command_node: symbol!(
+                "mpv_command_node",
+                unsafe extern "C" fn(*mut c_void, *const Node, *mut Node) -> c_int
+            ),
+            free_node: symbol!("mpv_free_node_contents", unsafe extern "C" fn(*mut Node)),
             set: symbol!(
                 "mpv_set_property_async",
                 unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int, *mut c_void) -> c_int
@@ -455,6 +468,8 @@ struct RenderProfile {
     dscale: &'static str,
     fbo_format: &'static str,
     dither_depth: &'static str,
+    linear_downscaling: &'static str,
+    sigmoid_upscaling: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -471,13 +486,17 @@ fn render_profile(quality: Quality) -> RenderProfile {
             dscale: "spline36",
             fbo_format: "rgba16f",
             dither_depth: "auto",
+            linear_downscaling: "yes",
+            sigmoid_upscaling: "yes",
         },
         Quality::Optimize => RenderProfile {
             scale: "catmull_rom",
             cscale: "bilinear",
             dscale: "catmull_rom",
-            fbo_format: "rgba16f",
+            fbo_format: "rgb10_a2",
             dither_depth: "auto",
+            linear_downscaling: "yes",
+            sigmoid_upscaling: "yes",
         },
         Quality::Medium => RenderProfile {
             scale: "bilinear",
@@ -485,6 +504,8 @@ fn render_profile(quality: Quality) -> RenderProfile {
             dscale: "bilinear",
             fbo_format: "rgba8",
             dither_depth: "auto",
+            linear_downscaling: "no",
+            sigmoid_upscaling: "no",
         },
         Quality::Low => RenderProfile {
             scale: "bilinear",
@@ -492,6 +513,8 @@ fn render_profile(quality: Quality) -> RenderProfile {
             dscale: "bilinear",
             fbo_format: "rgba8",
             dither_depth: "no",
+            linear_downscaling: "no",
+            sigmoid_upscaling: "no",
         },
     }
 }
@@ -629,7 +652,7 @@ pub fn encode_with_quality(
     }
     // Exclusive reservation avoids silently truncating any pre-existing user/cache file.
     drop(
-        OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&output)
@@ -692,6 +715,22 @@ pub fn encode_with_quality(
     Ok(())
 }
 
+pub struct CapturedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
+    pub bytes: Vec<u8>,
+}
+
+pub struct OpenOptions<'a> {
+    pub fit: Fit,
+    pub quality: Quality,
+    pub gpu_preference: GpuPreference,
+    pub monitor: Option<&'a str>,
+    pub d3d11_flip: bool,
+    pub shader_cache_dir: Option<&'a Path>,
+}
+
 pub struct Mpv {
     handle: *mut c_void,
     api: Api,
@@ -743,6 +782,7 @@ impl Mpv {
             .check(unsafe { (player.api.logs)(handle, c"error".as_ptr()) })?;
         Ok(player)
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_at_with_quality(
         dll: &Path,
         host: HWND,
@@ -750,21 +790,51 @@ impl Mpv {
         fit: Fit,
         quality: Quality,
     ) -> Result<Self, String> {
-        if let Some(adapter) = gpu::preferred_adapter() {
-            match Self::open_with_adapter(dll, host, notify, fit, quality, Some(&adapter)) {
-                Ok(player) => return Ok(player),
-                Err(_) => return Self::open_with_adapter(dll, host, notify, fit, quality, None),
+        Self::open_at_with_options(
+            dll,
+            host,
+            notify,
+            OpenOptions {
+                fit,
+                quality,
+                gpu_preference: GpuPreference::Auto,
+                monitor: None,
+                d3d11_flip: false,
+                shader_cache_dir: None,
+            },
+        )
+    }
+    pub fn open_at_with_options(
+        dll: &Path,
+        host: HWND,
+        notify: HWND,
+        opts: OpenOptions<'_>,
+    ) -> Result<Self, String> {
+        let choice = gpu::choose_adapter(opts.monitor, opts.gpu_preference);
+        match Self::open_with_adapter(
+            dll,
+            host,
+            notify,
+            &opts,
+            choice.name.as_deref(),
+            choice.low_memory_uma,
+            opts.d3d11_flip,
+        ) {
+            Ok(player) => Ok(player),
+            Err(_) if choice.name.is_some() || opts.d3d11_flip => {
+                Self::open_with_adapter(dll, host, notify, &opts, None, true, false)
             }
+            Err(error) => Err(error),
         }
-        Self::open_with_adapter(dll, host, notify, fit, quality, None)
     }
     fn open_with_adapter(
         dll: &Path,
         host: HWND,
         notify: HWND,
-        fit: Fit,
-        quality: Quality,
+        opts: &OpenOptions<'_>,
         adapter: Option<&str>,
+        low_memory_uma: bool,
+        d3d11_flip: bool,
     ) -> Result<Self, String> {
         let api = Api::load(dll)?;
         // SAFETY: no concurrent access during initialization; libmpv handle owned by this object.
@@ -773,7 +843,9 @@ impl Mpv {
             return Err("Could not create decoder".into());
         }
         let player = Self::from_handle(handle, api);
-        let render = render_profile(quality);
+        let render = render_profile(opts.quality);
+        let demuxer_max = if low_memory_uma { "2MiB" } else { "4MiB" };
+        let hwdec_frames = if low_memory_uma { "2" } else { "3" };
         for (name, value) in [
             ("config", "no"),
             ("load-scripts", "no"),
@@ -794,7 +866,7 @@ impl Mpv {
             ("load-unsafe-playlists", "no"),
             ("demuxer-lavf-o", "protocol_whitelist=[file]"),
             ("cache", "no"),
-            ("demuxer-max-bytes", "4MiB"),
+            ("demuxer-max-bytes", demuxer_max),
             ("demuxer-max-back-bytes", "0"),
             ("demuxer-readahead-secs", "0.2"),
             // ponytail: two decode threads bound frame pools for entry-level dual-core CPUs.
@@ -806,16 +878,19 @@ impl Mpv {
             ("gpu-api", "d3d11"),
             ("gpu-context", "d3d11"),
             ("hwdec", "auto-safe"),
-            // ponytail: cap GPU decode surface pool and skip frame-exact resume seeks on low-VRAM laptops.
-            ("hwdec-extra-frames", "3"),
+            // ponytail: cap GPU decode surface pool and skip frame-exact resume seeks on low-VRAM/UMA laptops.
+            ("hwdec-extra-frames", hwdec_frames),
             ("hr-seek", "no"),
+            ("swapchain-depth", "1"),
             ("scale", render.scale),
             ("cscale", render.cscale),
             ("dscale", render.dscale),
+            ("linear-downscaling", render.linear_downscaling),
+            ("sigmoid-upscaling", render.sigmoid_upscaling),
             ("fbo-format", render.fbo_format),
             ("dither-depth", render.dither_depth),
             ("framedrop", "vo"),
-            ("d3d11-flip", "no"),
+            ("d3d11-flip", if d3d11_flip { "yes" } else { "no" }),
             ("border", "no"),
             ("osd-level", "0"),
             ("cursor-autohide", "no"),
@@ -823,11 +898,18 @@ impl Mpv {
         ] {
             player.option(name, value)?;
         }
+        if let Some(cache_dir) = opts.shader_cache_dir
+            && std::fs::create_dir_all(cache_dir).is_ok()
+            && let Some(dir_str) = cache_dir.to_str()
+        {
+            player.option("gpu-shader-cache", "yes")?;
+            player.option("gpu-shader-cache-dir", dir_str)?;
+        }
         if let Some(adapter) = adapter {
             player.option("d3d11-adapter", adapter)?;
         }
         player.option("wid", &(host.0 as usize as u32).to_string())?;
-        player.option("panscan", if fit == Fit::Fill { "1.0" } else { "0.0" })?;
+        player.option("panscan", if opts.fit == Fit::Fill { "1.0" } else { "0.0" })?;
         // SAFETY: initialized once on owning thread, wakeup only posts HWND notification.
         player
             .api
@@ -1055,6 +1137,124 @@ impl Mpv {
             .into_owned();
         unsafe { (self.api.free)(value.cast()) };
         Some(text)
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn capture_frame(&self) -> Result<CapturedFrame, String> {
+        struct NodeGuard<'a> {
+            node: Node,
+            api: &'a Api,
+        }
+        impl Drop for NodeGuard<'_> {
+            fn drop(&mut self) {
+                // SAFETY: result node initialized by mpv_command_node; freed once via mpv_free_node_contents.
+                unsafe {
+                    (self.api.free_node)(&mut self.node);
+                }
+            }
+        }
+        let values = [
+            Node {
+                value: NodeValue {
+                    string: c"screenshot-raw".as_ptr(),
+                },
+                format: 1,
+            },
+            Node {
+                value: NodeValue {
+                    string: c"window".as_ptr(),
+                },
+                format: 1,
+            },
+        ];
+        let arg_list = NodeList {
+            count: values.len() as c_int,
+            values: values.as_ptr(),
+            keys: ptr::null(),
+        };
+        let arg = Node {
+            value: NodeValue { list: &arg_list },
+            format: 7,
+        };
+        let mut guard = NodeGuard {
+            node: Node {
+                value: NodeValue { integer: 0 },
+                format: 0,
+            },
+            api: &self.api,
+        };
+        // SAFETY: args stay alive across synchronous call; guard always frees result contents.
+        self.api
+            .check(unsafe { (self.api.command_node)(self.handle, &arg, &mut guard.node) })?;
+        // SAFETY: command_node populated `guard.node.format`; union `.list` is valid when format == 8.
+        if guard.node.format != 8 || unsafe { guard.node.value.list }.is_null() {
+            return Err("Snapshot result is missing frame map".into());
+        }
+        // SAFETY: MPV_FORMAT_NODE_MAP (8) provides valid count, keys, and values until guard drops.
+        unsafe {
+            let map = &*guard.node.value.list;
+            if !(1..=16).contains(&map.count) || map.keys.is_null() || map.values.is_null() {
+                return Err("Snapshot frame map is malformed".into());
+            }
+            let mut width: Option<u32> = None;
+            let mut height: Option<u32> = None;
+            let mut stride: Option<usize> = None;
+            let mut is_bgr0 = false;
+            let mut data_slice: Option<(*const u8, usize)> = None;
+            for i in 0..map.count as usize {
+                let key_ptr = *map.keys.add(i);
+                if key_ptr.is_null() {
+                    continue;
+                }
+                let key = CStr::from_ptr(key_ptr).to_bytes();
+                let val = &*map.values.add(i);
+                match key {
+                    b"w" if val.format == 4 => {
+                        width = u32::try_from(val.value.integer)
+                            .ok()
+                            .filter(|&v| (1..=16384).contains(&v));
+                    }
+                    b"h" if val.format == 4 => {
+                        height = u32::try_from(val.value.integer)
+                            .ok()
+                            .filter(|&v| (1..=16384).contains(&v));
+                    }
+                    b"stride" if val.format == 4 => {
+                        stride = usize::try_from(val.value.integer).ok().filter(|&v| v > 0);
+                    }
+                    b"format" if val.format == 1 && !val.value.string.is_null() => {
+                        is_bgr0 = CStr::from_ptr(val.value.string) == c"bgr0";
+                    }
+                    b"data" if val.format == 9 && !val.value.ba.is_null() => {
+                        let ba = &*val.value.ba;
+                        if !ba.data.is_null() && ba.size > 0 {
+                            data_slice = Some((ba.data.cast::<u8>(), ba.size));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !is_bgr0 {
+                return Err("Snapshot pixel format is not bgr0".into());
+            }
+            let w = width.ok_or("Snapshot width is invalid")?;
+            let h = height.ok_or("Snapshot height is invalid")?;
+            let s = stride.ok_or("Snapshot stride is invalid")?;
+            let row_bytes = (w as usize).checked_mul(4).ok_or("Snapshot row overflow")?;
+            let expected = s
+                .checked_mul(h as usize)
+                .ok_or("Snapshot buffer overflow")?;
+            let (ptr, size) = data_slice.ok_or("Snapshot pixel data is missing")?;
+            if s < row_bytes || size < expected {
+                return Err("Snapshot pixel buffer size mismatch".into());
+            }
+            let bytes = std::slice::from_raw_parts(ptr, expected).to_vec();
+            Ok(CapturedFrame {
+                width: w,
+                height: h,
+                stride: s,
+                bytes,
+            })
+        }
     }
 }
 
@@ -1484,5 +1684,28 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.to_ascii_lowercase().contains("decoder") && !error.is_empty());
+    }
+    #[test]
+    fn render_profiles_keep_quality_tiers_and_optimize_bandwidth() {
+        let native = render_profile(Quality::Native);
+        assert_eq!(native.fbo_format, "rgba16f");
+        assert_eq!(native.scale, "spline36");
+        assert_eq!(native.linear_downscaling, "yes");
+
+        let optimize = render_profile(Quality::Optimize);
+        assert_eq!(optimize.fbo_format, "rgb10_a2");
+        assert_eq!(optimize.scale, "catmull_rom");
+        assert_eq!(optimize.linear_downscaling, "yes");
+        assert_eq!(optimize.sigmoid_upscaling, "yes");
+
+        let medium = render_profile(Quality::Medium);
+        assert_eq!(medium.fbo_format, "rgba8");
+        assert_eq!(medium.linear_downscaling, "no");
+        assert_eq!(medium.sigmoid_upscaling, "no");
+
+        let low = render_profile(Quality::Low);
+        assert_eq!(low.fbo_format, "rgba8");
+        assert_eq!(low.dither_depth, "no");
+        assert_eq!(low.linear_downscaling, "no");
     }
 }
