@@ -1,5 +1,5 @@
 use crate::{
-    core::{FPS_OPTIONS, Quality, validate_media, validate_path_syntax},
+    core::{FPS_OPTIONS, GpuPreference, Quality, validate_media, validate_path_syntax},
     mpv::{self, MediaInfo},
     thumbnail::SilentChild,
 };
@@ -15,12 +15,7 @@ use windows::{
     Win32::{
         Security::Cryptography::*,
         Storage::FileSystem::GetDiskFreeSpaceExW,
-        System::Threading::{
-            GetCurrentProcess, GetProcessAffinityMask, PROCESS_MODE_BACKGROUND_BEGIN,
-            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetPriorityClass,
-            SetProcessAffinityMask, SetProcessInformation,
-        },
+        System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass},
     },
     core::PCWSTR,
 };
@@ -39,6 +34,7 @@ pub struct Prepared {
     pub cached: bool,
     pub note: String,
 }
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     dll: &Path,
     source: &Path,
@@ -46,6 +42,7 @@ pub fn prepare(
     display: (u32, u32),
     fps: u32,
     quality: Quality,
+    gpu_preference: GpuPreference,
     cancelled: &AtomicBool,
 ) -> Result<Prepared, String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -64,8 +61,9 @@ pub fn prepare(
         OsStr::new(&h_arg),
         OsStr::new(&fps_arg),
         OsStr::new(quality.key()),
+        OsStr::new(gpu_preference.key()),
     ];
-    let child = SilentChild::spawn(&exe, &args, 0x0800_0040)
+    let child = SilentChild::spawn(&exe, &args, 0x0800_4000)
         .map_err(|e| format!("Could not start video preparation: {e}"))?;
     let text = preparation_output(child, Some(directory), cancelled)?;
     let result = parse_response(&text)?;
@@ -214,39 +212,13 @@ fn parse_response(text: &str) -> Result<Prepared, String> {
         note: lines[7].to_owned(),
     })
 }
-fn single_background_core_mask(process_mask: usize) -> Option<usize> {
-    if process_mask == 0 {
-        return None;
-    }
-    Some(1usize << (usize::BITS - 1 - process_mask.leading_zeros()))
-}
-
 pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
-    if !(6..=7).contains(&args.len()) {
+    if !(6..=8).contains(&args.len()) {
         return Err("Invalid preparation arguments".into());
     }
-    // SAFETY: best-effort background CPU, I/O, EcoQoS, and single-core affinity throttling.
+    // SAFETY: keep cache encoding unobtrusive via below-normal scheduling priority without single-core pinning.
     unsafe {
-        let process = GetCurrentProcess();
-        let _ = SetPriorityClass(process, PROCESS_MODE_BACKGROUND_BEGIN);
-        let state = PROCESS_POWER_THROTTLING_STATE {
-            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        };
-        let _ = SetProcessInformation(
-            process,
-            ProcessPowerThrottling,
-            (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
-            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
-        );
-        let mut proc_mask = 0usize;
-        let mut sys_mask = 0usize;
-        if GetProcessAffinityMask(process, &mut proc_mask, &mut sys_mask).is_ok()
-            && let Some(core_mask) = single_background_core_mask(proc_mask)
-        {
-            let _ = SetProcessAffinityMask(process, core_mask);
-        }
+        let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     }
     let number = |i: usize| {
         args[i]
@@ -261,13 +233,21 @@ pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
     } else {
         Quality::Optimize
     };
-    let prepared = prepare_local_with_quality(
+    let gpu_preference = if let Some(raw) = args.get(7) {
+        raw.to_str()
+            .and_then(GpuPreference::from_key)
+            .ok_or("Invalid preparation GPU preference".to_owned())?
+    } else {
+        GpuPreference::Auto
+    };
+    let prepared = prepare_local_with_options(
         Path::new(&args[0]),
         Path::new(&args[1]),
         Path::new(&args[2]),
         (number(3)?, number(4)?),
         number(5)?,
         quality,
+        gpu_preference,
         &AtomicBool::new(false),
     )?;
     let path = prepared
@@ -421,6 +401,7 @@ pub fn prepare_local(
     )
 }
 
+#[cfg(test)]
 pub fn prepare_local_with_quality(
     dll: &Path,
     source: &Path,
@@ -428,6 +409,29 @@ pub fn prepare_local_with_quality(
     display: (u32, u32),
     fps: u32,
     quality: Quality,
+    cancelled: &AtomicBool,
+) -> Result<Prepared, String> {
+    prepare_local_with_options(
+        dll,
+        source,
+        directory,
+        display,
+        fps,
+        quality,
+        GpuPreference::Auto,
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_local_with_options(
+    dll: &Path,
+    source: &Path,
+    directory: &Path,
+    display: (u32, u32),
+    fps: u32,
+    quality: Quality,
+    gpu_preference: GpuPreference,
     cancelled: &AtomicBool,
 ) -> Result<Prepared, String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -553,8 +557,16 @@ pub fn prepare_local_with_quality(
         return Err("Cache destination already exists; existing bytes were kept".into());
     }
     let mut partial_guard = PartialCleanup(Some(partial.clone()));
-    mpv::encode_with_quality(
-        dll, &source, &partial, target.0, target.1, fps, quality, cancelled,
+    mpv::encode_with_options(
+        dll,
+        &source,
+        &partial,
+        target.0,
+        target.1,
+        fps,
+        quality,
+        gpu_preference,
+        cancelled,
     )?;
     if fs::metadata(&partial).map_err(|e| e.to_string())?.len() > MAX_OUTPUT {
         return Err("Prepared video exceeds 512 MiB; partial cache is not used".into());
@@ -817,10 +829,24 @@ mod tests {
     }
 
     #[test]
-    fn single_background_core_mask_picks_highest_available_logical_cpu() {
-        assert_eq!(single_background_core_mask(0), None);
-        assert_eq!(single_background_core_mask(0b0001), Some(0b0001));
-        assert_eq!(single_background_core_mask(0b1111_1111), Some(0b1000_0000));
-        assert_eq!(single_background_core_mask(0b1010_1100), Some(0b1000_0000));
+    fn worker_validates_argument_count_and_gpu_preference_key() {
+        assert!(worker(&[]).is_err());
+        let bad_gpu: Vec<std::ffi::OsString> = vec![
+            "libmpv.dll".into(),
+            "in.mp4".into(),
+            "cache".into(),
+            "1920".into(),
+            "1080".into(),
+            "60".into(),
+            "optimize".into(),
+            "invalid-gpu".into(),
+        ];
+        assert_eq!(
+            worker(&bad_gpu).unwrap_err(),
+            "Invalid preparation GPU preference"
+        );
+        for pref in crate::core::GPU_OPTIONS {
+            assert_eq!(GpuPreference::from_key(pref.key()), Some(pref));
+        }
     }
 }

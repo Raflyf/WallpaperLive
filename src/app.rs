@@ -3514,10 +3514,19 @@ impl App {
         let tx = self.preparation_tx.clone();
         let id = self.preparation_id;
         let quality = self.settings.quality;
+        let gpu_preference = self.settings.gpu_preference;
         let hwnd = self.hwnd.0 as usize;
         let worker = std::thread::spawn(move || {
-            let result =
-                crate::cache::prepare(&dll, &path, &directory, display, fps, quality, &flag);
+            let result = crate::cache::prepare(
+                &dll,
+                &path,
+                &directory,
+                display,
+                fps,
+                quality,
+                gpu_preference,
+                &flag,
+            );
             if tx.send((id, result)).is_ok() {
                 // SAFETY: worker only posts completion; App owns and joins its lifetime on exit.
                 unsafe {

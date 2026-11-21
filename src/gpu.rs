@@ -4,6 +4,17 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 pub const LOW_MEMORY_UMA_LIMIT: usize = 512 << 20;
+pub const VENDOR_NVIDIA: u32 = 0x10DE;
+pub const VENDOR_AMD: u32 = 0x1002;
+pub const VENDOR_INTEL: u32 = 0x8086;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeBackend {
+    Nvenc,
+    Amf,
+    Qsv,
+    CpuX264,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdapterChoice {
@@ -14,6 +25,7 @@ pub struct AdapterChoice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterCandidate {
     pub name: String,
+    pub vendor_id: u32,
     pub dedicated_vram: usize,
     pub outputs: Vec<String>,
 }
@@ -73,13 +85,44 @@ pub fn select_adapter(
     }
 }
 
-pub fn choose_adapter(monitor: Option<&str>, pref: GpuPreference) -> AdapterChoice {
+fn vendor_encoder(vendor_id: u32) -> Option<EncodeBackend> {
+    match vendor_id {
+        VENDOR_NVIDIA => Some(EncodeBackend::Nvenc),
+        VENDOR_AMD => Some(EncodeBackend::Amf),
+        VENDOR_INTEL => Some(EncodeBackend::Qsv),
+        _ => None,
+    }
+}
+
+pub fn select_encode_backends(
+    candidates: &[AdapterCandidate],
+    pref: GpuPreference,
+) -> Vec<EncodeBackend> {
+    let mut ordered: Vec<&AdapterCandidate> = candidates.iter().collect();
+    ordered.sort_by(|a, b| match pref {
+        GpuPreference::Auto | GpuPreference::HighPerformance => {
+            (b.dedicated_vram > LOW_MEMORY_UMA_LIMIT, b.dedicated_vram)
+                .cmp(&(a.dedicated_vram > LOW_MEMORY_UMA_LIMIT, a.dedicated_vram))
+        }
+        GpuPreference::PowerSaving => (a.dedicated_vram > LOW_MEMORY_UMA_LIMIT, a.dedicated_vram)
+            .cmp(&(b.dedicated_vram > LOW_MEMORY_UMA_LIMIT, b.dedicated_vram)),
+    });
+    let mut backends = Vec::new();
+    for candidate in ordered {
+        if let Some(backend) = vendor_encoder(candidate.vendor_id)
+            && !backends.contains(&backend)
+        {
+            backends.push(backend);
+        }
+    }
+    backends.push(EncodeBackend::CpuX264);
+    backends
+}
+
+fn enumerate_adapters() -> Vec<AdapterCandidate> {
     // SAFETY: read-only DXGI adapter/output enumeration; COM references released by windows crate.
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
-        return AdapterChoice {
-            name: None,
-            low_memory_uma: true,
-        };
+        return Vec::new();
     };
     let mut candidates = Vec::new();
     for index in 0..64 {
@@ -110,11 +153,20 @@ pub fn choose_adapter(monitor: Option<&str>, pref: GpuPreference) -> AdapterChoi
         }
         candidates.push(AdapterCandidate {
             name,
+            vendor_id: desc.VendorId,
             dedicated_vram: desc.DedicatedVideoMemory,
             outputs,
         });
     }
-    select_adapter(&candidates, monitor, pref)
+    candidates
+}
+
+pub fn choose_adapter(monitor: Option<&str>, pref: GpuPreference) -> AdapterChoice {
+    select_adapter(&enumerate_adapters(), monitor, pref)
+}
+
+pub fn choose_encode_backends(pref: GpuPreference) -> Vec<EncodeBackend> {
+    select_encode_backends(&enumerate_adapters(), pref)
 }
 
 #[cfg(test)]
@@ -137,11 +189,13 @@ mod tests {
     fn auto_prefers_dedicated_gpu_and_falls_back_to_integrated() {
         let igpu = AdapterCandidate {
             name: "Intel UHD Graphics".into(),
+            vendor_id: VENDOR_INTEL,
             dedicated_vram: 128 << 20,
             outputs: vec![r"\\.\DISPLAY1".into()],
         };
         let dgpu = AdapterCandidate {
             name: "NVIDIA GeForce RTX".into(),
+            vendor_id: VENDOR_NVIDIA,
             dedicated_vram: 8 << 30,
             outputs: vec![r"\\.\DISPLAY2".into()],
         };
@@ -161,6 +215,7 @@ mod tests {
         // Hybrid laptop where BIOS reserves 1 GiB UMA for APU still prefers the higher-VRAM dGPU.
         let apu_1g = AdapterCandidate {
             name: "AMD Radeon Graphics".into(),
+            vendor_id: VENDOR_AMD,
             dedicated_vram: 1 << 30,
             outputs: vec![r"\\.\DISPLAY1".into()],
         };
@@ -184,11 +239,13 @@ mod tests {
         let dual_dgpu = vec![
             AdapterCandidate {
                 name: "GPU A".into(),
+                vendor_id: VENDOR_NVIDIA,
                 dedicated_vram: 8 << 30,
                 outputs: vec![r"\\.\DISPLAY1".into()],
             },
             AdapterCandidate {
                 name: "GPU B".into(),
+                vendor_id: VENDOR_AMD,
                 dedicated_vram: 8 << 30,
                 outputs: vec![r"\\.\DISPLAY2".into()],
             },
@@ -227,6 +284,7 @@ mod tests {
     fn handles_zero_vram_potato_igpu_and_empty_candidates() {
         let zero_vram_igpu = vec![AdapterCandidate {
             name: "Intel HD Graphics 4000".into(),
+            vendor_id: VENDOR_INTEL,
             dedicated_vram: 0,
             outputs: vec![r"\\.\DISPLAY1".into()],
         }];
@@ -239,6 +297,7 @@ mod tests {
         );
         let at_limit = vec![AdapterCandidate {
             name: "AMD Radeon Vega".into(),
+            vendor_id: VENDOR_AMD,
             dedicated_vram: LOW_MEMORY_UMA_LIMIT,
             outputs: vec![],
         }];
@@ -249,6 +308,101 @@ mod tests {
                 name: None,
                 low_memory_uma: true,
             }
+        );
+    }
+
+    #[test]
+    fn encode_backend_order_prefers_dgpu_then_igpu_then_cpu() {
+        let intel_igpu = AdapterCandidate {
+            name: "Intel UHD Graphics".into(),
+            vendor_id: VENDOR_INTEL,
+            dedicated_vram: 128 << 20,
+            outputs: vec![r"\\.\DISPLAY1".into()],
+        };
+        let nvidia_dgpu = AdapterCandidate {
+            name: "NVIDIA GeForce RTX".into(),
+            vendor_id: VENDOR_NVIDIA,
+            dedicated_vram: 8 << 30,
+            outputs: vec![r"\\.\DISPLAY2".into()],
+        };
+        let amd_apu = AdapterCandidate {
+            name: "AMD Radeon Graphics".into(),
+            vendor_id: VENDOR_AMD,
+            dedicated_vram: 1 << 30,
+            outputs: vec![r"\\.\DISPLAY1".into()],
+        };
+
+        let hybrid = [intel_igpu.clone(), nvidia_dgpu.clone()];
+        assert_eq!(
+            select_encode_backends(&hybrid, GpuPreference::Auto),
+            vec![
+                EncodeBackend::Nvenc,
+                EncodeBackend::Qsv,
+                EncodeBackend::CpuX264
+            ]
+        );
+        assert_eq!(
+            select_encode_backends(&hybrid, GpuPreference::HighPerformance),
+            vec![
+                EncodeBackend::Nvenc,
+                EncodeBackend::Qsv,
+                EncodeBackend::CpuX264
+            ]
+        );
+        assert_eq!(
+            select_encode_backends(&hybrid, GpuPreference::PowerSaving),
+            vec![
+                EncodeBackend::Qsv,
+                EncodeBackend::Nvenc,
+                EncodeBackend::CpuX264
+            ]
+        );
+
+        let amd_hybrid = [amd_apu.clone(), nvidia_dgpu.clone()];
+        assert_eq!(
+            select_encode_backends(&amd_hybrid, GpuPreference::Auto),
+            vec![
+                EncodeBackend::Nvenc,
+                EncodeBackend::Amf,
+                EncodeBackend::CpuX264
+            ]
+        );
+        assert_eq!(
+            select_encode_backends(&amd_hybrid, GpuPreference::PowerSaving),
+            vec![
+                EncodeBackend::Amf,
+                EncodeBackend::Nvenc,
+                EncodeBackend::CpuX264
+            ]
+        );
+
+        assert_eq!(
+            select_encode_backends(std::slice::from_ref(&intel_igpu), GpuPreference::Auto),
+            vec![EncodeBackend::Qsv, EncodeBackend::CpuX264]
+        );
+        assert_eq!(
+            select_encode_backends(std::slice::from_ref(&amd_apu), GpuPreference::Auto),
+            vec![EncodeBackend::Amf, EncodeBackend::CpuX264]
+        );
+        assert_eq!(
+            select_encode_backends(&[nvidia_dgpu.clone(), nvidia_dgpu], GpuPreference::Auto),
+            vec![EncodeBackend::Nvenc, EncodeBackend::CpuX264]
+        );
+        assert_eq!(
+            select_encode_backends(
+                &[AdapterCandidate {
+                    name: "Unknown Adapter".into(),
+                    vendor_id: 0x1234,
+                    dedicated_vram: 2 << 30,
+                    outputs: vec![],
+                }],
+                GpuPreference::Auto
+            ),
+            vec![EncodeBackend::CpuX264]
+        );
+        assert_eq!(
+            select_encode_backends(&[], GpuPreference::Auto),
+            vec![EncodeBackend::CpuX264]
         );
     }
 

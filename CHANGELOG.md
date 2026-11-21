@@ -15,6 +15,25 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## v0.2.5
+
+### Performance
+
+- **GPU-accelerated background cache encoding (`NVENC` / `AMF` / `QSV`) with fast CPU fallback:** Cache preparation now selects hardware H.264 encoders (`h264_nvenc` for NVIDIA, `h264_amf` for AMD, `h264_qsv` for Intel Quick Sync) paired with `d3d11va-copy` hardware decoding and native `nv12` frames, prioritizing dedicated GPUs first on `Auto` / `High Performance` and integrated GPUs first on `Power Saving`, with automatic fallback through secondary GPUs to multi-threaded CPU `libx264` (`2`–`4` threads scaled by `available_parallelism()`).
+- **Remove single-core / EcoQoS worker choke on 4K transcodes:** Replaced `IDLE_PRIORITY_CLASS`, `PROCESS_MODE_BACKGROUND_BEGIN`, `PROCESS_POWER_THROTTLING_EXECUTION_SPEED`, single-core `SetProcessAffinityMask` pinning, and hardcoded `threads=1` on the cache worker with `BELOW_NORMAL_PRIORITY_CLASS` (`0x0800_4000`), keeping the foreground UI and active desktop responsive while avoiding 5–15 minute 4K cache stalls.
+
+### Changed
+
+- Pass the active **GPU** sidebar setting (`GpuPreference`) into `--prepare-cache` workers (`prepare_local_with_options`, `encode_with_options`, `choose_encode_backends`) so hardware encoder selection respects user preference (`Auto`, `Power Saving`, `High Performance`).
+- Omit audio encoding options (`aid=no`) in cache workers when the source media has no audio stream.
+
+### Verification and limits
+
+- Update application, manifest, and WiX installer metadata to `0.2.5`.
+- Release v0.2.5 publishes `wallpaperlivesetup-v0.2.5.msi` and `SHA256SUMS.txt` via the GitHub Actions Release workflow.
+
+---
+
 ## v0.2.4
 
 ### Changed

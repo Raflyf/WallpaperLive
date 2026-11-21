@@ -460,10 +460,21 @@ struct RenderProfile {
     dumb_mode: &'static str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 struct EncodeProfile {
+    ovc: &'static str,
+    pix_fmt: &'static str,
+    hwdec: &'static str,
     filter_flags: &'static str,
-    ovcopts: &'static str,
+    ovcopts: String,
+}
+
+fn encode_cpu_threads(logical_cpus: usize) -> usize {
+    if logical_cpus <= 1 {
+        1
+    } else {
+        (logical_cpus / 2).clamp(2, 4)
+    }
 }
 
 fn render_profile(quality: Quality) -> RenderProfile {
@@ -511,28 +522,91 @@ fn render_profile(quality: Quality) -> RenderProfile {
     }
 }
 
-fn encode_profile(quality: Quality) -> EncodeProfile {
-    match quality {
-        Quality::Native => EncodeProfile {
-            filter_flags: "lanczos",
-            ovcopts: "preset=medium,crf=15,threads=1,rc-lookahead=25,refs=3",
-        },
-        Quality::High => EncodeProfile {
-            filter_flags: "lanczos",
-            ovcopts: "preset=medium,crf=17,threads=1,rc-lookahead=25,refs=3",
-        },
-        Quality::Optimize => EncodeProfile {
-            filter_flags: "bicubic",
-            ovcopts: "preset=fast,crf=19,threads=1,rc-lookahead=16,refs=2",
-        },
-        Quality::Medium => EncodeProfile {
-            filter_flags: "bicubic",
-            ovcopts: "preset=veryfast,crf=22,threads=1,rc-lookahead=10,refs=1",
-        },
-        Quality::Low => EncodeProfile {
-            filter_flags: "bilinear",
-            ovcopts: "preset=veryfast,crf=26,threads=1,rc-lookahead=8,refs=1",
-        },
+fn encode_profile_for_backend(
+    quality: Quality,
+    backend: gpu::EncodeBackend,
+    threads: usize,
+) -> EncodeProfile {
+    let filter_flags = match quality {
+        Quality::Native | Quality::High => "lanczos",
+        Quality::Optimize | Quality::Medium => "bicubic",
+        Quality::Low => "bilinear",
+    };
+    match backend {
+        gpu::EncodeBackend::CpuX264 => {
+            let ovcopts = match quality {
+                Quality::Native => {
+                    format!("preset=medium,crf=15,threads={threads},rc-lookahead=25,refs=3")
+                }
+                Quality::High => {
+                    format!("preset=medium,crf=17,threads={threads},rc-lookahead=25,refs=3")
+                }
+                Quality::Optimize => {
+                    format!("preset=fast,crf=19,threads={threads},rc-lookahead=16,refs=2")
+                }
+                Quality::Medium => {
+                    format!("preset=veryfast,crf=22,threads={threads},rc-lookahead=10,refs=1")
+                }
+                Quality::Low => {
+                    format!("preset=veryfast,crf=26,threads={threads},rc-lookahead=8,refs=1")
+                }
+            };
+            EncodeProfile {
+                ovc: "libx264",
+                pix_fmt: "yuv420p",
+                hwdec: "no",
+                filter_flags,
+                ovcopts,
+            }
+        }
+        gpu::EncodeBackend::Nvenc => {
+            let ovcopts = match quality {
+                Quality::Native => "preset=p5,rc=vbr,cq=18,b=0",
+                Quality::High => "preset=p5,rc=vbr,cq=20,b=0",
+                Quality::Optimize => "preset=p4,rc=vbr,cq=22,b=0",
+                Quality::Medium => "preset=p3,rc=vbr,cq=25,b=0",
+                Quality::Low => "preset=p2,rc=vbr,cq=29,b=0",
+            };
+            EncodeProfile {
+                ovc: "h264_nvenc",
+                pix_fmt: "nv12",
+                hwdec: "d3d11va-copy",
+                filter_flags,
+                ovcopts: ovcopts.into(),
+            }
+        }
+        gpu::EncodeBackend::Amf => {
+            let ovcopts = match quality {
+                Quality::Native => "quality=quality,rc=cqp,qp_i=18,qp_p=18",
+                Quality::High => "quality=quality,rc=cqp,qp_i=20,qp_p=20",
+                Quality::Optimize => "quality=balanced,rc=cqp,qp_i=22,qp_p=22",
+                Quality::Medium => "quality=speed,rc=cqp,qp_i=25,qp_p=25",
+                Quality::Low => "quality=speed,rc=cqp,qp_i=29,qp_p=29",
+            };
+            EncodeProfile {
+                ovc: "h264_amf",
+                pix_fmt: "nv12",
+                hwdec: "d3d11va-copy",
+                filter_flags,
+                ovcopts: ovcopts.into(),
+            }
+        }
+        gpu::EncodeBackend::Qsv => {
+            let ovcopts = match quality {
+                Quality::Native => "preset=slower,global_quality=18",
+                Quality::High => "preset=slow,global_quality=20",
+                Quality::Optimize => "preset=medium,global_quality=22",
+                Quality::Medium => "preset=fast,global_quality=25",
+                Quality::Low => "preset=veryfast,global_quality=29",
+            };
+            EncodeProfile {
+                ovc: "h264_qsv",
+                pix_fmt: "nv12",
+                hwdec: "d3d11va-copy",
+                filter_flags,
+                ovcopts: ovcopts.into(),
+            }
+        }
     }
 }
 
@@ -558,6 +632,7 @@ pub fn encode(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn encode_with_quality(
     dll: &Path,
@@ -567,6 +642,31 @@ pub fn encode_with_quality(
     height: u32,
     fps: u32,
     quality: Quality,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    encode_with_options(
+        dll,
+        source,
+        output,
+        width,
+        height,
+        fps,
+        quality,
+        GpuPreference::Auto,
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encode_with_options(
+    dll: &Path,
+    source: &Path,
+    output: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    quality: Quality,
+    gpu_preference: GpuPreference,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -600,6 +700,43 @@ pub fn encode_with_quality(
     if output == source || output.exists() {
         return Err("Existing media or cache file will not be overwritten".into());
     }
+    let threads = encode_cpu_threads(std::thread::available_parallelism().map_or(2, usize::from));
+    let deadline = Instant::now() + Duration::from_secs(15 * 60);
+    let backends = gpu::choose_encode_backends(gpu_preference);
+    for (idx, backend) in backends.iter().copied().enumerate() {
+        match encode_once(
+            dll, &source, &output, &parsed, width, height, rate, quality, backend, threads,
+            deadline, cancelled,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let _ = std::fs::remove_file(&output);
+                if cancelled.load(Ordering::Relaxed) || idx + 1 == backends.len() {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Err("Could not encode video cache".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_once(
+    dll: &Path,
+    source: &Path,
+    output: &Path,
+    parsed: &Probed,
+    width: u32,
+    height: u32,
+    rate: f64,
+    quality: Quality,
+    backend: gpu::EncodeBackend,
+    threads: usize,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let profile = encode_profile_for_backend(quality, backend, threads);
+    let threads_str = threads.to_string();
     let player = Mpv::headless(dll)?;
     let rotate = match parsed.rotation.rem_euclid(360) {
         90 => "transpose=clock,",
@@ -607,20 +744,16 @@ pub fn encode_with_quality(
         270 => "transpose=cclock,",
         _ => "",
     };
-    let encode_cfg = encode_profile(quality);
     let filter = format!(
-        "lavfi=graph=[{rotate}scale=w={width}:h={height}:flags={},setsar=1,fps={rate:.6}:round=near,format=yuv420p]:o=[threads=1]",
-        encode_cfg.filter_flags
+        "lavfi=graph=[{rotate}scale=w={width}:h={height}:flags={},setsar=1,fps={rate:.6}:round=near,format={}]:o=[threads={threads}]",
+        profile.filter_flags, profile.pix_fmt
     );
     for (name, value) in [
-        ("vd-lavc-threads", "1"),
+        ("hwdec", profile.hwdec),
+        ("vd-lavc-threads", threads_str.as_str()),
         ("of", "mp4"),
-        ("ovc", "libx264"),
-        // FFmpeg names this AVOption "refs"; "ref" is only valid inside x264-params.
-        ("ovcopts", encode_cfg.ovcopts),
-        ("oac", "aac"),
-        ("oacopts", "b=128000,threads=1"),
-        ("aid", "auto"),
+        ("ovc", profile.ovc),
+        ("ovcopts", profile.ovcopts.as_str()),
         ("vo", "lavc"),
         ("ao", "lavc"),
         ("video-rotate", "no"),
@@ -632,6 +765,13 @@ pub fn encode_with_quality(
         ("untimed", "yes"),
     ] {
         player.option(name, value)?;
+    }
+    if parsed.info.audio {
+        for (name, value) in [("oac", "aac"), ("oacopts", "b=128000"), ("aid", "auto")] {
+            player.option(name, value)?;
+        }
+    } else {
+        player.option("aid", "no")?;
     }
     player.option("vf", &filter)?;
     player.option(
@@ -648,15 +788,14 @@ pub fn encode_with_quality(
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&output)
+            .open(output)
             .map_err(|e| format!("Could not reserve cache output: {e}"))?,
     );
     // SAFETY: encoding options are set before initialization on a fresh headless context.
     player
         .api
         .check(unsafe { (player.api.initialize)(player.handle) })?;
-    player.load(&source)?;
-    let deadline = Instant::now() + Duration::from_secs(15 * 60);
+    player.load(source)?;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Err("Conversion cancelled; partial cache is not reusable".into());
@@ -664,7 +803,7 @@ pub fn encode_with_quality(
         if Instant::now() >= deadline {
             return Err("Conversion timed out after 15 minutes".into());
         }
-        if std::fs::metadata(&output).map_err(|e| e.to_string())?.len() > 512 * 1024 * 1024 {
+        if std::fs::metadata(output).map_err(|e| e.to_string())?.len() > 512 * 1024 * 1024 {
             return Err("Conversion exceeded the 512 MiB cache-file limit".into());
         }
         // SAFETY: one event consumer; event fields read before the next wait invalidates them.
@@ -686,11 +825,11 @@ pub fn encode_with_quality(
     if cancelled.load(Ordering::Relaxed) {
         return Err("Conversion cancelled; partial cache is not reusable".into());
     }
-    let bytes = std::fs::metadata(&output).map_err(|e| e.to_string())?.len();
+    let bytes = std::fs::metadata(output).map_err(|e| e.to_string())?.len();
     if !(1..=512 * 1024 * 1024).contains(&bytes) {
         return Err("Encoded cache is empty or exceeds 512 MiB".into());
     }
-    let cache = probe_media(dll, &output)?;
+    let cache = probe_media(dll, output)?;
     if cache.width != width
         || cache.height != height
         || cache.hdr
@@ -1580,5 +1719,43 @@ mod tests {
         assert_eq!(low.dither_depth, "no");
         assert_eq!(low.linear_downscaling, "no");
         assert_eq!(low.dumb_mode, "yes");
+    }
+
+    #[test]
+    fn encode_cpu_threads_and_backend_profiles_match_contract() {
+        assert_eq!(encode_cpu_threads(0), 1);
+        assert_eq!(encode_cpu_threads(1), 1);
+        assert_eq!(encode_cpu_threads(2), 2);
+        assert_eq!(encode_cpu_threads(4), 2);
+        assert_eq!(encode_cpu_threads(6), 3);
+        assert_eq!(encode_cpu_threads(8), 4);
+        assert_eq!(encode_cpu_threads(16), 4);
+
+        let nv = encode_profile_for_backend(Quality::Medium, gpu::EncodeBackend::Nvenc, 4);
+        assert_eq!(nv.ovc, "h264_nvenc");
+        assert_eq!(nv.pix_fmt, "nv12");
+        assert_eq!(nv.hwdec, "d3d11va-copy");
+        assert_eq!(nv.filter_flags, "bicubic");
+        assert!(nv.ovcopts.contains("b=0") && nv.ovcopts.contains("cq=25"));
+
+        let amf = encode_profile_for_backend(Quality::High, gpu::EncodeBackend::Amf, 4);
+        assert_eq!(amf.ovc, "h264_amf");
+        assert_eq!(amf.pix_fmt, "nv12");
+        assert_eq!(amf.hwdec, "d3d11va-copy");
+        assert_eq!(amf.filter_flags, "lanczos");
+        assert!(amf.ovcopts.contains("qp_i=20") && amf.ovcopts.contains("qp_p=20"));
+
+        let qsv = encode_profile_for_backend(Quality::Optimize, gpu::EncodeBackend::Qsv, 4);
+        assert_eq!(qsv.ovc, "h264_qsv");
+        assert_eq!(qsv.pix_fmt, "nv12");
+        assert_eq!(qsv.hwdec, "d3d11va-copy");
+        assert!(qsv.ovcopts.contains("global_quality=22"));
+
+        let cpu = encode_profile_for_backend(Quality::Low, gpu::EncodeBackend::CpuX264, 3);
+        assert_eq!(cpu.ovc, "libx264");
+        assert_eq!(cpu.pix_fmt, "yuv420p");
+        assert_eq!(cpu.hwdec, "no");
+        assert_eq!(cpu.filter_flags, "bilinear");
+        assert!(cpu.ovcopts.contains("threads=3"));
     }
 }

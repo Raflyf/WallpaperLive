@@ -6,7 +6,7 @@
 <p align="center"><strong>Bring your own live wallpapers.</strong><br>A native Windows app for applying your local videos, GIFs and images as desktop wallpapers.</p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.2.4"><img src="https://img.shields.io/badge/release-v0.2.4-586575" alt="Release v0.2.4"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.2.5"><img src="https://img.shields.io/badge/release-v0.2.5-586575" alt="Release v0.2.5"></a>
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
   <a href="https://saweria.co/BuyMatcha"><img src="https://img.shields.io/badge/Saweria-BuyMatcha-faae2b" alt="Saweria"></a>
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.4/wallpaperlivesetup-v0.2.4.msi"><strong>Download Windows installer</strong></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.5/wallpaperlivesetup-v0.2.5.msi"><strong>Download Windows installer</strong></a>
   &nbsp;Â·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;Â·&nbsp; <a href="#resource-use">Resource use</a>
   &nbsp;Â·&nbsp; <a href="https://github.com/Raflyf/WallpaperLive/issues">Report a bug</a>
@@ -115,17 +115,17 @@ The desktop capture also shows 0 MB/s disk and 0 Mbps network; paused shows 0 MB
 
 ## Download and install
 
-1. [Download wallpaperlivesetup-v0.2.4.msi](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.4/wallpaperlivesetup-v0.2.4.msi) and run it as your normal Windows user.
+1. [Download wallpaperlivesetup-v0.2.5.msi](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.5/wallpaperlivesetup-v0.2.5.msi) and run it as your normal Windows user.
 2. When applying a video without `libmpv-2.dll` present, review the in-app decoder prompt and confirm to download and verify it automatically (or run `scripts\Get-Decoder.ps1` once). A matching installed decoder skips the download.
 3. Open WallpaperLive from the Start menu, add trusted local media, choose a thumbnail/display and select Set wallpaper.
 
-[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.4/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases) · [Code signing policy](#code-signing-policy)
+[Installer checksum](https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.5/SHA256SUMS.txt) · [All releases](https://github.com/Raflyf/WallpaperLive/releases) · [Code signing policy](#code-signing-policy)
 
-Installer downloads include the release version, such as `wallpaperlivesetup-v0.2.4.msi`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
+Installer downloads include the release version, such as `wallpaperlivesetup-v0.2.5.msi`, so different versions can sit in the same download folder. Downloading the same version twice may still add a browser suffix such as `(1)`.
 
 Open **Settings** to see the installed app's **Version**, taken from the executable's build rather than the installer filename.
 
-Setup installs per user without administrator rights as a Windows Installer MSI package (`wallpaperlivesetup-v0.2.4.msi`). It provides an option to launch the app on completion, but does not apply a wallpaper or enable startup automatically. Published builds prior to CI signing activation (including `v0.2.1` through `v0.2.4`) are unsigned: keep Windows security protections enabled. See [Code signing policy](#code-signing-policy) for planned release signing details. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
+Setup installs per user without administrator rights as a Windows Installer MSI package (`wallpaperlivesetup-v0.2.5.msi`). It provides an option to launch the app on completion, but does not apply a wallpaper or enable startup automatically. Published builds prior to CI signing activation (including `v0.2.1` through `v0.2.5`) are unsigned: keep Windows security protections enabled. See [Code signing policy](#code-signing-policy) for planned release signing details. Store the installer in a dedicated folder without unrelated DLLs; do not run as administrator to bypass desktop access errors.
 
 <details>
 <summary>Offline install or upgrade</summary>
@@ -154,7 +154,7 @@ The picker accepts `MP4`, `GIF`, `MKV`, `WebM`, `MOV`, `AVI`, `MPG`, `MPEG`, `M4
 - Conversion accepts finite video up to one hour/16 GiB, uses one below-normal-priority worker and stops at 15 minutes or 512 MiB per output. Cache budget is 2 GiB; if another copy cannot fit within the budget, conversion is refused and original playback continues. No files are evicted automatically. Clear unused cache requires confirmation and protects imported library media, all active originals and active or waiting cache outputs. Original media is never removed. Cancelled partials are never played. Cache lives in `%LOCALAPPDATA%\WallpaperLive\video-cache`.
 - Pause stops animation/audio, releases thumbnails and cancels/defer conversion. Windows receives a resident-page trim request on confirmed pause, load completion and hiding the panel; this can reclaim resident pages without releasing private decoder allocations or dedicated VRAM. Pages can become resident again and page faults can increase. An unfinished conversion restarts in the background after resume. A completed cache waits at least two seconds after resume before a separate handoff near the current media position.
 - Only nine visible thumbnails plus the selection are retained, each at most 480 Ã— 270 pixels. Hidden, minimized or paused panels drop those buffers. Packet settings are 4 MiB forward, no backward cache and 0.2 seconds readahead, with two software-decode threads. These are not a total RAM cap.
-- The encoder uses x264 `veryfast`, CRF 23, two threads, lookahead 10 and one reference frame (`refs=1`). Reference/lookahead values already match `veryfast`; an additional 75% memory saving was not measured. CRF encoding is lossy, not a guarantee of identical pixels.
+- Hardware-capable devices encode H.264 cache copies using GPU fixed-function encoders (`h264_nvenc`, `h264_amf`, or `h264_qsv` with `d3d11va-copy` decode following the selected GPU preference: dedicated GPU first on `Auto`/`High Performance`, integrated GPU first on `Power Saving`) and fall back automatically to multi-threaded CPU `libx264` (`BELOW_NORMAL_PRIORITY_CLASS`, 2–4 threads depending on logical CPUs). Hardware constant-quality (`cq`/`cqp`/`global_quality`) and CRF encoding are lossy, not a guarantee of identical pixels.
 
 Historical v0.1.1 comparison, **not the screenshot results above**: one sequential RTX 3050 Laptop GPU fixture pair used a 1920 Ã— 1080 native window with D3D11VA decoding for 15 seconds per condition. Original 4K/60 FPS used median 275.5 MiB working set / 856.3 MiB private bytes; 1080p/30 FPS cache used 187.1 MiB / 355.1 MiB. Process CPU was 3.79% / 1.84% of total machine capacity. After decoder destruction, working sets were about 57 MiB including the Python host, excluding the app panel. It was not a repeatability test; GPU utilization and VRAM were not measured.
 
@@ -194,7 +194,7 @@ For maintainer packaging, [Installer.ps1](scripts/Installer.ps1) runs after a re
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Installer.ps1
 ```
 
-Setup File version is `0.2.4.0`; Product version is `0.2.4`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
+Setup File version is `0.2.5.0`; Product version is `0.2.5`. The installer build reads the output's PE version metadata and rejects a mismatch before publication.
 
 The app and Start-menu shortcut use the same stable taskbar identity, `Raflyf.WallpaperLive`. Large and small icons are registered before the panel window is created; the executable also embeds the product ICO for the Windows shell. CI does not prove how an existing Windows taskbar renders it.
 
@@ -210,7 +210,7 @@ Both links are directly accessible in **Settings**.
 
 Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
 
-Releases published prior to SignPath CI integration (including `v0.2.1` through `v0.2.4`) remain unsigned until release signing is enabled in [Windows checks](.github/workflows/ci.yml). Signed releases are built automatically from public repository source on GitHub Actions.
+Releases published prior to SignPath CI integration (including `v0.2.1` through `v0.2.5`) remain unsigned until release signing is enabled in [Windows checks](.github/workflows/ci.yml). Signed releases are built automatically from public repository source on GitHub Actions.
 
 - **Authors / Committers:** [Rafly Firmansyah (`@Raflyf`)](https://github.com/Raflyf)
 - **Reviewers:** [Rafly Firmansyah (`@Raflyf`)](https://github.com/Raflyf) (all pull requests require maintainer review before merge)
