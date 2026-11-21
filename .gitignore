@@ -36,3 +36,6 @@
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Local user capture drop folder
+/snapshot/
