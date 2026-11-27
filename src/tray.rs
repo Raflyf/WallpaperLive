@@ -102,16 +102,41 @@ struct Entry {
     padding: i32,
     checked: bool,
 }
+
+#[derive(Clone)]
+struct ActiveMenuEntry {
+    text: Vec<u16>,
+    font: HFONT,
+    colors: Palette,
+    width: u32,
+    height: u32,
+    padding: i32,
+    checked: bool,
+}
+
+struct ActiveMenuState {
+    menu_open: bool,
+    entries: Vec<ActiveMenuEntry>,
+}
+
+thread_local! {
+    static ACTIVE_MENU: std::cell::RefCell<Option<ActiveMenuState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct Menu {
     handle: HMENU,
     #[allow(clippy::vec_box)]
-    // Native menu stores stable itemData pointers while this Vec can grow.
     entries: Vec<Box<Entry>>,
     brush: HBRUSH,
     font: HFONT,
+    registered_active: bool,
 }
 impl Drop for Menu {
     fn drop(&mut self) {
+        if self.registered_active {
+            ACTIVE_MENU.with(|slot| *slot.borrow_mut() = None);
+        }
         // SAFETY: menu is destroyed before its borrowed names, font and background brush.
         unsafe {
             let _ = DestroyMenu(self.handle);
@@ -139,6 +164,7 @@ impl Menu {
                 entries: Vec::with_capacity(items.len()),
                 brush: HBRUSH::default(),
                 font: HFONT::default(),
+                registered_active: false,
             };
             if let Some(colors) = colors {
                 let mut metrics = NONCLIENTMETRICSW {
@@ -178,14 +204,27 @@ impl Menu {
                 let scale = |n| n * dpi as i32 / 96;
                 let pad_left = scale(if check_gutter { 26 } else { 16 });
                 let pad_right = scale(16);
+                let mut active_entries = Vec::with_capacity(items.len());
                 let measure_result = (|| -> Result<(), String> {
-                    for (id, label) in items {
+                    for (idx, (id, label)) in items.iter().enumerate() {
                         let mut text: Vec<_> = label.encode_utf16().chain(Some(0)).collect();
                         let mut size = SIZE::default();
                         if !GetTextExtentPoint32W(dc, &text[..text.len() - 1], &mut size).as_bool()
                         {
                             return Err("Could not measure tray menu text".into());
                         }
+                        let width = (size.cx + pad_left + pad_right) as u32;
+                        let height = (size.cy.max(scale(16)) + scale(12)) as u32;
+                        let checked = selected_id == Some(*id);
+                        active_entries.push(ActiveMenuEntry {
+                            text: text.clone(),
+                            font: menu.font,
+                            colors,
+                            width,
+                            height,
+                            padding: pad_left,
+                            checked,
+                        });
                         let entry = Box::new(Entry {
                             accessible: MSAAMENUINFO {
                                 dwMSAASignature: MSAA_MENU_SIG as u32,
@@ -195,17 +234,18 @@ impl Menu {
                             text,
                             font: menu.font,
                             colors,
-                            width: (size.cx + pad_left + pad_right) as u32,
-                            height: (size.cy.max(scale(16)) + scale(12)) as u32,
+                            width,
+                            height,
                             padding: pad_left,
-                            checked: selected_id == Some(*id),
+                            checked,
                         });
                         let info = MENUITEMINFOW {
                             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
                             fMask: MIIM_ID | MIIM_FTYPE | MIIM_DATA | MIIM_STRING,
                             fType: MFT_OWNERDRAW,
                             wID: *id as u32,
-                            dwItemData: (&*entry as *const Entry) as usize,
+                            // Store 1-based validated index, never a raw pointer dereferenced in WndProc.
+                            dwItemData: idx + 1,
                             dwTypeData: entry.accessible.pszWText,
                             cch: entry.accessible.cchWText,
                             ..Default::default()
@@ -219,6 +259,13 @@ impl Menu {
                 SelectObject(dc, old);
                 ReleaseDC(owner, dc);
                 measure_result?;
+                ACTIVE_MENU.with(|slot| {
+                    *slot.borrow_mut() = Some(ActiveMenuState {
+                        menu_open: true,
+                        entries: active_entries,
+                    });
+                });
+                menu.registered_active = true;
             } else {
                 for (id, label) in items {
                     let text: Vec<_> = label.encode_utf16().chain(Some(0)).collect();
@@ -393,6 +440,7 @@ pub fn menu_at(
 }
 
 mod dropdown {
+    use std::cell::RefCell;
     use std::mem::size_of;
     use std::sync::Once;
     use std::time::Instant;
@@ -559,9 +607,14 @@ mod dropdown {
         }
     }
 
-    unsafe fn state_ptr<'a>(hwnd: HWND) -> *mut State<'a> {
-        // SAFETY: GWLP_USERDATA holds the live stack State pointer until WM_NCDESTROY/exit.
-        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State<'a> }
+    unsafe fn state_cell<'a>(hwnd: HWND) -> Option<&'a RefCell<State<'a>>> {
+        // SAFETY: GWLP_USERDATA holds a shared RefCell<State> pointer until WM_DESTROY/exit.
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<State<'a>> };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
     }
 
     unsafe fn measure_required_width(owner: HWND, labels: &[&str], dpi: i32) -> i32 {
@@ -636,7 +689,21 @@ mod dropdown {
         }
     }
 
-    unsafe fn paint_popup(hwnd: HWND, state: &State<'_>) {
+    struct PaintSnapshot<'a> {
+        items: &'a [&'a str],
+        checked: &'a [bool],
+        separator_before: &'a [bool],
+        has_check_gutter: bool,
+        highlight_checked: bool,
+        hover_index: Option<usize>,
+        item_h: i32,
+        scroll_top: usize,
+        reveal_t: f32,
+        dpi: i32,
+        glass: bool,
+    }
+
+    unsafe fn paint_popup(hwnd: HWND, snap: &PaintSnapshot<'_>) {
         // SAFETY: BeginPaint/EndPaint wraps buffered Win32 painting inside visuals::paint_dropdown_into.
         unsafe {
             let mut ps = PAINTSTRUCT::default();
@@ -649,17 +716,17 @@ mod dropdown {
             if !crate::visuals::paint_dropdown_into(
                 hdc,
                 client,
-                state.items,
-                state.checked,
-                state.separator_before,
-                state.has_check_gutter,
-                state.highlight_checked,
-                state.hover_index,
-                state.item_h,
-                state.scroll_top,
-                state.reveal_t,
-                state.dpi,
-                state.glass,
+                snap.items,
+                snap.checked,
+                snap.separator_before,
+                snap.has_check_gutter,
+                snap.highlight_checked,
+                snap.hover_index,
+                snap.item_h,
+                snap.scroll_top,
+                snap.reveal_t,
+                snap.dpi,
+                snap.glass,
             ) {
                 crate::visuals::fill(hdc, client, crate::visuals::CARD);
             }
@@ -673,13 +740,17 @@ mod dropdown {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        // SAFETY: accesses live State only between creation and destruction of popup.
+        // SAFETY: accesses live RefCell<State> with short non-overlapping borrows, never held across Win32 calls.
         unsafe {
-            let ptr = state_ptr(hwnd);
-            if ptr.is_null() {
-                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            if msg == WM_DESTROY {
+                let _ = KillTimer(hwnd, REVEAL_TIMER_ID);
+                let _ = RemovePropW(hwnd, w!("WallpaperLive.Glass"));
+                let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                return LRESULT(0);
             }
-            let state = &mut *ptr;
+            let Some(cell) = state_cell(hwnd) else {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            };
             let mut client = RECT::default();
             let _ = GetClientRect(hwnd, &mut client);
             let width = client.right - client.left;
@@ -687,14 +758,38 @@ mod dropdown {
             match msg {
                 WM_ERASEBKGND => LRESULT(1),
                 WM_PAINT => {
-                    paint_popup(hwnd, state);
+                    let snap = cell.try_borrow().ok().map(|s| PaintSnapshot {
+                        items: s.items,
+                        checked: s.checked,
+                        separator_before: s.separator_before,
+                        has_check_gutter: s.has_check_gutter,
+                        highlight_checked: s.highlight_checked,
+                        hover_index: s.hover_index,
+                        item_h: s.item_h,
+                        scroll_top: s.scroll_top,
+                        reveal_t: s.reveal_t,
+                        dpi: s.dpi,
+                        glass: s.glass,
+                    });
+                    if let Some(snap) = snap {
+                        paint_popup(hwnd, &snap);
+                    }
                     LRESULT(0)
                 }
                 WM_TIMER if wparam.0 == REVEAL_TIMER_ID => {
-                    let elapsed = state.opened_at.elapsed().as_secs_f32() * 1000.0;
-                    state.reveal_t = (elapsed / REVEAL_MS as f32).clamp(0.0, 1.0);
-                    if state.reveal_t >= 1.0 {
-                        state.animate = false;
+                    let stop_timer = if let Ok(mut state) = cell.try_borrow_mut() {
+                        let elapsed = state.opened_at.elapsed().as_secs_f32() * 1000.0;
+                        state.reveal_t = (elapsed / REVEAL_MS as f32).clamp(0.0, 1.0);
+                        if state.reveal_t >= 1.0 {
+                            state.animate = false;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if stop_timer {
                         let _ = KillTimer(hwnd, REVEAL_TIMER_ID);
                     }
                     let _ = InvalidateRect(hwnd, None, false);
@@ -703,9 +798,18 @@ mod dropdown {
                 WM_MOUSEMOVE => {
                     let x = (lparam.0 & 0xffff) as i16 as i32;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-                    let next = state.row_at(width, x, y);
-                    if next != state.hover_index {
-                        state.hover_index = next;
+                    let changed = if let Ok(mut state) = cell.try_borrow_mut() {
+                        let next = state.row_at(width, x, y);
+                        if next != state.hover_index {
+                            state.hover_index = next;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if changed {
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                     LRESULT(0)
@@ -714,60 +818,83 @@ mod dropdown {
                 WM_LBUTTONDOWN => {
                     let x = (lparam.0 & 0xffff) as i16 as i32;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-                    if let Some(idx) = state.row_at(width, x, y) {
-                        state.pressed_inside = true;
-                        if GetCapture() != hwnd {
-                            let _ = SetCapture(hwnd);
+                    let (want_capture, want_redraw) = if let Ok(mut state) = cell.try_borrow_mut() {
+                        if let Some(idx) = state.row_at(width, x, y) {
+                            state.pressed_inside = true;
+                            let redraw = state.hover_index != Some(idx);
+                            if redraw {
+                                state.hover_index = Some(idx);
+                            }
+                            (true, redraw)
+                        } else {
+                            if x < 0 || x >= width || y < 0 || y >= client.bottom {
+                                state.finish(None);
+                            }
+                            (false, false)
                         }
-                        if state.hover_index != Some(idx) {
-                            state.hover_index = Some(idx);
-                            let _ = InvalidateRect(hwnd, None, false);
-                        }
-                    } else if x < 0 || x >= width || y < 0 || y >= client.bottom {
-                        state.finish(None);
+                    } else {
+                        (false, false)
+                    };
+                    if want_capture && GetCapture() != hwnd {
+                        let _ = SetCapture(hwnd);
+                    }
+                    if want_redraw {
+                        let _ = InvalidateRect(hwnd, None, false);
                     }
                     LRESULT(0)
                 }
                 WM_LBUTTONUP => {
                     let x = (lparam.0 & 0xffff) as i16 as i32;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-                    let row = state.row_at(width, x, y);
-                    if state.pressed_inside {
-                        state.finish(row);
-                    } else if let Some(idx) = row {
-                        state.finish(Some(idx));
+                    if let Ok(mut state) = cell.try_borrow_mut() {
+                        let row = state.row_at(width, x, y);
+                        if state.pressed_inside {
+                            state.finish(row);
+                        } else if let Some(idx) = row {
+                            state.finish(Some(idx));
+                        }
                     }
                     LRESULT(0)
                 }
                 WM_RBUTTONDOWN | WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN | WM_CANCELMODE => {
-                    state.finish(None);
+                    if let Ok(mut state) = cell.try_borrow_mut() {
+                        state.finish(None);
+                    }
                     LRESULT(0)
                 }
                 WM_CAPTURECHANGED => {
-                    if state.open && HWND(lparam.0 as *mut std::ffi::c_void) != hwnd {
+                    if HWND(lparam.0 as *mut std::ffi::c_void) != hwnd
+                        && let Ok(mut state) = cell.try_borrow_mut()
+                        && state.open
+                    {
                         state.finish(None);
                     }
                     LRESULT(0)
                 }
                 WM_MOUSEWHEEL => {
                     let delta = ((wparam.0 >> 16) & 0xffff) as i16 as i32;
-                    let max_scroll = state.items.len().saturating_sub(state.visible_rows);
-                    if max_scroll > 0 {
-                        let step = if delta > 0 { -1isize } else { 1isize };
-                        let next_top = (state.scroll_top as isize + step)
-                            .clamp(0, max_scroll as isize)
-                            as usize;
-                        if next_top != state.scroll_top {
-                            state.scroll_top = next_top;
-                            let _ = InvalidateRect(hwnd, None, false);
+                    let redraw = if let Ok(mut state) = cell.try_borrow_mut() {
+                        let max_scroll = state.items.len().saturating_sub(state.visible_rows);
+                        if max_scroll > 0 {
+                            let step = if delta > 0 { -1isize } else { 1isize };
+                            let next_top = (state.scroll_top as isize + step)
+                                .clamp(0, max_scroll as isize)
+                                as usize;
+                            if next_top != state.scroll_top {
+                                state.scroll_top = next_top;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
                         }
+                    } else {
+                        false
+                    };
+                    if redraw {
+                        let _ = InvalidateRect(hwnd, None, false);
                     }
-                    LRESULT(0)
-                }
-                WM_DESTROY => {
-                    let _ = KillTimer(hwnd, REVEAL_TIMER_ID);
-                    let _ = RemovePropW(hwnd, w!("WallpaperLive.Glass"));
-                    let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     LRESULT(0)
                 }
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -853,7 +980,7 @@ mod dropdown {
                 .min(labels.len().saturating_sub(geom.visible_rows));
 
             let animate = crate::visuals::animations_enabled(owner);
-            let mut state = State {
+            let state = RefCell::new(State {
                 items: &labels,
                 checked: &checked,
                 separator_before: &separator_before,
@@ -873,7 +1000,7 @@ mod dropdown {
                 reveal_t: if animate { 0.0 } else { 1.0 },
                 chosen_index: None,
                 open: true,
-            };
+            });
 
             let popup = CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -894,9 +1021,10 @@ mod dropdown {
             let _ = SetWindowLongPtrW(
                 popup,
                 GWLP_USERDATA,
-                (&mut state as *mut State<'_>) as isize,
+                (&state as *const RefCell<State<'_>>) as isize,
             );
-            state.glass = configure_backdrop(popup, w, h, dpi);
+            let glass = configure_backdrop(popup, w, h, dpi);
+            state.borrow_mut().glass = glass;
             let _ = ShowWindow(popup, SW_SHOWNOACTIVATE);
             if animate {
                 let _ = SetTimer(popup, REVEAL_TIMER_ID, 16, None);
@@ -904,12 +1032,12 @@ mod dropdown {
             let _ = SetCapture(popup);
 
             let mut msg = MSG::default();
-            while state.open && GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            while state.borrow().open && GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 if msg.hwnd == owner
                     && msg.message == WM_ACTIVATE
                     && (msg.wParam.0 & 0xffff) as u32 == WA_INACTIVE
                 {
-                    state.finish(None);
+                    state.borrow_mut().finish(None);
                     let _ = TranslateMessage(&msg);
                     let _ = DispatchMessageW(&msg);
                     break;
@@ -918,37 +1046,54 @@ mod dropdown {
                     let vk = msg.wParam.0 as u16;
                     match vk {
                         x if x == VK_ESCAPE.0 || x == VK_TAB.0 => {
-                            state.finish(None);
+                            state.borrow_mut().finish(None);
                             continue;
                         }
                         x if x == VK_RETURN.0 || x == VK_SPACE.0 => {
-                            let chosen = state.hover_index.or(state.checked_index);
-                            state.finish(chosen);
+                            let mut s = state.borrow_mut();
+                            let chosen = s.hover_index.or(s.checked_index);
+                            s.finish(chosen);
                             continue;
                         }
                         x if x == VK_UP.0 => {
-                            state.step_selection(-1);
+                            state.borrow_mut().step_selection(-1);
                             let _ = InvalidateRect(popup, None, false);
                             continue;
                         }
                         x if x == VK_DOWN.0 => {
-                            state.step_selection(1);
+                            state.borrow_mut().step_selection(1);
                             let _ = InvalidateRect(popup, None, false);
                             continue;
                         }
                         x if x == VK_HOME.0 => {
-                            if !state.items.is_empty() {
-                                state.hover_index = Some(0);
-                                state.ensure_visible(0);
+                            let redraw = {
+                                let mut s = state.borrow_mut();
+                                if !s.items.is_empty() {
+                                    s.hover_index = Some(0);
+                                    s.ensure_visible(0);
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if redraw {
                                 let _ = InvalidateRect(popup, None, false);
                             }
                             continue;
                         }
                         x if x == VK_END.0 => {
-                            if !state.items.is_empty() {
-                                let last = state.items.len() - 1;
-                                state.hover_index = Some(last);
-                                state.ensure_visible(last);
+                            let redraw = {
+                                let mut s = state.borrow_mut();
+                                if !s.items.is_empty() {
+                                    let last = s.items.len() - 1;
+                                    s.hover_index = Some(last);
+                                    s.ensure_visible(last);
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if redraw {
                                 let _ = InvalidateRect(popup, None, false);
                             }
                             continue;
@@ -958,16 +1103,26 @@ mod dropdown {
                 }
                 if msg.message == WM_MOUSEWHEEL && msg.hwnd != popup {
                     let delta = ((msg.wParam.0 >> 16) & 0xffff) as i16 as i32;
-                    let max_scroll = state.items.len().saturating_sub(state.visible_rows);
-                    if max_scroll > 0 {
-                        let step = if delta > 0 { -1isize } else { 1isize };
-                        let next_top = (state.scroll_top as isize + step)
-                            .clamp(0, max_scroll as isize)
-                            as usize;
-                        if next_top != state.scroll_top {
-                            state.scroll_top = next_top;
-                            let _ = InvalidateRect(popup, None, false);
+                    let redraw = {
+                        let mut s = state.borrow_mut();
+                        let max_scroll = s.items.len().saturating_sub(s.visible_rows);
+                        if max_scroll > 0 {
+                            let step = if delta > 0 { -1isize } else { 1isize };
+                            let next_top = (s.scroll_top as isize + step)
+                                .clamp(0, max_scroll as isize)
+                                as usize;
+                            if next_top != s.scroll_top {
+                                s.scroll_top = next_top;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
                         }
+                    };
+                    if redraw {
+                        let _ = InvalidateRect(popup, None, false);
                     }
                     continue;
                 }
@@ -981,13 +1136,17 @@ mod dropdown {
                             | WM_NCRBUTTONDOWN
                     )
                 {
-                    state.finish(None);
+                    state.borrow_mut().finish(None);
+                    continue;
+                }
+                // Drop forged posted system pointer messages before dispatching.
+                if crate::app::is_disallowed_queued_pointer_msg(msg.message) {
                     continue;
                 }
                 let _ = TranslateMessage(&msg);
                 let _ = DispatchMessageW(&msg);
                 if msg.hwnd == owner && matches!(msg.message, WM_CLOSE | WM_DESTROY) {
-                    state.finish(None);
+                    state.borrow_mut().finish(None);
                 }
             }
 
@@ -996,8 +1155,8 @@ mod dropdown {
                 let _ = ReleaseCapture();
             }
             let _ = DestroyWindow(popup);
-            Ok(state
-                .chosen_index
+            let chosen_index = state.borrow().chosen_index;
+            Ok(chosen_index
                 .and_then(|idx| entries.get(idx))
                 .map(|entry| entry.id)
                 .unwrap_or(0))
@@ -1047,7 +1206,7 @@ mod dropdown {
             let labels = ["All folders", r"D:\wallpapers\live"];
             let checked = [false, true];
             let separators = [false, false];
-            let mut state = State {
+            let state = RefCell::new(State {
                 items: &labels,
                 checked: &checked,
                 separator_before: &separators,
@@ -1067,14 +1226,17 @@ mod dropdown {
                 reveal_t: 1.0,
                 chosen_index: None,
                 open: true,
-            };
-            state.finish(Some(1));
-            state.finish(None);
-            assert_eq!(state.chosen_index, Some(1));
-            assert!(!state.open);
+            });
+            state.borrow_mut().finish(Some(1));
+            state.borrow_mut().finish(None);
+            assert_eq!(state.borrow().chosen_index, Some(1));
+            assert!(!state.borrow().open);
 
-            state.chosen_index = None;
-            state.open = true;
+            {
+                let mut s = state.borrow_mut();
+                s.chosen_index = None;
+                s.open = true;
+            }
 
             // SAFETY: offscreen no-activate popups created and destroyed within this test only.
             unsafe {
@@ -1113,7 +1275,7 @@ mod dropdown {
                 let _ = SetWindowLongPtrW(
                     popup,
                     GWLP_USERDATA,
-                    (&mut state as *mut State<'_>) as isize,
+                    (&state as *const RefCell<State<'_>>) as isize,
                 );
                 let _ = ShowWindow(popup, SW_SHOWNOACTIVATE);
                 let _ = SetCapture(popup);
@@ -1126,20 +1288,24 @@ mod dropdown {
                 );
                 assert_eq!(ma.0, MA_NOACTIVATE as isize);
 
-                let click_lp = LPARAM((((state.pad_y + state.item_h / 2) << 16) | 40) as isize);
+                let (pad_y, item_h) = {
+                    let s = state.borrow();
+                    (s.pad_y, s.item_h)
+                };
+                let click_lp = LPARAM((((pad_y + item_h / 2) << 16) | 40) as isize);
                 let _ = SendMessageW(popup, WM_LBUTTONDOWN, WPARAM(1), click_lp);
-                assert!(state.pressed_inside);
-                assert!(state.open);
+                assert!(state.borrow().pressed_inside);
+                assert!(state.borrow().open);
 
                 let _ = SendMessageW(popup, WM_LBUTTONUP, WPARAM(0), click_lp);
-                assert_eq!(state.chosen_index, Some(0));
-                assert!(!state.open);
+                assert_eq!(state.borrow().chosen_index, Some(0));
+                assert!(!state.borrow().open);
 
                 let _ = SendMessageW(popup, WM_CAPTURECHANGED, WPARAM(0), LPARAM(0));
                 if GetCapture() == popup {
                     let _ = ReleaseCapture();
                 }
-                assert_eq!(state.chosen_index, Some(0));
+                assert_eq!(state.borrow().chosen_index, Some(0));
 
                 let _ = SetWindowLongPtrW(popup, GWLP_USERDATA, 0);
                 let _ = DestroyWindow(popup);
@@ -1153,19 +1319,38 @@ pub unsafe fn measure(item: &mut MEASUREITEMSTRUCT) -> bool {
     if item.CtlType != ODT_MENU || item.itemData == 0 {
         return false;
     }
-    // SAFETY: caller dispatches native menu notifications; itemData belongs to the live Menu.
-    let entry = unsafe { &*(item.itemData as *const Entry) };
-    item.itemWidth = entry.width;
-    item.itemHeight = entry.height;
+    let idx = item.itemData - 1;
+    let dims = ACTIVE_MENU.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|active| active.menu_open)
+            .and_then(|active| active.entries.get(idx))
+            .map(|entry| (entry.width, entry.height))
+    });
+    let Some((width, height)) = dims else {
+        return false;
+    };
+    item.itemWidth = width;
+    item.itemHeight = height;
     true
 }
 pub unsafe fn draw(item: &DRAWITEMSTRUCT) -> bool {
     if item.CtlType != ODT_MENU || item.itemData == 0 {
         return false;
     }
-    // SAFETY: itemData, HDC and rectangle are supplied by native menu dispatch and outlive this call.
+    let idx = item.itemData - 1;
+    let entry = ACTIVE_MENU.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|active| active.menu_open)
+            .and_then(|active| active.entries.get(idx))
+            .cloned()
+    });
+    let Some(entry) = entry else {
+        return false;
+    };
+    // SAFETY: HDC and rectangle are supplied by native menu dispatch; entry was validated via index bounds.
     unsafe {
-        let entry = &*(item.itemData as *const Entry);
         let selected = item.itemState.0 & ODS_SELECTED.0 != 0;
         let disabled = item.itemState.0 & (ODS_DISABLED.0 | ODS_GRAYED.0) != 0;
         let saved = SaveDC(item.hDC);
@@ -1290,7 +1475,7 @@ mod tests {
                     let previous = SelectObject(dc, bitmap);
                     let mut top = 0;
                     for (index, entry) in menu.entries.iter().enumerate() {
-                        let data = (&**entry as *const Entry) as usize;
+                        let data = index + 1;
                         let mut size = MEASUREITEMSTRUCT {
                             CtlType: ODT_MENU,
                             itemData: data,
@@ -1369,6 +1554,22 @@ mod tests {
                     SelectObject(dc, previous);
                     let _ = DeleteObject(bitmap);
                     let _ = DeleteDC(dc);
+                }
+                // Out-of-bounds itemData and closed menu must never dereference or succeed.
+                unsafe {
+                    let mut invalid = MEASUREITEMSTRUCT {
+                        CtlType: ODT_MENU,
+                        itemData: 0xDEAD_BEEF,
+                        ..Default::default()
+                    };
+                    assert!(!measure(&mut invalid));
+                    drop(menu);
+                    let mut closed = MEASUREITEMSTRUCT {
+                        CtlType: ODT_MENU,
+                        itemData: 1,
+                        ..Default::default()
+                    };
+                    assert!(!measure(&mut closed));
                 }
             }
         }

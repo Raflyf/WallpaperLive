@@ -35,6 +35,11 @@ IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE BE LIA
 
 Except as contained in this notice, the name of a copyright holder shall not be used in advertising or otherwise to promote the sale, use or other dealings in these Data Files or Software without prior written authorization of the copyright holder.
 
+## Fonts and typography
+
+- `assets/Quicksand-Bold.otf`: Copyright (c) 2011, Andrew Paglinawan (`www.andrewpaglinawan.com`), with Reserved Font Name "Quicksand". Licensed under the SIL Open Font License, Version 1.1 (`http://scripts.sil.org/OFL`). Embedded at build time for the desktop clock overlay numerals.
+- Weekday vector glyph contours in `src/clock_widget.rs`: embedded geometric uppercase stroke geometry inspired by Anurati styling; no third-party Anurati font binary is bundled.
+
 ## Native media decoder
 
 Playback and local cache encoding use libmpv, a native C library. Cache encoding invokes the H.264/AAC encoders already present in the user's installed decoder; no additional transcoder executable or decoder bytes are bundled. When the decoder is missing, WallpaperLive asks for explicit consent to download and verify the pinned Windows build directly inside the app (or users can run `scripts\Get-Decoder.ps1`), reusing a compatible existing `libmpv-2.dll` or a local `mpv-dev.7z` archive when present. Neither the decoder archive nor DLL is included in WallpaperLive's source or installer.
@@ -46,7 +51,7 @@ Archive SHA256: df7c433a2d481fdaf6163b201f26abbb0eff0c215c51368397088c6d8f7a001b
 DLL SHA256:     c91949577ae9cc2d500208da51f2c4a24cfa7a02d0ce6e130bf67ec738b450bb
 ```
 
-mpv is GPL-2.0-or-later by default. Its client API header is ISC-licensed, which does not relicense the decoder. Linked codecs and libraries have their own licenses. The full corresponding-source record of this third-party Windows build has not been audited for redistribution, so it must not be bundled or republished as part of this release. The application accepts compatible user-supplied libmpv API 2 libraries from its documented local locations.
+mpv is GPL-2.0-or-later by default. Its client API header is ISC-licensed, which does not relicense the decoder. Linked codecs and libraries have their own licenses. The full corresponding-source record of this third-party Windows build has not been audited for redistribution, so it must not be bundled or republished as part of this release. The application loads `libmpv-2.dll` exclusively from its local `runtime` directory after verifying its SHA-256 checksum against the pinned digest above.
 
 ## Installer components
 

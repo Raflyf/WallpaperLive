@@ -6,7 +6,7 @@
 <p align="center"><strong>Bring your own live wallpapers.</strong><br>A native Windows app for playing local videos, GIFs, and images as desktop wallpapers.</p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.2.5"><img src="https://img.shields.io/badge/release-v0.2.5-586575" alt="Release v0.2.5"></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/tag/v0.2.6"><img src="https://img.shields.io/badge/release-v0.2.6-586575" alt="Release v0.2.6"></a>
   <a href="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml"><img src="https://github.com/Raflyf/WallpaperLive/actions/workflows/ci.yml/badge.svg" alt="Windows build checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-586575" alt="GPL-3.0-or-later"></a>
   <a href="https://saweria.co/BuyMatcha"><img src="https://img.shields.io/badge/Saweria-BuyMatcha-faae2b" alt="Saweria"></a>
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.5/wallpaperlivesetup-v0.2.5.msi"><strong>Download Windows installer</strong></a>
+  <a href="https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.6/wallpaperlivesetup-v0.2.6.msi"><strong>Download Windows installer</strong></a>
   &nbsp;&middot;&nbsp; <a href="https://livelydesk.vercel.app">Full showcase &amp; docs</a>
   &nbsp;&middot;&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;&middot;&nbsp; <a href="#resource-use">Resource use</a>
@@ -54,7 +54,7 @@ Watch the continuous 1080p live playback demo, scrub the interactive 4K GPU cach
 
 - **Independent multi-display Library:** Import files or subfolders up to 4096 entries (`MP4`, `MKV`, `WebM`, `MOV`, `AVI`, `GIF`, `APNG`, `PNG`, `JPG`, `WebP`), browse a 3x3 grid (`Space`, `Left`/`Right` hotkeys), search/sort, retry thumbnails, or assign distinct wallpapers per monitor or `All displays`.
 - **Placement, FPS cap, and Quality tiers:** Choose `Fill` or `Fit`, cap playback at `24`, `30`, `45`, or `60` FPS on running players without reloading, switch 5 cache presets (`Native`, `High`, `Optimize`, `Medium`, `Low`), and choose `GPU` preference (`Auto`, `High Performance`, `Power Saving`).
-- **GPU-accelerated 4K caching (v0.2.5):** Oversized SDR videos start immediately while a background worker builds a display-sized H.264/AAC MP4 copy using hardware encoders (`h264_nvenc`, `h264_amf`, or `h264_qsv` with `d3d11va-copy` decode following GPU preference) and automatic multi-threaded `libx264` CPU fallback.
+- **GPU-accelerated 4K caching (v0.2.6):** Oversized SDR videos start immediately while a background worker drops excess frames before scaling and encodes a display-sized H.264/AAC MP4 copy using hardware encoders (`h264_nvenc`, `h264_amf`, or `h264_qsv` following GPU preference) and automatic multi-threaded `libx264` CPU fallback.
 - **Smoked Ink Black Acrylic UI:** Toggle native Windows translucent Ink Black (`#111111`) Acrylic blur or solid styling directly in Settings (`Acrylic blur`).
 - **Desktop Day Clock widget:** Anurati display typography, 12h/24h toggle, size/opacity sliders, HSV wheel + `#RRGGBB` hex input with `Confirm`, screen color eyedropper, drag/reposition, and behind-desktop-icons layering.
 - **2D occlusion & power auto-pause:** Pauses independently per display on fullscreen/maximized windows, battery power, session lock, display sleep, and suspend while retaining the last frame for instant resume.
@@ -85,7 +85,7 @@ Watch the continuous 1080p live playback demo, scrub the interactive 4K GPU cach
 
 ## Download and install
 
-1. [Download wallpaperlivesetup-v0.2.5.msi](<https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.5/wallpaperlivesetup-v0.2.5.msi>) and verify its hash against [SHA256SUMS.txt](<https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.5/SHA256SUMS.txt>).
+1. [Download wallpaperlivesetup-v0.2.6.msi](<https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.6/wallpaperlivesetup-v0.2.6.msi>) and verify its hash against [SHA256SUMS.txt](<https://github.com/Raflyf/WallpaperLive/releases/download/v0.2.6/SHA256SUMS.txt>).
 2. Run Setup as your normal Windows user (no admin rights needed). Store the installer in its own folder without unrelated DLLs.
 3. On first video playback without a compatible `libmpv-2.dll`, review the in-app Acrylic consent dialog to download and SHA-256 verify the decoder (or run `scripts\Get-Decoder.ps1` / supply `mpv-dev.7z` offline beside the installer).
 
@@ -96,7 +96,7 @@ Watch the continuous 1080p live playback demo, scrub the interactive 4K GPU cach
 <details>
 <summary>Technical cache limits, hardware encoders, and source build commands</summary>
 
-- **GPU & CPU cache pipeline:** Finite SDR videos (up to 1 hour / 16 GiB) encode in one below-normal-priority worker (15 min / 512 MiB cap, 2 GiB total cache budget under `%LOCALAPPDATA%\WallpaperLive\video-cache`). Hardware-capable PCs use `h264_nvenc`, `h264_amf`, or `h264_qsv` with `d3d11va-copy` decode following the selected GPU preference, falling back automatically to multi-threaded `libx264`.
+- **GPU & CPU cache pipeline:** Finite SDR videos (up to 1 hour / 16 GiB) encode in one below-normal-priority worker (15 min / 512 MiB cap, 2 GiB total cache budget under `%LOCALAPPDATA%\WallpaperLive\video-cache`). Hardware-capable PCs use `h264_nvenc`, `h264_amf`, or `h264_qsv` following the selected GPU preference, falling back automatically to multi-threaded `libx264`.
 - **Safety boundary:** Playback runs with user privileges, not in a sandbox. URLs, playlists, network paths, and executables are rejected; malformed local files can crash the decoder.
 - **Build & verify from source (Rust + MSVC):**
 
@@ -117,7 +117,7 @@ Optional support via [Buy me a coffee](<https://yapp.ink/raflyf>) or [Saweria](<
 
 ## Code signing policy
 
-WallpaperLive releases (including `v0.2.5`) are currently **unsigned** (no Authenticode code-signing certificate is active). All official binaries and `SHA256SUMS.txt` manifests are built transparently from public source via [Windows checks](<.github/workflows/ci.yml>) on GitHub Actions. Always download from [GitHub Releases](<https://github.com/Raflyf/WallpaperLive/releases>), verify SHA-256 digests before installing, and keep Windows security protections enabled.
+WallpaperLive releases (including `v0.2.6`) are currently **unsigned** (no Authenticode code-signing certificate is active). All official binaries and `SHA256SUMS.txt` manifests are built transparently from public source via [Windows checks](<.github/workflows/ci.yml>) on GitHub Actions. Always download from [GitHub Releases](<https://github.com/Raflyf/WallpaperLive/releases>), verify SHA-256 digests before installing, and keep Windows security protections enabled.
 
 ## Privacy policy
 

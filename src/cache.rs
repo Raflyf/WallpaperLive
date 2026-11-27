@@ -36,7 +36,7 @@ pub struct Prepared {
 }
 #[allow(clippy::too_many_arguments)]
 pub fn prepare(
-    dll: &Path,
+    _dll: &Path,
     source: &Path,
     directory: &Path,
     display: (u32, u32),
@@ -52,9 +52,9 @@ pub fn prepare(
     let w_arg = display.0.to_string();
     let h_arg = display.1.to_string();
     let fps_arg = fps.to_string();
+    // Do not pass arbitrary DLL paths on the CLI; worker resolves its own runtime\libmpv-2.dll.
     let args = [
         OsStr::new("--prepare-cache"),
-        dll.as_os_str(),
         source.as_os_str(),
         directory.as_os_str(),
         OsStr::new(&w_arg),
@@ -107,7 +107,7 @@ fn preparation_output(
         .take_stdout()
         .ok_or("Preparation worker has no output")?;
     let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(512);
         stdout
             .take(RESPONSE_LIMIT + 1)
             .read_to_end(&mut bytes)
@@ -115,11 +115,6 @@ fn preparation_output(
     });
     let start = Instant::now();
     let wait_result = loop {
-        match child.try_wait() {
-            Ok(Some(ok)) => break Ok(ok),
-            Ok(None) => {}
-            Err(e) => break Err(e),
-        }
         if cancelled.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(920) {
             break match child.kill_and_wait() {
                 Ok(()) => Err(if cancelled.load(Ordering::Relaxed) {
@@ -131,7 +126,11 @@ fn preparation_output(
                 Err(e) => Err(e),
             };
         }
-        std::thread::park_timeout(Duration::from_millis(50));
+        match child.wait_timeout(50) {
+            Ok(Some(ok)) => break Ok(ok),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
     };
     drop(child);
     let read_result = reader.join();
@@ -212,40 +211,88 @@ fn parse_response(text: &str) -> Result<Prepared, String> {
         note: lines[7].to_owned(),
     })
 }
+fn resolve_worker_decoder(explicit_arg: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(requested) = explicit_arg {
+        let valid_name = requested
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("libmpv-2.dll"));
+        if !valid_name
+            || !requested.is_absolute()
+            || validate_path_syntax(requested).is_err()
+            || crate::core::has_reparse_ancestor(requested)?
+        {
+            return Err("Arbitrary external decoder path is not allowed".into());
+        }
+        let trusted = mpv::trusted_runtime_decoder_path()?;
+        let req_canon = requested
+            .canonicalize()
+            .map_err(|_| "Arbitrary external decoder path is not allowed".to_owned())?;
+        let trusted_canon = trusted
+            .canonicalize()
+            .map_err(|e| format!("Could not resolve runtime decoder: {e}"))?;
+        if !req_canon
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&trusted_canon.as_os_str().to_string_lossy())
+        {
+            return Err("Arbitrary external decoder path is not allowed".into());
+        }
+        return Ok(trusted);
+    }
+    mpv::trusted_runtime_decoder_path()
+}
+
 pub fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
-    if !(6..=8).contains(&args.len()) {
+    if !(5..=8).contains(&args.len()) {
         return Err("Invalid preparation arguments".into());
     }
     // SAFETY: keep cache encoding unobtrusive via below-normal scheduling priority without single-core pinning.
     unsafe {
         let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     }
+    let parse_u32 = |arg: &std::ffi::OsString| arg.to_str().and_then(|s| s.parse::<u32>().ok());
+    // Support current 5..=7 arg layout (internal runtime decoder resolution) and reject any
+    // legacy 6..=8 arg invocation whose DLL argument is not the exact canonical runtime DLL.
+    let (explicit_dll, offset) = if args.len() <= 7
+        && parse_u32(&args[2]).is_some()
+        && parse_u32(&args[3]).is_some()
+        && parse_u32(&args[4]).is_some()
+    {
+        (None, 0usize)
+    } else if (6..=8).contains(&args.len()) {
+        (Some(Path::new(&args[0])), 1usize)
+    } else {
+        return Err("Invalid preparation arguments".into());
+    };
     let number = |i: usize| {
-        args[i]
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
+        args.get(offset + i)
+            .and_then(parse_u32)
             .ok_or("Invalid preparation dimensions".to_owned())
     };
-    let quality = if let Some(raw) = args.get(6) {
+    let dims = (number(2)?, number(3)?);
+    let fps = number(4)?;
+    let quality = if let Some(raw) = args.get(offset + 5) {
         raw.to_str()
             .and_then(Quality::from_key)
             .ok_or("Invalid preparation quality".to_owned())?
     } else {
         Quality::Optimize
     };
-    let gpu_preference = if let Some(raw) = args.get(7) {
+    let gpu_preference = if let Some(raw) = args.get(offset + 6) {
         raw.to_str()
             .and_then(GpuPreference::from_key)
             .ok_or("Invalid preparation GPU preference".to_owned())?
     } else {
         GpuPreference::Auto
     };
+    let dll = resolve_worker_decoder(explicit_dll)?;
     let prepared = prepare_local_with_options(
-        Path::new(&args[0]),
-        Path::new(&args[1]),
-        Path::new(&args[2]),
-        (number(3)?, number(4)?),
-        number(5)?,
+        &dll,
+        Path::new(&args[offset]),
+        Path::new(&args[offset + 1]),
+        dims,
+        fps,
         quality,
         gpu_preference,
         &AtomicBool::new(false),
@@ -443,7 +490,10 @@ pub fn prepare_local_with_options(
     let source = validate_media(source)?;
     validate_path_syntax(directory)?;
     fs::create_dir_all(directory).map_err(|e| format!("Could not create video cache: {e}"))?;
-    let info = mpv::probe_media(dll, &source)?;
+    // Pin verified libmpv-2.dll once for the entire probe -> encode -> validate workflow.
+    let _decoder_session = mpv::open_session(dll)?;
+    let probed = mpv::probe_source(dll, &source)?;
+    let info = &probed.info;
     if quality == Quality::Native {
         return Ok(Prepared {
             path: source,
@@ -509,7 +559,7 @@ pub fn prepare_local_with_options(
         }
         let output = mpv::probe_media(dll, &destination)?;
         unchanged(&source, metadata.len(), modified)?;
-        if !valid_output(&output, &info, target, fps) {
+        if !valid_output(&output, info, target, fps) {
             return Err("Cached video is invalid; move it aside before retrying".into());
         }
         prepared.path = destination;
@@ -557,10 +607,11 @@ pub fn prepare_local_with_options(
         return Err("Cache destination already exists; existing bytes were kept".into());
     }
     let mut partial_guard = PartialCleanup(Some(partial.clone()));
-    mpv::encode_with_options(
+    let output = mpv::encode_probed(
         dll,
         &source,
         &partial,
+        &probed,
         target.0,
         target.1,
         fps,
@@ -572,8 +623,7 @@ pub fn prepare_local_with_options(
         return Err("Prepared video exceeds 512 MiB; partial cache is not used".into());
     }
     unchanged(&source, metadata.len(), modified)?;
-    let output = mpv::probe_media(dll, &partial)?;
-    if !valid_output(&output, &info, target, fps) {
+    if !valid_output(&output, info, target, fps) {
         return Err("Prepared video failed resolution, frame-rate, duration or audio validation; original file was kept".into());
     }
     if cancelled.load(Ordering::Relaxed) {
@@ -636,7 +686,13 @@ fn sha256(path: &Path, cancelled: &AtomicBool) -> Result<String, String> {
     unsafe {
         check(BCryptFinishHash(hash.0, &mut digest, 0))?;
     }
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -832,7 +888,6 @@ mod tests {
     fn worker_validates_argument_count_and_gpu_preference_key() {
         assert!(worker(&[]).is_err());
         let bad_gpu: Vec<std::ffi::OsString> = vec![
-            "libmpv.dll".into(),
             "in.mp4".into(),
             "cache".into(),
             "1920".into(),
@@ -845,6 +900,28 @@ mod tests {
             worker(&bad_gpu).unwrap_err(),
             "Invalid preparation GPU preference"
         );
+        for bad_dll in [
+            "libmpv.dll",
+            r"C:\Windows\System32\kernel32.dll",
+            r"\\attacker\share\evil.dll",
+        ] {
+            let evil: Vec<std::ffi::OsString> = vec![
+                bad_dll.into(),
+                r"C:\in.mp4".into(),
+                r"C:\cache".into(),
+                "1920".into(),
+                "1080".into(),
+                "60".into(),
+                "optimize".into(),
+                "auto".into(),
+            ];
+            let err = worker(&evil).unwrap_err();
+            assert!(
+                err.contains("Arbitrary external decoder path")
+                    || err.contains("Decoder is missing"),
+                "unexpected error for {bad_dll}: {err}"
+            );
+        }
         for pref in crate::core::GPU_OPTIONS {
             assert_eq!(GpuPreference::from_key(pref.key()), Some(pref));
         }

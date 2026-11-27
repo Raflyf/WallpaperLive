@@ -192,6 +192,33 @@ public static class IconResources {
             return ms.ToArray();
         }
     }
+    static byte[] TryRead(string file, int type, int id) {
+        try { return Read(file, type, id); } catch { return null; }
+    }
+    static bool GroupMatches(byte[] actual, byte[] expected, int count) {
+        if (actual == null || actual.Length != expected.Length) return false;
+        for (int i = 0; i < 6; i++) if (actual[i] != expected[i]) return false;
+        for (int i = 0; i < count; i++) {
+            int o = 6 + i * 14;
+            // Width, height, color count, reserved (0..3), bit count (6..7), bytesInRes (8..11), nID (12..13) must match exactly.
+            // rc.exe normalizes wPlanes=0 in ICO headers to wPlanes=1 in RT_GROUP_ICON.
+            for (int j = 0; j < 4; j++) if (actual[o + j] != expected[o + j]) return false;
+            ushort actPlanes = BitConverter.ToUInt16(actual, o + 4);
+            ushort expPlanes = BitConverter.ToUInt16(expected, o + 4);
+            if (actPlanes != expPlanes && !(expPlanes == 0 && actPlanes == 1)) return false;
+            for (int j = 6; j < 14; j++) if (actual[o + j] != expected[o + j]) return false;
+        }
+        return true;
+    }
+    static bool AlreadyMatches(string file, byte[] group, byte[][] frames) {
+        byte[] existingGroup = TryRead(file, 14, 1);
+        if (!GroupMatches(existingGroup, group, frames.Length)) return false;
+        for (int i = 0; i < frames.Length; i++) {
+            byte[] existingFrame = TryRead(file, 3, i + 1);
+            if (existingFrame == null || !existingFrame.SequenceEqual(frames[i])) return false;
+        }
+        return TryRead(file, 16, 1) != null;
+    }
     public static void Apply(string file, byte[] ico, byte[] versionInfo, bool verifyOnly) {
         if (ico.Length < 6 || ico.Length > 4194304 || BitConverter.ToUInt16(ico, 0) != 0 || BitConverter.ToUInt16(ico, 2) != 1)
             throw new InvalidOperationException("Invalid ICO header");
@@ -212,7 +239,8 @@ public static class IconResources {
             Buffer.BlockCopy(BitConverter.GetBytes((ushort)(i + 1)), 0, group, 18 + i * 14, 2);
         }
         byte[] manifest = Read(file, 24, 1);
-        if (!verifyOnly) {
+        bool embeddedAtLinkTime = AlreadyMatches(file, group, frames);
+        if (!verifyOnly && !embeddedAtLinkTime) {
             IntPtr update = BeginUpdateResourceW(file, false);
             if (update == IntPtr.Zero) throw new Win32Exception();
             try {
@@ -225,8 +253,9 @@ public static class IconResources {
             } finally { if (update != IntPtr.Zero) EndUpdateResourceW(update, true); }
         }
         if (!Read(file, 24, 1).SequenceEqual(manifest)) throw new InvalidOperationException("Application manifest changed");
-        if (!Read(file, 14, 1).SequenceEqual(group)) throw new InvalidOperationException("Embedded icon group differs");
-        if (!Read(file, 16, 1).SequenceEqual(versionInfo)) throw new InvalidOperationException("Embedded version resource differs");
+        if (!GroupMatches(Read(file, 14, 1), group, count)) throw new InvalidOperationException("Embedded icon group differs");
+        if (!embeddedAtLinkTime && !Read(file, 16, 1).SequenceEqual(versionInfo)) throw new InvalidOperationException("Embedded version resource differs");
+        if (Read(file, 16, 1).Length == 0) throw new InvalidOperationException("Embedded version resource missing");
         for (int i = 0; i < count; i++)
             if (!Read(file, 3, i + 1).SequenceEqual(frames[i])) throw new InvalidOperationException("Embedded icon frame differs");
     }

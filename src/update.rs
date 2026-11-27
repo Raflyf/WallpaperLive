@@ -1,8 +1,8 @@
 use std::{
-    ffi::c_void,
-    fs::{self, File},
+    ffi::{OsStr, c_void},
+    fs::{self, File, OpenOptions},
     io::{BufWriter, Read, Write},
-    os::windows::process::CommandExt,
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
     ptr,
@@ -12,15 +12,26 @@ use std::{
 use windows::{
     Data::Json::{IJsonObjectStatics, JsonObject},
     Win32::{
+        Foundation::{CloseHandle, HANDLE},
         Networking::WinHttp::*,
         Security::Cryptography::{
             BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS,
-            BCRYPT_SHA256_ALGORITHM, BCryptCloseAlgorithmProvider, BCryptCreateHash,
-            BCryptDestroyHash, BCryptFinishHash, BCryptHashData, BCryptOpenAlgorithmProvider,
+            BCRYPT_SHA256_ALGORITHM, BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptCloseAlgorithmProvider,
+            BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptGenRandom, BCryptHashData,
+            BCryptOpenAlgorithmProvider,
         },
-        System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, GetFileInformationByHandle,
+        },
+        System::{
+            Threading::{
+                CREATE_DEFAULT_ERROR_MODE, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+            },
+            WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
+        },
     },
-    core::{HSTRING, Interface, PCWSTR, w},
+    core::{HSTRING, Interface, PCWSTR, PWSTR, w},
 };
 
 const MAX_BODY: usize = 128 * 1024;
@@ -29,7 +40,8 @@ const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
 const DECODER_URL: &str = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261107/mpv-dev-x86_64-20261107-git-9028187538.7z";
 const DECODER_ARCHIVE_SHA256: &str =
     "df7c433a2d481fdaf6163b201f26abbb0eff0c215c51368397088c6d8f7a001b";
-const DECODER_DLL_SHA256: &str = "c91949577ae9cc2d500208da51f2c4a24cfa7a02d0ce6e130bf67ec738b450bb";
+pub const DECODER_DLL_SHA256: &str =
+    "c91949577ae9cc2d500208da51f2c4a24cfa7a02d0ce6e130bf67ec738b450bb";
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -38,8 +50,62 @@ const PHASE_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum DownloadEvent {
     Progress(Option<u8>),
     Verifying,
-    Ready(PathBuf),
+    Ready(PathBuf, [u8; 32]),
     Failed(String),
+}
+
+pub fn expected_decoder_sha256() -> Result<[u8; 32], String> {
+    parse_sha256_hex(DECODER_DLL_SHA256)
+}
+
+pub fn random_bytes(buf: &mut [u8]) -> Result<(), String> {
+    // SAFETY: fills caller buffer using Windows CNG system preferred CSPRNG.
+    unsafe { BCryptGenRandom(None, buf, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+        .ok()
+        .map_err(|e| format!("System random generator failed: {e}"))
+}
+
+pub fn random_hex_16() -> Result<String, String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0u8; 16];
+    random_bytes(&mut bytes)?;
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    Ok(out)
+}
+
+fn configure_tls_session(session: &Handle) -> Result<(), String> {
+    // Enforce TLS 1.2+ (preferring TLS 1.2 | TLS 1.3; fall back to TLS 1.2 on older Windows 10 builds).
+    if session
+        .option(
+            WINHTTP_OPTION_SECURE_PROTOCOLS,
+            WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3,
+        )
+        .is_err()
+    {
+        session.option(
+            WINHTTP_OPTION_SECURE_PROTOCOLS,
+            WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2,
+        )?;
+    }
+    Ok(())
+}
+
+fn harden_https_request(request: &Handle) -> Result<(), String> {
+    request.option(
+        WINHTTP_OPTION_DISABLE_FEATURE,
+        WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION,
+    )?;
+    request.option(
+        WINHTTP_OPTION_AUTOLOGON_POLICY,
+        WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH,
+    )?;
+    // Enforce certificate revocation checking on TLS connections.
+    request.option(WINHTTP_OPTION_ENABLE_FEATURE, WINHTTP_ENABLE_SSL_REVOCATION)?;
+    Ok(())
 }
 
 struct Handle(*mut c_void);
@@ -134,6 +200,12 @@ pub fn allowed_download_host(host: &str) -> bool {
 }
 
 pub fn split_https_url(url: &str) -> Result<(&str, &str), String> {
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '\0')
+    {
+        return Err("Update download URL contains disallowed characters".into());
+    }
     let rest = url
         .strip_prefix("https://")
         .ok_or("Untrusted update download scheme")?;
@@ -144,7 +216,7 @@ pub fn split_https_url(url: &str) -> Result<(&str, &str), String> {
     if authority.is_empty()
         || authority.contains('@')
         || authority.contains(':')
-        || authority.contains(['\\', ' '])
+        || authority.contains('\\')
         || !allowed_download_host(authority)
     {
         return Err("Untrusted update download host".into());
@@ -272,6 +344,7 @@ fn fetch(cancelled: &AtomicBool, deadline: Instant) -> Result<Vec<u8>, String> {
             0,
         )
     })?;
+    configure_tls_session(&session)?;
     session.timeout(cancelled, deadline)?;
     let connection =
         Handle::new(unsafe { WinHttpConnect(session.0, w!("api.github.com"), 443, 0) })?;
@@ -287,14 +360,7 @@ fn fetch(cancelled: &AtomicBool, deadline: Instant) -> Result<Vec<u8>, String> {
             WINHTTP_FLAG_SECURE,
         )
     })?;
-    request.option(
-        WINHTTP_OPTION_DISABLE_FEATURE,
-        WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION,
-    )?;
-    request.option(
-        WINHTTP_OPTION_AUTOLOGON_POLICY,
-        WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH,
-    )?;
+    harden_https_request(&request)?;
     request.timeout(cancelled, deadline)?;
     let headers: Vec<u16> = "Accept: application/vnd.github+json\r\n"
         .encode_utf16()
@@ -398,7 +464,7 @@ impl Drop for HashHandle {
     }
 }
 
-pub fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
+pub fn sha256_reader<R: Read>(reader: &mut R) -> Result<[u8; 32], String> {
     let mut alg = BCRYPT_ALG_HANDLE::default();
     // SAFETY: valid CNG constants; handles owned and closed via RAII guards.
     unsafe {
@@ -420,12 +486,11 @@ pub fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
         .map_err(|e| format!("SHA-256 hash creation failed: {e}"))?;
     let hash = HashHandle(hash);
 
-    let mut file = File::open(path).map_err(|e| format!("Could not read downloaded file: {e}"))?;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file
+        let n = reader
             .read(&mut buf)
-            .map_err(|e| format!("Could not hash downloaded file: {e}"))?;
+            .map_err(|e| format!("Could not hash file: {e}"))?;
         if n == 0 {
             break;
         }
@@ -440,6 +505,33 @@ pub fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
         .ok()
         .map_err(|e| format!("SHA-256 verification failed: {e}"))?;
     Ok(digest)
+}
+
+pub fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
+    if crate::core::has_reparse_ancestor(path)? {
+        return Err("Refusing to hash reparse point or symlink path".into());
+    }
+    let mut file = open_regular_readonly_locked(path)?;
+    sha256_reader(&mut file)
+}
+
+fn open_regular_readonly_locked(path: &Path) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+        .map_err(|e| format!("Could not open file for verification: {e}"))?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: valid owned file handle; inspects attributes atomically on the open handle.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+        .map_err(|e| format!("Could not inspect file attributes: {e}"))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+    {
+        return Err("Refusing to read reparse point or directory".into());
+    }
+    Ok(file)
 }
 
 fn open_verified_https_stream(
@@ -461,6 +553,7 @@ fn open_verified_https_stream(
             0,
         )
     })?;
+    configure_tls_session(&session)?;
     let timeout = checkpoint_capped(cancelled, deadline, PHASE_TIMEOUT)?;
     // SAFETY: owns session handle.
     unsafe { WinHttpSetTimeouts(session.0, timeout, timeout, timeout, timeout) }
@@ -484,14 +577,7 @@ fn open_verified_https_stream(
                 WINHTTP_FLAG_SECURE,
             )
         })?;
-        request.option(
-            WINHTTP_OPTION_DISABLE_FEATURE,
-            WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION,
-        )?;
-        request.option(
-            WINHTTP_OPTION_AUTOLOGON_POLICY,
-            WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH,
-        )?;
+        harden_https_request(&request)?;
         let req_timeout = checkpoint_capped(cancelled, deadline, PHASE_TIMEOUT)?;
         unsafe {
             WinHttpSetTimeouts(
@@ -647,9 +733,15 @@ fn download_verified_file(
         return Err(format!("{label} exceeds maximum allowed size"));
     }
 
+    if crate::core::has_reparse_ancestor(part_path)? {
+        return Err("Download target path must not traverse a reparse point".into());
+    }
     let write_res: Result<(), String> = (|| {
-        let file =
-            File::create(part_path).map_err(|e| format!("Could not create download file: {e}"))?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(part_path)
+            .map_err(|e| format!("Could not create download file: {e}"))?;
         let mut writer = BufWriter::new(file);
         let mut downloaded = 0u64;
         let mut last_pct: Option<u8> = None;
@@ -723,7 +815,7 @@ pub fn download_verified_installer(
     dir: &Path,
     cancelled: &AtomicBool,
     mut on_progress: impl FnMut(Option<u8>),
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, [u8; 32]), String> {
     let canonical = normalize_tag(tag)?;
     let sums_url = format!(
         "https://github.com/Raflyf/WallpaperLive/releases/download/{canonical}/SHA256SUMS.txt"
@@ -738,9 +830,16 @@ pub fn download_verified_installer(
         "https://github.com/Raflyf/WallpaperLive/releases/download/{canonical}/{installer_name}"
     );
 
+    if crate::core::has_reparse_ancestor(dir)? {
+        return Err("Updates folder must not traverse a reparse point".into());
+    }
     fs::create_dir_all(dir).map_err(|e| format!("Could not prepare updates folder: {e}"))?;
+    if crate::core::has_reparse_ancestor(dir)? {
+        return Err("Updates folder must not be a reparse point".into());
+    }
+    let suffix = random_hex_16()?;
     let final_path = dir.join(&installer_name);
-    let part_path = dir.join(format!("{installer_name}.part"));
+    let part_path = dir.join(format!("{installer_name}.{suffix}.part"));
 
     download_verified_file(
         VerifiedDownload {
@@ -756,22 +855,134 @@ pub fn download_verified_installer(
     )?;
 
     if final_path.exists() {
+        if crate::core::is_reparse_point(&final_path).unwrap_or(true) {
+            let _ = fs::remove_file(&part_path);
+            return Err("Existing installer destination is a reparse point".into());
+        }
         let _ = fs::remove_file(&final_path);
     }
     if let Err(err) = fs::rename(&part_path, &final_path) {
         let _ = fs::remove_file(&part_path);
         return Err(format!("Could not finalize installer file: {err}"));
     }
-    Ok(final_path)
+    Ok((final_path, expected_sha))
 }
 
-fn system_tar_exe() -> Result<PathBuf, String> {
+fn system32_dir() -> PathBuf {
     let root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let tar = root.join("System32").join("tar.exe");
-    if tar.is_file() {
+    root.join("System32")
+}
+
+fn append_quoted_arg(out: &mut Vec<u16>, arg: &OsStr) {
+    out.push(b'"' as u16);
+    let mut backslashes = 0usize;
+    for u in arg.encode_wide() {
+        if u == b'\\' as u16 {
+            backslashes += 1;
+        } else if u == b'"' as u16 {
+            out.resize(out.len() + backslashes * 2 + 1, b'\\' as u16);
+            out.push(b'"' as u16);
+            backslashes = 0;
+        } else {
+            out.resize(out.len() + backslashes, b'\\' as u16);
+            out.push(u);
+            backslashes = 0;
+        }
+    }
+    out.resize(out.len() + backslashes * 2, b'\\' as u16);
+    out.push(b'"' as u16);
+}
+
+pub fn launch_verified_installer(path: &Path, expected_sha: [u8; 32]) -> Result<(), String> {
+    crate::core::validate_path_syntax(path)?;
+    if !crate::core::is_local_drive(path) {
+        return Err("Installer must reside on a local drive".into());
+    }
+    if crate::core::has_reparse_ancestor(path)? {
+        return Err("Refusing to launch installer through a reparse point".into());
+    }
+    // Hold a FILE_SHARE_READ-only handle across SHA-256 verification and CreateProcessW to prevent TOCTOU swap.
+    let mut locked_file = open_regular_readonly_locked(path)?;
+    let actual_sha = sha256_reader(&mut locked_file)?;
+    if actual_sha != expected_sha {
+        return Err("Installer SHA-256 verification failed right before launch".into());
+    }
+
+    let sys32 = system32_dir();
+    let is_msi = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("msi"));
+    let is_exe = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    if !is_msi && !is_exe {
+        return Err("Unsupported installer file type".into());
+    }
+
+    let (app_path, mut cmd_line) = if is_msi {
+        let msiexec = sys32.join("msiexec.exe");
+        if !msiexec.is_file() || crate::core::has_reparse_ancestor(&msiexec)? {
+            return Err("Windows Installer (msiexec.exe) is unavailable".into());
+        }
+        let mut cmd = Vec::new();
+        append_quoted_arg(&mut cmd, msiexec.as_os_str());
+        for ch in " /i ".encode_utf16() {
+            cmd.push(ch);
+        }
+        append_quoted_arg(&mut cmd, path.as_os_str());
+        cmd.push(0);
+        (msiexec, cmd)
+    } else {
+        let mut cmd = Vec::new();
+        append_quoted_arg(&mut cmd, path.as_os_str());
+        cmd.push(0);
+        (path.to_path_buf(), cmd)
+    };
+
+    let app_w: Vec<u16> = app_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let cwd_w: Vec<u16> = sys32.as_os_str().encode_wide().chain(Some(0)).collect();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    // SAFETY: launches verified installer or System32\msiexec.exe with CWD locked to System32.
+    let res = unsafe {
+        CreateProcessW(
+            PCWSTR(app_w.as_ptr()),
+            PWSTR(cmd_line.as_mut_ptr()),
+            None,
+            None,
+            false,
+            CREATE_DEFAULT_ERROR_MODE,
+            None,
+            PCWSTR(cwd_w.as_ptr()),
+            &startup,
+            &mut pi,
+        )
+    };
+    drop(locked_file);
+    res.map_err(|e| format!("Could not launch the downloaded installer: {e}"))?;
+    // SAFETY: close process/thread handles returned by CreateProcessW immediately.
+    unsafe {
+        if !pi.hThread.is_invalid() {
+            let _ = CloseHandle(pi.hThread);
+        }
+        if !pi.hProcess.is_invalid() {
+            let _ = CloseHandle(pi.hProcess);
+        }
+    }
+    Ok(())
+}
+
+fn system_tar_exe() -> Result<PathBuf, String> {
+    let tar = system32_dir().join("tar.exe");
+    if tar.is_file() && !crate::core::has_reparse_ancestor(&tar)? {
         Ok(tar)
     } else {
         Err("Windows tar.exe is unavailable to extract libmpv-2.dll".into())
@@ -782,24 +993,31 @@ pub fn download_verified_decoder(
     runtime_dir: &Path,
     cancelled: &AtomicBool,
     mut on_progress: impl FnMut(Option<u8>),
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, [u8; 32]), String> {
     let archive_sha = parse_sha256_hex(DECODER_ARCHIVE_SHA256)?;
     let dll_sha = parse_sha256_hex(DECODER_DLL_SHA256)?;
+    if crate::core::has_reparse_ancestor(runtime_dir)? {
+        return Err("Runtime folder must not traverse a reparse point".into());
+    }
     let dll_path = runtime_dir.join("libmpv-2.dll");
     if dll_path.exists() {
-        if !dll_path.is_file() {
+        if crate::core::is_reparse_point(&dll_path).unwrap_or(true) || !dll_path.is_file() {
             return Err("Decoder path exists but is not a regular DLL file".into());
         }
         if sha256_file(&dll_path)? == dll_sha {
-            return Ok(dll_path);
+            return Ok((dll_path, dll_sha));
         }
         return Err("Existing libmpv-2.dll differs from pinned build; left untouched.".into());
     }
 
     fs::create_dir_all(runtime_dir)
         .map_err(|e| format!("Could not prepare runtime folder: {e}"))?;
-    let stage = runtime_dir.join(format!(".decoder-stage-{}", std::process::id()));
-    fs::create_dir_all(&stage).map_err(|e| format!("Could not prepare staging folder: {e}"))?;
+    if crate::core::has_reparse_ancestor(runtime_dir)? {
+        return Err("Runtime folder must not be a reparse point".into());
+    }
+    let suffix = random_hex_16()?;
+    let stage = runtime_dir.join(format!(".decoder-stage-{suffix}"));
+    fs::create_dir(&stage).map_err(|e| format!("Could not prepare staging folder: {e}"))?;
     let archive_path = stage.join("mpv-dev.7z");
     let staged_dll = stage.join("libmpv-2.dll");
 
@@ -835,14 +1053,44 @@ pub fn download_verified_decoder(
         }
     };
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let status = Command::new(&tar)
+    let mut child = match Command::new(&tar)
+        .current_dir(&stage)
         .arg("-xf")
         .arg(&archive_path)
         .arg("-C")
         .arg(&stage)
         .arg("libmpv-2.dll")
         .creation_flags(CREATE_NO_WINDOW)
-        .status();
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            cleanup();
+            return Err(format!("Could not run tar.exe: {err}"));
+        }
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(exit)) => break Ok(exit),
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("Could not monitor tar.exe: {err}"));
+            }
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err("Decoder download cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err("Decoder extraction timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     match status {
         Ok(exit) if exit.success() => {}
         Ok(exit) => {
@@ -851,11 +1099,11 @@ pub fn download_verified_decoder(
         }
         Err(err) => {
             cleanup();
-            return Err(format!("Could not run tar.exe: {err}"));
+            return Err(err);
         }
     }
 
-    if !staged_dll.is_file() {
+    if crate::core::is_reparse_point(&staged_dll).unwrap_or(true) || !staged_dll.is_file() {
         cleanup();
         return Err("libmpv-2.dll was missing from the downloaded archive".into());
     }
@@ -876,7 +1124,7 @@ pub fn download_verified_decoder(
         return Err(format!("Could not install libmpv-2.dll: {err}"));
     }
     cleanup();
-    Ok(dll_path)
+    Ok((dll_path, dll_sha))
 }
 
 #[cfg(test)]
@@ -1001,6 +1249,16 @@ mod tests {
         assert!(split_https_url("http://github.com/a").is_err());
         assert!(split_https_url("https://evil.example/a.exe").is_err());
         assert!(split_https_url("https://github.com@evil.example/a").is_err());
+        assert!(split_https_url("https://github.com/a\r\nX-Injected: 1").is_err());
+        assert!(split_https_url("https://github.com/a\0b").is_err());
+        assert!(split_https_url("https://github.com/a b").is_err());
+        assert!(split_https_url("https://github.com/a\tb").is_err());
+
+        let r1 = random_hex_16().unwrap();
+        let r2 = random_hex_16().unwrap();
+        assert_eq!(r1.len(), 32);
+        assert!(r1.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(r1, r2);
 
         let expected = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let manifest_msi = format!("{expected}  wallpaperlivesetup-v0.2.2.msi\n");

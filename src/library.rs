@@ -1,6 +1,6 @@
 use crate::core::{live_extension, supported_extension, validate_media, validate_path_syntax};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -29,17 +29,33 @@ impl Sort {
 }
 
 fn key(path: &Path) -> String {
-    path.components()
-        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
-        .collect::<Vec<_>>()
-        .join("\\")
+    let mut out = String::with_capacity(path.as_os_str().len());
+    for (idx, part) in path.components().enumerate() {
+        if idx > 0 {
+            out.push('\\');
+        }
+        let s = part.as_os_str().to_string_lossy();
+        if s.is_ascii() {
+            for b in s.bytes() {
+                out.push(b.to_ascii_lowercase() as char);
+            }
+        } else {
+            out.push_str(&s.to_lowercase());
+        }
+    }
+    out
 }
 fn in_folder(path: &Path, folder: &Path) -> bool {
     let mut parts = path.components();
     folder.components().all(|parent| {
         parts.next().is_some_and(|part| {
-            part.as_os_str().to_string_lossy().to_lowercase()
-                == parent.as_os_str().to_string_lossy().to_lowercase()
+            let a = part.as_os_str().to_string_lossy();
+            let b = parent.as_os_str().to_string_lossy();
+            if a.is_ascii() && b.is_ascii() {
+                a.eq_ignore_ascii_case(&b)
+            } else {
+                a.to_lowercase() == b.to_lowercase()
+            }
         })
     })
 }
@@ -118,11 +134,13 @@ pub fn scan_folder(source: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 pub fn filtered(paths: &[PathBuf], folder: Option<&Path>) -> Vec<PathBuf> {
-    paths
-        .iter()
-        .filter(|path| folder.is_none_or(|folder| in_folder(path, folder)))
-        .cloned()
-        .collect()
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        if folder.is_none_or(|folder| in_folder(path, folder)) {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 pub fn view(paths: &[PathBuf], folder: Option<&Path>, query: &str, sort: Sort) -> Vec<PathBuf> {
     let query = query.trim().to_lowercase();
@@ -137,7 +155,12 @@ pub fn view(paths: &[PathBuf], folder: Option<&Path>, query: &str, sort: Sort) -
         result.retain(|path| name(path).contains(&query));
     }
     if sort != Sort::Newest {
-        result.sort_by_cached_key(|path| (name(path), key(path), path.clone()));
+        let mut keyed: Vec<(String, String, PathBuf)> = result
+            .into_iter()
+            .map(|path| (name(&path), key(&path), path))
+            .collect();
+        keyed.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+        result = keyed.into_iter().map(|(_, _, path)| path).collect();
         if sort == Sort::NameDesc {
             result.reverse();
         }
@@ -164,7 +187,9 @@ pub fn decode(text: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
         return Err("Invalid library version".into());
     }
     let mut files = Vec::new();
+    let mut seen_files = HashSet::new();
     let mut roots = Vec::new();
+    let mut seen_roots = HashSet::new();
     for line in lines {
         let (folder, text) = if version == "version=1" {
             (false, line)
@@ -178,14 +203,14 @@ pub fn decode(text: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
         let path = PathBuf::from(text);
         validate_path_syntax(&path)?;
         if folder {
-            if !roots.contains(&path) {
+            if seen_roots.insert(path.clone()) {
                 roots.push(path);
             }
         } else {
             if !supported_extension(&path) {
                 return Err("Invalid library media format".into());
             }
-            if !files.contains(&path) {
+            if seen_files.insert(path.clone()) {
                 files.push(path);
             }
         }
@@ -193,6 +218,8 @@ pub fn decode(text: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
             return Err("Library exceeds 4096 entries".into());
         }
     }
+    files.shrink_to_fit();
+    roots.shrink_to_fit();
     Ok((files, roots))
 }
 

@@ -262,10 +262,15 @@ impl SilentChild {
         self.stdout.take()
     }
 
+    #[cfg(test)]
     pub(crate) fn try_wait(&mut self) -> Result<Option<bool>, String> {
+        self.wait_timeout(0)
+    }
+
+    pub(crate) fn wait_timeout(&mut self, timeout_ms: u32) -> Result<Option<bool>, String> {
         let h = HANDLE(self.process.as_raw_handle());
-        // SAFETY: `self.process` owns a valid Windows process handle.
-        let wait = unsafe { WaitForSingleObject(h, 0) };
+        // SAFETY: `self.process` owns a valid Windows process handle; blocks up to timeout_ms and wakes immediately on exit.
+        let wait = unsafe { WaitForSingleObject(h, timeout_ms) };
         if wait == WAIT_TIMEOUT {
             return Ok(None);
         }
@@ -339,7 +344,7 @@ fn capture_output(
         .take_stdout()
         .ok_or("Thumbnail worker has no output")?;
     let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity((WIDTH * HEIGHT * 4 + 8) as usize);
         stdout
             .take(LIMIT + 1)
             .read_to_end(&mut output)
@@ -347,11 +352,6 @@ fn capture_output(
     });
     let start = Instant::now();
     let wait_result = loop {
-        match child.try_wait() {
-            Ok(Some(ok)) => break Ok(ok),
-            Ok(None) => {}
-            Err(e) => break Err(e),
-        }
         if cancelled.load(std::sync::atomic::Ordering::Relaxed)
             || start.elapsed() >= Duration::from_secs(10)
         {
@@ -365,7 +365,11 @@ fn capture_output(
                 Err(e) => Err(format!("Could not stop thumbnail worker: {e}")),
             };
         }
-        std::thread::park_timeout(Duration::from_millis(50));
+        match child.wait_timeout(50) {
+            Ok(Some(ok)) => break Ok(ok),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
     };
     drop(child);
     let read_result = reader.join();

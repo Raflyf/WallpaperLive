@@ -1,6 +1,6 @@
 [package]
 name = "wallpaperlive"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 autoexamples = false
 license = "GPL-3.0-or-later"
@@ -17,8 +17,8 @@ windows = { version = "0.58.0", features = ["Win32_Foundation", "Win32_Security"
 embed-manifest = "1.5.1"
 
 [profile.release]
-lto = true
+lto = "fat"
 codegen-units = 1
-strip = true
+strip = "symbols"
 panic = "abort"
 opt-level = "s"

@@ -15,6 +15,27 @@ Release history for WallpaperLive. Each version describes its own changes; older
 
 ---
 
+## v0.2.6
+
+### Performance
+
+- **Lower 4K60 playback VRAM, commit RAM, and GPU utilization:** Tuned `libmpv` D3D11VA playback (`hwdec-extra-frames=0`, `demuxer-max-bytes=1MiB`, `demuxer-readahead-secs=0.1`, `vd-lavc-dr=no`, `deband=no`, `icc-profile-auto=no`, `interpolation=no`, `temporal-dither=no`, `audio-buffer=0.1`, `gpu-tex-pad-x/y=0`, `d3d11-output-format=rgba8` on `rgba8` profiles), cutting 4K60 dedicated VRAM by `35.9 MiB` (`344.8 -> 308.9 MiB`), peak commit RAM by `37.8 MiB` (`600.0 -> 562.2 MiB`), and GPU utilization by `7.3 pp` (`55.3% -> 48.0%`) with zero dropped frames.
+- **2x faster, lower-RAM 4K cache preparation:** Reordered the `lavfi` filter graph so `fps` frame-dropping runs before `rotate`/`scale`, removed the ~384 MiB `d3d11va-copy` decode surface pool + GPU readback stall in favor of single-thread CPU decode feeding hardware GPU encoders (`h264_nvenc` / `h264_amf` / `h264_qsv`), pinned verified `libmpv-2.dll` once per worker session (`DecoderSession` / `VERIFIED_API` `Weak<Api>`), and replaced 50 ms worker polling with `WaitForSingleObject` (`SilentChild::wait_timeout`). Empirically cut cold 4K60-to-1080p30 cache wall time from `4.40 s` to `2.36 s` (`-46%`), peak RAM from `478.7 MiB` to `358.9 MiB` (`-25%`), peak commit by `128 MiB`, shared GPU memory from `622.2 MiB` to `238.9 MiB` (`-62%`), CPU time by `25%`, and GPU utilization from `70%` to `15%`; warm cache hits dropped `27%` in time and `25%` in peak RAM.
+- **Lower idle/tray RAM, CPU, and GPU overhead:** Added `visuals::trim_for_tray()` and `clock_widget::trim_transient_caches()` (including `IDXGIDevice3::Trim()` on DirectComposition surfaces) on tray hide and after non-preview minute renders, compacted heap and trimmed working sets on pause, stepped hidden steady-state fallback polling from `2000 ms` to `4000 ms` (with instant `SetWinEventHook` reactivity), skipped thumbnail scheduling while hidden, reused `occluding_buf` and `track-list` CStr buffers, rewrote `box_blur_horizontal` / `box_blur_vertical` to cache-friendly row-major reciprocal-multiply passes, and eliminated redundant allocations across `core`, `library`, `visuals`, `clock_widget`, and `mpv` with `lto = "fat"` + `opt-level = "s"`.
+
+### Security
+
+- **PE binary & process hardening:** Embedded icon, application manifest, and `VS_VERSION_INFO` at link time via `build.rs` (`rc.exe`) so post-link resource updates never shift `.reloc`, enabling full MSVC Control Flow Guard (`/GUARD:CF`), CET Shadow Stack (`/CETCOMPAT`), `/DEPENDENTLOADFLAG:0x800`, and `--remap-path-prefix` path stripping; hardened process entry (`harden_process()`) with `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`, `SetDllDirectoryW("")`, `ProcessExtensionPointDisablePolicy`, and `ProcessImageLoadPolicy` (`NoRemoteImages | NoLowMandatoryLabelImages`).
+- **TOCTOU-resistant decoder verification & supply-chain checks:** Hold a `FILE_SHARE_READ` handle across `BY_HANDLE_FILE_INFORMATION` validation, pinned SHA-256 verification, and `LoadLibraryExW` (`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`); enforced strict local non-reparse path validation across settings, cache, thumbnails, and CLI workers; enforced TLS 1.2+/1.3 with CRL/OCSP revocation checking and pinned GitHub hosts/SHA-256 digests across in-app updates and build/decoder PowerShell scripts.
+- **IPC & UI boundary hardening:** Gated internal `WM_APP` action dispatch with a CSPRNG process token (`internal_action_token`), rejected disallowed queued pointer-bearing window messages, verified `TransparentBar.Window` owning PID image paths, and replaced shell-command Explorer reveal with `SHOpenFolderAndSelectItems`.
+
+### Verification and limits
+
+- Update application, manifest, and WiX installer metadata to `0.2.6`.
+- Release v0.2.6 publishes `wallpaperlivesetup-v0.2.6.msi` and `SHA256SUMS.txt` via the GitHub Actions Release workflow.
+
+---
+
 ## v0.2.5
 
 ### Performance

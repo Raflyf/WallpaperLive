@@ -4,14 +4,23 @@ mod gpu;
 use std::{
     cell::Cell,
     ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
+    io::Write as _,
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     path::{Path, PathBuf},
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use windows::{
     Win32::{
-        Foundation::{FreeLibrary, HMODULE, HWND, LPARAM, WPARAM},
+        Foundation::{FreeLibrary, HANDLE, HMODULE, HWND, LPARAM, WPARAM},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, GetFileInformationByHandle,
+        },
         System::LibraryLoader::{
             GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
             LoadLibraryExW,
@@ -133,6 +142,9 @@ fn fps_filter(fps: u32, source_fps: f64) -> Result<String, String> {
 }
 
 struct Library(HMODULE);
+// SAFETY: HMODULE is an immutable process-wide module handle freed once on final Arc<Api> drop.
+unsafe impl Send for Library {}
+unsafe impl Sync for Library {}
 impl Drop for Library {
     fn drop(&mut self) {
         // SAFETY: this owns one LoadLibrary reference, retained until all mpv handles are gone.
@@ -140,6 +152,31 @@ impl Drop for Library {
             let _ = FreeLibrary(self.0);
         }
     }
+}
+
+struct CachedApi {
+    vol_serial: u32,
+    index_high: u32,
+    index_low: u32,
+    size_high: u32,
+    size_low: u32,
+    expected_sha: [u8; 32],
+    api: Weak<Api>,
+}
+
+static VERIFIED_API: Mutex<Option<CachedApi>> = Mutex::new(None);
+
+/// Holds an active verified `libmpv-2.dll` session across sequential probe/encode operations
+/// so the 121 MB DLL is SHA-256 verified and loaded once per workflow while still unloading cleanly
+/// as soon as the session and all `Mpv` handles drop.
+pub(crate) struct DecoderSession {
+    _api: Arc<Api>,
+}
+
+pub(crate) fn open_session(dll: &Path) -> Result<DecoderSession, String> {
+    Ok(DecoderSession {
+        _api: Api::load(dll)?,
+    })
 }
 
 struct Api {
@@ -160,14 +197,90 @@ struct Api {
     _library: Library,
 }
 
+pub fn trusted_runtime_decoder_path() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe
+        .parent()
+        .ok_or("Application directory not found")?
+        .to_owned();
+    let mut candidates = vec![dir.join("runtime").join("libmpv-2.dll")];
+    if cfg!(debug_assertions) || cfg!(test) {
+        candidates.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("runtime")
+                .join("libmpv-2.dll"),
+        );
+    }
+    for candidate in candidates {
+        if crate::core::has_reparse_ancestor(&candidate)? {
+            return Err("Decoder path or runtime directory is a reparse point".into());
+        }
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(
+        "Decoder is missing. Run scripts\\Get-Decoder.ps1 from the install folder once, then try again."
+            .into(),
+    )
+}
+
 impl Api {
-    fn load(path: &Path) -> Result<Self, String> {
+    fn load(path: &Path) -> Result<Arc<Self>, String> {
         if !path.is_absolute() {
             return Err("Decoder path must be absolute".into());
         }
+        crate::core::validate_path_syntax(path)?;
+        if !crate::core::is_local_drive(path) {
+            return Err("Decoder must reside on a local drive".into());
+        }
+        if crate::core::has_reparse_ancestor(path)? {
+            return Err("Refusing to load decoder through a reparse point or symlink".into());
+        }
+        let expected_sha = crate::update::expected_decoder_sha256()?;
+        // Hold a FILE_SHARE_READ-only handle across verification and LoadLibraryExW to prevent TOCTOU swap.
+        let mut locked_file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)
+            .map_err(|e| format!("Decoder unavailable. Run scripts/Get-Decoder.ps1. ({e})"))?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: valid owned handle inspected prior to identity check, hashing, and image load.
+        unsafe { GetFileInformationByHandle(HANDLE(locked_file.as_raw_handle()), &mut info) }
+            .map_err(|e| format!("Could not inspect decoder file attributes: {e}"))?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        {
+            return Err("Refusing to load reparse point or directory as decoder".into());
+        }
+        // Serialize verification/load so concurrent opens reuse one pinned Arc<Api> without
+        // duplicate 121 MiB SHA-256 reads or redundant LoadLibraryExW calls.
+        let mut guard = VERIFIED_API
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = guard.as_ref()
+            && cached.vol_serial == info.dwVolumeSerialNumber
+            && cached.index_high == info.nFileIndexHigh
+            && cached.index_low == info.nFileIndexLow
+            && cached.size_high == info.nFileSizeHigh
+            && cached.size_low == info.nFileSizeLow
+            && cached.expected_sha == expected_sha
+            && let Some(existing) = cached.api.upgrade()
+        {
+            return Ok(existing);
+        }
+        let actual_sha = crate::update::sha256_reader(&mut locked_file)?;
+        if actual_sha != expected_sha {
+            return Err(
+                "Decoder libmpv-2.dll SHA-256 verification failed; refusing to load untrusted DLL"
+                    .into(),
+            );
+        }
         let text = path.to_str().ok_or("Decoder path is not valid Unicode")?;
         let wide: Vec<_> = text.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: absolute UTF-16 path; dependencies searched only beside DLL and in System32.
+        // SAFETY: verified absolute local non-reparse UTF-16 path still read-locked against write/delete;
+        // dependencies searched only beside DLL and in System32.
         let library = Library(
             unsafe {
                 LoadLibraryExW(
@@ -178,6 +291,7 @@ impl Api {
             }
             .map_err(|e| format!("Decoder unavailable. Run scripts/Get-Decoder.ps1. ({e})"))?,
         );
+        drop(locked_file);
         macro_rules! symbol {
             ($name:literal, $ty:ty) => {{
                 // SAFETY: symbol types match include/mpv/client.h API 2; library outlives pointers.
@@ -192,7 +306,7 @@ impl Api {
         if unsafe { version() } >> 16 != 2 {
             return Err("Incompatible decoder API version (libmpv API 2 required)".into());
         }
-        Ok(Self {
+        let api = Arc::new(Self {
             create: symbol!("mpv_create", unsafe extern "C" fn() -> *mut c_void),
             initialize: symbol!("mpv_initialize", unsafe extern "C" fn(*mut c_void) -> c_int),
             destroy: symbol!("mpv_terminate_destroy", unsafe extern "C" fn(*mut c_void)),
@@ -238,7 +352,17 @@ impl Api {
                 unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int
             ),
             _library: library,
-        })
+        });
+        *guard = Some(CachedApi {
+            vol_serial: info.dwVolumeSerialNumber,
+            index_high: info.nFileIndexHigh,
+            index_low: info.nFileIndexLow,
+            size_high: info.nFileSizeHigh,
+            size_low: info.nFileSizeLow,
+            expected_sha,
+            api: Arc::downgrade(&api),
+        });
+        Ok(api)
     }
     fn check(&self, result: c_int) -> Result<(), String> {
         if result >= 0 {
@@ -318,8 +442,8 @@ fn conversion_plan(
     Ok((w, h, info.fps.min(fps as f64)))
 }
 
-struct Probed {
-    info: MediaInfo,
+pub(crate) struct Probed {
+    pub(crate) info: MediaInfo,
     rotation: i32,
 }
 
@@ -327,15 +451,16 @@ fn probe(dll: &Path, source: &Path) -> Result<Probed, String> {
     let source = crate::core::validate_media(source)?;
     let player = Mpv::headless(dll)?;
     for (name, value) in [
-        ("vo", "null"),
-        ("ao", "null"),
-        ("aid", "no"),
-        ("pause", "yes"),
-        ("keep-open", "yes"),
-        ("idle", "yes"),
-        ("video-rotate", "no"),
+        (c"vo", c"null"),
+        (c"ao", c"null"),
+        (c"aid", c"no"),
+        (c"pause", c"yes"),
+        (c"keep-open", c"yes"),
+        (c"idle", c"yes"),
+        (c"video-rotate", c"no"),
+        (c"vd-lavc-threads", c"1"),
     ] {
-        player.option(name, value)?;
+        player.option_cstr(name, value)?;
     }
     // SAFETY: owned headless context initialized once with no output device or window.
     player
@@ -344,6 +469,7 @@ fn probe(dll: &Path, source: &Path) -> Result<Probed, String> {
     player.load(&source)?;
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut loaded = false;
+    let mut prop_buf = Vec::with_capacity(32);
     loop {
         let event = unsafe { &*(player.api.wait)(player.handle, 0.05) };
         worker_error(&player, event)?;
@@ -352,41 +478,43 @@ fn probe(dll: &Path, source: &Path) -> Result<Probed, String> {
         }
         loaded |= event.id == 8;
         if loaded {
-            let property = |name: &str| {
-                CString::new(name)
-                    .ok()
-                    .and_then(|name| player.property(&name))
-            };
-            let number = |name: &str| property(name).and_then(|s| s.parse::<f64>().ok());
-            if let (Some(dw), Some(dh)) =
-                (number("video-out-params/dw"), number("video-out-params/dh"))
-            {
-                let rotation = number("video-dec-params/rotate").unwrap_or(0.0) as i32;
+            let number = |name: &CStr| player.property(name).and_then(|s| s.parse::<f64>().ok());
+            if let (Some(dw), Some(dh)) = (
+                number(c"video-out-params/dw"),
+                number(c"video-out-params/dh"),
+            ) {
+                let rotation = number(c"video-dec-params/rotate").unwrap_or(0.0) as i32;
                 let (width, height) = display_dimensions(dw as u32, dh as u32, rotation)?;
-                let count = number("track-list/count").unwrap_or(0.0).clamp(0.0, 256.0) as usize;
+                let count = number(c"track-list/count").unwrap_or(0.0).clamp(0.0, 256.0) as usize;
                 let mut audio = false;
                 let mut image = false;
+                let mut track_prop = |n: usize, suffix: &str| -> Option<String> {
+                    prop_buf.clear();
+                    let _ = write!(&mut prop_buf, "track-list/{n}/{suffix}\0");
+                    CStr::from_bytes_with_nul(&prop_buf)
+                        .ok()
+                        .and_then(|c| player.property(c))
+                };
                 for n in 0..count {
-                    let kind = property(&format!("track-list/{n}/type"));
+                    let kind = track_prop(n, "type");
                     audio |= kind.as_deref() == Some("audio");
                     if kind.as_deref() == Some("video")
-                        && property(&format!("track-list/{n}/selected")).as_deref() == Some("yes")
+                        && track_prop(n, "selected").as_deref() == Some("yes")
                     {
-                        image |= property(&format!("track-list/{n}/image")).as_deref()
-                            == Some("yes")
-                            || property(&format!("track-list/{n}/albumart")).as_deref()
-                                == Some("yes");
+                        image |= track_prop(n, "image").as_deref() == Some("yes")
+                            || track_prop(n, "albumart").as_deref() == Some("yes");
                     }
                 }
-                let gamma = property("video-out-params/gamma")
-                    .or_else(|| property("video-dec-params/gamma"))
+                let gamma = player
+                    .property(c"video-out-params/gamma")
+                    .or_else(|| player.property(c"video-dec-params/gamma"))
                     .ok_or("Video color information is unavailable")?;
                 let hdr = matches!(gamma.as_str(), "pq" | "hlg" | "st2084" | "smpte2084")
-                    || number("video-out-params/sig-peak")
-                        .or_else(|| number("video-dec-params/sig-peak"))
+                    || number(c"video-out-params/sig-peak")
+                        .or_else(|| number(c"video-dec-params/sig-peak"))
                         .is_some_and(|n| n > 1.0);
-                let fps = number("container-fps").unwrap_or(0.0);
-                let duration = number("duration").unwrap_or(0.0);
+                let fps = number(c"container-fps").unwrap_or(0.0);
+                let duration = number(c"duration").unwrap_or(0.0);
                 if !image
                     && (!fps.is_finite() || fps <= 0.0 || !duration.is_finite() || duration <= 0.0)
                 {
@@ -410,6 +538,10 @@ fn probe(dll: &Path, source: &Path) -> Result<Probed, String> {
             return Err("Video probe timed out after 8 seconds".into());
         }
     }
+}
+
+pub(crate) fn probe_source(dll: &Path, source: &Path) -> Result<Probed, String> {
+    probe(dll, source)
 }
 
 pub fn probe_media(dll: &Path, source: &Path) -> Result<MediaInfo, String> {
@@ -561,16 +693,17 @@ fn encode_profile_for_backend(
         }
         gpu::EncodeBackend::Nvenc => {
             let ovcopts = match quality {
-                Quality::Native => "preset=p5,rc=vbr,cq=18,b=0",
-                Quality::High => "preset=p5,rc=vbr,cq=20,b=0",
-                Quality::Optimize => "preset=p4,rc=vbr,cq=22,b=0",
-                Quality::Medium => "preset=p3,rc=vbr,cq=25,b=0",
-                Quality::Low => "preset=p2,rc=vbr,cq=29,b=0",
+                Quality::Native => "preset=p5,rc=vbr,cq=18,b=0,surfaces=8",
+                Quality::High => "preset=p5,rc=vbr,cq=20,b=0,surfaces=8",
+                Quality::Optimize => "preset=p4,rc=vbr,cq=22,b=0,surfaces=8",
+                Quality::Medium => "preset=p3,rc=vbr,cq=25,b=0,surfaces=8",
+                Quality::Low => "preset=p2,rc=vbr,cq=29,b=0,surfaces=8",
             };
             EncodeProfile {
                 ovc: "h264_nvenc",
                 pix_fmt: "nv12",
-                hwdec: "d3d11va-copy",
+                // CPU decode avoids a ~384 MiB D3D11VA surface pool + GPU readback stall before CPU scale.
+                hwdec: "no",
                 filter_flags,
                 ovcopts: ovcopts.into(),
             }
@@ -586,7 +719,7 @@ fn encode_profile_for_backend(
             EncodeProfile {
                 ovc: "h264_amf",
                 pix_fmt: "nv12",
-                hwdec: "d3d11va-copy",
+                hwdec: "no",
                 filter_flags,
                 ovcopts: ovcopts.into(),
             }
@@ -602,7 +735,7 @@ fn encode_profile_for_backend(
             EncodeProfile {
                 ovc: "h264_qsv",
                 pix_fmt: "nv12",
-                hwdec: "d3d11va-copy",
+                hwdec: "no",
                 filter_flags,
                 ovcopts: ovcopts.into(),
             }
@@ -658,6 +791,7 @@ pub fn encode_with_quality(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_with_options(
     dll: &Path,
     source: &Path,
@@ -672,6 +806,40 @@ pub fn encode_with_options(
     if cancelled.load(Ordering::Relaxed) {
         return Err("Conversion cancelled".into());
     }
+    let _session = open_session(dll)?;
+    let source = crate::core::validate_media(source)?;
+    let parsed = probe(dll, &source)?;
+    encode_probed(
+        dll,
+        &source,
+        output,
+        &parsed,
+        width,
+        height,
+        fps,
+        quality,
+        gpu_preference,
+        cancelled,
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_probed(
+    dll: &Path,
+    source: &Path,
+    output: &Path,
+    parsed: &Probed,
+    width: u32,
+    height: u32,
+    fps: u32,
+    quality: Quality,
+    gpu_preference: GpuPreference,
+    cancelled: &AtomicBool,
+) -> Result<MediaInfo, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Conversion cancelled".into());
+    }
     if !output.is_absolute() || output.to_str().is_none() {
         return Err("Cache output path must be absolute Unicode".into());
     }
@@ -680,7 +848,6 @@ pub fn encode_with_options(
         return Err("Existing media or cache file will not be overwritten".into());
     }
     let source = crate::core::validate_media(source)?;
-    let parsed = probe(dll, &source)?;
     let (width, height, rate) = conversion_plan(&parsed.info, width, height, fps)?;
     let parent = output
         .parent()
@@ -705,10 +872,10 @@ pub fn encode_with_options(
     let backends = gpu::choose_encode_backends(gpu_preference);
     for (idx, backend) in backends.iter().copied().enumerate() {
         match encode_once(
-            dll, &source, &output, &parsed, width, height, rate, quality, backend, threads,
+            dll, &source, &output, parsed, width, height, rate, quality, backend, threads,
             deadline, cancelled,
         ) {
-            Ok(()) => return Ok(()),
+            Ok(info) => return Ok(info),
             Err(err) => {
                 let _ = std::fs::remove_file(&output);
                 if cancelled.load(Ordering::Relaxed) || idx + 1 == backends.len() {
@@ -734,9 +901,16 @@ fn encode_once(
     threads: usize,
     deadline: Instant,
     cancelled: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<MediaInfo, String> {
     let profile = encode_profile_for_backend(quality, backend, threads);
-    let threads_str = threads.to_string();
+    // Single decode thread on HW-encode keeps 4K working set minimal; cap filter/CPU threads at 2.
+    let decode_threads = if backend == gpu::EncodeBackend::CpuX264 {
+        threads.min(2)
+    } else {
+        1
+    };
+    let filter_threads = threads.min(2);
+    let decode_threads_str = decode_threads.to_string();
     let player = Mpv::headless(dll)?;
     let rotate = match parsed.rotation.rem_euclid(360) {
         90 => "transpose=clock,",
@@ -744,13 +918,14 @@ fn encode_once(
         270 => "transpose=cclock,",
         _ => "",
     };
+    // Drop surplus frames before rotation/scaling so 60->30fps scales half as many 4K frames.
     let filter = format!(
-        "lavfi=graph=[{rotate}scale=w={width}:h={height}:flags={},setsar=1,fps={rate:.6}:round=near,format={}]:o=[threads={threads}]",
+        "lavfi=graph=[fps={rate:.6}:round=near,{rotate}scale=w={width}:h={height}:flags={},setsar=1,format={}]:o=[threads={filter_threads}]",
         profile.filter_flags, profile.pix_fmt
     );
     for (name, value) in [
         ("hwdec", profile.hwdec),
-        ("vd-lavc-threads", threads_str.as_str()),
+        ("vd-lavc-threads", decode_threads_str.as_str()),
         ("of", "mp4"),
         ("ovc", profile.ovc),
         ("ovcopts", profile.ovcopts.as_str()),
@@ -763,15 +938,22 @@ fn encode_once(
         ("pause", "no"),
         ("ocopy-metadata", "no"),
         ("untimed", "yes"),
+        ("demuxer-max-bytes", "1MiB"),
+        ("hwdec-extra-frames", "0"),
+        ("vd-lavc-dr", "no"),
     ] {
         player.option(name, value)?;
     }
     if parsed.info.audio {
-        for (name, value) in [("oac", "aac"), ("oacopts", "b=128000"), ("aid", "auto")] {
-            player.option(name, value)?;
+        for (name, value) in [
+            (c"oac", c"aac"),
+            (c"oacopts", c"b=128000"),
+            (c"aid", c"auto"),
+        ] {
+            player.option_cstr(name, value)?;
         }
     } else {
-        player.option("aid", "no")?;
+        player.option_cstr(c"aid", c"no")?;
     }
     player.option("vf", &filter)?;
     player.option(
@@ -844,7 +1026,7 @@ fn encode_once(
             parsed.info
         ));
     }
-    Ok(())
+    Ok(cache)
 }
 
 pub struct OpenOptions<'a> {
@@ -858,12 +1040,12 @@ pub struct OpenOptions<'a> {
 
 pub struct Mpv {
     handle: *mut c_void,
-    api: Api,
+    api: Arc<Api>,
     load_request: Cell<u64>,
     current_entry: Cell<Option<i64>>,
 }
 impl Mpv {
-    fn from_handle(handle: *mut c_void, api: Api) -> Self {
+    fn from_handle(handle: *mut c_void, api: Arc<Api>) -> Self {
         Self {
             handle,
             api,
@@ -880,26 +1062,31 @@ impl Mpv {
         }
         let player = Self::from_handle(handle, api);
         for (name, value) in [
-            ("config", "no"),
-            ("load-scripts", "no"),
-            ("osc", "no"),
-            ("ytdl", "no"),
-            ("terminal", "no"),
-            ("media-controls", "no"),
-            ("stop-screensaver", "no"),
-            ("sid", "no"),
-            ("autoload-files", "no"),
-            ("access-references", "no"),
-            ("load-unsafe-playlists", "no"),
-            ("demuxer-lavf-o", "protocol_whitelist=[file]"),
-            ("cache", "no"),
-            ("demuxer-max-bytes", "4MiB"),
-            ("demuxer-max-back-bytes", "0"),
-            ("demuxer-readahead-secs", "0.2"),
-            ("vd-lavc-threads", "2"),
-            ("hwdec", "no"),
+            (c"config", c"no"),
+            (c"load-scripts", c"no"),
+            (c"osc", c"no"),
+            (c"ytdl", c"no"),
+            (c"terminal", c"no"),
+            (c"media-controls", c"no"),
+            (c"stop-screensaver", c"no"),
+            (c"sid", c"no"),
+            (c"autoload-files", c"no"),
+            (c"access-references", c"no"),
+            (c"load-unsafe-playlists", c"no"),
+            (c"demuxer-lavf-o", c"protocol_whitelist=[file]"),
+            (c"stream-lavf-o", c"protocol_whitelist=[file]"),
+            (c"ordered-chapters", c"no"),
+            (c"use-filedir-conf", c"no"),
+            (c"load-auto-profiles", c"no"),
+            (c"audio-display", c"no"),
+            (c"cache", c"no"),
+            (c"demuxer-max-bytes", c"2MiB"),
+            (c"demuxer-max-back-bytes", c"0"),
+            (c"demuxer-readahead-secs", c"0.1"),
+            (c"vd-lavc-threads", c"2"),
+            (c"hwdec", c"no"),
         ] {
-            player.option(name, value)?;
+            player.option_cstr(name, value)?;
         }
         // SAFETY: logs are copied from the event queue before the next native wait.
         player
@@ -969,45 +1156,69 @@ impl Mpv {
         }
         let player = Self::from_handle(handle, api);
         let render = render_profile(opts.quality);
-        let demuxer_max = if low_memory_uma { "2MiB" } else { "4MiB" };
-        let hwdec_frames = if low_memory_uma { "2" } else { "3" };
+        let _ = low_memory_uma;
+        let demuxer_max = c"1MiB";
+        // Zero extra D3D11VA surfaces beyond codec DPB + swapchain cuts ~36 MiB VRAM and ~39 MiB commit on 4K60.
+        let hwdec_frames = c"0";
         for (name, value) in [
-            ("config", "no"),
-            ("load-scripts", "no"),
-            ("osc", "no"),
-            ("ytdl", "no"),
-            ("input-default-bindings", "no"),
-            ("input-cursor", "no"),
-            ("input-cursor-passthrough", "yes"),
-            ("input-vo-keyboard", "no"),
-            ("terminal", "no"),
-            ("media-controls", "no"),
-            ("stop-screensaver", "no"),
-            ("aid", "no"),
-            ("mute", "yes"),
-            ("sid", "no"),
-            ("autoload-files", "no"),
-            ("access-references", "no"),
-            ("load-unsafe-playlists", "no"),
-            ("demuxer-lavf-o", "protocol_whitelist=[file]"),
-            ("cache", "no"),
-            ("demuxer-max-bytes", demuxer_max),
-            ("demuxer-max-back-bytes", "0"),
-            ("demuxer-readahead-secs", "0.2"),
-            // ponytail: two decode threads bound frame pools for entry-level dual-core CPUs.
-            ("vd-lavc-threads", "2"),
-            ("loop-file", "inf"),
-            ("image-display-duration", "inf"),
-            ("keep-open", "yes"),
-            ("vo", "gpu"),
-            ("gpu-api", "d3d11"),
-            ("gpu-context", "d3d11"),
+            (c"config", c"no"),
+            (c"load-scripts", c"no"),
+            (c"osc", c"no"),
+            (c"ytdl", c"no"),
+            (c"input-default-bindings", c"no"),
+            (c"input-cursor", c"no"),
+            (c"input-cursor-passthrough", c"yes"),
+            (c"input-vo-keyboard", c"no"),
+            (c"terminal", c"no"),
+            (c"media-controls", c"no"),
+            (c"stop-screensaver", c"no"),
+            (c"aid", c"no"),
+            (c"mute", c"yes"),
+            (c"sid", c"no"),
+            (c"autoload-files", c"no"),
+            (c"access-references", c"no"),
+            (c"load-unsafe-playlists", c"no"),
+            (c"demuxer-lavf-o", c"protocol_whitelist=[file]"),
+            (c"stream-lavf-o", c"protocol_whitelist=[file]"),
+            (c"ordered-chapters", c"no"),
+            (c"use-filedir-conf", c"no"),
+            (c"load-auto-profiles", c"no"),
+            (c"audio-display", c"no"),
+            (c"audio-buffer", c"0.1"),
+            (c"cache", c"no"),
+            (c"demuxer-max-bytes", demuxer_max),
+            (c"demuxer-max-back-bytes", c"0"),
+            (c"demuxer-readahead-secs", c"0.1"),
+            // Two decode threads keep hwdec fed smoothly without bloating frame pools; disable DR scratch pools on D3D11VA.
+            (c"vd-lavc-threads", c"2"),
+            (c"vd-lavc-dr", c"no"),
+            (c"loop-file", c"inf"),
+            (c"image-display-duration", c"inf"),
+            (c"keep-open", c"yes"),
+            (c"vo", c"gpu"),
+            (c"gpu-api", c"d3d11"),
+            (c"gpu-context", c"d3d11"),
+            (c"hwdec", c"auto-safe"),
+            (c"hwdec-extra-frames", hwdec_frames),
+            (c"hr-seek", c"no"),
+            (c"swapchain-depth", c"1"),
+            (c"deband", c"no"),
+            (c"icc-profile-auto", c"no"),
+            (c"interpolation", c"no"),
+            (c"temporal-dither", c"no"),
+            (c"gpu-tex-pad-x", c"0"),
+            (c"gpu-tex-pad-y", c"0"),
+            (c"framedrop", c"vo"),
+            (c"d3d11-flip", if d3d11_flip { c"yes" } else { c"no" }),
+            (c"border", c"no"),
+            (c"osd-level", c"0"),
+            (c"cursor-autohide", c"no"),
+            (c"video-unscaled", c"no"),
+        ] {
+            player.option_cstr(name, value)?;
+        }
+        for (name, value) in [
             ("gpu-dumb-mode", render.dumb_mode),
-            ("hwdec", "auto-safe"),
-            // ponytail: cap GPU decode surface pool and skip frame-exact resume seeks on low-VRAM/UMA laptops.
-            ("hwdec-extra-frames", hwdec_frames),
-            ("hr-seek", "no"),
-            ("swapchain-depth", "1"),
             ("scale", render.scale),
             ("cscale", render.cscale),
             ("dscale", render.dscale),
@@ -1015,27 +1226,31 @@ impl Mpv {
             ("sigmoid-upscaling", render.sigmoid_upscaling),
             ("fbo-format", render.fbo_format),
             ("dither-depth", render.dither_depth),
-            ("framedrop", "vo"),
-            ("d3d11-flip", if d3d11_flip { "yes" } else { "no" }),
-            ("border", "no"),
-            ("osd-level", "0"),
-            ("cursor-autohide", "no"),
-            ("video-unscaled", "no"),
         ] {
             player.option(name, value)?;
+        }
+        if render.fbo_format == "rgba8" {
+            player.option_cstr(c"d3d11-output-format", c"rgba8")?;
         }
         if let Some(cache_dir) = opts.shader_cache_dir
             && std::fs::create_dir_all(cache_dir).is_ok()
             && let Some(dir_str) = cache_dir.to_str()
         {
-            player.option("gpu-shader-cache", "yes")?;
+            player.option_cstr(c"gpu-shader-cache", c"yes")?;
             player.option("gpu-shader-cache-dir", dir_str)?;
         }
         if let Some(adapter) = adapter {
             player.option("d3d11-adapter", adapter)?;
         }
-        player.option("wid", &(host.0 as usize as u32).to_string())?;
-        player.option("panscan", if opts.fit == Fit::Fill { "1.0" } else { "0.0" })?;
+        player.option("wid", &(host.0 as isize as i64).to_string())?;
+        player.option_cstr(
+            c"panscan",
+            if opts.fit == Fit::Fill {
+                c"1.0"
+            } else {
+                c"0.0"
+            },
+        )?;
         // SAFETY: initialized once on owning thread, wakeup only posts HWND notification.
         player
             .api
@@ -1046,10 +1261,8 @@ impl Mpv {
         unsafe { (player.api.wakeup)(handle, Some(wakeup), notify.0) };
         Ok(player)
     }
-    fn option(&self, name: &str, value: &str) -> Result<(), String> {
-        let name = CString::new(name).map_err(|_| "Invalid decoder option")?;
-        let value = CString::new(value).map_err(|_| "Invalid decoder option value")?;
-        // SAFETY: arguments stay alive during call; no shell string parsing.
+    fn option_cstr(&self, name: &CStr, value: &CStr) -> Result<(), String> {
+        // SAFETY: static/borrowed NUL-terminated CStr pointers stay alive during call.
         self.api
             .check(unsafe { (self.api.option)(self.handle, name.as_ptr(), value.as_ptr()) })
             .map_err(|error| {
@@ -1059,6 +1272,11 @@ impl Mpv {
                     value.to_string_lossy()
                 )
             })
+    }
+    fn option(&self, name: &str, value: &str) -> Result<(), String> {
+        let name = CString::new(name).map_err(|_| "Invalid decoder option")?;
+        let value = CString::new(value).map_err(|_| "Invalid decoder option value")?;
+        self.option_cstr(&name, &value)
     }
     pub fn load(&self, path: &Path) -> Result<u64, String> {
         let filename = CString::new(path.to_str().ok_or("Filename is not valid Unicode")?)
@@ -1693,6 +1911,36 @@ mod tests {
         .unwrap();
         assert!(error.to_ascii_lowercase().contains("decoder") && !error.is_empty());
     }
+
+    #[test]
+    fn untrusted_decoder_sha256_mismatch_is_rejected_before_load() {
+        let fake = std::env::temp_dir().join(format!("wl-fake-mpv-{}.dll", std::process::id()));
+        std::fs::write(&fake, b"MZ-not-a-valid-pinned-libmpv-dll").unwrap();
+        let err = Api::load(&fake).err().unwrap();
+        let _ = std::fs::remove_file(&fake);
+        assert!(
+            err.contains("SHA-256 verification failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pinned_runtime_decoder_loads_while_read_locked_and_accepts_defensive_options() {
+        let dll = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/libmpv-2.dll");
+        if !dll.is_file() {
+            return;
+        }
+        let player = Mpv::headless(&dll)
+            .expect("pinned runtime libmpv-2.dll should load and accept defensive options");
+        player
+            .option("vo", "null")
+            .and_then(|_| player.option("ao", "null"))
+            .unwrap();
+        player
+            .api
+            .check(unsafe { (player.api.initialize)(player.handle) })
+            .expect("libmpv initialize with defensive options");
+    }
     #[test]
     fn render_profiles_keep_quality_tiers_and_optimize_bandwidth() {
         let native = render_profile(Quality::Native);
@@ -1734,21 +1982,21 @@ mod tests {
         let nv = encode_profile_for_backend(Quality::Medium, gpu::EncodeBackend::Nvenc, 4);
         assert_eq!(nv.ovc, "h264_nvenc");
         assert_eq!(nv.pix_fmt, "nv12");
-        assert_eq!(nv.hwdec, "d3d11va-copy");
+        assert_eq!(nv.hwdec, "no");
         assert_eq!(nv.filter_flags, "bicubic");
         assert!(nv.ovcopts.contains("b=0") && nv.ovcopts.contains("cq=25"));
 
         let amf = encode_profile_for_backend(Quality::High, gpu::EncodeBackend::Amf, 4);
         assert_eq!(amf.ovc, "h264_amf");
         assert_eq!(amf.pix_fmt, "nv12");
-        assert_eq!(amf.hwdec, "d3d11va-copy");
+        assert_eq!(amf.hwdec, "no");
         assert_eq!(amf.filter_flags, "lanczos");
         assert!(amf.ovcopts.contains("qp_i=20") && amf.ovcopts.contains("qp_p=20"));
 
         let qsv = encode_profile_for_backend(Quality::Optimize, gpu::EncodeBackend::Qsv, 4);
         assert_eq!(qsv.ovc, "h264_qsv");
         assert_eq!(qsv.pix_fmt, "nv12");
-        assert_eq!(qsv.hwdec, "d3d11va-copy");
+        assert_eq!(qsv.hwdec, "no");
         assert!(qsv.ovcopts.contains("global_quality=22"));
 
         let cpu = encode_profile_for_backend(Quality::Low, gpu::EncodeBackend::CpuX264, 3);
@@ -1757,5 +2005,31 @@ mod tests {
         assert_eq!(cpu.hwdec, "no");
         assert_eq!(cpu.filter_flags, "bilinear");
         assert!(cpu.ovcopts.contains("threads=3"));
+    }
+
+    #[test]
+    fn verified_api_session_reuses_pinned_image_and_unloads_on_drop() {
+        let dll = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/libmpv-2.dll");
+        if !dll.is_file() {
+            return;
+        }
+        let first = Api::load(&dll).expect("load first pinned API");
+        let second = Api::load(&dll).expect("reuse pinned API");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "active verified libmpv image must be reused without redundant SHA-256 hash/load"
+        );
+        let weak = Arc::downgrade(&first);
+        let count_both = Arc::strong_count(&first);
+        assert!(count_both >= 2);
+        drop(second);
+        let only_ours = Arc::strong_count(&first) == 1;
+        drop(first);
+        if only_ours {
+            assert!(
+                weak.upgrade().is_none(),
+                "VERIFIED_API Weak reference must release DLL cleanly once all sessions drop"
+            );
+        }
     }
 }

@@ -190,8 +190,11 @@ impl Settings {
         if self.wallpapers.len() > 64 {
             return Err("Too many display wallpaper assignments".into());
         }
-        let mut content = format!(
-            "version=4\nfit={}\nbattery={}\nmonitor={}\npath={}\naudio={}\nfullscreen={}\nfps={}\n",
+        use std::fmt::Write as _;
+        let mut content = String::with_capacity(256 + self.wallpapers.len() * 96);
+        let _ = writeln!(
+            content,
+            "version=4\nfit={}\nbattery={}\nmonitor={}\npath={}\naudio={}\nfullscreen={}\nfps={}",
             if self.fit == Fit::Fill {
                 "fill"
             } else {
@@ -204,7 +207,7 @@ impl Settings {
             self.pause_fullscreen,
             self.fps
         );
-        let mut monitors = std::collections::HashSet::new();
+        let mut monitors = std::collections::HashSet::with_capacity(self.wallpapers.len());
         for (monitor, path) in &self.wallpapers {
             if monitor.is_empty()
                 || monitor == "*"
@@ -217,19 +220,16 @@ impl Settings {
             if !supported_extension(path) {
                 return Err("Invalid display wallpaper format".into());
             }
-            content.push_str(&format!(
-                "display={monitor}\nwallpaper={}\n",
-                path.display()
-            ));
+            let _ = writeln!(content, "display={monitor}\nwallpaper={}", path.display());
         }
         if self.acrylic_blur {
             content.push_str("acrylic=true\n");
         }
         if self.quality != Quality::Optimize {
-            content.push_str(&format!("quality={}\n", self.quality.key()));
+            let _ = writeln!(content, "quality={}", self.quality.key());
         }
         if self.gpu_preference != GpuPreference::Auto {
-            content.push_str(&format!("gpu={}\n", self.gpu_preference.key()));
+            let _ = writeln!(content, "gpu={}", self.gpu_preference.key());
         }
         if !self.auto_update_check {
             content.push_str("updates=false\n");
@@ -247,22 +247,24 @@ impl Settings {
             content.push_str("clock_24h=false\n");
         }
         if self.clock_size != 100 {
-            content.push_str(&format!("clock_size={}\n", self.clock_size.clamp(50, 200)));
+            let _ = writeln!(content, "clock_size={}", self.clock_size.clamp(50, 200));
         }
         if self.clock_opacity != 100 {
-            content.push_str(&format!(
-                "clock_opacity={}\n",
+            let _ = writeln!(
+                content,
+                "clock_opacity={}",
                 self.clock_opacity.clamp(20, 100)
-            ));
+            );
         }
         if (self.clock_color & 0x00FF_FFFF) != 0x00FF_FFFF {
-            content.push_str(&format!(
-                "clock_color={:06X}\n",
+            let _ = writeln!(
+                content,
+                "clock_color={:06X}",
                 self.clock_color & 0x00FF_FFFF
-            ));
+            );
         }
         if let Some((cx, cy)) = self.clock_pos {
-            content.push_str(&format!("clock_pos={cx},{cy}\n"));
+            let _ = writeln!(content, "clock_pos={cx},{cy}");
         }
         Ok(content)
     }
@@ -584,6 +586,29 @@ impl Rect {
     }
 }
 
+#[inline]
+fn rect_covers_percent(rect: Rect, target: Rect, threshold_percent: u32) -> bool {
+    let target_w = target.right - target.left;
+    let target_h = target.bottom - target.top;
+    if target_w <= 0 || target_h <= 0 {
+        return false;
+    }
+    let pct = threshold_percent.min(100);
+    if pct == 0 {
+        return true;
+    }
+    let left = rect.left.max(target.left);
+    let top = rect.top.max(target.top);
+    let right = rect.right.min(target.right);
+    let bottom = rect.bottom.min(target.bottom);
+    if right <= left || bottom <= top {
+        return false;
+    }
+    let covered = u128::from((right - left) as u32) * u128::from((bottom - top) as u32);
+    let total = u128::from(target_w as u32) * u128::from(target_h as u32);
+    covered * 100 >= total * u128::from(pct)
+}
+
 pub fn rect_union_covers(rects: &[Rect], target: Rect, threshold_percent: u32) -> bool {
     if target.right <= target.left || target.bottom <= target.top {
         return false;
@@ -592,7 +617,13 @@ pub fn rect_union_covers(rects: &[Rect], target: Rect, threshold_percent: u32) -
     if pct == 0 {
         return true;
     }
-    let mut clipped = Vec::new();
+    if rects.is_empty() {
+        return false;
+    }
+    if let [single] = rects {
+        return rect_covers_percent(*single, target, pct);
+    }
+    let mut clipped = Vec::with_capacity(rects.len());
     for &r in rects {
         let left = r.left.max(target.left);
         let top = r.top.max(target.top);
@@ -609,6 +640,9 @@ pub fn rect_union_covers(rects: &[Rect], target: Rect, threshold_percent: u32) -
     }
     if clipped.is_empty() {
         return false;
+    }
+    if let [single] = clipped.as_slice() {
+        return rect_covers_percent(*single, target, pct);
     }
     let mut xs = Vec::with_capacity(clipped.len() * 2);
     for r in &clipped {
@@ -666,15 +700,37 @@ pub fn evaluate_display_windows(
     } else {
         display
     };
-    let fullscreen = windows.iter().any(|(rect, _)| rect.covers(display));
-    let maximized = windows
-        .iter()
-        .any(|&(rect, zoomed)| zoomed && rect_union_covers(&[rect], area, 80));
-    let rects: Vec<Rect> = windows
-        .iter()
-        .filter_map(|&(r, _)| r.intersects(area).then_some(r))
-        .collect();
-    let occluded = rect_union_covers(&rects, area, 98);
+    let mut fullscreen = false;
+    let mut maximized = false;
+    let mut single_occluded = false;
+    let mut intersecting = 0usize;
+    for &(rect, zoomed) in windows {
+        if !fullscreen && rect.covers(display) {
+            fullscreen = true;
+        }
+        if !maximized && zoomed && rect_covers_percent(rect, area, 80) {
+            maximized = true;
+        }
+        if rect.intersects(area) {
+            intersecting += 1;
+            if !single_occluded && rect_covers_percent(rect, area, 98) {
+                single_occluded = true;
+            }
+        }
+    }
+    let occluded = if single_occluded {
+        true
+    } else if intersecting <= 1 {
+        false
+    } else {
+        let mut rects = Vec::with_capacity(intersecting);
+        for &(r, _) in windows {
+            if r.intersects(area) {
+                rects.push(r);
+            }
+        }
+        rect_union_covers(&rects, area, 98)
+    };
     (fullscreen, maximized, occluded)
 }
 
@@ -694,28 +750,98 @@ pub fn validate_path_syntax(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn extension_lowercase(path: &Path) -> Option<String> {
+#[inline]
+fn matches_ext(path: &Path, list: &[&str]) -> bool {
     path.extension()
         .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
+        .is_some_and(|ext| list.iter().any(|cand| ext.eq_ignore_ascii_case(cand)))
 }
 pub fn live_extension(path: &Path) -> bool {
-    matches!(
-        extension_lowercase(path).as_deref(),
-        Some("mp4" | "gif" | "mkv" | "webm" | "mov" | "avi" | "mpg" | "mpeg" | "m4v" | "apng")
-    )
+    const LIVE: [&str; 10] = [
+        "mp4", "gif", "mkv", "webm", "mov", "avi", "mpg", "mpeg", "m4v", "apng",
+    ];
+    matches_ext(path, &LIVE)
 }
 pub fn supported_extension(path: &Path) -> bool {
-    live_extension(path)
-        || matches!(
-            extension_lowercase(path).as_deref(),
-            Some("png" | "jpg" | "jpeg" | "bmp" | "webp")
-        )
+    const STILL: [&str; 5] = ["png", "jpg", "jpeg", "bmp", "webp"];
+    live_extension(path) || matches_ext(path, &STILL)
 }
+pub fn is_local_drive(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return false;
+    }
+    let root: [u16; 4] = [u16::from(bytes[0]), u16::from(b':'), u16::from(b'\\'), 0];
+    // SAFETY: NUL-terminated static-length drive root query; does not mutate drive state.
+    let drive_type = unsafe {
+        windows::Win32::Storage::FileSystem::GetDriveTypeW(windows::core::PCWSTR(root.as_ptr()))
+    };
+    // DRIVE_REMOVABLE (2), DRIVE_FIXED (3), DRIVE_CDROM (5); explicitly blocks DRIVE_REMOTE (4).
+    matches!(drive_type, 2 | 3 | 5)
+}
+
+pub fn is_fixed_or_removable_drive(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return false;
+    }
+    let root: [u16; 4] = [u16::from(bytes[0]), u16::from(b':'), u16::from(b'\\'), 0];
+    // SAFETY: NUL-terminated static-length drive root query; does not mutate drive state.
+    let drive_type = unsafe {
+        windows::Win32::Storage::FileSystem::GetDriveTypeW(windows::core::PCWSTR(root.as_ptr()))
+    };
+    // DRIVE_REMOVABLE (2) or DRIVE_FIXED (3) only; blocks DRIVE_REMOTE (4).
+    matches!(drive_type, 2 | 3)
+}
+
+pub fn is_reparse_point(path: &Path) -> std::io::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let meta = std::fs::symlink_metadata(path)?;
+    Ok(meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+pub fn has_reparse_ancestor(path: &Path) -> Result<bool, String> {
+    let mut current = Some(path);
+    while let Some(p) = current {
+        // Stop at drive root (e.g. C:\).
+        if p.parent().is_none() {
+            break;
+        }
+        match is_reparse_point(p) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Could not inspect path attributes: {e}")),
+        }
+        current = p.parent();
+    }
+    Ok(false)
+}
+
 pub fn validate_media(path: &Path) -> Result<PathBuf, String> {
     validate_path_syntax(path)?;
     if !supported_extension(path) {
         return Err("Unsupported file format".into());
+    }
+    if !is_local_drive(path) {
+        return Err(
+            "Choose a file on a local drive, not a network share or mapped remote drive".into(),
+        );
     }
     let canonical = path
         .canonicalize()
@@ -723,6 +849,11 @@ pub fn validate_media(path: &Path) -> Result<PathBuf, String> {
     let s = canonical.to_str().ok_or("File name is not valid Unicode")?;
     let clean = PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(s));
     validate_path_syntax(&clean)?;
+    if !is_local_drive(&clean) {
+        return Err(
+            "Choose a file on a local drive, not a network share or mapped remote drive".into(),
+        );
+    }
     if !clean.is_file() {
         return Err("Choose a media file, not a folder".into());
     }
@@ -1037,6 +1168,10 @@ mod tests {
         assert!(
             validate_media(Path::new(r"C:\definitely-missing-wallpaper-3f491927.mp4")).is_err()
         );
+        assert!(!is_local_drive(Path::new(r"\\server\share\clip.mp4")));
+        assert!(!is_local_drive(Path::new("relative.mp4")));
+        assert!(is_local_drive(Path::new(r"C:\Windows\System32")));
+        assert!(validate_media(Path::new(r"\\127.0.0.1\c$\clip.mp4")).is_err());
     }
 
     #[test]

@@ -431,7 +431,6 @@ pub const CARD_ALPHA: u8 = 16;
 const CONTROL_ALPHA: u8 = 32;
 const HOVER_ALPHA: u8 = 64;
 const ACTIVE_TILE_ALPHA: u8 = 96;
-const ACTIVE_ALPHA: u8 = 244;
 pub const BORDER_ALPHA: u8 = 200;
 const DIVIDER_ALPHA: u8 = 136;
 const SEARCH_ALPHA: u8 = 228;
@@ -590,7 +589,13 @@ pub fn playing(path: Option<PathBuf>) {
     SKIN.with(|s| s.borrow_mut().playing = path.into_iter().collect());
 }
 pub fn playing_all(paths: &[PathBuf]) {
-    SKIN.with(|s| s.borrow_mut().playing = paths.to_vec());
+    SKIN.with(|s| {
+        let mut skin = s.borrow_mut();
+        if skin.playing.as_slice() != paths {
+            skin.playing.clear();
+            skin.playing.extend_from_slice(paths);
+        }
+    });
 }
 pub fn selected(path: Option<PathBuf>) {
     SKIN.with(|s| {
@@ -1114,8 +1119,16 @@ unsafe fn paint_children_with_visibility(
                         0,
                     ) {
                         let prev_bmp = SelectObject(temp_dc, temp_bmp);
-                        if !temp_bits.is_null() {
-                            let total = (cw * ch) as usize;
+                        if !temp_bits.is_null() && cw > 0 && ch > 0 {
+                            let Some(total) = (cw as usize)
+                                .checked_mul(ch as usize)
+                                .filter(|&n| n <= isize::MAX as usize / std::mem::size_of::<u32>())
+                            else {
+                                SelectObject(temp_dc, prev_bmp);
+                                let _ = DeleteObject(temp_bmp);
+                                let _ = DeleteDC(temp_dc);
+                                continue;
+                            };
                             std::slice::from_raw_parts_mut(temp_bits as *mut u32, total)
                                 .fill(control_color(id));
                             SendMessageW(
@@ -1293,7 +1306,16 @@ pub fn capture_region(
             return None;
         };
         let prev = SelectObject(dc, bitmap);
-        let total = (client.right * client.bottom) as usize;
+        let Some(total) = (client.right > 0 && client.bottom > 0 && !bits.is_null())
+            .then(|| (client.right as usize).checked_mul(client.bottom as usize))
+            .flatten()
+            .filter(|&n| n <= isize::MAX as usize / std::mem::size_of::<u32>())
+        else {
+            SelectObject(dc, prev);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+            return None;
+        };
         std::slice::from_raw_parts_mut(bits as *mut u32, total).fill(0);
         struct CaptureRegionGuard(bool);
         impl Drop for CaptureRegionGuard {
@@ -1596,9 +1618,23 @@ pub fn tick_animations(window: HWND) -> bool {
 pub fn set_tab(tab: Tab) {
     if tab != Tab::Clock {
         CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
+        CLOCK_FOCUS.with(|f| f.set(None));
     }
     SKIN.with(|s| s.borrow_mut().tab = tab);
 }
+
+pub fn clear_font_cache() {
+    FONTS.with(|f| {
+        for (_, font) in f.borrow_mut().drain() {
+            // SAFETY: UI thread exclusively owns cached GDI font handles.
+            unsafe {
+                let _ = DeleteObject(font);
+            }
+        }
+    });
+    CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
+}
+
 pub fn clear() {
     SKIN.with(|s| {
         let mut skin = s.borrow_mut();
@@ -1626,16 +1662,18 @@ pub fn clear() {
             }
         }
     });
-    FONTS.with(|f| {
-        for (_, font) in f.borrow_mut().drain() {
+    PENS.with(|p| {
+        for (_, pen) in p.borrow_mut().drain() {
             unsafe {
-                let _ = DeleteObject(font);
+                let _ = DeleteObject(pen);
             }
         }
     });
+    clear_font_cache();
+    CLOCK_FOCUS.with(|f| f.set(None));
     TRANSITION_BACKDROP.with(|slot| *slot.borrow_mut() = TransitionBackdrop::default());
     BX_COLS_SCRATCH.with(|slot| *slot.borrow_mut() = Vec::new());
-    CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
+    BLUR_ROW_SCRATCH.with(|slot| *slot.borrow_mut() = (Vec::new(), Vec::new(), Vec::new()));
     TEXT_SCRATCH.with(|slot| *slot.borrow_mut() = TextScratch::default());
     SYNCED_LAYOUT.with(|slot| slot.set(None));
     invalidate_theme_cache();
@@ -1646,9 +1684,50 @@ pub fn clear() {
 pub fn trim_transient_caches() {
     TEXT_SCRATCH.with(|slot| slot.borrow_mut().reset());
     BX_COLS_SCRATCH.with(|slot| *slot.borrow_mut() = Vec::new());
+    BLUR_ROW_SCRATCH.with(|slot| *slot.borrow_mut() = (Vec::new(), Vec::new(), Vec::new()));
     if SKIN.with(|s| s.borrow().tab != Tab::Clock) {
         CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
     }
+}
+
+/// Releases panel-only GDI handles, thumbnail bitmaps, backdrop buffers, and scratch memory
+/// while hidden in the system tray. All caches lazily rebuild on next `show()`.
+pub fn trim_for_tray() {
+    retain_thumbnails(&[]);
+    invalidate_backdrop_cache();
+    CLOCK_WHEEL_CACHE.with(|slot| *slot.borrow_mut() = None);
+    TEXT_SCRATCH.with(|slot| slot.borrow_mut().reset());
+    BX_COLS_SCRATCH.with(|slot| *slot.borrow_mut() = Vec::new());
+    BLUR_ROW_SCRATCH.with(|slot| *slot.borrow_mut() = (Vec::new(), Vec::new(), Vec::new()));
+    BRUSHES.with(|b| {
+        let mut map = b.borrow_mut();
+        for (_, brush) in map.drain() {
+            // SAFETY: UI thread exclusively owns cached GDI brush handles while panel is hidden.
+            unsafe {
+                let _ = DeleteObject(brush);
+            }
+        }
+        map.shrink_to_fit();
+    });
+    PENS.with(|p| {
+        let mut map = p.borrow_mut();
+        for (_, pen) in map.drain() {
+            // SAFETY: UI thread exclusively owns cached GDI pen handles while panel is hidden.
+            unsafe {
+                let _ = DeleteObject(pen);
+            }
+        }
+        map.shrink_to_fit();
+    });
+    clear_font_cache();
+    FONTS.with(|f| f.borrow_mut().shrink_to_fit());
+    invalidate_theme_cache();
+    SKIN.with(|s| {
+        let mut skin = s.borrow_mut();
+        skin.marked.shrink_to_fit();
+        skin.playing.shrink_to_fit();
+        skin.tiles.shrink_to_fit();
+    });
 }
 
 #[derive(Default)]
@@ -1927,8 +2006,11 @@ thread_local! {
     static TEXT_THEME: Cell<HTHEME> = const { Cell::new(HTHEME(0)) };
     static TEXT_SCRATCH: RefCell<TextScratch> = RefCell::new(TextScratch::default());
     static THEME_CACHE: RefCell<CachedTheme> = RefCell::new(CachedTheme::default());
-    static OS_SETTINGS_CACHE: Cell<(Option<bool>, Option<bool>)> = const { Cell::new((None, None)) };
+    static OS_SETTINGS_CACHE: Cell<(Option<bool>, Option<bool>, Option<bool>)> =
+        const { Cell::new((None, None, None)) };
     static BX_COLS_SCRATCH: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static BLUR_ROW_SCRATCH: RefCell<(Vec<u32>, Vec<u32>, Vec<u32>)> =
+        const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
     static USER_ACRYLIC: Cell<bool> = const { Cell::new(false) };
     static CAPTURE_REQUIRE_VISIBLE: Cell<bool> = const { Cell::new(true) };
     static TRANSITION_BACKDROP: RefCell<TransitionBackdrop> = RefCell::new(TransitionBackdrop::default());
@@ -1970,7 +2052,72 @@ pub fn invalidate_theme_cache() {
 }
 
 pub fn invalidate_os_settings_cache() {
-    OS_SETTINGS_CACHE.with(|cache| cache.set((None, None)));
+    OS_SETTINGS_CACHE.with(|cache| cache.set((None, None, None)));
+}
+
+#[inline]
+fn colorref_to_rgb(c: u32) -> u32 {
+    let r = c & 0xFF;
+    let g = (c >> 8) & 0xFF;
+    let b = (c >> 16) & 0xFF;
+    (r << 16) | (g << 8) | b
+}
+
+pub fn high_contrast_active() -> bool {
+    if let Some(cached) = OS_SETTINGS_CACHE.with(|cache| cache.get().2) {
+        return cached;
+    }
+    let mut hc = HIGHCONTRASTW {
+        cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: read-only OS high-contrast query via stack-allocated HIGHCONTRASTW.
+    let active = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            Some((&mut hc as *mut HIGHCONTRASTW).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && hc.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
+    };
+    OS_SETTINGS_CACHE.with(|cache| {
+        let (tr, anim, _) = cache.get();
+        cache.set((tr, anim, Some(active)));
+    });
+    active
+}
+
+#[derive(Clone, Copy)]
+struct HighContrastColors {
+    window: u32,
+    window_text: u32,
+    btn_face: u32,
+    btn_text: u32,
+    highlight: u32,
+    highlight_text: u32,
+    gray_text: u32,
+    border: u32,
+}
+
+fn high_contrast_colors() -> Option<HighContrastColors> {
+    if !high_contrast_active() {
+        return None;
+    }
+    // SAFETY: GetSysColor is a read-only Win32 system palette lookup.
+    unsafe {
+        Some(HighContrastColors {
+            window: colorref_to_rgb(GetSysColor(COLOR_WINDOW)),
+            window_text: colorref_to_rgb(GetSysColor(COLOR_WINDOWTEXT)),
+            btn_face: colorref_to_rgb(GetSysColor(COLOR_BTNFACE)),
+            btn_text: colorref_to_rgb(GetSysColor(COLOR_BTNTEXT)),
+            highlight: colorref_to_rgb(GetSysColor(COLOR_HIGHLIGHT)),
+            highlight_text: colorref_to_rgb(GetSysColor(COLOR_HIGHLIGHTTEXT)),
+            gray_text: colorref_to_rgb(GetSysColor(COLOR_GRAYTEXT)),
+            border: colorref_to_rgb(GetSysColor(COLOR_WINDOWFRAME)),
+        })
+    }
 }
 
 pub fn set_user_acrylic(enabled: bool) {
@@ -1992,15 +2139,15 @@ struct PaintBuffer {
 fn fill_interior_pixel(
     pixel: &mut RGBQUAD,
     fill_alpha: u8,
-    sheen_w: f32,
-    sheen_target_r: f32,
-    sheen_target_g: f32,
-    sheen_target_b: f32,
+    sheen_w_u8: u32,
+    sheen_target_r: u32,
+    sheen_target_g: u32,
+    sheen_target_b: u32,
 ) {
     if pixel.rgbReserved != 0 {
         return;
     }
-    if sheen_w == 0.0 {
+    if sheen_w_u8 == 0 {
         if fill_alpha < 255 {
             pixel.rgbRed = premul_channel(pixel.rgbRed, fill_alpha);
             pixel.rgbGreen = premul_channel(pixel.rgbGreen, fill_alpha);
@@ -2009,13 +2156,10 @@ fn fill_interior_pixel(
         pixel.rgbReserved = fill_alpha;
         return;
     }
-    let apply = |c: u8, target: f32| -> u8 {
-        let cf = f32::from(c);
-        (cf + (target - cf) * sheen_w).clamp(0.0, 255.0).round() as u8
-    };
-    let r = apply(pixel.rgbRed, sheen_target_r);
-    let g = apply(pixel.rgbGreen, sheen_target_g);
-    let b = apply(pixel.rgbBlue, sheen_target_b);
+    let inv = 255 - sheen_w_u8;
+    let r = div255_round(u32::from(pixel.rgbRed) * inv + sheen_target_r * sheen_w_u8) as u8;
+    let g = div255_round(u32::from(pixel.rgbGreen) * inv + sheen_target_g * sheen_w_u8) as u8;
+    let b = div255_round(u32::from(pixel.rgbBlue) * inv + sheen_target_b * sheen_w_u8) as u8;
     if fill_alpha < 255 {
         pixel.rgbRed = premul_channel(r, fill_alpha);
         pixel.rgbGreen = premul_channel(g, fill_alpha);
@@ -2256,6 +2400,10 @@ impl PaintBuffer {
             } else {
                 (22.0, 22.0, 26.0, (-face_sheen).clamp(0.0, 0.25))
             };
+            let sheen_w_u8 = (sheen_w * 255.0).round() as u32;
+            let sheen_tr_u32 = sheen_target_r as u32;
+            let sheen_tg_u32 = sheen_target_g as u32;
+            let sheen_tb_u32 = sheen_target_b as u32;
             let top_w = top_edge * 0.78;
             let bot_w = bot_edge * 0.52;
             let mut row_br = br;
@@ -2279,21 +2427,25 @@ impl PaintBuffer {
             let border_pre_b = row_bb * border_scale;
             let y_inner = yi >= edge_band && yi < bounds_h - edge_band;
             let y_deep = yi >= corner_band && yi < bounds_h - corner_band;
-            for (offset, pixel) in row.iter_mut().enumerate() {
-                let xi = rect_left - bounds.left + offset as i32;
-                if y_deep && xi >= edge_band && xi < bounds_w - edge_band
-                    || y_inner && xi >= corner_band && xi < bounds_w - corner_band
-                {
-                    fill_interior_pixel(
-                        pixel,
-                        mask.fill_alpha,
-                        sheen_w,
-                        sheen_target_r,
-                        sheen_target_g,
-                        sheen_target_b,
-                    );
-                    continue;
+            let fast_margin = if y_deep {
+                Some(edge_band)
+            } else if y_inner {
+                Some(corner_band)
+            } else {
+                None
+            };
+            let x_base = rect_left - bounds.left;
+            let (fast_start, fast_end) = match fast_margin {
+                Some(margin) => {
+                    let s = (margin - x_base).clamp(0, row.len() as i32) as usize;
+                    let e =
+                        ((bounds_w - margin) - x_base).clamp(s as i32, row.len() as i32) as usize;
+                    (s, e)
                 }
+                None => (0, 0),
+            };
+            let process_edge = |offset: usize, pixel: &mut RGBQUAD| {
+                let xi = x_base + offset as i32;
                 let px = xi as f32 + 0.5;
                 let qx = (px - hw).abs() - (hw - radius);
                 let qy = (py - hh).abs() - (hh - radius);
@@ -2302,12 +2454,12 @@ impl PaintBuffer {
                     fill_interior_pixel(
                         pixel,
                         mask.fill_alpha,
-                        sheen_w,
-                        sheen_target_r,
-                        sheen_target_g,
-                        sheen_target_b,
+                        sheen_w_u8,
+                        sheen_tr_u32,
+                        sheen_tg_u32,
+                        sheen_tb_u32,
                     );
-                    continue;
+                    return;
                 }
                 let shape_cov = (0.5 - d).clamp(0.0, 1.0);
                 let inner_cov = (0.5 - (d + mask.border_width)).clamp(0.0, 1.0);
@@ -2358,6 +2510,30 @@ impl PaintBuffer {
                 pixel.rgbGreen = blend(fill_pre_g, border_pre_g, host_pre_g);
                 pixel.rgbBlue = blend(fill_pre_b, border_pre_b, host_pre_b);
                 pixel.rgbReserved = out_a;
+            };
+            if fast_start < fast_end {
+                let (left_edge, rest) = row.split_at_mut(fast_start);
+                let (mid_span, right_edge) = rest.split_at_mut(fast_end - fast_start);
+                for (offset, pixel) in left_edge.iter_mut().enumerate() {
+                    process_edge(offset, pixel);
+                }
+                for pixel in mid_span.iter_mut() {
+                    fill_interior_pixel(
+                        pixel,
+                        mask.fill_alpha,
+                        sheen_w_u8,
+                        sheen_tr_u32,
+                        sheen_tg_u32,
+                        sheen_tb_u32,
+                    );
+                }
+                for (i, pixel) in right_edge.iter_mut().enumerate() {
+                    process_edge(fast_end + i, pixel);
+                }
+            } else {
+                for (offset, pixel) in row.iter_mut().enumerate() {
+                    process_edge(offset, pixel);
+                }
             }
         }
         true
@@ -3042,28 +3218,24 @@ pub unsafe fn fill(dc: HDC, r: RECT, color: u32) {
     }
 }
 unsafe fn rounded(dc: HDC, r: RECT, color: u32, border: u32, radius: i32) {
-    // SAFETY: restore native objects before deleting the created pen; brush is thread-cached.
+    // SAFETY: cached brush and pen belong to this UI thread; restore prior DC selections.
     unsafe {
-        let pen = CreatePen(PS_SOLID, 1, rgb(border));
         let b = SelectObject(dc, brush(color));
-        let p = SelectObject(dc, pen);
+        let p = SelectObject(dc, cached_pen(1, border));
         let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
         SelectObject(dc, b);
         SelectObject(dc, p);
-        let _ = DeleteObject(pen);
     }
 }
 unsafe fn raised_rounded(dc: HDC, r: RECT, color: u32, border: u32, highlight: u32, radius: i32) {
-    // SAFETY: restore native objects before deleting created pens; brush is thread-cached.
+    // SAFETY: cached brush and pens belong to this UI thread; restore prior DC selections.
     unsafe {
         rounded(dc, r, color, border, radius);
         if highlight != 0 && r.right - r.left > radius * 2 && r.bottom - r.top > radius {
-            let h_pen = CreatePen(PS_SOLID, 1, rgb(highlight));
-            let old = SelectObject(dc, h_pen);
+            let old = SelectObject(dc, cached_pen(1, highlight));
             let _ = MoveToEx(dc, r.left + radius / 2, r.top + 1, None);
             let _ = LineTo(dc, r.right - radius / 2, r.top + 1);
             SelectObject(dc, old);
-            let _ = DeleteObject(h_pen);
         }
     }
 }
@@ -3120,11 +3292,17 @@ unsafe fn draw_glass_label(req: GlassLabelReq<'_>) -> bool {
 
         TEXT_SCRATCH.with(|slot| {
             let mut scratch = slot.borrow_mut();
-            if !scratch.ensure(rw, rh) {
+            if !scratch.ensure(rw, rh) || scratch.bits.is_null() || scratch.w < rw || scratch.h < rh
+            {
                 return false;
             }
             let sw = scratch.w as usize;
-            let total_rows = (rh as usize).saturating_mul(sw);
+            let Some(total_rows) = (rh as usize)
+                .checked_mul(sw)
+                .filter(|&n| n <= isize::MAX as usize / std::mem::size_of::<u32>())
+            else {
+                return false;
+            };
             let src_bits = std::slice::from_raw_parts_mut(scratch.bits, total_rows);
             src_bits.fill(0);
 
@@ -3724,7 +3902,16 @@ unsafe fn draw_item_into(
         let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
         let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
         let primary = id == 102;
-        let (color, border, top_rim, bottom_rim, sheen_strength) = if disabled {
+        let hc = high_contrast_colors();
+        let (color, border, top_rim, bottom_rim, sheen_strength) = if let Some(hc) = hc {
+            if disabled {
+                (hc.btn_face, hc.gray_text, 0, 0, 0.0)
+            } else if (is_tab && active_tab) || primary || hot || pressed {
+                (hc.highlight, hc.window_text, 0, 0, 0.0)
+            } else {
+                (hc.btn_face, hc.border, 0, 0, 0.0)
+            }
+        } else if disabled {
             (
                 if is_card_host { DISABLED_FILL } else { PANEL },
                 DISABLED_BORDER,
@@ -3774,7 +3961,7 @@ unsafe fn draw_item_into(
         } else {
             (CARD, HIGHLIGHT, CREAM, INK, 0.24)
         };
-        let fill_alpha = if !glass_active {
+        let fill_alpha = if !glass_active || hc.is_some() {
             255
         } else if disabled {
             if is_card_host { 36 } else { 44 }
@@ -3786,9 +3973,10 @@ unsafe fn draw_item_into(
             } else {
                 CONTROL_ALPHA
             };
-            lerp_u8(base_a, ACTIVE_ALPHA, tab_weight)
+            // Keep active tab fully opaque so INK on ORANGE strictly preserves >= 4.71:1 AA contrast.
+            lerp_u8(base_a, 255, tab_weight)
         } else if primary {
-            ACTIVE_ALPHA
+            255
         } else if pressed {
             140
         } else if hot {
@@ -3796,7 +3984,7 @@ unsafe fn draw_item_into(
         } else {
             CONTROL_ALPHA
         };
-        let border_alpha = if !glass_active || (primary && !disabled) {
+        let border_alpha = if !glass_active || hc.is_some() || (primary && !disabled) {
             255
         } else if is_tab {
             lerp_u8(if hot { 240 } else { BORDER_ALPHA }, 255, tab_weight)
@@ -3837,12 +4025,23 @@ unsafe fn draw_item_into(
             105 | 106 | FOLDER_FILTER | FPS | SORT | QUALITY | GPU_PREF
         );
         let compact_selector = matches!(id, FPS | QUALITY);
-        let label_color = if disabled {
+        let label_color = if let Some(hc) = hc {
+            if disabled {
+                hc.gray_text
+            } else if (is_tab && active_tab) || primary || hot || pressed {
+                hc.highlight_text
+            } else {
+                hc.btn_text
+            }
+        } else if disabled {
             DISABLED_TEXT
         } else if primary && pressed {
             TEXT_ON_DARK
         } else if primary {
             TEXT_ON_ACCENT
+        } else if is_tab && pressed && tab_weight >= 0.55 {
+            // Pressed active tab uses ACCENT_DARK (#ad451b); CREAM yields 4.98:1 AA contrast vs INK's 3.28:1.
+            TEXT_ON_DARK
         } else if is_tab {
             lerp_rgb(
                 TEXT_ON_DARK,
@@ -3973,8 +4172,8 @@ pub fn transparency_enabled() -> bool {
         }
     };
     OS_SETTINGS_CACHE.with(|cache| {
-        let (_, anim) = cache.get();
-        cache.set((Some(value), anim));
+        let (_, anim, hc) = cache.get();
+        cache.set((Some(value), anim, hc));
     });
     value
 }
@@ -4091,38 +4290,97 @@ unsafe fn apply_hybrid_acrylic(window: HWND) -> bool {
     }
 }
 
+#[inline(always)]
+fn blur_div_round(sum: u32, half: u32, recip: u64) -> u32 {
+    ((u64::from(sum + half) * recip) >> 32) as u32
+}
+
 fn box_blur_horizontal(src: &[u32], dst: &mut [u32], width: i32, height: i32, radius: i32) {
     if width <= 0 || height <= 0 || radius <= 0 {
         return;
     }
-    let total = (width as usize).saturating_mul(height as usize);
+    let w = width as usize;
+    let h = height as usize;
+    let total = w.saturating_mul(h);
     if src.len() < total || dst.len() < total {
         return;
     }
     let denom = (radius * 2 + 1) as u32;
     let half = denom / 2;
+    let recip = ((1u64 << 32) + u64::from(denom) - 1) / u64::from(denom);
+    let r = radius as usize;
     let max_x = width - 1;
-    for y in 0..height {
-        let row = y as usize * width as usize;
+    let has_middle = w > r * 2 + 1;
+
+    for (src_row, dst_row) in src[..total]
+        .chunks_exact(w)
+        .zip(dst[..total].chunks_exact_mut(w))
+    {
         let mut sum_r = 0u32;
         let mut sum_g = 0u32;
         let mut sum_b = 0u32;
         for dx in -radius..=radius {
-            let px = src[row + dx.clamp(0, max_x) as usize];
+            let px = src_row[dx.clamp(0, max_x) as usize];
             sum_r += (px >> 16) & 255;
             sum_g += (px >> 8) & 255;
             sum_b += px & 255;
         }
-        for x in 0..width {
-            dst[row + x as usize] = (((sum_r + half) / denom) << 16)
-                | (((sum_g + half) / denom) << 8)
-                | ((sum_b + half) / denom);
-            if x + 1 < width {
-                let rem = src[row + (x - radius).clamp(0, max_x) as usize];
-                let add = src[row + (x + 1 + radius).clamp(0, max_x) as usize];
+        if has_middle {
+            let left_px = src_row[0];
+            let left_r = (left_px >> 16) & 255;
+            let left_g = (left_px >> 8) & 255;
+            let left_b = left_px & 255;
+            for x in 0..r {
+                dst_row[x] = (blur_div_round(sum_r, half, recip) << 16)
+                    | (blur_div_round(sum_g, half, recip) << 8)
+                    | blur_div_round(sum_b, half, recip);
+                let add = src_row[x + 1 + r];
+                sum_r = sum_r + ((add >> 16) & 255) - left_r;
+                sum_g = sum_g + ((add >> 8) & 255) - left_g;
+                sum_b = sum_b + (add & 255) - left_b;
+            }
+            let mid_len = w - r * 2 - 1;
+            let rem_slice = &src_row[..mid_len];
+            let add_slice = &src_row[2 * r + 1..2 * r + 1 + mid_len];
+            for ((out, &rem), &add) in dst_row[r..r + mid_len]
+                .iter_mut()
+                .zip(rem_slice)
+                .zip(add_slice)
+            {
+                *out = (blur_div_round(sum_r, half, recip) << 16)
+                    | (blur_div_round(sum_g, half, recip) << 8)
+                    | blur_div_round(sum_b, half, recip);
                 sum_r = sum_r + ((add >> 16) & 255) - ((rem >> 16) & 255);
                 sum_g = sum_g + ((add >> 8) & 255) - ((rem >> 8) & 255);
                 sum_b = sum_b + (add & 255) - (rem & 255);
+            }
+            let right_px = src_row[w - 1];
+            let right_r = (right_px >> 16) & 255;
+            let right_g = (right_px >> 8) & 255;
+            let right_b = right_px & 255;
+            for x in (w - r - 1)..w {
+                dst_row[x] = (blur_div_round(sum_r, half, recip) << 16)
+                    | (blur_div_round(sum_g, half, recip) << 8)
+                    | blur_div_round(sum_b, half, recip);
+                if x + 1 < w {
+                    let rem = src_row[x - r];
+                    sum_r = sum_r + right_r - ((rem >> 16) & 255);
+                    sum_g = sum_g + right_g - ((rem >> 8) & 255);
+                    sum_b = sum_b + right_b - (rem & 255);
+                }
+            }
+        } else {
+            for x in 0..width {
+                dst_row[x as usize] = (blur_div_round(sum_r, half, recip) << 16)
+                    | (blur_div_round(sum_g, half, recip) << 8)
+                    | blur_div_round(sum_b, half, recip);
+                if x + 1 < width {
+                    let rem = src_row[(x - radius).clamp(0, max_x) as usize];
+                    let add = src_row[(x + 1 + radius).clamp(0, max_x) as usize];
+                    sum_r = sum_r + ((add >> 16) & 255) - ((rem >> 16) & 255);
+                    sum_g = sum_g + ((add >> 8) & 255) - ((rem >> 8) & 255);
+                    sum_b = sum_b + (add & 255) - (rem & 255);
+                }
             }
         }
     }
@@ -4132,38 +4390,74 @@ fn box_blur_vertical(src: &[u32], dst: &mut [u32], width: i32, height: i32, radi
     if width <= 0 || height <= 0 || radius <= 0 {
         return;
     }
-    let total = (width as usize).saturating_mul(height as usize);
+    let w = width as usize;
+    let h = height as usize;
+    let total = w.saturating_mul(h);
     if src.len() < total || dst.len() < total {
         return;
     }
     let denom = (radius * 2 + 1) as u32;
     let half = denom / 2;
-    let w = width as usize;
+    let recip = ((1u64 << 32) + u64::from(denom) - 1) / u64::from(denom);
     let max_y = height - 1;
-    for x in 0..width {
-        let col = x as usize;
-        let mut sum_r = 0u32;
-        let mut sum_g = 0u32;
-        let mut sum_b = 0u32;
+
+    // Row-major scan keeps L1 reads/writes sequential and auto-vectorizable (opt-cache-friendly).
+    BLUR_ROW_SCRATCH.with(|slot| {
+        let mut scratch = slot.borrow_mut();
+        let (sum_r, sum_g, sum_b) = &mut *scratch;
+        sum_r.clear();
+        sum_r.resize(w, 0);
+        sum_g.clear();
+        sum_g.resize(w, 0);
+        sum_b.clear();
+        sum_b.resize(w, 0);
+
         for dy in -radius..=radius {
-            let px = src[dy.clamp(0, max_y) as usize * w + col];
-            sum_r += (px >> 16) & 255;
-            sum_g += (px >> 8) & 255;
-            sum_b += px & 255;
-        }
-        for y in 0..height {
-            dst[y as usize * w + col] = (((sum_r + half) / denom) << 16)
-                | (((sum_g + half) / denom) << 8)
-                | ((sum_b + half) / denom);
-            if y + 1 < height {
-                let rem = src[(y - radius).clamp(0, max_y) as usize * w + col];
-                let add = src[(y + 1 + radius).clamp(0, max_y) as usize * w + col];
-                sum_r = sum_r + ((add >> 16) & 255) - ((rem >> 16) & 255);
-                sum_g = sum_g + ((add >> 8) & 255) - ((rem >> 8) & 255);
-                sum_b = sum_b + (add & 255) - (rem & 255);
+            let row_idx = dy.clamp(0, max_y) as usize * w;
+            let row = &src[row_idx..row_idx + w];
+            for (((&px, sr), sg), sb) in row
+                .iter()
+                .zip(sum_r.iter_mut())
+                .zip(sum_g.iter_mut())
+                .zip(sum_b.iter_mut())
+            {
+                *sr += (px >> 16) & 255;
+                *sg += (px >> 8) & 255;
+                *sb += px & 255;
             }
         }
-    }
+
+        for (y_usize, dst_row) in dst[..total].chunks_exact_mut(w).enumerate() {
+            for (((out, &sr), &sg), &sb) in dst_row
+                .iter_mut()
+                .zip(sum_r.iter())
+                .zip(sum_g.iter())
+                .zip(sum_b.iter())
+            {
+                *out = (blur_div_round(sr, half, recip) << 16)
+                    | (blur_div_round(sg, half, recip) << 8)
+                    | blur_div_round(sb, half, recip);
+            }
+            let y = y_usize as i32;
+            if y + 1 < height {
+                let rem_idx = (y - radius).clamp(0, max_y) as usize * w;
+                let add_idx = (y + 1 + radius).clamp(0, max_y) as usize * w;
+                let rem_row = &src[rem_idx..rem_idx + w];
+                let add_row = &src[add_idx..add_idx + w];
+                for ((((&rem, &add), sr), sg), sb) in rem_row
+                    .iter()
+                    .zip(add_row.iter())
+                    .zip(sum_r.iter_mut())
+                    .zip(sum_g.iter_mut())
+                    .zip(sum_b.iter_mut())
+                {
+                    *sr = *sr + ((add >> 16) & 255) - ((rem >> 16) & 255);
+                    *sg = *sg + ((add >> 8) & 255) - ((rem >> 8) & 255);
+                    *sb = *sb + (add & 255) - (rem & 255);
+                }
+            }
+        }
+    });
 }
 
 fn active_wallpaper_bitmap() -> Option<HBITMAP> {
@@ -4245,6 +4539,7 @@ fn map_backdrop_overlay_rects(
     Some((dst, rect(sl, st, sr, sb)))
 }
 
+#[inline(always)]
 fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let tint_a = (ACRYLIC_TINT_COLOR >> 24) & 255;
     let inv_a = 255 - tint_a;
@@ -4256,16 +4551,16 @@ fn tint_transition_backdrop_pixel(px: u32) -> u32 {
     let b = px & 255;
     let y_px = (77 * r + 150 * g + 29 * b + 128) >> 8;
     // Preserve ~94% of wallpaper chroma before the Ink Black Acrylic tint blend.
-    let desat = |ch: u32| -> u32 { (ch * 240 + y_px * 15 + 127) / 255 };
+    let desat = |ch: u32| -> u32 { div255_round(ch * 240 + y_px * 15) };
     let dr = desat(r);
     let dg = desat(g);
     let db = desat(b);
     let y_desat = (77 * dr + 150 * dg + 29 * db + 128) >> 8;
-    let y_target = 22 + (y_px * 44 + 127) / 255;
+    let y_target = 22 + div255_round(y_px * 44);
     let dy = y_target as i32 - y_desat as i32;
     let blend = |ch: u32, tint_ch: u32| -> u32 {
         let shifted = (ch as i32 + dy).clamp(0, 255) as u32;
-        (shifted * inv_a + tint_ch * tint_a + 127) / 255
+        div255_round(shifted * inv_a + tint_ch * tint_a)
     };
     let out_r = blend(dr, tint_r);
     let out_g = blend(dg, tint_g);
@@ -4648,8 +4943,8 @@ pub fn os_window_animations_enabled() -> bool {
         }
     };
     OS_SETTINGS_CACHE.with(|cache| {
-        let (tr, _) = cache.get();
-        cache.set((tr, Some(enabled)));
+        let (tr, _, hc) = cache.get();
+        cache.set((tr, Some(enabled), hc));
     });
     enabled
 }
@@ -5414,11 +5709,19 @@ unsafe fn paint_scene(
         let should_paint_box =
             |r: RECT| rects_intersect(r, dirty) && !(skip_trans_bg && rect_contains(trans_clip, r));
 
-        fill_clipped(pixels(layout.client), BODY);
-        fill_clipped(pixels(layout.header), BODY);
-        fill_clipped(top_divider, divider_color);
-        fill_clipped(header_divider, divider_color);
-        fill_clipped(caption_divider, divider_color);
+        let hc = high_contrast_colors();
+        let body_col = hc.map_or(BODY, |c| c.window);
+        let card_col = hc.map_or(CARD, |c| c.window);
+        let footer_col = hc.map_or(FOOTER, |c| c.window);
+        let line_col = hc.map_or(LINE, |c| c.border);
+        let highlight_col = hc.map_or(HIGHLIGHT, |c| c.border);
+        let div_col = hc.map_or(divider_color, |c| c.border);
+
+        fill_clipped(pixels(layout.client), body_col);
+        fill_clipped(pixels(layout.header), body_col);
+        fill_clipped(top_divider, div_col);
+        fill_clipped(header_divider, div_col);
+        fill_clipped(caption_divider, div_col);
         for &(btn, area) in &layout.caption_buttons {
             let area_px = pixels(area);
             if should_paint_box(area_px)
@@ -5430,43 +5733,43 @@ unsafe fn paint_scene(
         if !covers_body {
             match tab {
                 Tab::Library => {
-                    fill_clipped(pixels(layout.sidebar), CARD);
-                    fill_clipped(side_divider, divider_color);
+                    fill_clipped(pixels(layout.sidebar), card_col);
+                    fill_clipped(side_divider, div_col);
                     if let Some(div) = side_inner_divider {
-                        fill_clipped(div, divider_color);
+                        fill_clipped(div, div_col);
                     }
                 }
                 Tab::Settings | Tab::Clock => {
                     let prefs_px = pixels(layout.settings_preferences_panel);
                     if should_paint_box(prefs_px) {
-                        raised_rounded(dc, prefs_px, CARD, LINE, HIGHLIGHT, scale(12));
+                        raised_rounded(dc, prefs_px, card_col, line_col, highlight_col, scale(12));
                     }
                     let res_px = pixels(layout.settings_resources_panel);
                     if should_paint_box(res_px) {
-                        raised_rounded(dc, res_px, CARD, LINE, HIGHLIGHT, scale(12));
+                        raised_rounded(dc, res_px, card_col, line_col, highlight_col, scale(12));
                     }
                     if let Some(div) = prefs_divider {
-                        fill_clipped(div, divider_color);
+                        fill_clipped(div, div_col);
                     }
                     if tab == Tab::Settings
                         && let Some(div) = resources_divider
                     {
-                        fill_clipped(div, divider_color);
+                        fill_clipped(div, div_col);
                     }
                 }
                 Tab::Sources => {
                     let src_px = pixels(layout.sources_panel);
                     if should_paint_box(src_px) {
-                        raised_rounded(dc, src_px, CARD, LINE, HIGHLIGHT, scale(12));
+                        raised_rounded(dc, src_px, card_col, line_col, highlight_col, scale(12));
                     }
                     if let Some(div) = sources_divider {
-                        fill_clipped(div, divider_color);
+                        fill_clipped(div, div_col);
                     }
                 }
             }
         }
-        fill_clipped(pixels(layout.footer), FOOTER);
-        fill_clipped(footer_divider, divider_color);
+        fill_clipped(pixels(layout.footer), footer_col);
+        fill_clipped(footer_divider, div_col);
         if let Some(buffer) = buffer {
             if glass_active {
                 let tint_clipped = |r: RECT, alpha: u8| -> bool {
@@ -6775,6 +7078,7 @@ pub(crate) struct UpdatePopupPaint<'a> {
     pub downloading: bool,
     pub hover: Option<UpdatePopupHit>,
     pub pressed: Option<UpdatePopupHit>,
+    pub focused: Option<UpdatePopupHit>,
     pub dpi: i32,
     pub glass: bool,
 }
@@ -6794,12 +7098,20 @@ pub(crate) unsafe fn paint_update_popup_into(
     let downloading = paint.downloading;
     let hover = paint.hover;
     let pressed = paint.pressed;
+    let focused = paint.focused;
     let dpi = paint.dpi;
-    let glass = paint.glass;
+    let hc = high_contrast_colors();
+    let glass = paint.glass && hc.is_none();
     if area.right <= area.left || area.bottom <= area.top {
         return false;
     }
     let s = |n: i32| n * dpi.max(96) / 96;
+    let card_bg = hc.map_or(CARD, |c| c.window);
+    let line_col = hc.map_or(LINE, |c| c.border);
+    let text_col = hc.map_or(TEXT, |c| c.window_text);
+    let muted_col = hc.map_or(MUTED, |c| c.window_text);
+    let focus_ring_light = hc.map_or(CREAM, |c| c.window_text);
+    let focus_ring_accent = hc.map_or(INK, |c| c.highlight_text);
     // SAFETY: target HDC owns area for the synchronous buffered paint session.
     unsafe {
         let Some(buffer) = PaintBuffer::new(target, area) else {
@@ -6813,10 +7125,10 @@ pub(crate) unsafe fn paint_update_popup_into(
         let _text_guard = TextTargetGuard::push(theme, buffer.handle, buffer.area, glass);
         let ok = (|| -> bool {
             let card_alpha = if glass { DROPDOWN_ALPHA } else { 255 };
-            fill(buffer.dc, area, CARD);
+            fill(buffer.dc, area, card_bg);
             let outer_mask = RoundedMask {
                 ellipse: s(12),
-                border: LINE,
+                border: line_col,
                 border_width: 1.0,
                 border_alpha: if glass { BORDER_ALPHA } else { 255 },
                 fill_alpha: card_alpha,
@@ -6824,9 +7136,9 @@ pub(crate) unsafe fn paint_update_popup_into(
                 focus_inset: 0.0,
                 host_color: INK,
                 host_alpha: if glass { 0 } else { 255 },
-                top_rim: GLASS_RIM,
-                bottom_rim: INK,
-                sheen_strength: 0.03,
+                top_rim: if hc.is_some() { line_col } else { GLASS_RIM },
+                bottom_rim: if hc.is_some() { line_col } else { INK },
+                sheen_strength: if hc.is_some() { 0.0 } else { 0.03 },
             };
             if !buffer.apply_rounded_rect_mask(area, &outer_mask) {
                 return false;
@@ -6837,8 +7149,7 @@ pub(crate) unsafe fn paint_update_popup_into(
             let cy = s(28);
             let rad = s(7).max(5);
             let stroke = (s(2) / 2).max(1);
-            let icon_pen = CreatePen(PS_SOLID, stroke, rgb(TEXT));
-            let old_pen = SelectObject(buffer.dc, icon_pen);
+            let old_pen = SelectObject(buffer.dc, cached_pen(stroke, text_col));
             let _ = Arc(
                 buffer.dc,
                 cx - rad,
@@ -6868,7 +7179,6 @@ pub(crate) unsafe fn paint_update_popup_into(
             let _ = LineTo(buffer.dc, cx - rad, cy + rad / 2 - s(1));
             let _ = LineTo(buffer.dc, cx - rad + s(4), cy + rad / 2 - s(1));
             SelectObject(buffer.dc, old_pen);
-            let _ = DeleteObject(icon_pen);
             let _ = buffer.tint_background(
                 rect(
                     cx - rad - s(3),
@@ -6880,48 +7190,60 @@ pub(crate) unsafe fn paint_update_popup_into(
             );
 
             // Close (x) button top-right.
-            if hover == Some(UpdatePopupHit::Close) || pressed == Some(UpdatePopupHit::Close) {
+            let c_focus = focused == Some(UpdatePopupHit::Close);
+            if hover == Some(UpdatePopupHit::Close)
+                || pressed == Some(UpdatePopupHit::Close)
+                || c_focus
+            {
                 let cr = layout.close;
-                fill(buffer.dc, cr, CARD_LIT);
+                fill(buffer.dc, cr, hc.map_or(CARD_LIT, |c| c.highlight));
                 let _ = buffer.clear_alpha(cr);
                 let _ = buffer.apply_rounded_rect_mask(
                     cr,
                     &RoundedMask {
                         ellipse: s(8),
-                        border: HIGHLIGHT,
+                        border: hc.map_or(HIGHLIGHT, |c| c.border),
                         border_width: 1.0,
                         border_alpha: if glass { 196 } else { 255 },
-                        fill_alpha: if pressed == Some(UpdatePopupHit::Close) {
+                        fill_alpha: if hc.is_some() {
+                            255
+                        } else if pressed == Some(UpdatePopupHit::Close) {
                             200
-                        } else {
+                        } else if hover == Some(UpdatePopupHit::Close) {
                             164
+                        } else {
+                            96
                         },
-                        focus: 0,
-                        focus_inset: 0.0,
-                        host_color: CARD,
+                        focus: if c_focus { focus_ring_light } else { 0 },
+                        focus_inset: s(2).max(2) as f32,
+                        host_color: card_bg,
                         host_alpha: card_alpha,
-                        top_rim: CREAM,
-                        bottom_rim: INK,
-                        sheen_strength: 0.04,
+                        top_rim: if hc.is_some() { 0 } else { CREAM },
+                        bottom_rim: if hc.is_some() { 0 } else { INK },
+                        sheen_strength: if hc.is_some() { 0.0 } else { 0.04 },
                     },
                 );
             }
             let ccx = (layout.close.left + layout.close.right) / 2;
             let ccy = (layout.close.top + layout.close.bottom) / 2;
             let x_r = s(4).max(3);
-            let x_color = if hover == Some(UpdatePopupHit::Close) {
+            let x_color = if let Some(hc) = hc {
+                if hover == Some(UpdatePopupHit::Close) || c_focus {
+                    hc.highlight_text
+                } else {
+                    hc.window_text
+                }
+            } else if hover == Some(UpdatePopupHit::Close) || c_focus {
                 TEXT
             } else {
                 MUTED
             };
-            let x_pen = CreatePen(PS_SOLID, stroke, rgb(x_color));
-            let old_x = SelectObject(buffer.dc, x_pen);
+            let old_x = SelectObject(buffer.dc, cached_pen(stroke, x_color));
             let _ = MoveToEx(buffer.dc, ccx - x_r, ccy - x_r, None);
             let _ = LineTo(buffer.dc, ccx + x_r + 1, ccy + x_r + 1);
             let _ = MoveToEx(buffer.dc, ccx + x_r, ccy - x_r, None);
             let _ = LineTo(buffer.dc, ccx - x_r - 1, ccy + x_r + 1);
             SelectObject(buffer.dc, old_x);
-            let _ = DeleteObject(x_pen);
             let _ = buffer.tint_background(layout.close, 255);
 
             // Title & subtitle.
@@ -6931,7 +7253,7 @@ pub(crate) unsafe fn paint_update_popup_into(
                 rect(s(46), s(16), layout.close.left - s(8), s(40)),
                 s(15),
                 true,
-                TEXT,
+                text_col,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
             label(
@@ -6940,14 +7262,21 @@ pub(crate) unsafe fn paint_update_popup_into(
                 rect(s(46), s(42), layout.width - s(16), s(66)),
                 s(13),
                 false,
-                MUTED,
+                muted_col,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
 
             // Primary pill button ("Update" / "Downloading...").
             let u_hot = hover == Some(UpdatePopupHit::Update) && !downloading;
             let u_down = pressed == Some(UpdatePopupHit::Update) && !downloading;
-            let u_fill = if downloading {
+            let u_focus = focused == Some(UpdatePopupHit::Update) && !downloading;
+            let u_fill = if let Some(hc) = hc {
+                if downloading {
+                    hc.btn_face
+                } else {
+                    hc.highlight
+                }
+            } else if downloading {
                 DISABLED_FILL
             } else if u_down {
                 ACCENT_DARK
@@ -6962,47 +7291,102 @@ pub(crate) unsafe fn paint_update_popup_into(
                 layout.update_btn,
                 &RoundedMask {
                     ellipse: s(32),
-                    border: if downloading {
+                    border: if let Some(hc) = hc {
+                        hc.border
+                    } else if downloading {
                         DISABLED_BORDER
                     } else {
                         ACCENT_DARK
                     },
                     border_width: 1.0,
                     border_alpha: 255,
-                    fill_alpha: if downloading { 220 } else { ACTIVE_ALPHA },
-                    focus: 0,
-                    focus_inset: 0.0,
-                    host_color: CARD,
+                    fill_alpha: if downloading && hc.is_none() {
+                        220
+                    } else {
+                        255
+                    },
+                    focus: if u_focus {
+                        if u_down {
+                            focus_ring_light
+                        } else {
+                            focus_ring_accent
+                        }
+                    } else {
+                        0
+                    },
+                    focus_inset: s(3).max(2) as f32,
+                    host_color: card_bg,
                     host_alpha: card_alpha,
-                    top_rim: if downloading { 0 } else { ACCENT_SOFT },
-                    bottom_rim: INK,
-                    sheen_strength: if downloading { 0.0 } else { 0.06 },
+                    top_rim: if downloading || hc.is_some() {
+                        0
+                    } else {
+                        ACCENT_SOFT
+                    },
+                    bottom_rim: if hc.is_some() { 0 } else { INK },
+                    sheen_strength: if downloading || hc.is_some() {
+                        0.0
+                    } else {
+                        0.06
+                    },
                 },
             );
+            let u_text_col = if let Some(hc) = hc {
+                if downloading {
+                    hc.gray_text
+                } else {
+                    hc.highlight_text
+                }
+            } else if downloading {
+                MUTED
+            } else if u_down {
+                // ACCENT_DARK (#ad451b) requires CREAM (4.98:1) for WCAG AA normal text.
+                TEXT_ON_DARK
+            } else {
+                TEXT_ON_ACCENT
+            };
             label(
                 buffer.dc,
                 update_label,
                 layout.update_btn,
                 s(13),
                 true,
-                if downloading { MUTED } else { TEXT_ON_ACCENT },
+                u_text_col,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
 
             // Secondary outlined pill ("What's new" + external link glyph).
             let w_hot = hover == Some(UpdatePopupHit::WhatsNew);
             let w_down = pressed == Some(UpdatePopupHit::WhatsNew);
-            let w_fill = if w_down || w_hot { CARD_LIT } else { CARD };
+            let w_focus = focused == Some(UpdatePopupHit::WhatsNew);
+            let w_fill = if let Some(hc) = hc {
+                if w_down || w_hot {
+                    hc.highlight
+                } else {
+                    hc.btn_face
+                }
+            } else if w_down || w_hot {
+                CARD_LIT
+            } else {
+                CARD
+            };
             fill(buffer.dc, layout.whats_new_btn, w_fill);
             let _ = buffer.clear_alpha(layout.whats_new_btn);
             let _ = buffer.apply_rounded_rect_mask(
                 layout.whats_new_btn,
                 &RoundedMask {
                     ellipse: s(32),
-                    border: if w_hot { HIGHLIGHT } else { LINE },
+                    border: if let Some(hc) = hc {
+                        hc.border
+                    } else if w_hot || w_focus {
+                        HIGHLIGHT
+                    } else {
+                        LINE
+                    },
                     border_width: 1.0,
                     border_alpha: if glass { BORDER_ALPHA } else { 255 },
-                    fill_alpha: if w_down {
+                    fill_alpha: if hc.is_some() {
+                        255
+                    } else if w_down {
                         220
                     } else if w_hot {
                         if glass { 188 } else { 255 }
@@ -7011,13 +7395,13 @@ pub(crate) unsafe fn paint_update_popup_into(
                     } else {
                         255
                     },
-                    focus: 0,
-                    focus_inset: 0.0,
-                    host_color: CARD,
+                    focus: if w_focus { focus_ring_light } else { 0 },
+                    focus_inset: s(3).max(2) as f32,
+                    host_color: card_bg,
                     host_alpha: card_alpha,
-                    top_rim: GLASS_RIM,
-                    bottom_rim: INK,
-                    sheen_strength: 0.03,
+                    top_rim: if hc.is_some() { 0 } else { GLASS_RIM },
+                    bottom_rim: if hc.is_some() { 0 } else { INK },
+                    sheen_strength: if hc.is_some() { 0.0 } else { 0.03 },
                 },
             );
             let wn_text = if secondary_external {
@@ -7030,13 +7414,22 @@ pub(crate) unsafe fn paint_update_popup_into(
             } else {
                 layout.whats_new_btn
             };
+            let w_text_col = if let Some(hc) = hc {
+                if w_down || w_hot {
+                    hc.highlight_text
+                } else {
+                    hc.btn_text
+                }
+            } else {
+                TEXT
+            };
             label(
                 buffer.dc,
                 secondary_label,
                 wn_text,
                 s(13),
                 true,
-                TEXT,
+                w_text_col,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
             if secondary_external {
@@ -7044,8 +7437,10 @@ pub(crate) unsafe fn paint_update_popup_into(
                 let ix = layout.whats_new_btn.right - s(22);
                 let iy = (layout.whats_new_btn.top + layout.whats_new_btn.bottom) / 2 - s(5);
                 let box_sz = s(10).max(8);
-                let ext_pen = CreatePen(PS_SOLID, stroke, rgb(MUTED));
-                let old_ext = SelectObject(buffer.dc, ext_pen);
+                let old_ext = SelectObject(
+                    buffer.dc,
+                    cached_pen(stroke, if hc.is_some() { w_text_col } else { MUTED }),
+                );
                 let _ = MoveToEx(buffer.dc, ix + box_sz / 2, iy, None);
                 let _ = LineTo(buffer.dc, ix, iy);
                 let _ = LineTo(buffer.dc, ix, iy + box_sz);
@@ -7057,7 +7452,6 @@ pub(crate) unsafe fn paint_update_popup_into(
                 let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy - s(1));
                 let _ = LineTo(buffer.dc, ix + box_sz + s(1), iy + s(3));
                 SelectObject(buffer.dc, old_ext);
-                let _ = DeleteObject(ext_pen);
                 let _ = buffer.tint_background(
                     rect(ix - 2, iy - 3, ix + box_sz + s(4), iy + box_sz + 3),
                     255,
@@ -7066,15 +7460,44 @@ pub(crate) unsafe fn paint_update_popup_into(
 
             if let Some(footer_text) = footer_label.filter(|_| layout.footer_visible) {
                 let d_hot = hover == Some(UpdatePopupHit::Disable);
+                let d_focus = focused == Some(UpdatePopupHit::Disable);
                 label(
                     buffer.dc,
                     footer_text,
                     layout.disable_link,
                     s(12),
                     false,
-                    if d_hot { TEXT } else { MUTED },
+                    if d_hot || d_focus {
+                        text_col
+                    } else {
+                        muted_col
+                    },
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                 );
+                if d_focus {
+                    let old_p = SelectObject(buffer.dc, cached_pen(1, focus_ring_light));
+                    let old_b = SelectObject(buffer.dc, GetStockObject(NULL_BRUSH));
+                    let _ = RoundRect(
+                        buffer.dc,
+                        layout.disable_link.left - s(3),
+                        layout.disable_link.top,
+                        layout.disable_link.right + s(3),
+                        layout.disable_link.bottom,
+                        s(4),
+                        s(4),
+                    );
+                    SelectObject(buffer.dc, old_b);
+                    SelectObject(buffer.dc, old_p);
+                    let _ = buffer.tint_background(
+                        rect(
+                            layout.disable_link.left - s(4),
+                            layout.disable_link.top - 1,
+                            layout.disable_link.right + s(4),
+                            layout.disable_link.bottom + 1,
+                        ),
+                        255,
+                    );
+                }
             }
             theme.0 != 0 || buffer.opaque()
         })();
@@ -7117,8 +7540,205 @@ pub enum ClockDragTarget {
     Swatch(usize),
 }
 
+const CLOCK_FOCUS_ORDER: [ClockDragTarget; 8] = [
+    ClockDragTarget::SizeSlider,
+    ClockDragTarget::OpacitySlider,
+    ClockDragTarget::Swatch(0),
+    ClockDragTarget::Swatch(1),
+    ClockDragTarget::Swatch(2),
+    ClockDragTarget::Swatch(3),
+    ClockDragTarget::ColorWheel,
+    ClockDragTarget::BrightnessBar,
+];
+
 thread_local! {
     static CLOCK_UI: Cell<ClockUiState> = Cell::new(ClockUiState::default());
+    static CLOCK_FOCUS: Cell<Option<ClockDragTarget>> = const { Cell::new(None) };
+}
+
+pub fn clock_focus() -> Option<ClockDragTarget> {
+    CLOCK_FOCUS.with(Cell::get)
+}
+
+fn redraw_clock_panel(window: HWND) {
+    if window.0.is_null() {
+        return;
+    }
+    let mut client = RECT::default();
+    if unsafe { GetClientRect(window, &mut client) }.is_err() {
+        return;
+    }
+    let dpi = unsafe { GetDpiForWindow(window) }.max(96) as i32;
+    let layout = Layout::new(client.right * 96 / dpi, client.bottom * 96 / dpi);
+    let s = |n: i32| n * dpi / 96;
+    let p = layout.settings_resources_panel;
+    let rep = rect(s(p.left), s(p.top), s(p.right), s(p.bottom));
+    // SAFETY: invalidates only the owned Clock appearance panel on UI thread.
+    unsafe {
+        let _ = RedrawWindow(
+            window,
+            Some(&rep),
+            None,
+            RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW,
+        );
+    }
+}
+
+pub fn set_clock_focus(window: HWND, target: Option<ClockDragTarget>) {
+    let changed = CLOCK_FOCUS.with(|slot| slot.replace(target) != target);
+    if changed {
+        redraw_clock_panel(window);
+    }
+}
+
+/// Steps keyboard focus across custom-painted Clock appearance controls.
+/// Returns `true` if focus stayed inside the custom clock controls, or `false` when leaving to native controls.
+pub fn step_clock_focus(window: HWND, reverse: bool) -> bool {
+    let current = CLOCK_FOCUS.with(Cell::get);
+    let next = match current {
+        None => Some(if reverse {
+            CLOCK_FOCUS_ORDER[CLOCK_FOCUS_ORDER.len() - 1]
+        } else {
+            CLOCK_FOCUS_ORDER[0]
+        }),
+        Some(target) => {
+            let idx = CLOCK_FOCUS_ORDER
+                .iter()
+                .position(|&t| t == target)
+                .unwrap_or(0);
+            if reverse {
+                idx.checked_sub(1).map(|i| CLOCK_FOCUS_ORDER[i])
+            } else {
+                CLOCK_FOCUS_ORDER.get(idx + 1).copied()
+            }
+        }
+    };
+    CLOCK_FOCUS.with(|slot| slot.set(next));
+    redraw_clock_panel(window);
+    next.is_some()
+}
+
+pub fn adjust_clock_focused(window: HWND, vk: u16, shift: bool) -> Option<ClockUiState> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_DOWN, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP,
+    };
+    let target = CLOCK_FOCUS.with(Cell::get)?;
+    let step_mult = if shift { 2 } else { 1 };
+    let updated = CLOCK_UI.with(|slot| {
+        let mut st = slot.get();
+        let mut changed = false;
+        match target {
+            ClockDragTarget::SizeSlider => {
+                let delta = match vk {
+                    x if x == VK_LEFT.0 || x == VK_DOWN.0 => -5 * step_mult,
+                    x if x == VK_RIGHT.0 || x == VK_UP.0 => 5 * step_mult,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    let next = (st.size_pct as i32 + delta).clamp(50, 200) as u32;
+                    if next != st.size_pct {
+                        st.size_pct = next;
+                        changed = true;
+                    }
+                }
+            }
+            ClockDragTarget::OpacitySlider => {
+                let delta = match vk {
+                    x if x == VK_LEFT.0 || x == VK_DOWN.0 => -5 * step_mult,
+                    x if x == VK_RIGHT.0 || x == VK_UP.0 => 5 * step_mult,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    let next = (st.opacity_pct as i32 + delta).clamp(20, 100) as u32;
+                    if next != st.opacity_pct {
+                        st.opacity_pct = next;
+                        changed = true;
+                    }
+                }
+            }
+            ClockDragTarget::Swatch(idx) => {
+                if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
+                    if let Some(&col) = CLOCK_SWATCHES.get(idx) {
+                        let (h, s, v) = rgb_to_hsv(col);
+                        st.hue = h;
+                        st.sat = s;
+                        st.val = v;
+                        st.color = col;
+                        changed = true;
+                    }
+                } else if vk == VK_LEFT.0 || vk == VK_RIGHT.0 {
+                    let next_idx = if vk == VK_LEFT.0 {
+                        (idx + CLOCK_SWATCHES.len() - 1) % CLOCK_SWATCHES.len()
+                    } else {
+                        (idx + 1) % CLOCK_SWATCHES.len()
+                    };
+                    CLOCK_FOCUS.with(|f| f.set(Some(ClockDragTarget::Swatch(next_idx))));
+                    if let Some(&col) = CLOCK_SWATCHES.get(next_idx) {
+                        let (h, s, v) = rgb_to_hsv(col);
+                        st.hue = h;
+                        st.sat = s;
+                        st.val = v;
+                        st.color = col;
+                        changed = true;
+                    }
+                }
+            }
+            ClockDragTarget::ColorWheel => {
+                let hue_step = (1.0 / 24.0) * step_mult as f32;
+                let sat_step = 0.08 * step_mult as f32;
+                match vk {
+                    x if x == VK_LEFT.0 => {
+                        st.hue = (st.hue - hue_step).rem_euclid(1.0);
+                        st.sat = st.sat.max(0.25);
+                        st.val = st.val.max(0.5);
+                        st.color = hsv_to_rgb(st.hue, st.sat, st.val);
+                        changed = true;
+                    }
+                    x if x == VK_RIGHT.0 => {
+                        st.hue = (st.hue + hue_step).rem_euclid(1.0);
+                        st.sat = st.sat.max(0.25);
+                        st.val = st.val.max(0.5);
+                        st.color = hsv_to_rgb(st.hue, st.sat, st.val);
+                        changed = true;
+                    }
+                    x if x == VK_UP.0 => {
+                        st.sat = (st.sat + sat_step).clamp(0.0, 1.0);
+                        st.val = st.val.max(0.5);
+                        st.color = hsv_to_rgb(st.hue, st.sat, st.val);
+                        changed = true;
+                    }
+                    x if x == VK_DOWN.0 => {
+                        st.sat = (st.sat - sat_step).clamp(0.0, 1.0);
+                        st.color = hsv_to_rgb(st.hue, st.sat, st.val);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            ClockDragTarget::BrightnessBar => {
+                let delta = match vk {
+                    x if x == VK_LEFT.0 || x == VK_DOWN.0 => -0.05 * step_mult as f32,
+                    x if x == VK_RIGHT.0 || x == VK_UP.0 => 0.05 * step_mult as f32,
+                    _ => 0.0,
+                };
+                if delta != 0.0 {
+                    st.val = (st.val + delta).clamp(0.0, 1.0);
+                    st.color = hsv_to_rgb(st.hue, st.sat, st.val);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            slot.set(st);
+            Some(st)
+        } else {
+            None
+        }
+    });
+    if updated.is_some() {
+        redraw_clock_panel(window);
+    }
+    updated
 }
 
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> u32 {
@@ -7374,9 +7994,11 @@ pub fn apply_clock_pointer(window: HWND, target: ClockDragTarget, x: i32, y: i32
 
 struct CachedClockWheel {
     wheel_r: i32,
-    val_q: u8,
     pad: i32,
     side: i32,
+    // Base full-value (V=1.0) wheel cached per radius so brightness drags skip atan2/sqrt/hsv_to_rgb.
+    base_pixels: Vec<u32>,
+    val_q: u8,
     pixels: Vec<u32>,
 }
 
@@ -7393,74 +8015,115 @@ unsafe fn paint_clock_appearance_controls(
 ) {
     let s = |n: i32| n * dpi.max(96) / 96;
     let st = CLOCK_UI.with(Cell::get);
+    let focused_target = CLOCK_FOCUS.with(Cell::get);
     let g = clock_appearance_geom(layout, dpi);
+    let hc = high_contrast_colors();
+    let focus_col = hc.map_or(CREAM, |c| c.window_text);
 
     // SAFETY: dc & PaintBuffer are valid synchronously inside paint_scene.
     unsafe {
-        fill(dc, g.divider, if glass_active { GLASS_RIM } else { LINE });
+        fill(
+            dc,
+            g.divider,
+            hc.map_or(if glass_active { GLASS_RIM } else { LINE }, |c| c.border),
+        );
         if let Some(buf) = buffer
             && glass_active
         {
             let _ = buf.tint_background(g.divider, DIVIDER_ALPHA);
         }
 
-        // Helper for drawing a clean slider bar + circular handle + text labels.
-        let draw_slider =
-            |label_r: RECT, val_r: RECT, track: RECT, frac: f32, text: &str, val_str: &str| {
-                label(
+        // Helper for drawing a clean slider bar + circular handle + text labels + optional focus outline.
+        let draw_slider = |label_r: RECT,
+                           val_r: RECT,
+                           track: RECT,
+                           hit: RECT,
+                           frac: f32,
+                           text: &str,
+                           val_str: &str,
+                           focused: bool| {
+            label(
+                dc,
+                text,
+                label_r,
+                s(13),
+                false,
+                hc.map_or(MUTED, |c| c.window_text),
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            label(
+                dc,
+                val_str,
+                val_r,
+                s(13),
+                true,
+                hc.map_or(TEXT, |c| c.window_text),
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+            );
+            fill(dc, track, hc.map_or(LINE, |c| c.border));
+            let filled_w =
+                ((track.right - track.left) as f32 * frac.clamp(0.0, 1.0)).round() as i32;
+            let fill_r = rect(
+                track.left,
+                track.top,
+                (track.left + filled_w).max(track.left),
+                track.bottom,
+            );
+            fill(dc, fill_r, hc.map_or(ACCENT, |c| c.highlight));
+            let kr = s(7).max(6);
+            let kx = track.left + filled_w;
+            let ky = (track.top + track.bottom) / 2;
+            let knob_r = rect(kx - kr, ky - kr, kx + kr, ky + kr);
+            rounded(
+                dc,
+                knob_r,
+                hc.map_or(TEXT, |c| c.window_text),
+                hc.map_or(INK, |c| c.window),
+                kr * 2,
+            );
+            if focused {
+                let old_p = SelectObject(dc, cached_pen(1, focus_col));
+                let old_b = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                let _ = RoundRect(
                     dc,
-                    text,
-                    label_r,
-                    s(13),
-                    false,
-                    MUTED,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                    hit.left,
+                    hit.top + s(2),
+                    hit.right,
+                    hit.bottom - s(2),
+                    s(6),
+                    s(6),
                 );
-                label(
-                    dc,
-                    val_str,
-                    val_r,
-                    s(13),
-                    true,
-                    TEXT,
-                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
-                );
-                fill(dc, track, LINE);
-                let filled_w =
-                    ((track.right - track.left) as f32 * frac.clamp(0.0, 1.0)).round() as i32;
-                let fill_r = rect(
-                    track.left,
-                    track.top,
-                    (track.left + filled_w).max(track.left),
-                    track.bottom,
-                );
-                fill(dc, fill_r, ACCENT);
-                let kr = s(7).max(6);
-                let kx = track.left + filled_w;
-                let ky = (track.top + track.bottom) / 2;
-                let knob_r = rect(kx - kr, ky - kr, kx + kr, ky + kr);
-                rounded(dc, knob_r, TEXT, INK, kr * 2);
-                if let Some(buf) = buffer {
-                    let _ = buf.tint_background(track, 255);
-                    let _ = buf.tint_background(knob_r, 255);
+                SelectObject(dc, old_b);
+                SelectObject(dc, old_p);
+            }
+            if let Some(buf) = buffer {
+                let _ = buf.tint_background(track, 255);
+                let _ = buf.tint_background(knob_r, 255);
+                if focused {
+                    let _ = buf.tint_background(hit, 255);
                 }
-            };
+            }
+        };
 
         draw_slider(
             g.size_label,
             g.size_value,
             g.size_track,
+            g.size_hit,
             (st.size_pct as f32 - 50.0) / 150.0,
             "Size",
             &format!("{}%", st.size_pct),
+            focused_target == Some(ClockDragTarget::SizeSlider),
         );
         draw_slider(
             g.opacity_label,
             g.opacity_value,
             g.opacity_track,
+            g.opacity_hit,
             (st.opacity_pct as f32 - 20.0) / 80.0,
             "Opacity",
             &format!("{}%", st.opacity_pct),
+            focused_target == Some(ClockDragTarget::OpacitySlider),
         );
 
         label(
@@ -7469,7 +8132,7 @@ unsafe fn paint_clock_appearance_controls(
             g.colour_title,
             s(14),
             true,
-            TEXT,
+            hc.map_or(TEXT, |c| c.window_text),
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
         label(
@@ -7478,177 +8141,268 @@ unsafe fn paint_clock_appearance_controls(
             g.colour_hint,
             s(12),
             false,
-            MUTED,
+            hc.map_or(MUTED, |c| c.window_text),
             DT_LEFT | DT_WORDBREAK,
         );
 
-        // Quick swatch circles.
-        for &sw in &g.swatches {
-            // Mapped below by index.
-            let _ = sw;
-        }
         for (i, &sw) in g.swatches.iter().enumerate() {
             let col = CLOCK_SWATCHES[i];
             let active = (st.color & 0x00FF_FFFF) == (col & 0x00FF_FFFF);
-            rounded(dc, sw, col, if active { ACCENT } else { LINE }, s(12));
-            if let Some(buf) = buffer {
+            let focused = focused_target == Some(ClockDragTarget::Swatch(i));
+            rounded(
+                dc,
+                sw,
+                col,
+                if focused {
+                    focus_col
+                } else if active {
+                    ACCENT
+                } else {
+                    LINE
+                },
+                s(12),
+            );
+            if focused {
+                let outer = rect(
+                    sw.left - s(2),
+                    sw.top - s(2),
+                    sw.right + s(2),
+                    sw.bottom + s(2),
+                );
+                let old_p = SelectObject(dc, cached_pen(1, focus_col));
+                let old_b = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                let _ = RoundRect(
+                    dc,
+                    outer.left,
+                    outer.top,
+                    outer.right,
+                    outer.bottom,
+                    s(14),
+                    s(14),
+                );
+                SelectObject(dc, old_b);
+                SelectObject(dc, old_p);
+                if let Some(buf) = buffer {
+                    let _ = buf.tint_background(outer, 255);
+                }
+            } else if let Some(buf) = buffer {
                 let _ = buf.tint_background(sw, 255);
             }
         }
 
         // Hex colour badge backing pill (editable CLOCK_HEX_EDIT sits inside).
-        rounded(dc, g.hex_pill, INK, LINE, s(8));
+        rounded(
+            dc,
+            g.hex_pill,
+            hc.map_or(INK, |c| c.window),
+            hc.map_or(LINE, |c| c.border),
+            s(8),
+        );
         if let Some(buf) = buffer {
             let _ = buf.tint_background(g.hex_pill, 255);
+        }
+
+        if focused_target == Some(ClockDragTarget::ColorWheel) {
+            let wr = rect(
+                g.wheel_cx - g.wheel_r - s(4),
+                g.wheel_cy - g.wheel_r - s(4),
+                g.wheel_cx + g.wheel_r + s(4),
+                g.wheel_cy + g.wheel_r + s(4),
+            );
+            let old_p = SelectObject(dc, cached_pen(1, focus_col));
+            let old_b = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let _ = Ellipse(dc, wr.left, wr.top, wr.right, wr.bottom);
+            SelectObject(dc, old_b);
+            SelectObject(dc, old_p);
+            if let Some(buf) = buffer {
+                let _ = buf.tint_background(wr, 255);
+            }
+        } else if focused_target == Some(ClockDragTarget::BrightnessBar) {
+            let br = rect(
+                g.val_bar.left - s(3),
+                g.val_bar.top - s(3),
+                g.val_bar.right + s(3),
+                g.val_bar.bottom + s(3),
+            );
+            let old_p = SelectObject(dc, cached_pen(1, focus_col));
+            let old_b = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let _ = RoundRect(dc, br.left, br.top, br.right, br.bottom, s(4), s(4));
+            SelectObject(dc, old_b);
+            SelectObject(dc, old_p);
+            if let Some(buf) = buffer {
+                let _ = buf.tint_background(br, 255);
+            }
         }
 
         // Pixel-rendered HSV wheel & linear brightness bar into PaintBuffer DIB bits.
         if let Some(buf) = buffer {
             let mut bits = std::ptr::null_mut();
             let mut stride = 0;
-            if GdiFlush().as_bool()
+            let buf_w = buf.area.right - buf.area.left;
+            let buf_h = buf.area.bottom - buf.area.top;
+            if buf_w > 0
+                && buf_h > 0
+                && GdiFlush().as_bool()
                 && GetBufferedPaintBits(buf.handle, &mut bits, &mut stride).is_ok()
                 && !bits.is_null()
+                && stride >= buf_w
+                && let Some(len) = (stride as usize)
+                    .checked_mul(buf_h as usize)
+                    .filter(|&n| n <= isize::MAX as usize / std::mem::size_of::<u32>())
             {
-                let buf_w = buf.area.right - buf.area.left;
-                let buf_h = buf.area.bottom - buf.area.top;
-                if let Some(len) = (stride as usize).checked_mul(buf_h as usize) {
-                    let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, len);
-                    let wheel_r = g.wheel_r.max(1);
-                    let r = wheel_r as f32;
-                    let pad = wheel_r + 2;
-                    let side = pad * 2 + 1;
-                    let val_effective = st.val.max(0.18);
-                    let val_q = (val_effective * 255.0).round().clamp(0.0, 255.0) as u8;
-                    CLOCK_WHEEL_CACHE.with(|slot| {
-                        let mut cache = slot.borrow_mut();
-                        let rebuild = cache.as_ref().is_none_or(|c| {
-                            c.wheel_r != wheel_r
-                                || c.val_q != val_q
-                                || c.side != side
-                                || c.pixels.len() != (side as usize) * (side as usize)
-                        });
-                        if rebuild {
-                            let mut wbuf = vec![0u32; (side as usize) * (side as usize)];
-                            let r_sq = (r + 1.0) * (r + 1.0);
-                            let inv_2pi = 1.0 / (2.0 * std::f32::consts::PI);
-                            for dy in -pad..=pad {
-                                let row = (dy + pad) as usize * side as usize;
-                                for dx in -pad..=pad {
-                                    let dist_sq = (dx * dx + dy * dy) as f32;
-                                    if dist_sq <= r_sq {
-                                        let dist = dist_sq.sqrt();
-                                        let sat = (dist / r).clamp(0.0, 1.0);
-                                        let hue = ((dy as f32).atan2(dx as f32) * inv_2pi)
-                                            .rem_euclid(1.0);
-                                        let col = hsv_to_rgb(hue, sat, val_effective);
-                                        wbuf[row + (dx + pad) as usize] = if dist <= r {
-                                            0xFF00_0000 | col
-                                        } else {
-                                            0xFF55_5555
-                                        };
-                                    }
+                let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, len);
+                let wheel_r = g.wheel_r.max(1);
+                let r = wheel_r as f32;
+                let pad = wheel_r + 2;
+                let side = pad * 2 + 1;
+                let val_effective = st.val.max(0.18);
+                let val_q = (val_effective * 255.0).round().clamp(0.0, 255.0) as u8;
+                CLOCK_WHEEL_CACHE.with(|slot| {
+                    let mut cache = slot.borrow_mut();
+                    let rebuild_base = cache.as_ref().is_none_or(|c| {
+                        c.wheel_r != wheel_r
+                            || c.side != side
+                            || c.base_pixels.len() != (side as usize) * (side as usize)
+                    });
+                    if rebuild_base {
+                        let mut base = vec![0u32; (side as usize) * (side as usize)];
+                        let r_sq = (r + 1.0) * (r + 1.0);
+                        let inv_2pi = 1.0 / (2.0 * std::f32::consts::PI);
+                        for dy in -pad..=pad {
+                            let row = (dy + pad) as usize * side as usize;
+                            for dx in -pad..=pad {
+                                let dist_sq = (dx * dx + dy * dy) as f32;
+                                if dist_sq <= r_sq {
+                                    let dist = dist_sq.sqrt();
+                                    let sat = (dist / r).clamp(0.0, 1.0);
+                                    let hue =
+                                        ((dy as f32).atan2(dx as f32) * inv_2pi).rem_euclid(1.0);
+                                    let col = hsv_to_rgb(hue, sat, 1.0);
+                                    // Bit 24 distinguishes interior wheel pixels from 1px rim pixels.
+                                    base[row + (dx + pad) as usize] = if dist <= r {
+                                        0xFF00_0000 | col
+                                    } else {
+                                        0xFE55_5555
+                                    };
                                 }
                             }
-                            *cache = Some(CachedClockWheel {
-                                wheel_r,
-                                val_q,
-                                pad,
-                                side,
-                                pixels: wbuf,
-                            });
                         }
-                        if let Some(c) = cache.as_ref() {
-                            for dy in -c.pad..=c.pad {
-                                let py = g.wheel_cy + dy - buf.area.top;
-                                if py < 0 || py >= buf_h {
+                        *cache = Some(CachedClockWheel {
+                            wheel_r,
+                            pad,
+                            side,
+                            base_pixels: base,
+                            val_q: 0,
+                            pixels: Vec::new(),
+                        });
+                    }
+                    if let Some(c) = cache.as_mut() {
+                        if c.val_q != val_q || c.pixels.len() != c.base_pixels.len() {
+                            c.pixels.resize(c.base_pixels.len(), 0);
+                            let v_u32 = u32::from(val_q);
+                            for (dst, &src) in c.pixels.iter_mut().zip(&c.base_pixels) {
+                                if src == 0 {
+                                    *dst = 0;
+                                } else if (src >> 24) == 0xFE {
+                                    *dst = 0xFF55_5555;
+                                } else {
+                                    let rr = (((src >> 16) & 255) * v_u32 + 127) / 255;
+                                    let gg = (((src >> 8) & 255) * v_u32 + 127) / 255;
+                                    let bb = ((src & 255) * v_u32 + 127) / 255;
+                                    *dst = 0xFF00_0000 | (rr << 16) | (gg << 8) | bb;
+                                }
+                            }
+                            c.val_q = val_q;
+                        }
+                        for dy in -c.pad..=c.pad {
+                            let py = g.wheel_cy + dy - buf.area.top;
+                            if py < 0 || py >= buf_h {
+                                continue;
+                            }
+                            let dst_row = py as usize * stride as usize;
+                            let src_row = (dy + c.pad) as usize * c.side as usize;
+                            for dx in -c.pad..=c.pad {
+                                let px = g.wheel_cx + dx - buf.area.left;
+                                if px < 0 || px >= buf_w {
                                     continue;
                                 }
-                                let dst_row = py as usize * stride as usize;
-                                let src_row = (dy + c.pad) as usize * c.side as usize;
-                                for dx in -c.pad..=c.pad {
-                                    let px = g.wheel_cx + dx - buf.area.left;
-                                    if px < 0 || px >= buf_w {
-                                        continue;
-                                    }
-                                    let src = c.pixels[src_row + (dx + c.pad) as usize];
-                                    if src != 0 {
-                                        pixels[dst_row + px as usize] = src;
-                                    }
+                                let src = c.pixels[src_row + (dx + c.pad) as usize];
+                                if src != 0 {
+                                    pixels[dst_row + px as usize] = src;
                                 }
                             }
                         }
-                    });
-                    // Selection ring inside wheel.
-                    let ang = st.hue * 2.0 * std::f32::consts::PI;
-                    let tx = (g.wheel_cx as f32 + st.sat * r * ang.cos()).round() as i32;
-                    let ty = (g.wheel_cy as f32 + st.sat * r * ang.sin()).round() as i32;
-                    let tr = s(5).max(4);
-                    for dy in -tr..=tr {
-                        let py = ty + dy - buf.area.top;
-                        if py < 0 || py >= buf_h {
+                    }
+                });
+                // Selection ring inside wheel.
+                let ang = st.hue * 2.0 * std::f32::consts::PI;
+                let tx = (g.wheel_cx as f32 + st.sat * r * ang.cos()).round() as i32;
+                let ty = (g.wheel_cy as f32 + st.sat * r * ang.sin()).round() as i32;
+                let tr = s(5).max(4);
+                for dy in -tr..=tr {
+                    let py = ty + dy - buf.area.top;
+                    if py < 0 || py >= buf_h {
+                        continue;
+                    }
+                    let row = py as usize * stride as usize;
+                    for dx in -tr..=tr {
+                        let px = tx + dx - buf.area.left;
+                        if px < 0 || px >= buf_w {
                             continue;
                         }
-                        let row = py as usize * stride as usize;
-                        for dx in -tr..=tr {
-                            let px = tx + dx - buf.area.left;
-                            if px < 0 || px >= buf_w {
-                                continue;
-                            }
-                            let d = ((dx * dx + dy * dy) as f32).sqrt();
-                            if (d - (tr - 1) as f32).abs() <= 1.2 {
-                                pixels[row + px as usize] = 0xFFFF_FFFF;
-                            } else if (d - tr as f32).abs() <= 1.1 {
-                                pixels[row + px as usize] = 0xFF11_1111;
-                            }
+                        let d = ((dx * dx + dy * dy) as f32).sqrt();
+                        if (d - (tr - 1) as f32).abs() <= 1.2 {
+                            pixels[row + px as usize] = 0xFFFF_FFFF;
+                        } else if (d - tr as f32).abs() <= 1.1 {
+                            pixels[row + px as usize] = 0xFF11_1111;
                         }
                     }
-                    // Brightness bar gradient.
-                    let bw = (g.val_bar.right - g.val_bar.left).max(1);
-                    for py_abs in g.val_bar.top..g.val_bar.bottom {
-                        let py = py_abs - buf.area.top;
-                        if py < 0 || py >= buf_h {
-                            continue;
-                        }
-                        let row = py as usize * stride as usize;
-                        for px_abs in g.val_bar.left..g.val_bar.right {
-                            let px = px_abs - buf.area.left;
-                            if px < 0 || px >= buf_w {
-                                continue;
-                            }
-                            let v = (px_abs - g.val_bar.left) as f32 / (bw - 1).max(1) as f32;
-                            let col = hsv_to_rgb(st.hue, st.sat, v);
-                            let edge = py_abs == g.val_bar.top
-                                || py_abs == g.val_bar.bottom - 1
-                                || px_abs == g.val_bar.left
-                                || px_abs == g.val_bar.right - 1;
-                            pixels[row + px as usize] =
-                                if edge { 0xFF66_6666 } else { 0xFF00_0000 | col };
-                        }
+                }
+                // Brightness bar gradient.
+                let bw = (g.val_bar.right - g.val_bar.left).max(1);
+                for py_abs in g.val_bar.top..g.val_bar.bottom {
+                    let py = py_abs - buf.area.top;
+                    if py < 0 || py >= buf_h {
+                        continue;
                     }
-                    // Brightness thumb indicator.
-                    let vx = g.val_bar.left + (st.val * bw as f32).round() as i32;
-                    let vy = (g.val_bar.top + g.val_bar.bottom) / 2;
-                    let vr = s(7).max(6);
-                    for dy in -vr..=vr {
-                        let py = vy + dy - buf.area.top;
-                        if py < 0 || py >= buf_h {
+                    let row = py as usize * stride as usize;
+                    for px_abs in g.val_bar.left..g.val_bar.right {
+                        let px = px_abs - buf.area.left;
+                        if px < 0 || px >= buf_w {
                             continue;
                         }
-                        let row = py as usize * stride as usize;
-                        for dx in -vr..=vr {
-                            let px = vx + dx - buf.area.left;
-                            if px < 0 || px >= buf_w {
-                                continue;
-                            }
-                            let d = ((dx * dx + dy * dy) as f32).sqrt();
-                            if d <= vr as f32 {
-                                pixels[row + px as usize] = if d >= (vr - 2) as f32 {
-                                    0xFFFF_FFFF
-                                } else {
-                                    0xFF00_0000 | (st.color & 0x00FF_FFFF)
-                                };
-                            }
+                        let v = (px_abs - g.val_bar.left) as f32 / (bw - 1).max(1) as f32;
+                        let col = hsv_to_rgb(st.hue, st.sat, v);
+                        let edge = py_abs == g.val_bar.top
+                            || py_abs == g.val_bar.bottom - 1
+                            || px_abs == g.val_bar.left
+                            || px_abs == g.val_bar.right - 1;
+                        pixels[row + px as usize] =
+                            if edge { 0xFF66_6666 } else { 0xFF00_0000 | col };
+                    }
+                }
+                // Brightness thumb indicator.
+                let vx = g.val_bar.left + (st.val * bw as f32).round() as i32;
+                let vy = (g.val_bar.top + g.val_bar.bottom) / 2;
+                let vr = s(7).max(6);
+                for dy in -vr..=vr {
+                    let py = vy + dy - buf.area.top;
+                    if py < 0 || py >= buf_h {
+                        continue;
+                    }
+                    let row = py as usize * stride as usize;
+                    for dx in -vr..=vr {
+                        let px = vx + dx - buf.area.left;
+                        if px < 0 || px >= buf_w {
+                            continue;
+                        }
+                        let d = ((dx * dx + dy * dy) as f32).sqrt();
+                        if d <= vr as f32 {
+                            pixels[row + px as usize] = if d >= (vr - 2) as f32 {
+                                0xFFFF_FFFF
+                            } else {
+                                0xFF00_0000 | (st.color & 0x00FF_FFFF)
+                            };
                         }
                     }
                 }
@@ -7672,9 +8426,12 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
         } else {
             SetBkMode(dc, TRANSPARENT);
         }
+        let hc = high_contrast_colors();
         SetTextColor(
             dc,
-            rgb(if id == 113 {
+            rgb(if let Some(hc) = hc {
+                hc.window_text
+            } else if id == 113 {
                 TEXT_ON_DARK
             } else if matches!(
                 id,
@@ -7685,13 +8442,14 @@ pub unsafe fn control_colors(message: u32, dc: HDC, window: HWND) -> Option<LRES
                 TEXT
             }),
         );
-        let color = control_color(id);
+        let color = hc.map_or_else(|| control_color(id), |c| c.window);
         SetBkColor(dc, rgb(color));
         Some(LRESULT(brush(color).0 as isize))
     }
 }
 thread_local! {
     static BRUSHES: RefCell<HashMap<u32, HBRUSH>> = RefCell::new(HashMap::new());
+    static PENS: RefCell<HashMap<(i32, u32), HPEN>> = RefCell::new(HashMap::new());
     static FONTS: RefCell<HashMap<(i32, bool), HFONT>> = RefCell::new(HashMap::new());
 }
 pub fn brush(color: u32) -> HBRUSH {
@@ -7699,6 +8457,14 @@ pub fn brush(color: u32) -> HBRUSH {
         *b.borrow_mut()
             .entry(color)
             .or_insert_with(|| unsafe { CreateSolidBrush(rgb(color)) })
+    })
+}
+fn cached_pen(width: i32, color: u32) -> HPEN {
+    let w = width.max(1);
+    PENS.with(|p| {
+        *p.borrow_mut()
+            .entry((w, color))
+            .or_insert_with(|| unsafe { CreatePen(PS_SOLID, w, rgb(color)) })
     })
 }
 fn cached_font(size: i32, bold: bool) -> HFONT {
@@ -9657,6 +10423,7 @@ mod tests {
                     downloading: false,
                     hover: Some(UpdatePopupHit::WhatsNew),
                     pressed: None,
+                    focused: Some(UpdatePopupHit::Update),
                     dpi: 96,
                     glass: false,
                 },
@@ -10006,5 +10773,77 @@ mod tests {
             assert_eq!(control_corner_ellipse(TAB_SETTINGS, dpi), expected);
             assert_eq!(control_corner_ellipse(TAB_CLOCK, dpi), expected);
         }
+    }
+
+    #[test]
+    fn box_blur_passes_match_exact_integer_reference() {
+        let (w, h, r) = (29i32, 17i32, 5i32);
+        let mut src = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let cr = ((x * 37 + y * 19) & 255) as u32;
+                let cg = ((x * 13 + y * 53 + 7) & 255) as u32;
+                let cb = ((x * 61 + y * 11 + 23) & 255) as u32;
+                src.push((cr << 16) | (cg << 8) | cb);
+            }
+        }
+        let denom = (r * 2 + 1) as u32;
+        let half = denom / 2;
+        let mut ref_h = vec![0u32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
+                for dx in -r..=r {
+                    let px = src[(y * w + (x + dx).clamp(0, w - 1)) as usize];
+                    sr += (px >> 16) & 255;
+                    sg += (px >> 8) & 255;
+                    sb += px & 255;
+                }
+                ref_h[(y * w + x) as usize] = (((sr + half) / denom) << 16)
+                    | (((sg + half) / denom) << 8)
+                    | ((sb + half) / denom);
+            }
+        }
+        let mut ref_v = vec![0u32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
+                for dy in -r..=r {
+                    let px = ref_h[((y + dy).clamp(0, h - 1) * w + x) as usize];
+                    sr += (px >> 16) & 255;
+                    sg += (px >> 8) & 255;
+                    sb += px & 255;
+                }
+                ref_v[(y * w + x) as usize] = (((sr + half) / denom) << 16)
+                    | (((sg + half) / denom) << 8)
+                    | ((sb + half) / denom);
+            }
+        }
+        let mut got_h = vec![0u32; (w * h) as usize];
+        let mut got_v = vec![0u32; (w * h) as usize];
+        box_blur_horizontal(&src, &mut got_h, w, h, r);
+        assert_eq!(got_h, ref_h);
+        box_blur_vertical(&got_h, &mut got_v, w, h, r);
+        assert_eq!(got_v, ref_v);
+    }
+
+    #[test]
+    fn trim_for_tray_releases_scratch_and_backdrop_caches() {
+        let mut src = vec![0x0011_2233u32; 64 * 32];
+        let mut dst = vec![0u32; 64 * 32];
+        box_blur_vertical(&src, &mut dst, 64, 32, 3);
+        src[0] = dst[0];
+        trim_for_tray();
+        BLUR_ROW_SCRATCH.with(|s| {
+            let (r, g, b) = &*s.borrow();
+            assert_eq!(r.capacity(), 0);
+            assert_eq!(g.capacity(), 0);
+            assert_eq!(b.capacity(), 0);
+        });
+        TRANSITION_BACKDROP.with(|s| {
+            let bd = s.borrow();
+            assert!(bd.pixels.is_empty());
+            assert!(bd.raw_pixels.is_empty());
+        });
     }
 }

@@ -23,7 +23,7 @@ pub struct Monitor {
 }
 
 pub fn monitors() -> Result<Vec<Monitor>, String> {
-    let mut monitors: Vec<Monitor> = Vec::new();
+    let mut monitors: Vec<Monitor> = Vec::with_capacity(4);
     // SAFETY: callback is synchronous, Vec remains alive and exclusively borrowed for duration.
     if !unsafe {
         EnumDisplayMonitors(

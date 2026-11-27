@@ -44,6 +44,14 @@ jobs:
           if-no-files-found: warn
       - name: Release application
         run: |
+          $cargoHome = if ([string]::IsNullOrWhiteSpace($env:CARGO_HOME)) { Join-Path $env:USERPROFILE '.cargo' } else { $env:CARGO_HOME }
+          $flags = @(
+            '-C', 'control-flow-guard=checks',
+            "--remap-path-prefix=$cargoHome=/cargo",
+            "--remap-path-prefix=$env:USERPROFILE=/user",
+            "--remap-path-prefix=$PWD=/src"
+          )
+          $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]0x1f
           cargo +stable build --locked --release --bin wallpaperlive
           if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
           & .\scripts\Embed-Icon.ps1 -Executable .\target\release\wallpaperlive.exe
@@ -79,6 +87,8 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -87,6 +97,10 @@ jobs:
         with:
           name: wallpaperlive-windows-x64
           path: dist
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/wallpaperlivesetup-*.msi
       - name: Publish release
         shell: pwsh
         env:
@@ -128,8 +142,11 @@ jobs:
           - See [Code signing policy](https://github.com/$env:GH_REPO#code-signing-policy) and [Privacy policy](https://github.com/$env:GH_REPO#privacy-policy).
           "@
           $notes | Set-Content -LiteralPath .\dist\release-notes.md -Encoding utf8
-          gh release view $env:RELEASE_TAG --json isDraft --jq '.isDraft' > $null
+          $isDraft = (gh release view $env:RELEASE_TAG --json isDraft --jq '.isDraft' 2>$null)
           if ($LASTEXITCODE -eq 0) {
+            if (($isDraft | Out-String).Trim() -ne 'true') {
+              throw "Refusing to overwrite already published release $env:RELEASE_TAG."
+            }
             gh release upload $env:RELEASE_TAG $installerPath '.\dist\SHA256SUMS.txt' --clobber
             if ($LASTEXITCODE -ne 0) { throw "Release upload failed: $LASTEXITCODE" }
             gh release edit $env:RELEASE_TAG --draft=false --notes-file '.\dist\release-notes.md'

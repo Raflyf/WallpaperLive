@@ -11,7 +11,40 @@ mod tray;
 mod update;
 mod update_popup;
 mod visuals;
+fn harden_process() {
+    use windows::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories, SetDllDirectoryW,
+    };
+    use windows::Win32::System::SystemServices::{
+        PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY, PROCESS_MITIGATION_IMAGE_LOAD_POLICY,
+    };
+    use windows::Win32::System::Threading::{
+        ProcessExtensionPointDisablePolicy, ProcessImageLoadPolicy, SetProcessMitigationPolicy,
+    };
+    use windows::core::w;
+    // SAFETY: process-wide DLL search and mitigation hardening executed once at entry before any dynamic loads.
+    unsafe {
+        let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+        let _ = SetDllDirectoryW(w!(""));
+        let mut ext = PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY::default();
+        ext.Anonymous.Flags = 1; // DisableExtensionPoints = 1
+        let _ = SetProcessMitigationPolicy(
+            ProcessExtensionPointDisablePolicy,
+            (&ext as *const PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY).cast(),
+            std::mem::size_of::<PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY>(),
+        );
+        let mut img = PROCESS_MITIGATION_IMAGE_LOAD_POLICY::default();
+        img.Anonymous.Flags = 0x1 | 0x2; // NoRemoteImages = 1, NoLowMandatoryLabelImages = 1
+        let _ = SetProcessMitigationPolicy(
+            ProcessImageLoadPolicy,
+            (&img as *const PROCESS_MITIGATION_IMAGE_LOAD_POLICY).cast(),
+            std::mem::size_of::<PROCESS_MITIGATION_IMAGE_LOAD_POLICY>(),
+        );
+    }
+}
+
 fn main() {
+    harden_process();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--thumbnail") {
         use std::io::Write;

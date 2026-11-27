@@ -5,9 +5,13 @@ use crate::{
     visuals,
 };
 use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    rc::Rc,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 use windows::{
@@ -37,14 +41,15 @@ use windows::{
             HiDpi::*,
             Input::KeyboardAndMouse::{
                 EnableWindow, GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture,
-                SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL,
-                VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SPACE,
+                SetCapture, SetFocus, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
+                VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F6, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT,
+                VK_SPACE, VK_TAB, VK_UP,
             },
             Shell::*,
             WindowsAndMessaging::*,
         },
     },
-    core::{PCWSTR, w},
+    core::{PCWSTR, PWSTR, w},
 };
 
 const ACTION: u32 = WM_APP + 1;
@@ -108,10 +113,161 @@ static WINDOW_EVENT_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::
 static WINDOW_EVENT_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+const MAX_DATA_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_DEFERRED_APP_MSGS: usize = 256;
+
 thread_local! {
-    static CLOCK_DRAG: std::cell::Cell<Option<visuals::ClockDragTarget>> =
-        const { std::cell::Cell::new(None) };
-    static HEX_EDIT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CLOCK_DRAG: Cell<Option<visuals::ClockDragTarget>> = const { Cell::new(None) };
+    static HEX_EDIT_SYNC: Cell<bool> = const { Cell::new(false) };
+    static ACTIVE_APP: RefCell<Option<(HWND, Rc<RefCell<App>>)>> = const { RefCell::new(None) };
+    static DEFERRED_APP_MSGS: RefCell<VecDeque<(u32, WPARAM, LPARAM)>> =
+        const { RefCell::new(VecDeque::new()) };
+    static PENDING_DROPS: RefCell<VecDeque<Option<PathBuf>>> =
+        const { RefCell::new(VecDeque::new()) };
+    static APP_SHOULD_QUIT: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn internal_action_token() -> isize {
+    static TOKEN: OnceLock<isize> = OnceLock::new();
+    *TOKEN.get_or_init(|| {
+        let mut bytes = [0u8; std::mem::size_of::<isize>()];
+        for _ in 0..8 {
+            if crate::update::random_bytes(&mut bytes).is_ok() {
+                let value = isize::from_ne_bytes(bytes);
+                if value != 0 {
+                    return value;
+                }
+            }
+        }
+        let fallback = (std::process::id() as usize).wrapping_mul(0x9E37_79B9) ^ 0x5A5A_A5A5;
+        if fallback == 0 { 1 } else { fallback as isize }
+    })
+}
+
+pub(crate) fn is_disallowed_queued_pointer_msg(message: u32) -> bool {
+    matches!(
+        message,
+        WM_NCCALCSIZE
+            | WM_WINDOWPOSCHANGING
+            | WM_DPICHANGED
+            | WM_GETMINMAXINFO
+            | WM_POWERBROADCAST
+            | WM_DRAWITEM
+            | WM_MEASUREITEM
+    )
+}
+
+fn is_valid_lparam_ptr<T>(lparam: LPARAM) -> bool {
+    let addr = lparam.0 as usize;
+    addr >= 0x10000 && addr.is_multiple_of(std::mem::align_of::<T>())
+}
+
+fn action_allowed(wparam: WPARAM, lparam: LPARAM) -> bool {
+    lparam.0 == internal_action_token() || (wparam.0 & 0xffff) == OPEN
+}
+
+fn read_bounded_utf8(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    if crate::core::is_reparse_point(path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "reparse point rejected",
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds maximum allowed size",
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn resolve_data_dir_from(
+    override_dir: Option<std::ffi::OsString>,
+    local_appdata: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if let Some(raw) = override_dir.filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(raw);
+        if crate::core::validate_path_syntax(&path).is_err()
+            || !crate::core::is_fixed_or_removable_drive(&path)
+            || crate::core::has_reparse_ancestor(&path).unwrap_or(true)
+        {
+            return Err(
+                "WALLPAPERLIVE_DATA_DIR must be an absolute local directory without reparse points"
+                    .into(),
+            );
+        }
+        return Ok(path);
+    }
+    local_appdata
+        .filter(|v| !v.is_empty())
+        .map(|p| PathBuf::from(p).join("WallpaperLive"))
+        .ok_or_else(|| "Windows data directory is unavailable".into())
+}
+
+fn is_safe_local_exe(path: &Path, expected_name: &str) -> bool {
+    if crate::core::validate_path_syntax(path).is_err()
+        || !crate::core::is_fixed_or_removable_drive(path)
+    {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(expected_name)
+        && path.is_file()
+        && !crate::core::has_reparse_ancestor(path).unwrap_or(true)
+}
+
+fn process_image_path(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: read-only limited-information process handle closed via Handle RAII guard.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let handle = Handle(raw);
+    let mut buf = vec![0u16; 4096];
+    let mut len = buf.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buf[..len as usize],
+    )))
+}
+
+fn reveal_in_explorer(path: &Path) -> Result<(), String> {
+    struct CoGuard(bool);
+    impl Drop for CoGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                // SAFETY: balances CoInitializeEx on the same thread.
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+    let wide_path = wide(&path.to_string_lossy());
+    // SAFETY: invokes standard Shell item reveal API without spawning shell commands via PATH.
+    unsafe {
+        let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let _co = CoGuard(init == S_OK || init == S_FALSE);
+        let pidl = ILCreateFromPathW(PCWSTR(wide_path.as_ptr()));
+        if pidl.is_null() {
+            return Err("Could not locate the file in File Explorer".into());
+        }
+        let res = SHOpenFolderAndSelectItems(pidl.cast_const(), None, 0);
+        ILFree(Some(pidl.cast_const()));
+        res.map_err(|_| "Could not open File Explorer for the selected file".to_string())
+    }
 }
 
 const TB_CMD_STARTUP: usize = 1;
@@ -134,11 +290,21 @@ fn parse_hex_color(raw: &str) -> Option<u32> {
         .map(|value| value & 0x00FF_FFFF)
 }
 
-fn find_transparentbar_window() -> Option<HWND> {
-    // SAFETY: read-only class lookup across current session desktop.
-    unsafe { FindWindowW(w!("TransparentBar.Window"), None) }
+fn find_transparentbar_window(expected_exe: &Path) -> Option<HWND> {
+    let expected = fs::canonicalize(expected_exe).ok()?;
+    // SAFETY: read-only class lookup + PID image verification against canonical local exe path.
+    let hwnd = unsafe { FindWindowW(w!("TransparentBar.Window"), None) }
         .ok()
-        .filter(|h| !h.0.is_null())
+        .filter(|h| !h.0.is_null())?;
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    let actual = process_image_path(pid).and_then(|p| fs::canonicalize(p).ok())?;
+    actual
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+        .then_some(hwnd)
 }
 
 fn read_hkcu_dword(subkey: PCWSTR, name: PCWSTR, fallback: bool) -> bool {
@@ -300,11 +466,14 @@ fn read_playback_specs(
     let mut raw_codec = None;
     let mut has_audio = false;
     let mut still_image = false;
+    let mut prop_buf = Vec::with_capacity(32);
     for i in 0..track_count {
-        let prop = |suffix: &str| -> Option<String> {
-            std::ffi::CString::new(format!("track-list/{i}/{suffix}"))
+        let mut prop = |suffix: &str| -> Option<String> {
+            prop_buf.clear();
+            let _ = write!(&mut prop_buf, "track-list/{i}/{suffix}\0");
+            std::ffi::CStr::from_bytes_with_nul(&prop_buf)
                 .ok()
-                .and_then(|c| player.property(&c))
+                .and_then(|c| player.property(c))
         };
         match prop("type").as_deref() {
             Some("audio") => has_audio = true,
@@ -509,15 +678,15 @@ fn is_shell_class(class: &[u16]) -> bool {
     })
 }
 
-fn collect_occluding_windows() -> Vec<(Rect, bool)> {
-    struct EnumState {
+fn collect_occluding_windows_into(windows: &mut Vec<(Rect, bool)>) {
+    struct EnumState<'a> {
         self_pid: u32,
-        windows: Vec<(Rect, bool)>,
+        windows: &'a mut Vec<(Rect, bool)>,
     }
     unsafe extern "system" fn callback(hwnd: HWND, data: LPARAM) -> BOOL {
         // SAFETY: synchronous top-level EnumWindows callback; state lives on caller stack.
         unsafe {
-            let state = &mut *(data.0 as *mut EnumState);
+            let state = &mut *(data.0 as *mut EnumState<'_>);
             if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
                 return BOOL(1);
             }
@@ -580,18 +749,18 @@ fn collect_occluding_windows() -> Vec<(Rect, bool)> {
             BOOL(1)
         }
     }
+    windows.clear();
     let mut state = EnumState {
         self_pid: std::process::id(),
-        windows: Vec::with_capacity(32),
+        windows,
     };
-    // SAFETY: EnumWindows completes synchronously before returning `state.windows`.
+    // SAFETY: EnumWindows completes synchronously before `state` drops.
     unsafe {
         let _ = EnumWindows(
             Some(callback),
-            LPARAM((&mut state as *mut EnumState) as isize),
+            LPARAM((&mut state as *mut EnumState<'_>) as isize),
         );
     }
-    state.windows
 }
 
 unsafe extern "system" fn foreground_win_event_proc(
@@ -673,26 +842,33 @@ fn copy_to_clipboard(hwnd: HWND, text: &str) -> Result<(), String> {
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            // SAFETY: balances successful OpenClipboard on all exit paths.
+            unsafe {
+                let _ = CloseClipboard();
+            }
+        }
+    }
     let wide = wide(text);
     let bytes = wide.len() * std::mem::size_of::<u16>();
     unsafe {
         OpenClipboard(hwnd).map_err(native_error)?;
+        let _guard = ClipboardGuard;
         let _ = EmptyClipboard();
         let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes).map_err(native_error)?;
         let ptr = GlobalLock(hmem);
         if ptr.is_null() {
             let _ = GlobalFree(hmem);
-            let _ = CloseClipboard();
             return Err("Could not lock clipboard memory".into());
         }
         std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr.cast(), wide.len());
         let _ = GlobalUnlock(hmem);
         if SetClipboardData(13, HANDLE(hmem.0)).is_err() {
             let _ = GlobalFree(hmem);
-            let _ = CloseClipboard();
             return Err("Could not set clipboard data".into());
         }
-        let _ = CloseClipboard();
         Ok(())
     }
 }
@@ -918,7 +1094,8 @@ struct App {
     resume_position: f64,
     paused_since: Option<Instant>,
     pause_trimmed: bool,
-    window_snapshot: Option<Vec<(Rect, bool)>>,
+    window_snapshot_valid: bool,
+    occluding_buf: Vec<(Rect, bool)>,
     timer_interval_ms: u32,
     wts_tick: u8,
     status_cache: std::cell::RefCell<(String, &'static str, &'static str, Option<bool>)>,
@@ -1121,10 +1298,12 @@ impl App {
         Ok(())
     }
     fn tick_displays(&mut self) -> Result<(), String> {
-        self.window_snapshot = self
-            .settings
-            .pause_fullscreen
-            .then(collect_occluding_windows);
+        if self.settings.pause_fullscreen {
+            collect_occluding_windows_into(&mut self.occluding_buf);
+            self.window_snapshot_valid = true;
+        } else {
+            self.window_snapshot_valid = false;
+        }
         self.update_reasons();
         self.reasons.fullscreen = false;
         self.reasons.maximized = false;
@@ -1153,7 +1332,7 @@ impl App {
                 error = Some(failure);
             }
         }
-        self.window_snapshot = None;
+        self.window_snapshot_valid = false;
         self.displays.retain(DisplayState::active);
         self.sync_audio()?;
         visuals::playing_all(&self.active_paths());
@@ -1175,7 +1354,14 @@ impl App {
                 let _ = KillTimer(self.hwnd, 1);
             }
         }
-        self.request_thumbnails();
+        if self.thumbnail_thread.is_some()
+            || (!self.hwnd.0.is_null()
+                && unsafe {
+                    IsWindowVisible(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool()
+                })
+        {
+            self.request_thumbnails();
+        }
         self.update_status();
         if let Some(error) = error {
             return Err(error);
@@ -1945,9 +2131,9 @@ impl App {
                 self.start()?;
             }
             CTX_EXPLORER => {
-                let _ = std::process::Command::new("explorer.exe")
-                    .arg(format!("/select,{}", path.display()))
-                    .spawn();
+                if let Err(e) = reveal_in_explorer(&path) {
+                    self.set_error(e);
+                }
             }
             CTX_COPY_PATH => {
                 if let Err(e) = copy_to_clipboard(self.hwnd, &path.to_string_lossy()) {
@@ -2474,7 +2660,9 @@ impl App {
         }
         let parent = self.config.parent().ok_or("Invalid library directory")?;
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let mut recent = String::from("version=2\n");
+        let mut recent =
+            String::with_capacity(16 + self.folder_roots.len() * 48 + paths.len() * 64);
+        recent.push_str("version=2\n");
         for root in &self.folder_roots {
             crate::core::validate_path_syntax(root)?;
             recent.push_str("folder=");
@@ -2978,7 +3166,7 @@ impl App {
                         }
                     });
                 match result {
-                    Ok(path) => post_event(crate::update::DownloadEvent::Ready(path)),
+                    Ok((path, sha)) => post_event(crate::update::DownloadEvent::Ready(path, sha)),
                     Err(err) => post_event(crate::update::DownloadEvent::Failed(err)),
                 }
             }),
@@ -2986,7 +3174,7 @@ impl App {
         Ok(())
     }
     fn update_download_event(&mut self) -> Result<bool, String> {
-        let mut launch_path: Option<PathBuf> = None;
+        let mut launch_target: Option<(PathBuf, [u8; 32])> = None;
         let mut finished_err: Option<String> = None;
         while let Ok(ev) = self.update_download_rx.try_recv() {
             match ev {
@@ -2996,15 +3184,15 @@ impl App {
                 crate::update::DownloadEvent::Verifying => {
                     crate::update_popup::set_verifying(self.hwnd);
                 }
-                crate::update::DownloadEvent::Ready(path) => {
-                    launch_path = Some(path);
+                crate::update::DownloadEvent::Ready(path, sha) => {
+                    launch_target = Some((path, sha));
                 }
                 crate::update::DownloadEvent::Failed(err) => {
                     finished_err = Some(err);
                 }
             }
         }
-        if launch_path.is_some() || finished_err.is_some() {
+        if launch_target.is_some() || finished_err.is_some() {
             if let Some((_, worker)) = self.update_download_thread.take() {
                 let _ = worker.join();
             }
@@ -3021,28 +3209,9 @@ impl App {
             crate::update_popup::set_error(self.hwnd, &err);
             return Ok(false);
         }
-        if let Some(path) = launch_path {
-            let file_w = wide(&path.to_string_lossy());
-            let dir_w = path
-                .parent()
-                .map(|p| wide(&p.to_string_lossy()))
-                .unwrap_or_else(|| wide(""));
-            // SAFETY: launches only the SHA-256 verified GitHub release installer just downloaded by user action.
-            let res = unsafe {
-                ShellExecuteW(
-                    self.hwnd,
-                    w!("open"),
-                    PCWSTR(file_w.as_ptr()),
-                    PCWSTR::null(),
-                    PCWSTR(dir_w.as_ptr()),
-                    SW_SHOWNORMAL,
-                )
-            };
-            if res.0 as isize <= 32 {
-                crate::update_popup::set_error(
-                    self.hwnd,
-                    "Could not launch the downloaded installer",
-                );
+        if let Some((path, sha)) = launch_target {
+            if let Err(err) = crate::update::launch_verified_installer(&path, sha) {
+                crate::update_popup::set_error(self.hwnd, &err);
                 return Ok(false);
             }
             crate::update_popup::dismiss(self.hwnd);
@@ -3095,7 +3264,7 @@ impl App {
                     }
                 });
                 match result {
-                    Ok(path) => post_event(crate::update::DownloadEvent::Ready(path)),
+                    Ok((path, sha)) => post_event(crate::update::DownloadEvent::Ready(path, sha)),
                     Err(err) => post_event(crate::update::DownloadEvent::Failed(err)),
                 }
             }),
@@ -3140,7 +3309,7 @@ impl App {
                     crate::update_popup::set_decoder_verifying(self.hwnd);
                     status_changed = true;
                 }
-                crate::update::DownloadEvent::Ready(path) => {
+                crate::update::DownloadEvent::Ready(path, _sha) => {
                     ready_path = Some(path);
                 }
                 crate::update::DownloadEvent::Failed(err) => {
@@ -3258,7 +3427,7 @@ impl App {
         let Some(exe) = find_transparentbar_exe() else {
             return self.open_website(TRANSPARENT_BAR_URL);
         };
-        let mut tb_hwnd = find_transparentbar_window();
+        let mut tb_hwnd = find_transparentbar_window(&exe);
         if tb_hwnd.is_none() {
             let mut cmd = std::process::Command::new(&exe);
             if let Some(dir) = exe.parent()
@@ -3284,18 +3453,12 @@ impl App {
             return self.open_website(SUPPORT_URL);
         }
         if tb_hwnd.is_none() {
-            for _ in 0..20 {
-                tb_hwnd = find_transparentbar_window();
-                if tb_hwnd.is_some() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
+            tb_hwnd = find_transparentbar_window(&exe);
         }
         let Some(hwnd) = tb_hwnd else {
             return Err("TransparentBar is still starting. Click again in a moment.".into());
         };
-        // SAFETY: TransparentBar.Window handles WM_COMMAND ids directly on its UI loop.
+        // SAFETY: verified TransparentBar.Window handles WM_COMMAND ids directly on its UI loop.
         unsafe {
             let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(chosen), LPARAM(0));
         }
@@ -3742,16 +3905,15 @@ impl App {
                 self.reasons.maximized = false;
                 self.reasons.occluded = false;
             } else {
-                let owned_snapshot;
-                let windows = if let Some(cached) = self.window_snapshot.as_deref() {
-                    cached
-                } else {
-                    owned_snapshot = collect_occluding_windows();
-                    &owned_snapshot
-                };
+                if !self.window_snapshot_valid {
+                    collect_occluding_windows_into(&mut self.occluding_buf);
+                }
                 let screen = self.screen();
-                let (fullscreen, maximized, occluded) =
-                    crate::core::evaluate_display_windows(windows, screen.rect, screen.work_rect);
+                let (fullscreen, maximized, occluded) = crate::core::evaluate_display_windows(
+                    &self.occluding_buf,
+                    screen.rect,
+                    screen.work_rect,
+                );
                 self.reasons.fullscreen = fullscreen;
                 self.reasons.maximized = maximized;
                 self.reasons.occluded = occluded;
@@ -3774,7 +3936,17 @@ impl App {
         self_fast || display_fast || self.thumbnail_thread.is_some()
     }
     fn arm_monitor(&mut self) -> Result<(), String> {
-        let interval = if self.needs_fast_monitor() { 500 } else { 2000 };
+        // When hidden in tray and steady, WinEventHook + power/session notifications fire immediately,
+        // so the fallback poll only needs a low-frequency 4000ms cadence.
+        let panel_hidden = !self.hwnd.0.is_null()
+            && unsafe { !IsWindowVisible(self.hwnd).as_bool() || IsIconic(self.hwnd).as_bool() };
+        let interval = if self.needs_fast_monitor() {
+            500
+        } else if panel_hidden {
+            4000
+        } else {
+            2000
+        };
         if self.timer_interval_ms == interval {
             return Ok(());
         }
@@ -3994,11 +4166,8 @@ impl App {
             }
             Event::Pause(paused) => {
                 if paused && !self.actual_pause && self.loaded && self.reasons.reason().is_some() {
-                    // ponytail: trims resident pages, not decoder allocations; retain frame for fast resume.
-                    unsafe {
-                        let _ =
-                            SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-                    }
+                    // Compacts heap and trims resident pages while retaining last frame for fast resume.
+                    trim_working_set();
                 }
                 self.actual_pause = paused;
             }
@@ -4745,9 +4914,15 @@ impl App {
                     }
                     crate::clock_widget::ensure_desktop_visible();
                     self.cancel_thumbnails();
-                    visuals::retain_thumbnails(&[]);
-                    visuals::trim_transient_caches();
-                    // ponytail: trim panel memory and shift to EcoQoS while running in tray.
+                    visuals::trim_for_tray();
+                    crate::clock_widget::trim_transient_caches();
+                    self.occluding_buf.clear();
+                    self.occluding_buf.shrink_to_fit();
+                    self.window_snapshot_valid = false;
+                    // Trim panel GDI/heap memory, step down fallback timer, and shift to EcoQoS in tray.
+                    if self.timer_interval_ms != 0 {
+                        let _ = self.arm_monitor();
+                    }
                     trim_working_set();
                     set_background_efficiency(true);
                 } else {
@@ -5041,7 +5216,7 @@ impl App {
                 self.settings.clock_size = st.size_pct;
                 self.settings.clock_opacity = st.opacity_pct;
                 self.settings.clock_color = st.color;
-                self.sync_clock();
+                self.sync_clock_live_preview();
             }
             visuals::CLOCK_STYLE_COMMIT => {
                 let st = visuals::clock_ui_state();
@@ -5158,6 +5333,28 @@ impl App {
         if !self.hwnd.0.is_null() && unsafe { IsWindow(self.hwnd).as_bool() } {
             crate::clock_widget::sync(self.hwnd, ACTION, self.clock_config());
         }
+    }
+    fn sync_clock_live_preview(&self) {
+        self.sync_clock_controls();
+        if !self.hwnd.0.is_null() && unsafe { IsWindow(self.hwnd).as_bool() } {
+            crate::clock_widget::sync_live_preview(self.hwnd, ACTION, self.clock_config());
+        }
+    }
+    fn apply_focused_tile(&mut self, id: usize) -> Result<(), String> {
+        if let Some(path) = self
+            .library_view()
+            .get(self.page * 9 + id - visuals::TILE_BASE)
+            .cloned()
+        {
+            self.last_tile_click = None;
+            self.selected = Some(path.clone());
+            self.marked = vec![path];
+            self.error = None;
+            self.refresh_library()?;
+            self.recovery = None;
+            self.start()?;
+        }
+        Ok(())
     }
     fn save_and_sync_clock(&self) -> Result<(), String> {
         if !self.config.as_os_str().is_empty() {
@@ -5374,22 +5571,7 @@ fn window_text(hwnd: HWND) -> String {
     }
 }
 fn decoder_path() -> Result<PathBuf, String> {
-    let directory = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .ok_or("Application directory not found")?
-        .to_owned();
-    let mut candidates = vec![
-        directory.join("runtime/libmpv-2.dll"),
-        directory.join("libmpv-2.dll"),
-    ];
-    if cfg!(debug_assertions) {
-        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/libmpv-2.dll"));
-    }
-    candidates
-        .into_iter()
-        .find(|p| p.is_file())
-        .ok_or("Decoder is missing. Run scripts\\Get-Decoder.ps1 from the install folder once, then try again.".into())
+    crate::mpv::trusted_runtime_decoder_path()
 }
 struct RegKey(HKEY);
 impl Drop for RegKey {
@@ -5631,7 +5813,9 @@ fn find_transparentbar_exe() -> Option<PathBuf> {
     {
         candidates.push(path);
     }
-    candidates.into_iter().find(|p| p.is_file())
+    candidates
+        .into_iter()
+        .find(|p| is_safe_local_exe(p, "transparentbar.exe"))
 }
 
 fn transparentbar_button_label() -> &'static str {
@@ -5706,14 +5890,13 @@ pub fn run() -> Result<(), String> {
             None,
         )
         .map_err(native_error)?;
-        let data = std::env::var_os("WALLPAPERLIVE_DATA_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("WallpaperLive"))
-            })
-            .ok_or("Windows data directory is unavailable")?;
+        let data = resolve_data_dir_from(
+            std::env::var_os("WALLPAPERLIVE_DATA_DIR"),
+            std::env::var_os("LOCALAPPDATA"),
+        )?;
         let config = data.join("settings.ini");
-        let (settings, error, config_valid) = match fs::read_to_string(&config) {
+        let (settings, error, config_valid) = match read_bounded_utf8(&config, MAX_DATA_FILE_BYTES)
+        {
             Ok(text) => match Settings::decode(&text) {
                 Ok(settings) => (settings, None, true),
                 Err(e) => (Settings::default(), Some(e), false),
@@ -5727,7 +5910,7 @@ pub fn run() -> Result<(), String> {
         };
         let selected = settings.path.clone();
         let (library, folder_roots, library_error) =
-            match fs::read_to_string(config.with_file_name("recent.txt")) {
+            match read_bounded_utf8(&config.with_file_name("recent.txt"), MAX_DATA_FILE_BYTES) {
                 Ok(text) => match crate::library::decode(&text) {
                     Ok((files, roots)) => (files, roots, None),
                     Err(error) => (
@@ -5815,7 +5998,8 @@ pub fn run() -> Result<(), String> {
             resume_position: 0.0,
             paused_since: None,
             pause_trimmed: false,
-            window_snapshot: None,
+            window_snapshot_valid: false,
+            occluding_buf: Vec::new(),
             timer_interval_ms: 0,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
@@ -5898,6 +6082,8 @@ pub fn run() -> Result<(), String> {
         {
             app.set_error(error);
         }
+        let app = Rc::new(RefCell::new(app));
+        let _active_app = ActiveAppGuard::install(hwnd, Rc::clone(&app));
         let mut message = MSG::default();
         loop {
             let result = GetMessageW(&mut message, None, 0, 0).0;
@@ -5907,151 +6093,345 @@ pub fn run() -> Result<(), String> {
             if result < 0 {
                 return Err("Windows message loop failed".into());
             }
+            if is_disallowed_queued_pointer_msg(message.message) {
+                continue;
+            }
             if message.message == WM_KEYDOWN {
                 let vk = message.wParam.0 as u16;
                 let focus = GetFocus();
-                if focus == app.control(visuals::SEARCH)
-                    && (vk == VK_SPACE.0 || vk == VK_LEFT.0 || vk == VK_RIGHT.0)
-                {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                    continue;
-                }
-                if app.tab == visuals::Tab::Sources && vk == VK_ESCAPE.0 {
-                    if let Err(error) = app.switch_tab(visuals::Tab::Library) {
-                        app.set_error(error);
+                let focused_id = GetDlgCtrlID(focus) as usize;
+                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                if vk == VK_ESCAPE.0 && crate::update_popup::is_open(hwnd) {
+                    if let Some((_, dismiss_act)) = crate::update_popup::dismiss_action_for(hwnd) {
+                        let mut app_ref = app.borrow_mut();
+                        if let Err(error) = app_ref.action(dismiss_act, 0) {
+                            app_ref.set_error(error);
+                        }
                     }
+                    drain_deferred_app_messages(hwnd);
                     continue;
                 }
-                if app.tab == visuals::Tab::Library && vk == VK_SPACE.0 {
-                    let focused_id = GetDlgCtrlID(focus) as usize;
-                    if focus == hwnd
-                        || (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&focused_id)
+                if vk == VK_F6.0 && crate::update_popup::is_open(hwnd) {
+                    crate::update_popup::focus_popup(hwnd);
+                    continue;
+                }
+                let (is_edit_focus, tab) = {
+                    let app_ref = app.borrow();
+                    let is_edit = focus == app_ref.control(visuals::SEARCH)
+                        || focus == app_ref.control(visuals::CLOCK_HEX_EDIT);
+                    (is_edit, app_ref.tab)
+                };
+                if is_edit_focus {
+                    if vk == VK_TAB.0 && tab == visuals::Tab::Clock && !shift {
+                        if visuals::step_clock_focus(hwnd, false) {
+                            let _ = SetFocus(hwnd);
+                            continue;
+                        }
+                    } else if matches!(
+                        vk,
+                        x if x == VK_SPACE.0
+                            || x == VK_LEFT.0
+                            || x == VK_RIGHT.0
+                            || x == VK_UP.0
+                            || x == VK_DOWN.0
+                            || x == VK_RETURN.0
+                    ) {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                        drain_deferred_app_messages(hwnd);
+                        continue;
+                    }
+                } else if tab == visuals::Tab::Sources && vk == VK_ESCAPE.0 {
+                    let mut app_ref = app.borrow_mut();
+                    if let Err(error) = app_ref.switch_tab(visuals::Tab::Library) {
+                        app_ref.set_error(error);
+                    }
+                    drop(app_ref);
+                    drain_deferred_app_messages(hwnd);
+                    continue;
+                } else if tab == visuals::Tab::Clock {
+                    if vk == VK_ESCAPE.0 {
+                        if crate::clock_widget::is_repositioning() {
+                            let mut app_ref = app.borrow_mut();
+                            if let Err(error) = app_ref.action(visuals::CLOCK_REPOSITION, 0) {
+                                app_ref.set_error(error);
+                            }
+                            drop(app_ref);
+                            drain_deferred_app_messages(hwnd);
+                            continue;
+                        }
+                        if visuals::clock_focus().is_some() {
+                            visuals::set_clock_focus(hwnd, None);
+                            continue;
+                        }
+                    } else if vk == VK_TAB.0 {
+                        if visuals::clock_focus().is_some() {
+                            if visuals::step_clock_focus(hwnd, shift) {
+                                continue;
+                            }
+                        } else if shift
+                            && focused_id == visuals::CLOCK_ENABLE
+                            && visuals::step_clock_focus(hwnd, true)
+                        {
+                            let _ = SetFocus(hwnd);
+                            continue;
+                        }
+                    } else if visuals::clock_focus().is_some()
+                        && matches!(
+                            vk,
+                            x if x == VK_LEFT.0
+                                || x == VK_RIGHT.0
+                                || x == VK_UP.0
+                                || x == VK_DOWN.0
+                                || x == VK_SPACE.0
+                                || x == VK_RETURN.0
+                        )
                     {
-                        app.reasons.manual = !app.reasons.manual;
-                        if let Err(error) = app.tick() {
-                            app.set_error(error);
+                        if visuals::adjust_clock_focused(hwnd, vk, shift).is_some() {
+                            let mut app_ref = app.borrow_mut();
+                            if let Err(error) = app_ref.action(visuals::CLOCK_STYLE_COMMIT, 0) {
+                                app_ref.set_error(error);
+                            }
+                            drop(app_ref);
+                            drain_deferred_app_messages(hwnd);
                         }
                         continue;
                     }
-                } else if app.tab == visuals::Tab::Library && vk == VK_LEFT.0 {
-                    let _ = app.step_page(-1);
-                    continue;
-                } else if app.tab == visuals::Tab::Library && vk == VK_RIGHT.0 {
-                    let _ = app.step_page(1);
-                    continue;
+                } else if tab == visuals::Tab::Library {
+                    if vk == VK_SPACE.0 && focus == hwnd {
+                        let mut app_ref = app.borrow_mut();
+                        app_ref.reasons.manual = !app_ref.reasons.manual;
+                        if let Err(error) = app_ref.tick() {
+                            app_ref.set_error(error);
+                        }
+                        drop(app_ref);
+                        drain_deferred_app_messages(hwnd);
+                        continue;
+                    } else if vk == VK_RETURN.0
+                        && (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&focused_id)
+                    {
+                        let mut app_ref = app.borrow_mut();
+                        if let Err(error) = app_ref.apply_focused_tile(focused_id) {
+                            app_ref.set_error(error);
+                        }
+                        drop(app_ref);
+                        drain_deferred_app_messages(hwnd);
+                        continue;
+                    } else if (vk == VK_LEFT.0 || vk == VK_RIGHT.0)
+                        && (focus == hwnd
+                            || (visuals::TILE_BASE..visuals::TILE_BASE + 9).contains(&focused_id)
+                            || matches!(focused_id, visuals::PREVIOUS | visuals::NEXT))
+                    {
+                        let delta = if vk == VK_LEFT.0 { -1 } else { 1 };
+                        let _ = app.borrow_mut().step_page(delta);
+                        drain_deferred_app_messages(hwnd);
+                        continue;
+                    }
                 }
             }
             if (WM_KEYFIRST..=WM_KEYLAST).contains(&message.message)
                 && IsDialogMessageW(hwnd, &message).as_bool()
             {
+                drain_deferred_app_messages(hwnd);
+                if APP_SHOULD_QUIT.with(Cell::get) {
+                    break;
+                }
                 continue;
             }
             let _ = TranslateMessage(&message);
-            let handled = message.hwnd == hwnd;
-            let action: Result<bool, String> = if handled {
-                match message.message {
-                    CONTEXT_MENU => {
-                        app.context_menu(HWND(message.wParam.0 as *mut _), message.lParam)?;
-                        Ok(false)
-                    }
-                    ACTION => app.action(
-                        message.wParam.0 & 0xffff,
-                        ((message.wParam.0 >> 16) & 0xffff) as u32,
-                    ),
-                    THUMBNAIL => {
-                        app.request_thumbnails();
-                        Ok(false)
-                    }
-                    PREPARED => app.tick().map(|_| false),
-                    UPDATE_READY => app.update_ready().map(|_| false),
-                    UPDATE_DOWNLOAD => app.update_download_event(),
-                    DECODER_DOWNLOAD => app.decoder_download_event(),
-                    LAYOUT => {
-                        app.request_thumbnails();
-                        app.layout().map(|_| false)
-                    }
-                    mpv::WM_MPV => app.tick().map(|_| false),
-                    FOREGROUND_EVENT => {
-                        WINDOW_EVENT_PENDING.store(false, std::sync::atomic::Ordering::Release);
-                        app.tick().map(|_| false)
-                    }
-                    WM_TIMER if message.wParam.0 == 2 => app.update_ready().map(|_| false),
-                    WM_TIMER if message.wParam.0 == visuals::ANIM_TIMER_ID => {
-                        let _ = visuals::tick_animations(hwnd);
-                        Ok(false)
-                    }
-                    WM_TIMER if message.wParam.0 == RESTORE_BACKDROP_TIMER_ID => {
-                        let _ = KillTimer(hwnd, RESTORE_BACKDROP_TIMER_ID);
-                        visuals::begin_backdrop_fade(hwnd);
-                        Ok(false)
-                    }
-                    WM_TIMER => app.tick().map(|_| false),
-                    POWER => {
-                        app.wts_tick = 0;
-                        match message.wParam.0 {
-                            1 => app.update_reasons(),
-                            2 => app.reasons.display_off = message.lParam.0 == 0,
-                            3 => app.reasons.suspended = message.lParam.0 != 0,
-                            _ => {}
-                        }
-                        app.tick().map(|_| false)
-                    }
-                    SESSION => {
-                        app.wts_tick = 0;
-                        app.reasons.session_event(message.wParam.0 as u32);
-                        app.tick().map(|_| false)
-                    }
-                    DISPLAY => (|| {
-                        if app.tray_present {
-                            let _ = app.tray(true);
-                        }
-                        app.displays_changed()?;
-                        app.sync_clock();
-                        Ok(false)
-                    })(),
-                    TRAY => match tray_event(message.lParam.0 as u32) {
-                        Some(TrayEvent::Update) => app.open_release().map(|_| false),
-                        Some(TrayEvent::Menu) => app.tray_menu(message.wParam),
-                        Some(TrayEvent::Open) => {
-                            app.show();
-                            Ok(false)
-                        }
-                        None => Ok(false),
-                    },
-                    DROP => {
-                        let drop = HDROP(message.wParam.0 as *mut _);
-                        let mut name = vec![0u16; 32768];
-                        let n = DragQueryFileW(drop, 0, Some(&mut name));
-                        DragFinish(drop);
-                        if n > 0 {
-                            let path = PathBuf::from(String::from_utf16_lossy(&name[..n as usize]));
-                            app.add_media(path).map(|_| false)
-                        } else {
-                            Err("Could not read the dropped file".into())
-                        }
-                    }
-                    _ => {
-                        if !IsDialogMessageW(hwnd, &message).as_bool() {
-                            let _ = TranslateMessage(&message);
-                            DispatchMessageW(&message);
-                        }
-                        Ok(false)
-                    }
-                }
-            } else {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-                Ok(false)
-            };
-            match action {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => app.set_error(error),
+            DispatchMessageW(&message);
+            drain_deferred_app_messages(hwnd);
+            if APP_SHOULD_QUIT.with(Cell::get) {
+                break;
             }
         }
     }
     Ok(())
+}
+
+struct ActiveAppGuard;
+impl ActiveAppGuard {
+    fn install(hwnd: HWND, app: Rc<RefCell<App>>) -> Self {
+        APP_SHOULD_QUIT.with(|q| q.set(false));
+        DEFERRED_APP_MSGS.with(|q| q.borrow_mut().clear());
+        PENDING_DROPS.with(|q| q.borrow_mut().clear());
+        ACTIVE_APP.with(|slot| *slot.borrow_mut() = Some((hwnd, app)));
+        Self
+    }
+}
+impl Drop for ActiveAppGuard {
+    fn drop(&mut self) {
+        ACTIVE_APP.with(|slot| *slot.borrow_mut() = None);
+        DEFERRED_APP_MSGS.with(|q| q.borrow_mut().clear());
+        PENDING_DROPS.with(|q| q.borrow_mut().clear());
+        APP_SHOULD_QUIT.with(|q| q.set(false));
+    }
+}
+
+fn is_coalescable_app_message(message: u32, wparam: WPARAM) -> bool {
+    matches!(
+        message,
+        FOREGROUND_EVENT
+            | LAYOUT
+            | mpv::WM_MPV
+            | THUMBNAIL
+            | PREPARED
+            | UPDATE_READY
+            | UPDATE_DOWNLOAD
+            | DECODER_DOWNLOAD
+            | DISPLAY
+    ) || (message == WM_TIMER && matches!(wparam.0, 1 | 2))
+}
+
+fn handle_app_message(
+    app: &mut App,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Result<bool, String> {
+    match message {
+        CONTEXT_MENU => {
+            app.context_menu(HWND(wparam.0 as *mut _), lparam)?;
+            Ok(false)
+        }
+        ACTION => app.action(wparam.0 & 0xffff, ((wparam.0 >> 16) & 0xffff) as u32),
+        THUMBNAIL => {
+            app.request_thumbnails();
+            Ok(false)
+        }
+        PREPARED => app.tick().map(|_| false),
+        UPDATE_READY => app.update_ready().map(|_| false),
+        UPDATE_DOWNLOAD => app.update_download_event(),
+        DECODER_DOWNLOAD => app.decoder_download_event(),
+        LAYOUT => {
+            app.request_thumbnails();
+            app.layout().map(|_| false)
+        }
+        mpv::WM_MPV => app.tick().map(|_| false),
+        FOREGROUND_EVENT => {
+            WINDOW_EVENT_PENDING.store(false, std::sync::atomic::Ordering::Release);
+            app.tick().map(|_| false)
+        }
+        WM_TIMER if wparam.0 == 2 => app.update_ready().map(|_| false),
+        WM_TIMER => app.tick().map(|_| false),
+        POWER => {
+            app.wts_tick = 0;
+            match wparam.0 {
+                1 => app.update_reasons(),
+                2 => app.reasons.display_off = lparam.0 == 0,
+                3 => app.reasons.suspended = lparam.0 != 0,
+                _ => {}
+            }
+            app.tick().map(|_| false)
+        }
+        SESSION => {
+            app.wts_tick = 0;
+            app.reasons.session_event(wparam.0 as u32);
+            app.tick().map(|_| false)
+        }
+        DISPLAY => {
+            if app.tray_present {
+                let _ = app.tray(true);
+            }
+            app.displays_changed()?;
+            app.sync_clock();
+            Ok(false)
+        }
+        TRAY => match tray_event(lparam.0 as u32) {
+            Some(TrayEvent::Update) => app.open_release().map(|_| false),
+            Some(TrayEvent::Menu) => app.tray_menu(wparam),
+            Some(TrayEvent::Open) => {
+                app.show();
+                Ok(false)
+            }
+            None => Ok(false),
+        },
+        DROP => {
+            let dropped = PENDING_DROPS.with(|q| q.borrow_mut().pop_front());
+            match dropped {
+                Some(Some(path)) => app.add_media(path).map(|_| false),
+                Some(None) => Err("Could not read the dropped file".into()),
+                None => Ok(false),
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+fn drain_deferred_app_messages(window: HWND) {
+    let target = ACTIVE_APP.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(h, _)| *h == window)
+            .map(|(_, app)| Rc::clone(app))
+    });
+    let Some(app_rc) = target else {
+        return;
+    };
+    while !APP_SHOULD_QUIT.with(Cell::get) {
+        let next = DEFERRED_APP_MSGS.with(|q| q.borrow_mut().pop_front());
+        let Some((message, wparam, lparam)) = next else {
+            break;
+        };
+        let Ok(mut app) = app_rc.try_borrow_mut() else {
+            DEFERRED_APP_MSGS.with(|q| q.borrow_mut().push_front((message, wparam, lparam)));
+            break;
+        };
+        let outcome = handle_app_message(&mut app, message, wparam, lparam);
+        match outcome {
+            Ok(true) => {
+                APP_SHOULD_QUIT.with(|q| q.set(true));
+                // SAFETY: terminates the panel's message loop on the UI thread.
+                unsafe { PostQuitMessage(0) };
+            }
+            Ok(false) => {}
+            Err(error) => app.set_error(error),
+        }
+    }
+}
+
+fn dispatch_or_defer_app_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+    if message == FOREGROUND_EVENT {
+        WINDOW_EVENT_PENDING.store(false, std::sync::atomic::Ordering::Release);
+    }
+    if message == ACTION && !action_allowed(wparam, lparam) {
+        return;
+    }
+    let target = ACTIVE_APP.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(h, _)| *h == window)
+            .map(|(_, app)| Rc::clone(app))
+    });
+    let Some(app_rc) = target else {
+        return;
+    };
+    let Ok(mut app) = app_rc.try_borrow_mut() else {
+        DEFERRED_APP_MSGS.with(|queue| {
+            let mut q = queue.borrow_mut();
+            if is_coalescable_app_message(message, wparam)
+                && q.iter().any(|(m, w, _)| *m == message && *w == wparam)
+            {
+                return;
+            }
+            if q.len() < MAX_DEFERRED_APP_MSGS {
+                q.push_back((message, wparam, lparam));
+            }
+        });
+        return;
+    };
+    let outcome = handle_app_message(&mut app, message, wparam, lparam);
+    match outcome {
+        Ok(true) => {
+            APP_SHOULD_QUIT.with(|q| q.set(true));
+            // SAFETY: terminates the panel's message loop on the UI thread.
+            unsafe { PostQuitMessage(0) };
+        }
+        Ok(false) => {}
+        Err(error) => app.set_error(error),
+    }
+    drop(app);
+    drain_deferred_app_messages(window);
 }
 
 unsafe extern "system" fn window_proc(
@@ -6060,14 +6440,36 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // SAFETY: no Rust state references; transient power/DPI payloads read only during native dispatch.
+    // SAFETY: UI-thread dispatch; ActiveApp borrows are non-overlapping via RefCell::try_borrow_mut.
     unsafe {
         let post = |message: u32, wparam: WPARAM, lparam: LPARAM| {
             let _ = PostMessageW(window, message, wparam, lparam);
         };
+        let post_action = |wparam: WPARAM| {
+            let _ = PostMessageW(window, ACTION, wparam, LPARAM(internal_action_token()));
+        };
+        const WM_NCMOUSELEAVE: u32 = 0x02A2;
         const WM_MOUSELEAVE: u32 = 0x02A3;
         match message {
-            WM_NCCALCSIZE if wparam.0 != 0 && lparam.0 != 0 => {
+            CONTEXT_MENU
+            | ACTION
+            | THUMBNAIL
+            | PREPARED
+            | UPDATE_READY
+            | UPDATE_DOWNLOAD
+            | DECODER_DOWNLOAD
+            | LAYOUT
+            | mpv::WM_MPV
+            | FOREGROUND_EVENT
+            | POWER
+            | SESSION
+            | DISPLAY
+            | TRAY
+            | DROP => {
+                dispatch_or_defer_app_message(window, message, wparam, lparam);
+                LRESULT(0)
+            }
+            WM_NCCALCSIZE if wparam.0 != 0 && is_valid_lparam_ptr::<NCCALCSIZE_PARAMS>(lparam) => {
                 let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
                 let saved_top = params.rgrc[0].top;
                 let _ = DefWindowProcW(window, message, wparam, lparam);
@@ -6131,8 +6533,12 @@ unsafe extern "system" fn window_proc(
                         } as isize);
                     }
                 }
-                if visuals::caption_button_hit(window, pt.x, pt.y).is_some() {
-                    return LRESULT(HTCLIENT as isize);
+                if let Some(btn) = visuals::caption_button_hit(window, pt.x, pt.y) {
+                    return LRESULT(if btn == visuals::CaptionButton::Maximize {
+                        HTMAXBUTTON
+                    } else {
+                        HTCLIENT
+                    } as isize);
                 }
                 let header_px = visuals::HEADER_HEIGHT * dpi / 96;
                 if pt.y >= 0 && pt.y < header_px {
@@ -6141,17 +6547,53 @@ unsafe extern "system" fn window_proc(
                 def
             }
             WM_NCMOUSEMOVE => {
-                if wparam.0 as u32 != HTCLIENT {
-                    visuals::set_caption_hover(window, None);
+                if wparam.0 as u32 == HTMAXBUTTON {
+                    if visuals::set_caption_hover(window, Some(visuals::CaptionButton::Maximize)) {
+                        let mut track = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE | TME_NONCLIENT,
+                            hwndTrack: window,
+                            dwHoverTime: 0,
+                        };
+                        let _ = TrackMouseEvent(&mut track);
+                    }
+                    LRESULT(0)
+                } else {
+                    if wparam.0 as u32 != HTCLIENT {
+                        visuals::set_caption_hover(window, None);
+                    }
+                    DefWindowProcW(window, message, wparam, lparam)
                 }
-                DefWindowProcW(window, message, wparam, lparam)
+            }
+            WM_NCMOUSELEAVE => {
+                visuals::set_caption_hover(window, None);
+                if visuals::caption_down() == Some(visuals::CaptionButton::Maximize) {
+                    visuals::set_caption_down(window, None);
+                }
+                LRESULT(0)
+            }
+            WM_NCLBUTTONDOWN if wparam.0 as u32 == HTMAXBUTTON => {
+                visuals::set_caption_down(window, Some(visuals::CaptionButton::Maximize));
+                LRESULT(0)
+            }
+            WM_NCLBUTTONUP if wparam.0 as u32 == HTMAXBUTTON => {
+                if visuals::caption_down() == Some(visuals::CaptionButton::Maximize) {
+                    visuals::set_caption_down(window, None);
+                    let cmd = if IsZoomed(window).as_bool() {
+                        SC_RESTORE
+                    } else {
+                        SC_MAXIMIZE
+                    };
+                    post(WM_SYSCOMMAND, WPARAM(cmd as usize), LPARAM(0));
+                }
+                LRESULT(0)
             }
             WM_MOUSEMOVE => {
                 let x = (lparam.0 & 0xffff) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-                if let Some(target) = CLOCK_DRAG.with(std::cell::Cell::get) {
+                if let Some(target) = CLOCK_DRAG.with(Cell::get) {
                     let _ = visuals::apply_clock_pointer(window, target, x, y);
-                    post(ACTION, WPARAM(visuals::CLOCK_STYLE_CHANGED), LPARAM(0));
+                    post_action(WPARAM(visuals::CLOCK_STYLE_CHANGED));
                     return LRESULT(0);
                 }
                 let hot = visuals::caption_button_hit(window, x, y);
@@ -6184,13 +6626,14 @@ unsafe extern "system" fn window_proc(
                 let x = (lparam.0 & 0xffff) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
                 if let Some(target) = visuals::clock_control_hit(window, x, y) {
+                    visuals::set_clock_focus(window, None);
                     let _ = visuals::apply_clock_pointer(window, target, x, y);
                     if matches!(target, visuals::ClockDragTarget::Swatch(_)) {
-                        post(ACTION, WPARAM(visuals::CLOCK_STYLE_COMMIT), LPARAM(0));
+                        post_action(WPARAM(visuals::CLOCK_STYLE_COMMIT));
                     } else {
                         CLOCK_DRAG.with(|c| c.set(Some(target)));
                         let _ = SetCapture(window);
-                        post(ACTION, WPARAM(visuals::CLOCK_STYLE_CHANGED), LPARAM(0));
+                        post_action(WPARAM(visuals::CLOCK_STYLE_CHANGED));
                     }
                     LRESULT(0)
                 } else if let Some(btn) = visuals::caption_button_hit(window, x, y) {
@@ -6207,7 +6650,7 @@ unsafe extern "system" fn window_proc(
                     let x = (lparam.0 & 0xffff) as i16 as i32;
                     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
                     let _ = visuals::apply_clock_pointer(window, target, x, y);
-                    post(ACTION, WPARAM(visuals::CLOCK_STYLE_COMMIT), LPARAM(0));
+                    post_action(WPARAM(visuals::CLOCK_STYLE_COMMIT));
                     LRESULT(0)
                 } else if let Some(pressed) = visuals::caption_down() {
                     visuals::set_caption_down(window, None);
@@ -6247,14 +6690,18 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_DRAWITEM if lparam.0 != 0 => {
+            WM_DRAWITEM if is_valid_lparam_ptr::<DRAWITEMSTRUCT>(lparam) => {
                 let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
                 if !crate::tray::draw(item) {
                     visuals::draw_item(item);
                 }
                 LRESULT(1)
             }
-            WM_MEASUREITEM if lparam.0 != 0 => {
+            WM_MEASUREITEM
+                if is_valid_lparam_ptr::<windows::Win32::UI::Controls::MEASUREITEMSTRUCT>(
+                    lparam,
+                ) =>
+            {
                 if crate::tray::measure(
                     &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT),
                 ) {
@@ -6268,7 +6715,9 @@ unsafe extern "system" fn window_proc(
                     .unwrap_or_else(|| DefWindowProcW(window, message, wparam, lparam))
             }
             WM_COMMAND => {
-                post(ACTION, wparam, lparam);
+                if lparam.0 != 0 && IsChild(window, HWND(lparam.0 as *mut _)).as_bool() {
+                    post_action(wparam);
+                }
                 LRESULT(0)
             }
             WM_CONTEXTMENU => {
@@ -6276,13 +6725,13 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_CLOSE => {
-                post(ACTION, WPARAM(HIDE), LPARAM(0));
+                post_action(WPARAM(HIDE));
                 LRESULT(0)
             }
             WM_QUERYENDSESSION => LRESULT(1),
             WM_ENDSESSION => {
                 if wparam.0 != 0 {
-                    post(ACTION, WPARAM(EXIT), LPARAM(0));
+                    post_action(WPARAM(EXIT));
                 }
                 LRESULT(0)
             }
@@ -6343,7 +6792,7 @@ unsafe extern "system" fn window_proc(
                 }
                 DefWindowProcW(window, message, wparam, lparam)
             }
-            WM_WINDOWPOSCHANGING if lparam.0 != 0 => {
+            WM_WINDOWPOSCHANGING if is_valid_lparam_ptr::<WINDOWPOS>(lparam) => {
                 let pos = &mut *(lparam.0 as *mut WINDOWPOS);
                 let iconic = IsIconic(window).as_bool();
                 let mut cur_rect = RECT::default();
@@ -6432,12 +6881,7 @@ unsafe extern "system" fn window_proc(
                 if wparam.0 == SIZE_MINIMIZED as usize {
                     let _ = SetPropW(window, ICONIC_PROPERTY, HANDLE(std::ptr::dangling_mut()));
                     if crate::clock_widget::is_repositioning() {
-                        let _ = PostMessageW(
-                            window,
-                            ACTION,
-                            WPARAM(visuals::CLOCK_REPOSITION),
-                            LPARAM(0),
-                        );
+                        post_action(WPARAM(visuals::CLOCK_REPOSITION));
                     }
                     crate::clock_widget::ensure_desktop_visible();
                     crate::update_popup::sync(window);
@@ -6485,12 +6929,20 @@ unsafe extern "system" fn window_proc(
                 visuals::begin_backdrop_fade(window);
                 LRESULT(0)
             }
+            WM_TIMER => {
+                dispatch_or_defer_app_message(window, message, wparam, lparam);
+                LRESULT(0)
+            }
             WM_DWMCOMPOSITIONCHANGED
             | WM_DWMCOLORIZATIONCOLORCHANGED
             | WM_THEMECHANGED
+            | WM_SYSCOLORCHANGE
             | WM_SETTINGCHANGE => {
                 visuals::invalidate_os_settings_cache();
-                if matches!(message, WM_DWMCOMPOSITIONCHANGED | WM_THEMECHANGED) {
+                if matches!(
+                    message,
+                    WM_DWMCOMPOSITIONCHANGED | WM_THEMECHANGED | WM_SYSCOLORCHANGE
+                ) {
                     visuals::invalidate_theme_cache();
                 }
                 let was_glass = visuals::glass_enabled(window);
@@ -6513,7 +6965,9 @@ unsafe extern "system" fn window_proc(
             }
             WM_DPICHANGED => {
                 visuals::invalidate_theme_cache();
-                if lparam.0 != 0 {
+                visuals::clear_font_cache();
+                crate::clock_widget::clear_font_cache();
+                if is_valid_lparam_ptr::<RECT>(lparam) {
                     let rect = *(lparam.0 as *const RECT);
                     let _ = SetWindowPos(
                         window,
@@ -6530,7 +6984,7 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_GETMINMAXINFO => {
-                if lparam.0 != 0 {
+                if is_valid_lparam_ptr::<MINMAXINFO>(lparam) {
                     let info = &mut *(lparam.0 as *mut MINMAXINFO);
                     let dpi = GetDpiForWindow(window).max(96) as i32;
                     let mut rect = RECT {
@@ -6560,7 +7014,21 @@ unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_DROPFILES => {
-                post(DROP, wparam, lparam);
+                if wparam.0 != 0 {
+                    let drop = HDROP(wparam.0 as *mut _);
+                    let mut name = vec![0u16; 32768];
+                    let n = DragQueryFileW(drop, 0, Some(&mut name));
+                    DragFinish(drop);
+                    let path = (n > 0)
+                        .then(|| PathBuf::from(String::from_utf16_lossy(&name[..n as usize])));
+                    PENDING_DROPS.with(|q| {
+                        let mut q = q.borrow_mut();
+                        if q.len() < 64 {
+                            q.push_back(path);
+                        }
+                    });
+                    dispatch_or_defer_app_message(window, DROP, WPARAM(0), LPARAM(0));
+                }
                 LRESULT(0)
             }
             TRAY_EVENT => {
@@ -6575,7 +7043,9 @@ unsafe extern "system" fn window_proc(
             }
             WM_POWERBROADCAST => {
                 match wparam.0 as u32 {
-                    PBT_POWERSETTINGCHANGE if lparam.0 != 0 => {
+                    PBT_POWERSETTINGCHANGE
+                        if is_valid_lparam_ptr::<POWERBROADCAST_SETTING>(lparam) =>
+                    {
                         let setting = &*(lparam.0 as *const POWERBROADCAST_SETTING);
                         if setting.DataLength == 4 {
                             let value =
@@ -6737,7 +7207,8 @@ mod tests {
             resume_position: 0.0,
             paused_since: None,
             pause_trimmed: false,
-            window_snapshot: None,
+            window_snapshot_valid: false,
+            occluding_buf: Vec::new(),
             timer_interval_ms: 0,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
@@ -8212,7 +8683,8 @@ mod tests {
             resume_position: 0.0,
             paused_since: None,
             pause_trimmed: false,
-            window_snapshot: None,
+            window_snapshot_valid: false,
+            occluding_buf: Vec::new(),
             timer_interval_ms: 0,
             wts_tick: 0,
             status_cache: std::cell::RefCell::new((String::new(), "", "", None)),
@@ -8629,6 +9101,11 @@ mod tests {
 
             let layout =
                 visuals::Layout::new(client.right * 96 / dpi, client.bottom.max(1) * 96 / dpi);
+            let (_, max_rect) = layout.caption_buttons[1];
+            let max_x = ((max_rect.left + max_rect.right) / 2) * dpi / 96;
+            let max_y = ((max_rect.top + max_rect.bottom) / 2) * dpi / 96;
+            assert_eq!(send_hittest(max_x, max_y), LRESULT(HTMAXBUTTON as isize));
+
             let (_, close_rect) = layout.caption_buttons[2];
             let close_x = ((close_rect.left + close_rect.right) / 2) * dpi / 96;
             let close_y = ((close_rect.top + close_rect.bottom) / 2) * dpi / 96;
@@ -9664,5 +10141,78 @@ mod tests {
         let _ = fs::remove_file(&video_path);
         let _ = fs::remove_file(&second_path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn action_message_requires_internal_token_except_open() {
+        let token = internal_action_token();
+        assert_ne!(token, 0);
+        assert!(action_allowed(WPARAM(OPEN), LPARAM(0)));
+        assert!(!action_allowed(WPARAM(EXIT), LPARAM(0)));
+        assert!(!action_allowed(WPARAM(visuals::UPDATE_NOW), LPARAM(0)));
+        assert!(!action_allowed(WPARAM(STARTUP), LPARAM(12345)));
+        assert!(action_allowed(WPARAM(EXIT), LPARAM(token)));
+        assert!(action_allowed(WPARAM(visuals::UPDATE_NOW), LPARAM(token)));
+    }
+
+    #[test]
+    fn resolve_data_dir_rejects_relative_and_unc_paths() {
+        let fallback = Some(std::ffi::OsString::from(r"C:\Users\Demo\AppData\Local"));
+        assert!(
+            resolve_data_dir_from(
+                Some(std::ffi::OsString::from(r"relative\dir")),
+                fallback.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_data_dir_from(
+                Some(std::ffi::OsString::from(r"\\server\share\dir")),
+                fallback.clone(),
+            )
+            .is_err()
+        );
+        let resolved = resolve_data_dir_from(None, fallback).unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from(r"C:\Users\Demo\AppData\Local\WallpaperLive")
+        );
+    }
+
+    #[test]
+    fn read_bounded_utf8_rejects_oversized_file() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scratch")
+            .join(format!("bounded-read-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.ini");
+        fs::write(&file, vec![b'a'; 128]).unwrap();
+        assert!(read_bounded_utf8(&file, 64).is_err());
+        assert_eq!(read_bounded_utf8(&file, 128).unwrap().len(), 128);
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn safe_local_exe_rejects_unc_and_wrong_name() {
+        assert!(!is_safe_local_exe(
+            Path::new(r"\\attacker\share\transparentbar.exe"),
+            "transparentbar.exe",
+        ));
+        assert!(!is_safe_local_exe(
+            Path::new(r"C:\Windows\System32\cmd.exe"),
+            "transparentbar.exe",
+        ));
+    }
+
+    #[test]
+    fn disallowed_queued_pointer_messages_are_filtered() {
+        assert!(is_disallowed_queued_pointer_msg(WM_NCCALCSIZE));
+        assert!(is_disallowed_queued_pointer_msg(WM_WINDOWPOSCHANGING));
+        assert!(is_disallowed_queued_pointer_msg(WM_POWERBROADCAST));
+        assert!(is_disallowed_queued_pointer_msg(WM_DRAWITEM));
+        assert!(is_disallowed_queued_pointer_msg(WM_MEASUREITEM));
+        assert!(!is_disallowed_queued_pointer_msg(WM_PAINT));
+        assert!(!is_disallowed_queued_pointer_msg(ACTION));
     }
 }

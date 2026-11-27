@@ -5,6 +5,8 @@ mod core;
 mod desktop;
 #[path = "../src/mpv.rs"]
 mod mpv;
+#[path = "../src/update.rs"]
+mod update;
 use std::{path::PathBuf, time::Instant};
 use windows::{
     Win32::{
